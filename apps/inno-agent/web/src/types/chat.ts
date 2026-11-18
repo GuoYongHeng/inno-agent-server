@@ -142,7 +142,7 @@ export interface PendingQuestion {
 	restored?: boolean;
 }
 
-/** A parked pi-permission-system `ask`, awaiting an approval decision. */
+/** A parked workspace write/edit approval, awaiting a decision. */
 export interface PendingPermission {
 	requestId: string;
 	source: string;

@@ -5,7 +5,9 @@ import type { JsonValue } from "@earendil-works/chord";
 import { defineTool, type ToolRegistration } from "@earendil-works/pi-durable";
 import { writeJson } from "../storage/file-store.js";
 import type { PersistedQuestion, QuestionBridgeResult, QuestionResponseStatus } from "./question-types.js";
-import { resolvePluginFile } from "./plugin-resolve.js";
+import { QuestionParamsSchema, type QuestionnaireResult } from "./ask-user-question/types.js";
+import { buildQuestionnaireResponse, buildToolResult } from "./ask-user-question/response-envelope.js";
+import { validateQuestionnaire } from "./ask-user-question/validate-questionnaire.js";
 
 export interface DurableQuestionBinding {
 	turnId: string;
@@ -220,59 +222,28 @@ export interface DurableQuestionToolOptions {
 	workspaceDir: string;
 }
 
-interface QuestionnaireSupport {
-	parameters: ToolRegistration["parameters"];
-	validate: (params: unknown) => { ok: boolean; error?: string; message?: string };
-	buildResponse: (result: QuestionBridgeResult, params: unknown) => {
-		content: Array<{ type: "text"; text: string }>;
-		details: Record<string, unknown>;
-	};
-	buildError: (text: string, details: QuestionBridgeResult) => {
-		content: Array<{ type: "text"; text: string }>;
-		details: Record<string, unknown>;
-	};
-}
-
-async function loadQuestionnaireSupport(): Promise<QuestionnaireSupport> {
-	const { createJiti } = await import("jiti/static");
-	const jiti = createJiti(import.meta.url, { moduleCache: false });
-	const typesPath = resolvePluginFile(import.meta.url, "@juicesharp/rpiv-ask-user-question", "tool/types.ts");
-	const envelopePath = resolvePluginFile(import.meta.url, "@juicesharp/rpiv-ask-user-question", "tool/response-envelope.ts");
-	const validationPath = resolvePluginFile(import.meta.url, "@juicesharp/rpiv-ask-user-question", "tool/validate-questionnaire.ts");
-	const types = await jiti.import(typesPath) as Record<string, unknown>;
-	const envelope = await jiti.import(envelopePath) as Record<string, unknown>;
-	const validation = await jiti.import(validationPath) as Record<string, unknown>;
-	return {
-		parameters: types.QuestionParamsSchema as ToolRegistration["parameters"],
-		validate: validation.validateQuestionnaire as QuestionnaireSupport["validate"],
-		buildResponse: envelope.buildQuestionnaireResponse as QuestionnaireSupport["buildResponse"],
-		buildError: envelope.buildToolResult as QuestionnaireSupport["buildError"],
-	};
-}
-
 /** Replay-safe re-entry presents the same persisted question after reopen. A
  * completed response returns from disk without waiting for another answer. */
 export async function createDurableQuestionRegistrations(
 	options: DurableQuestionToolOptions,
 ): Promise<ToolRegistration[]> {
-	const support = await loadQuestionnaireSupport();
 	const tool = defineTool({
 		name: "ask_user_question",
 		description: "Ask the user one or more questions with predefined options. Supports single-select, multi-select, free text input, and option previews.",
-		parameters: support.parameters,
+		parameters: QuestionParamsSchema,
 		executionMode: "sequential",
 		replay: "safe",
 		async execute(params, api, context) {
-			const validation = support.validate(params);
+			const validation = validateQuestionnaire(params);
 			if (!validation.ok) {
-				const result = support.buildError(validation.message ?? "Invalid questionnaire", {
-					answers: [], cancelled: true, ...(validation.error ? { error: validation.error } : {}),
+				const result = buildToolResult(validation.message, {
+					answers: [], cancelled: true, error: validation.error,
 				});
-				return { output: result.content, details: result.details as JsonValue };
+				return { output: result.content, details: result.details as unknown as JsonValue };
 			}
 			const answer = await options.store.ask(api.callId, params, context.abortSignal ?? new AbortController().signal);
-			const result = support.buildResponse(answer, params);
-			return { output: result.content, details: result.details as JsonValue };
+			const result = buildQuestionnaireResponse(answer as QuestionnaireResult, params);
+			return { output: result.content, details: result.details as unknown as JsonValue };
 		},
 	});
 	return [tool];

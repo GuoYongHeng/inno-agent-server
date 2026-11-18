@@ -10,7 +10,6 @@ import { Spinner } from "../ui/Spinner.js";
 import { MessageBubble } from "./MessageBubble.js";
 import { JobStreamBubbles } from "./JobStreamBubbles.js";
 import { StreamingBubbles } from "./StreamingBubbles.js";
-import { TodoWidget, extractTodoTasks } from "./TodoWidget.js";
 import { answeredQuestionnaireFromTool } from "../../utils/questionnaire.js";
 import type { AnsweredQuestionnaireView } from "../../utils/questionnaire.js";
 
@@ -222,11 +221,6 @@ export function ChatConversation({
 		// the user message itself.
 		return chat.messages[lastTurn.startMessageIndex]?.role === "user" ? lastTurn.startMessageIndex : -1;
 	}, [chat.messages, conversationTurns, traceTurnPresentation]);
-	const todoTasks = useMemo(
-		() => extractTodoTasks(chat),
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-		[chat.messages, chat.activeTools, chat.completedTools],
-	);
 	const activeWorkspaceId = useStoreSnapshot(workspaceStore, () => workspaceStore.activeWorkspaceId);
 	const resolveAttachmentUrl = useCallback(
 		(file: AttachmentRef) => workspaceFileUrl(file.path, activeWorkspaceId ?? undefined),
@@ -335,7 +329,6 @@ export function ChatConversation({
 								<div className="inno-conversation-status-gap-mask" aria-hidden="true" />
 							</div>
 						) : null}
-						{todoTasks ? <TodoWidget tasks={todoTasks} /> : null}
 						{wsError ? <p className="mb-2 text-xs text-[var(--inno-danger)]">{wsError}</p> : null}
 						<div className="inno-conversation-composer-wrap">
 							<div className="inno-conversation-composer-mask" aria-hidden="true" />

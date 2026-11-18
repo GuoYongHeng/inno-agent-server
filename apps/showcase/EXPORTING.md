@@ -1,5 +1,7 @@
 # 从真实对话导出一个可回放案例
 
+> **注意：导出管线已移除。** 案例导出（`npm run showcase:export` / `showcase:list` / `showcase:view`、产品内"导出为回放案例"按钮和 `POST /api/sessions/:id/showcase-export`）读取的是旧运行时的 JSONL 会话文件，已随旧运行时一起删除，可从 git 历史恢复。现有 `public/cases/*.json` 仍可回放（`npm run showcase:dev`）；下文关于导出的描述仅作历史参考。
+
 本文档是「真实 Inno Agent 会话 → showcase 回放站」的完整操作手册。案例数据如何构成、脱敏规则、限制与排查都在后面几节。
 
 ## 总览

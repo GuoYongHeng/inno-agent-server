@@ -18,7 +18,6 @@ interface ContextSession {
 		name: string;
 		description?: string;
 		parameters?: unknown;
-		sourceInfo?: { path?: string; source?: string };
 	}>;
 	getActiveToolNames(): string[];
 }
@@ -76,9 +75,8 @@ export function unavailableContextUsage(sessionId: string, status: "inactive" | 
 	return { sessionId, status, source: "sdk", tokens: null, contextWindow: null, percent: null, breakdown: [] };
 }
 
-/** Categories are heuristic weights, calibrated to the SDK's current context total.
- * Tool results stay in messages; tool schemas are counted only once. MCP attribution
- * uses extension provenance as well as names (direct MCP tools can have any prefix).
+/** Categories are heuristic weights, calibrated to the provider's reported context
+ * total. Tool results stay in messages; tool schemas are counted only once.
  */
 export function buildContextUsage(sessionId: string, session: ContextSession): SessionContextUsage {
 	const usage = session.getContextUsage();
@@ -89,7 +87,7 @@ export function buildContextUsage(sessionId: string, session: ContextSession): S
 	if (usage.tokens === null) {
 		return { ...base, status: "pending", source: "sdk", tokens: null, percent: null, breakdown: [] };
 	}
-	const weights = { system: 0, tools: 0, messages: 0, mcp: 0, skills: 0 };
+	const weights = { system: 0, tools: 0, messages: 0, skills: 0 };
 	const estimateText = (text: string) => Math.ceil(text.length / 4);
 	const prompt = session.systemPrompt.replace(/<available_skills>[\s\S]*?<\/available_skills>/g, (block) => {
 		weights.skills += estimateText(block);
@@ -99,9 +97,7 @@ export function buildContextUsage(sessionId: string, session: ContextSession): S
 	const active = new Set(session.getActiveToolNames());
 	for (const tool of session.getAllTools()) {
 		if (!active.has(tool.name)) continue;
-		const provenance = `${tool.sourceInfo?.path ?? ""} ${tool.sourceInfo?.source ?? ""}`;
-		const category = /^mcp(?:_|$)/i.test(tool.name) || /pi-mcp-adapter/.test(provenance) ? "mcp" : "tools";
-		weights[category] += estimateText(JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters }));
+		weights.tools += estimateText(JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters }));
 	}
 	for (const message of session.messages) weights.messages += estimateMessageTokens(message);
 	const entries = Object.entries(weights) as Array<[keyof typeof weights, number]>;

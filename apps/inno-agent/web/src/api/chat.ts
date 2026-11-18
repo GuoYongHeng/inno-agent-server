@@ -74,7 +74,7 @@ export async function submitChatQuestion(sessionId: string, turnId: string, ques
 	});
 }
 
-/** Answer a parked permission ask (pi-permission-system). A deny may carry a
+/** Answer a parked permission ask (a workspace write/edit approval card). A deny may carry a
  *  reason the agent sees. */
 export async function submitChatPermission(
 	sessionId: string,

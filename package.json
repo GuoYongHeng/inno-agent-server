@@ -37,7 +37,6 @@
 	"build": {
 		"appId": "com.inno.agent",
 		"productName": "Inno Agent",
-		"afterPack": "scripts/after-pack.cjs",
 		"directories": {
 			"output": "dist-electron"
 		},
@@ -51,9 +50,6 @@
 			"!node_modules/.cache/**/*"
 		],
 		"asarUnpack": [
-			"**/node_modules/node-pty/**/*",
-			"**/node_modules/@homebridge/**/*",
-			"**/node_modules/@injaneity/pi-computer-use/**/*",
 			"apps/inno-agent/presets/**/*",
 			"apps/inno-agent/scripts/**/*"
 		],

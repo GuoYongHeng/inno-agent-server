@@ -82,7 +82,7 @@ function workspaceIdFromBody(body: Record<string, unknown>): string {
 	return id || TEMP_WORKSPACE_ID;
 }
 
-/** Per-workspace private skills directory (matches inno-extension WORKSPACE_SKILLS_DIR). */
+/** Per-workspace private skills directory (same location agent/workspace-context.ts reads). */
 const WORKSPACE_PRIVATE_SKILLS_DIR = ".skills";
 
 function workspaceRelativePath(rootDir: string, filePath: string): string {

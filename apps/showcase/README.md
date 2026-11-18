@@ -1,5 +1,7 @@
 # Inno Agent Showcase
 
+> **注意：导出管线已移除。** 案例导出（`npm run showcase:export` / `showcase:list` / `showcase:view`、产品内"导出为回放案例"按钮和 `POST /api/sessions/:id/showcase-export`）读取的是旧运行时的 JSONL 会话文件，已随旧运行时一起删除，可从 git 历史恢复。现有 `public/cases/*.json` 仍可回放（`npm run showcase:dev`）；下文关于导出的描述仅作历史参考。
+
 静态案例回放站：把真实使用 Inno Agent 的会话录制导出为 JSON，然后**直接用产品真实前端**流式回放——文字逐字打出、thinking 展开、工具调用逐个出现并完成、右侧文件预览/知识库（L2 wiki)/学习者画像（L1）实时联动，和真实使用完全一致。
 
 ## 工作原理（v3：真实 UI + 流式 mock 后端）

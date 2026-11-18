@@ -115,7 +115,7 @@ export class ChatStoreImpl extends EventEmitter<ChatStoreEvents> {
 	 *  (backend may re-push a question event before the answer POST lands) and
 	 *  guards restored cards against reappearing from a stale cache. */
 	private answeredQuestionIds = new Set<string>();
-	/** Pending permission ask from pi-permission-system's gate (web approval card). */
+	/** Pending workspace write/edit approval (web approval card). */
 	pendingPermission: PendingPermission | null = null;
 	/** Permission request IDs the user already decided. Suppresses stale replays. */
 	private answeredPermissionIds = new Set<string>();

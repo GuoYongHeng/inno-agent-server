@@ -7,12 +7,12 @@ The welcome composer does not display session usage.
 ## Data contract
 
 `GET /api/sessions/:id/context-usage` returns aggregate counts only, with
-`Cache-Control: no-store`. It never activates a session or exposes prompt text,
+`Cache-Control: no-store`. It never exposes prompt text,
 message content, tool schemas, credentials, or filesystem paths.
 
 - `ready`: current context tokens, model context window, percentage and breakdown.
-- `pending`: Pi has compacted the context and has not yet reported a new total.
-- `inactive`: the requested session is not the singleton runtime's current session.
+- `pending`: reserved for a context that was compacted and has no new total yet.
+- `inactive`: reserved; durable sessions are always addressable, so it is not produced.
 - `unavailable`: no usable context window or usage data.
 
 Unknown values are `null`, not zero. Missing sessions return HTTP 404. The UI
@@ -20,16 +20,16 @@ also distinguishes loading and request failure, and retries automatically.
 
 ## Counting semantics
 
-The total uses the installed Pi SDK's `getContextUsage()` (provider usage plus
-estimated subsequent messages). Before a usable provider response exists, the
-initial estimate also includes the effective system prompt and active tool schemas.
+The total is the provider's last reported usage (input + output + cache) plus an
+estimate for the messages that follow it (`agent/context-usage.ts`). Before a usable
+provider response exists, the whole total is estimated from the effective system
+prompt, the registered tool schemas and the messages.
 
 Category weights are estimates, rounded and scaled to sum to the current total:
 
 - System: effective system prompt excluding the available-skills catalog.
-- Tools & subagents: active non-MCP tool definitions, not subagent context windows.
-- Messages: the current message branch, including tool results and loaded skill text.
-- Connectors & MCP: active schemas identified by MCP names or adapter provenance.
+- Tools: the registered tool definitions (name, description, parameters).
+- Messages: the session's active conversation (after an edit-and-resend, the fork), including tool results and loaded skill text.
 - Skill catalog: the `<available_skills>` section of the system prompt.
 
 Percentages use the whole context window as their denominator, not the used

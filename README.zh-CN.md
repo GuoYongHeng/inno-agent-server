@@ -14,11 +14,10 @@
 
 ## 运行时边界
 
-当前有两条显式执行路径：
+所有对话只有一条执行路径——**pi-durable**：
 
-- **Legacy 兼容路径**——CLI、Desktop 和 local server 默认保留单例 `AgentSession`、JSONL 历史、宿主工具和串行 prompt queue，仍是最简单的个人运行方式。
-- **Durable 执行路径**——`INNO_DURABLE_ENABLED=true` 启用独立的 per-session SQLite runtime；多用户模式强制使用 Durable，不回退到 legacy 全局队列。支持独立会话并发、request-ID 去重、崩溃恢复、连续 SSE 回放、可恢复的问题卡/审批，以及 tenant-local memory/OCR/channel。
-- **经验证的租户隔离**——Better Auth + PostgreSQL 提供 personal tenant 和资源所有权。provider 凭证、记忆、工作区、频道和任务均使用 tenant 数据根；未认证返回 401，跨租户资源返回 404。authenticated 模式关闭宿主 shell/通用文件工具和 PTY。
+- **Durable 执行**——每个会话是独立的 per-session SQLite runtime。支持独立会话并发、request-ID 去重、崩溃恢复、连续 SSE 回放、可恢复的问题卡/审批、会话级换模型、编辑并重发历史消息，以及 tenant-local memory/OCR/channel。早期的全局 `AgentSession` 运行时（CLI、bash 终端、MCP、子代理、系统级沙箱）已移除，旧的 JSONL 历史不再读取。
+- **经验证的租户隔离**——Better Auth + PostgreSQL 提供 personal tenant 和资源所有权。provider 凭证、记忆、工作区、频道和任务均使用 tenant 数据根；未认证返回 401，跨租户资源返回 404。任何模式下都没有宿主 shell 或终端，agent 只能在会话工作区内读写文件。
 - **单 owner 存储**——一个 durable storage 同时只有一个 owner。静态 tenant-owner 路由要求每个 worker 使用独立 RWO 数据根；不支持共享 SQLite/NFS active-active、自动 failover 或网络分区 fencing。
 - **明确的恢复语义**——已提交状态和应用 checkpoint 可以恢复，但模型调用、首次远端 OCR 提交、频道投递和部分文件 mutation 仍有 at-least-once crash window。
 
@@ -34,14 +33,11 @@
   - **L3 会话检索**——会话历史索引进 SQLite(FTS5),按相关性阈值门控的跨对话召回。
 - ⏰ **主动调度器**——自然语言创建 cron 任务,可从 agent、UI 或守护进程触发。
 - 💬 **个人 IM 渠道**——飞书(原生)+ 微信(iLink 扫码登录或 bridge 模式),统一dispatcher 回推提醒。
-- 🧪 **练习实验室**——工作区级 Web 终端(xterm.js over WebSocket),运行记录可被 agent 读取。
 - 🎯 **简单模式 + 预设**——面向非技术用户的一键预设工作区(教案、PPT 制作、情景讲解)。
 - 🧩 **技能系统 + 内容中心**——从远程 hub(GitHub 仓库或自建 bundle 服务)浏览、导入技能与预设。
 - ✏️ **对话分支编辑**——重新编辑已发送的纯文本 Web 消息，并从该节点重新生成后续对话；旧分支不会进入当前模型上下文。
 - 🔌 **可插拔模型供应商**——任意 `openai-completions` 或 `anthropic-messages` 端点(Anthropic、OpenAI、DeepSeek、Ollama、本地模型),UI 内实时切换。
 - 🌍 **国际化与主题**——中/英文界面,四套主题。
-- 🛡️ **可选系统级沙箱**——通过 [pi-sandbox](https://github.com/carderne/pi-sandbox) 管控 bash/文件操作;可选 `pi-subagents` 子代理。
-- 🖥️ **电脑控制(桌面端)**——桌面应用可通过 [`pi-computer-use`](https://github.com/injaneity/pi-computer-use) 查看并操作本机屏幕(无障碍树优先);服务器部署默认关闭。见[电脑控制](#电脑控制-computer-use)。
 
 ## 快速开始
 
@@ -73,9 +69,7 @@ docker compose up -d   # 服务端口 3000,挂载 runtime/ 与 workspace/
 
 ```bash
 npm run server          # Web UI(API + 已构建前端,端口 3000)
-npm run start           # CLI(纯终端 agent,无 HTTP)
 npm run electron        # 本地运行桌面应用
-npm run server:sandbox  # 带系统级沙箱的 Web UI(需要 ripgrep)
 
 # 开发模式:后端 :3000 + Vite 热更新 :5173
 npm run dev:server & npm run web:dev
@@ -88,7 +82,6 @@ npm run dev:server & npm run web:dev
 ```bash
 export INNO_AUTH_MODE=better-auth
 export INNO_MULTI_USER_ENABLED=true
-export INNO_DURABLE_ENABLED=true
 export DATABASE_URL=postgresql://inno:inno@127.0.0.1:5432/inno
 export BETTER_AUTH_SECRET='replace-with-at-least-32-random-characters'
 export BETTER_AUTH_URL=http://127.0.0.1:3000
@@ -129,9 +122,9 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
 
 ### 运行时路径
 
-CLI 与 server 都通过 `apps/inno-agent/src/runtime.ts` 解析路径。优先级:**CLI 参数 > 环境变量 > `~/.inno-agent/...`**。
+服务通过 `apps/inno-agent/src/runtime.ts` 解析路径。优先级:**命令行参数 > 环境变量 > `~/.inno-agent/...`**。
 
-| CLI 参数 | 环境变量 | 默认值 |
+| 参数 | 环境变量 | 默认值 |
 |---|---|---|
 | `--home` | `INNO_HOME` | `~/.inno-agent` |
 | `--config-dir` | `INNO_CONFIG_DIR` | `<home>/config` |
@@ -140,27 +133,9 @@ CLI 与 server 都通过 `apps/inno-agent/src/runtime.ts` 解析路径。优先�
 | `--workspace` | `INNO_WORKSPACE_DIR` | 调用时的工作目录 |
 | `--port` | `INNO_PORT` | `3000` |
 
-### 电脑控制(Computer Use)
+### 权限
 
-桌面应用内置 GUI 电脑控制能力(基于 [`@injaneity/pi-computer-use`](https://github.com/injaneity/pi-computer-use)):agent 通过操作系统无障碍树观察窗口,并可执行点击、输入、滚动、浏览器操控。被动观察类工具始终放行;每个有副作用的动作(`act_ui`、浏览器启动/导航/页面内 JS)都会先弹出审批卡片。macOS 首次使用会安装已签名的 helper 到 `~/Applications/pi-computer-use.app`,需在 **系统设置 → 隐私与安全性** 中授予**辅助功能**与**屏幕录制**权限(授权后若未生效,执行 `pkill -f pi-computer-use.app` 重启 helper)。
-
-**开启 / 关闭:**
-
-- **桌面应用**——默认开启。在 **设置 → 通用 → 电脑控制** 中切换,然后重启应用(工具在会话启动时注册,更改在重启后生效)。
-- **本地服务器 / CLI**——默认关闭。带上桌面标记启动即可开启:
-
-  ```bash
-  INNO_DESKTOP=1 npm run server -- --home ./runtime --workspace ./workspace --port 3000
-  ```
-
-  要关闭,**不带 `INNO_DESKTOP` 重启服务**即可。
-- **显式覆盖**(优先级高于环境变量默认值,双向生效),在 `config.json` 中:
-
-  ```json
-  "plugins": { "computerUse": { "enabled": true } }
-  ```
-
-- **线上部署**——保持默认(不设置 `INNO_DESKTOP`)即为关闭。
+agent 没有 shell，也没有宿主机执行能力。文件工具（`read`、`write`、`edit`）被限制在会话工作区内——路径检查会解析符号链接，删除、重命名、追加都被拒绝。写入和编辑需要先审批：Web UI 弹出审批卡片（仅此次 / 本会话允许 / 拒绝），决定会被持久化，崩溃或重启后返回同一个答案而不会再弹卡；非流式或无头运行以 `no_ui` 拒绝。详见 [docs/PERMISSIONS.md](./docs/PERMISSIONS.md)。
 
 ### 内容中心(Content Hub)
 
@@ -168,33 +143,33 @@ CLI 与 server 都通过 `apps/inno-agent/src/runtime.ts` 解析路径。优先�
 
 ## 架构
 
-四层结构：**用户界面 → 认证与租户应用层 → legacy 或 Durable agent 运行时 → 分层记忆。**
+四层结构：**用户界面 → 认证与租户应用层 → pi-durable agent 运行时 → 分层记忆。**
 
 ```text
-用户界面          CLI · Web UI (React) · 桌面应用 · 飞书 · 微信
+用户界面          Web UI (React) · 桌面应用 · 飞书 · 微信
         ↓
 应用层            Better Auth · personal tenant · ownership · HTTP/SSE
-                  渠道 · 调度器 · 工作区 · Practice Lab (local)
+                  渠道 · 调度器 · 工作区
         ↓
-Agent 运行时      Legacy PI AgentSession ──或── pi-durable session runtimes
-(PI SDK,未修改)   共享原生工具；legacy 独立反向适配器
+Agent 运行时      pi-durable session runtimes（每个会话一个 SQLite）
+(PI SDK,未修改)   原生工具：记忆 · OCR · 文档 · 搜索 · 调度 · 渠道
         ↓
 分层记忆          L1 学习者画像 · L2 原生 wiki · L3 会话检索
-                  local 使用全局目录；多用户使用经验证的 tenant 数据根
+                  local 使用本地数据目录；多用户使用经验证的 tenant 数据根
 ```
 
-- **Agent 核心**——legacy 使用 `@earendil-works/pi-coding-agent` 与 [`inno-extension.ts`](./apps/inno-agent/src/agent/inno-extension.ts)；Durable 使用独立的 `pi-durable` runtime，不经过 legacy 全局 prompt queue。memory/OCR/channel 工具使用原生 `(params, api, context)` ABI，legacy 仅通过独立反向适配器复用。PI SDK 内核不被修改。
+- **Agent 核心**——独立的 `pi-durable` runtime；工具使用原生 `(params, api, context)` ABI。PI SDK 内核未修改。详见 [docs/DURABLE_RUNTIME.md](./docs/DURABLE_RUNTIME.md)。
 - **多用户与恢复**——Better Auth + PostgreSQL 验证身份和所有权。Durable 提供 per-session SQLite、request-ID 去重、应用 SSE journal、问题/审批恢复和独立会话并发。详见[多用户 Durable 指南](./docs/MULTI_USER_DURABLE.md)。
-- **记忆**——L1(`src/memory/learner/`):证据驱动的画像 + 事件日志。L2(`src/memory/l2/`):带图谱、摘要、文档摄入与混合检索的结构化 wiki,经 agent 工具和 `/api/wiki/*` 暴露。L3(`src/memory/l3/`):tenant-scoped SQLite FTS5 索引,覆盖 owned legacy JSONL 与已提交的 Durable 历史。
-- **调度器**(`src/scheduler/`)——cron 任务持久化到 `jobs.json` + `runs.jsonl`。
+- **记忆**——L1(`src/memory/learner/`):证据驱动的画像 + 事件日志。L2(`src/memory/l2/`):带图谱、文档摄入与混合检索的结构化 wiki,经 agent 工具和 `/api/wiki/*` 暴露。L3(`src/memory/l3/`):tenant-scoped SQLite FTS5 会话历史索引。
+- **调度器**(`src/scheduler/`)——cron 任务持久化到 `jobs.json` + `runs.jsonl`；每次 agent 运行都在 durable 会话中执行。
 - **渠道**(`src/channels/`)——`ChannelRegistry`,支持飞书、微信(iLink / bridge)、QQ(bridge)。
-- **HTTP 服务**(`src/server.ts`)——原生 Node `http.createServer`,SSE 流式对话 + WebSocket 终端;路由表见 [`apps/inno-agent/README.md`](./apps/inno-agent/README.md)。
+- **HTTP 服务**(`src/server.ts`)——原生 Node `http.createServer`,SSE 流式对话;路由表见 [`apps/inno-agent/README.md`](./apps/inno-agent/README.md)。
 - **Web UI**(`web/src/`)——React 19 + Tailwind 4。状态在框架无关的 `EventEmitter` stores(`web/src/stores/`),REST/SSE 调用在 `web/src/api/`。
 
 ## 仓库结构
 
 ```text
-apps/inno-agent/           后端(CLI + HTTP 服务),TypeScript → dist/
+apps/inno-agent/           后端(HTTP 服务),TypeScript → dist/
 apps/inno-agent/web/       前端(React 19 + Tailwind 4 + Vite)
 apps/inno-agent/presets/   内置预设工作区(离线兜底)
 electron/                  Electron 主进程(桌面应用)
@@ -222,7 +197,7 @@ npm run server
 
 - [多用户 Durable 架构与验收](./docs/MULTI_USER_DURABLE.md)——重构目标、租户边界、恢复语义、真实服务验收和生产缺口。
 - [Durable 运行时契约](./docs/DURABLE_RUNTIME.md)——存储、重放、工具、调度和频道实现细节。
-- [认证与租户隔离](./docs/AUTHENTICATION.md)——Better Auth 配置、显式 legacy-owner 迁移和账号安全边界。
+- [认证与租户隔离](./docs/AUTHENTICATION.md)——Better Auth 配置和账号安全边界。
 - [技能教程 —— 构建工作区 Agent](./docs/use-cases/skill-tutorial.md)——用 `agent.md` 和 `.skills/` 构建工作区范围的自定义学习 agent。
 - [QUICKSTART.md](./QUICKSTART.md)——5 分钟上手指南。
 - [apps/inno-agent/README.md](./apps/inno-agent/README.md)——后端 API 路由表。

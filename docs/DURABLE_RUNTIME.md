@@ -9,32 +9,37 @@ packages. Node.js **22.19.0 or newer** is required. The isolated host lives in
 `apps/inno-agent/src/agent/durable-runtime.ts`; the application catalog and
 runtime leases live in `durable-session-service.ts`.
 
-Durable execution is opt-in in local and authenticated compatibility mode. Set
-`INNO_DURABLE_ENABLED=true` to make the Web UI default new sessions to durable.
-With Better Auth plus `INNO_MULTI_USER_ENABLED=true`, Durable is required:
-startup fails unless `INNO_DURABLE_ENABLED=true`, omitted session/job runtimes
-default to Durable, and legacy execution endpoints return 409 with
-`durable_required`. Owned legacy history remains readable and manageable, but
-new chat, question/permission responses, manual job runs, channel inbound work,
-and automatic/deferred scheduler runs never fall back to the shared legacy
-queue. Better Auth without the multi-user flag retains the compatibility path.
+Durable is the **only** agent runtime. The earlier `pi-coding-agent`
+runtime (global `AgentSession`, JSONL history, host tools, the serialized prompt
+queue) was removed, and `INNO_DURABLE_ENABLED` no longer exists. With Better
+Auth plus `INNO_MULTI_USER_ENABLED=true` every session and job is Durable and
+tenant-owned; locally the same code runs against the local data root.
 
-The explicit HTTP creation contract is:
+> **Reading note.** Parts of this document compare Durable with "legacy" behavior
+> or describe the "compatibility mode" that preceded the removal. Those passages
+> are kept as design history; where they conflict with the above, the removal
+> wins. Old JSONL conversation history is not read at all, and `runtime: "legacy"`
+> is rejected (`400`) by `POST /api/sessions` and by job create/update.
+
+Creating a session:
 
 ```http
 POST /api/sessions
 Content-Type: application/json
 
-{"runtime":"durable"}
+{}
 ```
 
 An owned existing `workspaceId` may be supplied. The authenticated temporary
 workspace fallback and `newWorkspace` (temporary or named) are also supported.
 `presetId` instantiates or reuses the preset's stable tenant-owned workspace.
-Outside multi-user mode, omitting `runtime`, or passing `"legacy"`, keeps the
-existing PI `SessionManager` JSONL behavior. Historical JSONL is never migrated
-or opened as durable storage; in multi-user mode it is historical read-only
-compatibility rather than an execution backend.
+`runtime` is accepted only for older clients and must be `"durable"`.
+
+Added after the removal: a session pins its own model (`PATCH /api/sessions/:id`
+with `provider` + `modelId`, effective from the next request); editing an earlier
+user message forks the conversation (`POST /api/sessions/:id/branch-before-message`)
+and the catalog's `conversationId` points the session at the fork; context usage
+(`GET /api/sessions/:id/context-usage`) follows the provider's last reported usage.
 
 Durable IDs have the form `durable-<uuid>` and never pass through legacy
 `.jsonl` filename helpers. Each tenant has its own application catalog and
@@ -53,8 +58,7 @@ INNO_DURABLE_SHARD_ID=worker-a
 INNO_DURABLE_SHARD_URLS='{"worker-a":"http://worker-a:3000","worker-b":"http://worker-b:3000"}'
 ```
 
-Sharding requires Better Auth, `INNO_MULTI_USER_ENABLED=true`, and
-`INNO_DURABLE_ENABLED=true`. After cookie authentication and personal-tenant
+Sharding requires Better Auth and `INNO_MULTI_USER_ENABLED=true`. After cookie authentication and personal-tenant
 provisioning, the server hashes the verified tenant ID onto the sorted shard IDs.
 A non-owner forwards the untouched request, including JSON bodies and SSE, to
 that owner before lazy agent bootstrap. The owner authenticates the forwarded

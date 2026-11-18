@@ -2,6 +2,8 @@
 
 本文介绍 `inno-agent-server` 当前的多租户架构、与 legacy 运行时的边界，以及已经完成的验证。它描述的是**受控部署可用的多用户运行时**，不是公网账号安全、生产容量或自动故障转移的上线签字。
 
+> **说明（旧运行时已移除）**：本文中的 "Legacy" 列、"compatibility mode" 和 `INNO_DURABLE_ENABLED` 描述的是 `pi-coding-agent` 运行时被移除之前的状态，保留作设计历史。现在 Durable 是唯一运行时：不存在 `INNO_DURABLE_ENABLED`，旧 JSONL 历史不再读取，`tenants:legacy` 迁移命令也已删除。以 [DURABLE_ROADMAP.md](./DURABLE_ROADMAP.md) 和 [DURABLE_RUNTIME.md](./DURABLE_RUNTIME.md) 开头的说明为准。
+
 ## 1. 重构目标
 
 原版本地面向单个学习者：一个进程中的单例 `AgentSession`、共享 prompt queue 和 JSONL session 文件足以保证简单可靠，但不同会话不能真正并发，也无法把多个账号安全地放在同一服务中。
@@ -139,7 +141,6 @@ INNO_DURABLE_SHARD_URLS='{"worker-a":"http://worker-a:3000","worker-b":"http://w
 ```bash
 export INNO_AUTH_MODE=better-auth
 export INNO_MULTI_USER_ENABLED=true
-export INNO_DURABLE_ENABLED=true
 export DATABASE_URL=postgresql://inno:inno@127.0.0.1:5432/inno
 export BETTER_AUTH_SECRET='replace-with-at-least-32-random-characters'
 export BETTER_AUTH_URL=http://127.0.0.1:3000

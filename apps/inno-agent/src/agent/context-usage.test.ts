@@ -8,9 +8,9 @@ function fixture(overrides: Partial<Input> = {}): Input {
 		systemPrompt: "System instructions. <available_skills>skill list</available_skills>",
 		getActiveToolNames: () => ["read", "docs_search"],
 		getAllTools: () => [
-			{ name: "read", description: "Read a file", parameters: {}, sourceInfo: { path: "builtin" } },
-			{ name: "docs_search", description: "Search docs", parameters: {}, sourceInfo: { path: "/node_modules/pi-mcp-adapter/index.ts" } },
-			{ name: "disabled", description: "x".repeat(10000), parameters: {}, sourceInfo: { path: "builtin" } },
+			{ name: "read", description: "Read a file", parameters: {} },
+			{ name: "docs_search", description: "Search docs", parameters: {} },
+			{ name: "disabled", description: "x".repeat(10000), parameters: {} },
 		] as never,
 		messages: [{ role: "assistant", content: [{ type: "text", text: "Hello" }], stopReason: "stop",
 			usage: { input: 64000, output: 1700, cacheRead: 0, cacheWrite: 0 } }] as never,
@@ -25,7 +25,7 @@ describe("buildContextUsage", () => {
 		expect(result.percent).toBeCloseTo(25.0625, 2);
 		expect(result.source).toBe("sdk");
 		expect(result.breakdown.reduce((sum, p) => sum + p.tokens, 0)).toBe(result.tokens);
-		expect(result.breakdown.find((p) => p.id === "mcp")!.tokens).toBeGreaterThan(0);
+		expect(result.breakdown.find((p) => p.id === "tools")!.tokens).toBeGreaterThan(0);
 		expect(result.breakdown.find((p) => p.id === "skills")!.tokens).toBeGreaterThan(0);
 		expect(JSON.stringify(result)).not.toContain("System instructions");
 		expect(JSON.stringify(result)).not.toContain("docs_search");
@@ -76,7 +76,6 @@ describe("buildDurableContextUsage", () => {
 		expect(result.tokens).toBe(1100);
 		expect(result.breakdown.reduce((sum, part) => sum + part.tokens, 0)).toBe(1100);
 		expect(result.breakdown.find((part) => part.id === "skills")!.tokens).toBeGreaterThan(0);
-		expect(result.breakdown.find((part) => part.id === "mcp")!.tokens).toBe(0);
 	});
 
 	it("estimates from instructions, tools and messages before any response", () => {

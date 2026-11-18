@@ -17,7 +17,7 @@ FROM node:22-bookworm
 # 切换 Debian 源到清华镜像，解决国内网络访问 deb.debian.org 不稳定的问题
 RUN sed -i 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update && apt-get install -y --no-install-recommends \
-    # node-pty 的 node-gyp 编译（python 由 Miniforge 提供）
+    # 原生 npm 模块的 node-gyp 编译（python 由 Miniforge 提供）
     make \
     g++ \
     # 运行时必要工具
@@ -27,10 +27,6 @@ RUN sed -i 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/d
     # 下载 Miniforge 所需
     wget \
     ca-certificates \
-    # 沙箱模式（可选）
-    bubblewrap \
-    socat \
-    ripgrep \
     # 文档解析（Office 格式转换）
     libreoffice \
     # 中文字体（CJK），避免中文显示为方块/tofu

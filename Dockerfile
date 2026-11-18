@@ -2,7 +2,7 @@
 FROM node:22-bookworm AS build
 WORKDIR /app
 
-# Install build tools for native modules (node-pty)
+# Install build tools for native npm modules (node-gyp)
 RUN sed -i 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update && apt-get install -y ca-certificates python3 make g++ \
     && sed -i 's|http://mirrors.tuna.tsinghua.edu.cn/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g' /etc/apt/sources.list.d/debian.sources \

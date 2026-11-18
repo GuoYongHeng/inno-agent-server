@@ -1,6 +1,6 @@
 # Inno Agent
 
-基于 PI SDK 的个人学习 Agent 后端，支持 CLI / Web UI / 飞书 / 微信、三层记忆、定时任务与 Practice Lab；同时提供基于 `pi-durable` 的独立会话并发、SQLite 持久执行和 Better Auth + PostgreSQL 多租户运行时。
+基于 `pi-durable` 的个人学习 Agent 后端，支持 Web UI / 飞书 / 微信、三层记忆与定时任务；每个对话是独立的 per-session SQLite 运行时，可在崩溃后恢复，并提供可选的 Better Auth + PostgreSQL 多用户模式。
 
 > 本文档聚焦后端开发与运行细节。项目整体介绍见仓库根目录的 [README.md](../../README.md)；多用户架构、隔离与恢复边界见 [docs/MULTI_USER_DURABLE.md](../../docs/MULTI_USER_DURABLE.md)，实现契约见 [docs/DURABLE_RUNTIME.md](../../docs/DURABLE_RUNTIME.md)。
 
@@ -84,83 +84,28 @@ npm run build && npm run server
 
 浏览器打开 **http://localhost:3000**
 
-### CLI 模式
-
-```bash
-npm run build && npm start
-```
-
-### 沙箱模式
-
-通过 `--sandbox` 启用 OS 级沙箱（基于 [pi-sandbox](https://github.com/carderne/pi-sandbox)），对 Agent 执行的 bash 命令和文件操作进行权限控制。
-
-前置要求：安装 `ripgrep`（`brew install ripgrep`）。
-
-```bash
-# CLI + 沙箱
-npm run sandbox -- --home ./runtime --workspace ./workspace
-
-# Server + 沙箱
-npm run server:sandbox -- --home ./runtime --workspace ./workspace --port 3000
-
-# 也可以直接传 --sandbox 标志
-npm run start -- --sandbox
-npm run server -- --sandbox
-```
-
-沙箱默认关闭，仅在传 `--sandbox` 时启用。启用后：
-
-- bash 命令通过 `sandbox-exec`（macOS）/ `bubblewrap`（Linux）进行 OS 级隔离
-- 文件读写/编辑操作按照策略检查路径权限
-- 被拦截时弹出交互式提示，可选择允许本次/本项目/全局
-
-沙箱配置文件：
-
-- 全局：`<configDir>/sandbox.json`（即 `runtime/config/sandbox.json`）
-- 项目级：`<workspaceDir>/.pi/sandbox.json`（优先级更高）
-
-配置示例：
-
-```json
-{
-  "enabled": true,
-  "network": {
-    "allowedDomains": ["github.com", "*.github.com"]
-  },
-  "filesystem": {
-    "denyRead": ["/Users", "/home"],
-    "allowRead": [".", "~/.config"],
-    "allowWrite": [".", "/tmp"],
-    "denyWrite": [".env", "*.pem", "*.key"]
-  }
-}
-```
-
 ## 项目结构
 
 ```
 src/                  # 后端 (Node.js)
-├── cli.ts            # CLI 入口
 ├── server.ts         # HTTP Server + SSE + REST API
-├── runtime.ts        # 运行时路径解析（CLI flag > env > 默认）
-├── agent/            # PI SDK AgentSession 封装 + inno 扩展
+├── runtime.ts        # 运行时路径解析（命令行参数 > env > 默认）
+├── agent/            # pi-durable 会话运行时、会话服务与原生工具
 ├── channels/         # 飞书 / 微信等渠道
 ├── scheduler/        # 定时任务
 ├── memory/           # L1 学习者 + L2 Wiki + L3 跨对话检索记忆
 │   ├── learner/      # L1 学习者画像
 │   ├── l2/           # L2 Wiki 知识库
 │   └── l3/           # L3 会话记录的 sqlite 索引与阈值召回
-├── terminal/         # Practice Lab WebSocket 终端与运行记录
 └── storage/          # 文件存储
 
 .inno/skills/         # Inno Agent 实际加载的项目级 Skills 目录
 
-web/                  # 前端 (React + Lit + Tailwind + Vite)
+web/                  # 前端 (React + Tailwind + Vite)
 ├── src/
 │   ├── api/          # 纯 TS fetch 封装（无框架依赖）
 │   ├── stores/       # EventEmitter 状态管理（无框架依赖）
 │   ├── react/        # React 组件
-│   ├── components/   # Lit Web Components
 │   ├── types/        # 共享类型
 │   └── utils/        # 工具函数
 └── index.html
@@ -173,20 +118,21 @@ web/                  # 前端 (React + Lit + Tailwind + Vite)
 | GET | `/health` | 健康检查 |
 | POST | `/api/chat` | 发送消息（完整响应） |
 | POST | `/api/chat/stream` | 发送消息（SSE 流式） |
-| GET | `/api/sessions` | 会话列表 |
-| GET | `/api/sessions/:id` | 会话详情 |
-| POST | `/api/sessions/:id/branch-before-message` | 在指定用户消息前创建活动分支，用于重新编辑并生成后续对话 |
+| GET/POST | `/api/sessions` | 会话列表 / 新建会话（均为 durable） |
+| GET/PATCH/DELETE | `/api/sessions/:id` | 会话详情 / 重命名或切换该会话的模型（`provider` + `modelId`，下一条消息起生效）/ 删除 |
+| GET | `/api/sessions/:id/context-usage` | 上下文用量（system / tools / messages / skills 分项） |
+| GET | `/api/sessions/:id/export.md` | 导出为 Markdown |
+| POST | `/api/sessions/:id/branch-before-message` | 在指定用户消息前分叉出新的对话，会话在分支上继续，被放弃的回复不再出现在历史和模型上下文中 |
 | GET | `/api/wiki/pages` | Wiki 页面列表 |
 | GET | `/api/wiki/page?path=` | 读取 Wiki 页面 |
 | PUT | `/api/wiki/page` | 保存 Wiki 页面 |
 | GET | `/api/wiki/graph` | 知识图谱数据 |
 | GET | `/api/wiki/stats` | Wiki 统计 |
-| GET | `/api/skills` | Skills 列表（读取 `.inno/skills/`） |
-| GET | `/api/commands` | 斜杠命令列表（extension 命令 / prompt 模板 / skills），供前端对话框命令面板使用 |
+| GET | `/api/skills` | Skills 列表（读取 skills 目录） |
 | POST | `/api/skills/upload` | 上传 `<skill-name>.zip` 并解压到 `.inno/skills/<name>/` |
 | PATCH | `/api/skills/:name` | 启用/关闭 Skill |
 | DELETE | `/api/skills/:name` | 删除 Skill |
-| POST | `/api/skills/reload` | 重新加载 PI 资源 |
+| POST | `/api/skills/reload` | 刷新技能面板（durable 会话在运行时打开时读取技能目录） |
 | GET | `/api/settings` | 配置信息 |
 | GET/POST/PATCH/DELETE | `/api/jobs[/:id]` | 定时任务 CRUD |
 | POST | `/api/jobs/:id/run` | 立即执行任务 |

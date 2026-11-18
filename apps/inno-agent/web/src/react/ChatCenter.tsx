@@ -1220,10 +1220,7 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 
 	const slashEntries = useMemo(() => {
 		if (slashQuery === null) return [];
-		// Bundled plugins' extension commands (rpiv-todo, pi-web-access, MCP
-		// adapter) are TUI overlays gated on ctx.hasUI — they no-op server-side,
-		// so only Inno's own webSafe commands are offered alongside skills and
-		// prompt templates (both expand into a normal turn).
+		// The agent publishes no commands; keep only ones that are safe to run headless.
 		const agentCommands = slashCommands.filter((command) => command.source !== "extension" || command.webSafe === true);
 		return buildSlashPaletteEntries(slashAppActions, agentCommands, slashQuery);
 	}, [slashAppActions, slashCommands, slashQuery]);

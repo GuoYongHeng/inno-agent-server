@@ -31,7 +31,6 @@
 			"system": "系统提示词",
 			"tools": "工具及子智能体",
 			"messages": "对话消息",
-			"mcp": "连接器及 MCP",
 			"skills": "技能目录"
 		}
 	},

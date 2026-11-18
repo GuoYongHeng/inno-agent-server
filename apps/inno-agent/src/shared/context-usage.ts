@@ -7,7 +7,7 @@ export interface SessionContextUsage {
 	contextWindow: number | null;
 	percent: number | null;
 	breakdown: Array<{
-		id: "system" | "tools" | "messages" | "mcp" | "skills";
+		id: "system" | "tools" | "messages" | "skills";
 		tokens: number;
 		percent: number;
 	}>;
