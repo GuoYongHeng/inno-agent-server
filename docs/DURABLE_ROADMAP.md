@@ -104,7 +104,7 @@ legacy 与 durable 此时仍并存：
 2. 聊天、取消、状态、事件重放：删除 `chat.ts` 的 legacy 分支。
 3. 调度：`job-runner` 仅保留 durable（`durable-job-runner.ts`）；本地与多租户调度共用路径。
 4. 渠道：本地模式的 `PersonalDispatcher` 也走 durable。
-5. BTW、话题生成、模型切换、上下文用量改为 durable 实现；`settings.ts` 的 `switchModel` 改为只更新配置，由下一轮读取。
+5. BTW、话题生成、上下文用量改为 durable 实现；**模型切换**：durable 增加会话级换模型（`conversation.configure({ model })`，下一轮生效，设计见 [DURABLE_S1_FINDINGS.md](./DURABLE_S1_FINDINGS.md) 第 6 节），`settings.ts` 的 `switchModel` 只保留为设置默认模型。
 6. 删除启动时 `initSession` 和"全局活动会话"概念，并同步前端依赖。
 
 **退出标准（合并门槛）**：把 `pi-runner.ts` 临时改为 `throw` 后，全部单元和集成测试仍通过，证明没有路径还在用它。
