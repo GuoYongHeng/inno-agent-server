@@ -1,4 +1,5 @@
-import { StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum, type Api, type Model } from "@earendil-works/pi-ai";
+import type { ModelAuthProvider } from "./model-auth.js";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { defineInnoTool } from "../../agent/inno-tool.js";
@@ -68,6 +69,10 @@ function uniquePaths(paths: string[]): string[] {
  * workspaces without recreating the extension. Durable mode keeps archive
  * deterministic (no nested model calls) and avoids append-only query logs.
  */
+/** Model access for LLM-written wiki pages. Durable archives leave it out and
+ * stay deterministic (no nested model calls, safe to replay). */
+export type RichGenerationProvider = () => { model: Model<Api>; modelRegistry: ModelAuthProvider } | undefined;
+
 export function createL2Tools(
 	l2DataDirInput: string | (() => string),
 	isEnabled?: () => boolean,
@@ -75,6 +80,7 @@ export function createL2Tools(
 	getActiveWorkspaceDir?: () => string,
 	restrictToWorkspace = false,
 	durableMode = false,
+	richGeneration?: RichGenerationProvider,
 ): ToolRegistration[] {
 	const resolveDataDir = () => typeof l2DataDirInput === "function" ? l2DataDirInput() : l2DataDirInput;
 	const resolveMemory = (dataDir: string) => typeof l2Memory === "function"
@@ -114,8 +120,10 @@ export function createL2Tools(
 		}),
 			async execute(params, api, context) {
 				const signal = context.abortSignal;
-				const model = durableMode ? undefined : api.innoLegacy?.model;
-				const modelRegistry = durableMode ? undefined : api.innoLegacy?.modelRegistry;
+				// Durable mode never calls a model, even when one is offered.
+				const rich = durableMode ? undefined : richGeneration?.();
+				const model = rich?.model;
+				const modelRegistry = rich?.modelRegistry;
 				if (isEnabled && !isEnabled()) return l2DisabledResult();
 				const reportProgress = (text: string, phase: string): void => {
 					try {

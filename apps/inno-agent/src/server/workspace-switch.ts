@@ -1,9 +1,7 @@
 import {
 	copyFileSync,
-	existsSync,
 	lstatSync,
 	mkdirSync,
-	statSync,
 	unlinkSync,
 	constants,
 } from "node:fs";
@@ -101,19 +99,11 @@ function inspectSourceFile(rootDir: string, path: string): InspectedSourceFile {
 	}
 }
 
-function sourceHistoryExists(sessionPath: string | null): boolean {
-	if (!sessionPath || !existsSync(sessionPath)) return false;
-	try {
-		return statSync(sessionPath).size > 0;
-	} catch {
-		return false;
-	}
-}
-
 export function buildWorkspaceSwitchPreview(input: {
 	dataDir: string;
 	sessionId: string;
-	sessionPath: string | null;
+	/** Whether the conversation already has messages. */
+	hasSessionHistory: boolean;
 	workspaceRegistry: WorkspaceRegistry;
 	targetWorkspaceId: string;
 }): WorkspaceSwitchPreview {
@@ -131,7 +121,7 @@ export function buildWorkspaceSwitchPreview(input: {
 		sessionId: input.sessionId,
 		workspaceId: sourceWorkspace.id,
 		workspaceRoot: sourceRoot,
-		hasSessionHistory: sourceHistoryExists(input.sessionPath),
+		hasSessionHistory: input.hasSessionHistory,
 	});
 	const files = activity.files
 		.map((entry) => {

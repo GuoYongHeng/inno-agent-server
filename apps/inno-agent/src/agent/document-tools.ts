@@ -51,7 +51,7 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolRegi
 			// The tool context is session-scoped. The process environment points at
 			// the runtime's default workspace and can be different from the
 			// workspace bound to the current chat session.
-			const workspaceDir = options.workspaceDir || api.innoLegacy?.cwd || process.env.INNO_WORKSPACE_DIR || process.cwd();
+			const workspaceDir = options.workspaceDir || process.env.INNO_WORKSPACE_DIR || process.cwd();
 			const pathCheck = options.restrictToWorkspace
 				? checkWorkspaceMutationPath(workspaceDir, typed.filePath)
 				: {

@@ -1,23 +1,19 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildBtwContextDigest, handleBtwRoutes, type BtwRouteContext } from "./btw.js";
-import { completeSideQuestion, appendAssistantNotificationInSession } from "../../agent/pi-runner.js";
 
-vi.mock("../../agent/pi-runner.js", async (importOriginal) => {
-	const original = await importOriginal<typeof import("../../agent/pi-runner.js")>();
-	return {
-		...original,
-		completeSideQuestion: vi.fn(),
-		appendAssistantNotificationInSession: vi.fn(),
-	};
-});
+const SESSION = "durable-1";
 
-const mockedComplete = vi.mocked(completeSideQuestion);
-const mockedAppend = vi.mocked(appendAssistantNotificationInSession);
+interface StubService {
+	get: ReturnType<typeof vi.fn>;
+	snapshot: ReturnType<typeof vi.fn>;
+	completeSideQuestion: ReturnType<typeof vi.fn>;
+	appendAssistantNotification: ReturnType<typeof vi.fn>;
+}
 
 function fakeReq(payload: unknown): HttpReq & PassThrough {
 	const stream = new PassThrough() as HttpReq & PassThrough;
@@ -44,26 +40,23 @@ function fakeRes(): ServerResponse & { statusCode: number; body: () => unknown }
 }
 
 let dataDir: string;
-let sessionFile: string;
+let service: StubService;
 let ctx: BtwRouteContext;
 
 beforeEach(() => {
 	dataDir = mkdtempSync(join(tmpdir(), "btw-routes-"));
-	sessionFile = join(dataDir, "sessions", "sess-1.jsonl");
-	mkdirSync(join(dataDir, "sessions"), { recursive: true });
-	writeFileSync(sessionFile, "");
-	ctx = {
-		dataDir,
-		sessionFileFromId: (_dir, id) => (id === "sess-1" ? sessionFile : null),
-		parseSessionFile: () => ({
+	service = {
+		get: vi.fn((_req: unknown, id: string) => (id === SESSION ? { id } : undefined)),
+		snapshot: vi.fn(async () => ({
 			messages: [
-				{ role: "user", content: "什么是闭包？" } as never,
-				{ role: "assistant", content: "闭包是能记住外层作用域的函数。" } as never,
+				{ role: "user", content: "什么是闭包？" },
+				{ role: "assistant", content: "闭包是能记住外层作用域的函数。" },
 			],
-		}),
+		})),
+		completeSideQuestion: vi.fn(),
+		appendAssistantNotification: vi.fn(async () => undefined),
 	};
-	mockedComplete.mockReset();
-	mockedAppend.mockReset();
+	ctx = { dataDir, durableSessions: service as never };
 });
 
 afterEach(() => {
@@ -105,7 +98,7 @@ describe("buildBtwContextDigest", () => {
 describe("handleBtwRoutes /api/btw/ask", () => {
 	it("loads and saves per-session side-question state", async () => {
 		const initial = fakeRes();
-		await handleBtwRoutes(fakeReq({}), initial as ServerResponse, "GET", "/api/btw/state/sess-1", ctx);
+		await handleBtwRoutes(fakeReq({}), initial as ServerResponse, "GET", `/api/btw/state/${SESSION}`, ctx);
 		expect(initial.statusCode).toBe(200);
 		expect(initial.body()).toMatchObject({ session: { tabs: [] } });
 
@@ -120,33 +113,34 @@ describe("handleBtwRoutes /api/btw/ask", () => {
 			minimized: false,
 		};
 		const saved = fakeRes();
-		await handleBtwRoutes(fakeReq(state), saved as ServerResponse, "PUT", "/api/btw/state/sess-1", ctx);
+		await handleBtwRoutes(fakeReq(state), saved as ServerResponse, "PUT", `/api/btw/state/${SESSION}`, ctx);
 		expect(saved.statusCode).toBe(200);
 		expect(saved.body()).toEqual(state);
 
 		const loaded = fakeRes();
-		await handleBtwRoutes(fakeReq({}), loaded as ServerResponse, "GET", "/api/btw/state/sess-1", ctx);
+		await handleBtwRoutes(fakeReq({}), loaded as ServerResponse, "GET", `/api/btw/state/${SESSION}`, ctx);
 		expect(loaded.body()).toEqual(state);
 	});
 
 	it("rejects malformed state payloads", async () => {
 		const res = fakeRes();
-		await handleBtwRoutes(fakeReq({ session: {}, window: {} }), res as ServerResponse, "PUT", "/api/btw/state/sess-1", ctx);
+		await handleBtwRoutes(fakeReq({ session: {}, window: {} }), res as ServerResponse, "PUT", `/api/btw/state/${SESSION}`, ctx);
 		expect(res.statusCode).toBe(400);
 	});
 
 	it("answers a side question with the digest and thread", async () => {
-		mockedComplete.mockResolvedValue("词法作用域决定的。");
+		service.completeSideQuestion.mockResolvedValue("词法作用域决定的。");
 		const res = fakeRes();
 		const handled = await handleBtwRoutes(fakeReq({
-			sessionId: "sess-1",
+			sessionId: SESSION,
 			question: "那自由变量呢？",
 			thread: [{ question: "什么是闭包？", answer: "闭包是…" }],
 		}), res as ServerResponse, "POST", "/api/btw/ask", ctx);
 		expect(handled).toBe(true);
 		expect(res.statusCode).toBe(200);
 		expect(res.body()).toEqual({ answer: "词法作用域决定的。" });
-		const input = mockedComplete.mock.calls[0][0];
+		const [, sessionId, input] = service.completeSideQuestion.mock.calls[0]!;
+		expect(sessionId).toBe(SESSION);
 		expect(input.question).toBe("那自由变量呢？");
 		expect(input.thread).toEqual([{ question: "什么是闭包？", answer: "闭包是…" }]);
 		expect(input.contextDigest).toContain("什么是闭包？");
@@ -154,13 +148,13 @@ describe("handleBtwRoutes /api/btw/ask", () => {
 	});
 
 	it("does not write a response after the client aborts", async () => {
-		mockedComplete.mockImplementation(({ signal }) => new Promise<string>((resolve) => {
+		service.completeSideQuestion.mockImplementation((_req, _id, { signal }) => new Promise<string>((resolve) => {
 			signal?.addEventListener("abort", () => resolve(""), { once: true });
 		}));
-		const req = fakeReq({ sessionId: "sess-1", question: "q" });
+		const req = fakeReq({ sessionId: SESSION, question: "q" });
 		const res = fakeRes();
 		const handled = handleBtwRoutes(req, res as ServerResponse, "POST", "/api/btw/ask", ctx);
-		await vi.waitFor(() => expect(mockedComplete).toHaveBeenCalled());
+		await vi.waitFor(() => expect(service.completeSideQuestion).toHaveBeenCalled());
 		req.emit("aborted");
 		await expect(handled).resolves.toBe(true);
 		expect(res.statusCode).toBe(0);
@@ -169,85 +163,69 @@ describe("handleBtwRoutes /api/btw/ask", () => {
 	it("rejects malformed bodies with 400", async () => {
 		for (const payload of [
 			{},
-			{ sessionId: "sess-1" },
-			{ sessionId: "sess-1", question: "   " },
-			{ sessionId: "sess-1", question: "q", thread: "nope" },
-			{ sessionId: "sess-1", question: "q", thread: [{ question: "q" }] },
-			{ sessionId: "sess-1", question: "x".repeat(4001) },
+			{ sessionId: SESSION },
+			{ sessionId: SESSION, question: "   " },
+			{ sessionId: SESSION, question: "q", thread: "nope" },
+			{ sessionId: SESSION, question: "q", thread: [{ question: "q" }] },
+			{ sessionId: SESSION, question: "x".repeat(4001) },
 		]) {
 			const res = fakeRes();
 			await handleBtwRoutes(fakeReq(payload), res as ServerResponse, "POST", "/api/btw/ask", ctx);
 			expect(res.statusCode).toBe(400);
 		}
-		expect(mockedComplete).not.toHaveBeenCalled();
+		expect(service.completeSideQuestion).not.toHaveBeenCalled();
 	});
 
 	it("returns 404 for an unknown session", async () => {
 		const res = fakeRes();
 		await handleBtwRoutes(fakeReq({ sessionId: "missing", question: "q" }), res as ServerResponse, "POST", "/api/btw/ask", ctx);
 		expect(res.statusCode).toBe(404);
-		expect(mockedComplete).not.toHaveBeenCalled();
+		expect(service.completeSideQuestion).not.toHaveBeenCalled();
 	});
 
 	it("returns 502 when the side completion fails", async () => {
-		mockedComplete.mockResolvedValue("");
+		service.completeSideQuestion.mockResolvedValue("");
 		const res = fakeRes();
-		await handleBtwRoutes(fakeReq({ sessionId: "sess-1", question: "q" }), res as ServerResponse, "POST", "/api/btw/ask", ctx);
+		await handleBtwRoutes(fakeReq({ sessionId: SESSION, question: "q" }), res as ServerResponse, "POST", "/api/btw/ask", ctx);
 		expect(res.statusCode).toBe(502);
 	});
 });
 
 describe("handleBtwRoutes /api/btw/bring-back", () => {
-	it("appends the confirmed Q/A as a session notification", async () => {
-		mockedAppend.mockResolvedValue(undefined);
+	const body = { sessionId: SESSION, question: "什么是闭包？", answer: "闭包是…", clientRequestId: "btw-exchange-1" };
+
+	it("appends the confirmed Q/A to the session history with a stable request ID", async () => {
+		const req = fakeReq(body);
 		const res = fakeRes();
-		await handleBtwRoutes(fakeReq({
-			sessionId: "sess-1",
-			question: "什么是闭包？",
-			answer: "闭包是…",
-		}), res as ServerResponse, "POST", "/api/btw/bring-back", ctx);
+		await handleBtwRoutes(req, res as ServerResponse, "POST", "/api/btw/bring-back", ctx);
 		expect(res.statusCode).toBe(200);
 		expect(res.body()).toEqual({ ok: true });
-		const [path, text] = mockedAppend.mock.calls[0];
-		expect(path).toBe(sessionFile);
+		const [, id, text, requestId] = service.appendAssistantNotification.mock.calls[0]!;
+		expect(id).toBe(SESSION);
+		expect(requestId).toBe("btw-exchange-1");
 		expect(text).toContain("📌 旁注问答");
 		expect(text).toContain("Q: 什么是闭包？");
 		expect(text).toContain("A: 闭包是…");
 	});
 
-	it("appends to durable history with a stable request ID", async () => {
-		const append = vi.fn(async () => undefined);
-		ctx.durableSessions = {
-			get: () => ({ id: "durable-1" }),
-			appendAssistantNotification: append,
-		} as never;
-		const req = fakeReq({
-			sessionId: "durable-1", question: "什么是闭包？", answer: "闭包是…", clientRequestId: "btw-exchange-1",
-		});
+	it("requires a request ID before writing history", async () => {
 		const res = fakeRes();
-		await handleBtwRoutes(req, res as ServerResponse, "POST", "/api/btw/bring-back", ctx);
-		expect(res.statusCode).toBe(200);
-		expect(append).toHaveBeenCalledWith(req, "durable-1", expect.stringContaining("📌 旁注问答"), "btw-exchange-1");
-		expect(mockedAppend).not.toHaveBeenCalled();
+		await handleBtwRoutes(fakeReq({ sessionId: SESSION, question: "q", answer: "a" }), res as ServerResponse, "POST", "/api/btw/bring-back", ctx);
+		expect(res.statusCode).toBe(400);
+		expect(service.appendAssistantNotification).not.toHaveBeenCalled();
 	});
 
-	it("requires a request ID before writing durable bring-back history", async () => {
-		const append = vi.fn(async () => undefined);
-		ctx.durableSessions = {
-			get: () => ({ id: "durable-1" }),
-			appendAssistantNotification: append,
-		} as never;
+	it("returns 404 for an unknown session", async () => {
 		const res = fakeRes();
-		await handleBtwRoutes(fakeReq({ sessionId: "durable-1", question: "q", answer: "a" }), res as ServerResponse, "POST", "/api/btw/bring-back", ctx);
-		expect(res.statusCode).toBe(400);
-		expect(append).not.toHaveBeenCalled();
-		expect(mockedAppend).not.toHaveBeenCalled();
+		await handleBtwRoutes(fakeReq({ ...body, sessionId: "missing" }), res as ServerResponse, "POST", "/api/btw/bring-back", ctx);
+		expect(res.statusCode).toBe(404);
+		expect(service.appendAssistantNotification).not.toHaveBeenCalled();
 	});
 
 	it("returns 500 when the append fails", async () => {
-		mockedAppend.mockRejectedValue(new Error("queue busy"));
+		service.appendAssistantNotification.mockRejectedValue(new Error("storage busy"));
 		const res = fakeRes();
-		await handleBtwRoutes(fakeReq({ sessionId: "sess-1", question: "q", answer: "a" }), res as ServerResponse, "POST", "/api/btw/bring-back", ctx);
+		await handleBtwRoutes(fakeReq(body), res as ServerResponse, "POST", "/api/btw/bring-back", ctx);
 		expect(res.statusCode).toBe(500);
 	});
 

@@ -1,3 +1,4 @@
+import type { DurableHttpContext } from "../durable-routes.js";
 import { execFile, spawnSync } from "node:child_process";
 import type { Dirent } from "node:fs";
 import {
@@ -15,7 +16,6 @@ import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative } from "node:path";
 import { promisify } from "node:util";
-import { applyWorkspaceCwd, getCurrentSessionId } from "../../agent/pi-runner.js";
 import { streamRegistry } from "../../chat/stream-registry.js";
 import { logger } from "../../logger.js";
 import type { RuntimePaths } from "../../runtime.js";
@@ -60,14 +60,7 @@ export interface WorkspacesRouteContext {
 	installSkillMarkdown: (fileName: string, data: Buffer, targetRoot?: string) => { name: string; filePath: string };
 	importWorkspaceZip: (fileName: string, data: Buffer, name?: string) => WorkspaceMeta;
 	scheduleSkillsReload: () => void;
-	sessionFileFromId: (sessionDir: string, id: string) => string | null;
-	releaseQueueFromQuestionBlockedTurn: (sessionId: string) => void;
-	runQueueOpWithTimeout: <T>(
-		req: HttpReq,
-		res: ServerResponse,
-		op: (signal: AbortSignal) => Promise<T>,
-		timeoutMs?: number,
-	) => Promise<T | null>;
+	durableSessions: DurableHttpContext["service"];
 }
 
 // ---------------------------------------------------------------------------
@@ -320,9 +313,7 @@ export async function handleWorkspacesRoutes(
 		installSkillMarkdown,
 		importWorkspaceZip,
 		scheduleSkillsReload,
-		sessionFileFromId,
-		releaseQueueFromQuestionBlockedTurn,
-		runQueueOpWithTimeout,
+		durableSessions,
 		tenantStore,
 	} = ctx;
 
@@ -371,9 +362,9 @@ export async function handleWorkspacesRoutes(
 		if (normalizedPath.startsWith("/") || /^[A-Za-z]:\//.test(normalizedPath)) return null;
 		return safeJoinReal(root, normalizedPath);
 	};
-	const sessionPathForSwitch = (sessionId: string): string | null => {
-		const sessionPath = sessionFileFromId(join(dataDir, "sessions"), sessionId);
-		if (!sessionPath || !existsSync(sessionPath)) {
+	const switchableSession = (sessionId: string): { hasHistory: boolean } | null => {
+		const session = durableSessions.get(req, sessionId);
+		if (!session) {
 			json(res, 404, { error: "Session not found" });
 			return null;
 		}
@@ -381,7 +372,7 @@ export async function handleWorkspacesRoutes(
 			json(res, 409, { error: "Cannot rebind a session with an active chat turn" });
 			return null;
 		}
-		return sessionPath;
+		return { hasHistory: session.messageCount > 0 };
 	};
 	const isAvailableSwitchTarget = (workspaceId: string): boolean => {
 		if (isSwitchableWorkspace(workspaceRegistry.getWorkspace(workspaceId))) return true;
@@ -915,8 +906,8 @@ export async function handleWorkspacesRoutes(
 	const sessionWorkspaceSwitchPreviewMatch = matchRoute("GET", method, url, "/api/sessions/:id/workspace/switch-preview");
 	if (sessionWorkspaceSwitchPreviewMatch) {
 		const sessionId = decodeURIComponent(sessionWorkspaceSwitchPreviewMatch.id);
-		const sessionPath = sessionPathForSwitch(sessionId);
-		if (!sessionPath) return true;
+		const switchSession = switchableSession(sessionId);
+		if (!switchSession) return true;
 		const requestedTargetWorkspaceId = new URL(url, "http://localhost").searchParams.get("targetWorkspaceId")?.trim() ?? "";
 		if (!requestedTargetWorkspaceId) {
 			json(res, 400, { error: "Missing targetWorkspaceId" });
@@ -937,7 +928,7 @@ export async function handleWorkspacesRoutes(
 			const preview = buildWorkspaceSwitchPreview({
 				dataDir,
 				sessionId,
-				sessionPath,
+				hasSessionHistory: switchSession.hasHistory,
 				workspaceRegistry,
 				targetWorkspaceId,
 			});
@@ -951,8 +942,8 @@ export async function handleWorkspacesRoutes(
 	const sessionWorkspaceSwitchMatch = matchRoute("POST", method, url, "/api/sessions/:id/workspace/switch");
 	if (sessionWorkspaceSwitchMatch) {
 		const sessionId = decodeURIComponent(sessionWorkspaceSwitchMatch.id);
-		const sessionPath = sessionPathForSwitch(sessionId);
-		if (!sessionPath) return true;
+		const switchSession = switchableSession(sessionId);
+		if (!switchSession) return true;
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const requestedTargetWorkspaceId = typeof body.targetWorkspaceId === "string" ? body.targetWorkspaceId.trim() : "";
 		if (!requestedTargetWorkspaceId) {
@@ -996,7 +987,7 @@ export async function handleWorkspacesRoutes(
 			preview = buildWorkspaceSwitchPreview({
 				dataDir,
 				sessionId,
-				sessionPath,
+				hasSessionHistory: switchSession.hasHistory,
 				workspaceRegistry,
 				targetWorkspaceId,
 			});
@@ -1005,31 +996,12 @@ export async function handleWorkspacesRoutes(
 			return true;
 		}
 
-		// Bind before touching any file. If the live agent cannot adopt the new
-		// cwd, restore the old binding and leave both workspaces untouched.
+		// Bind before touching any file. A durable session reads its workspace when
+		// its runtime opens, so the next message uses the new one.
 		if (!workspaceRegistry.bindSession(sessionId, targetWorkspaceId)) {
 			json(res, 404, { error: "Target workspace not found" });
 			return true;
 		}
-		if (getCurrentSessionId() === sessionId) {
-			releaseQueueFromQuestionBlockedTurn(sessionId);
-			try {
-				const applied = await runQueueOpWithTimeout(req, res, (signal) => {
-					const currentPath = sessionFileFromId(join(dataDir, "sessions"), sessionId);
-					if (!currentPath) throw new Error("Session not found");
-					return applyWorkspaceCwd(currentPath, { signal });
-				});
-				if (applied === null) {
-					workspaceRegistry.bindSession(sessionId, sourceWorkspaceId);
-					return true;
-				}
-			} catch (err) {
-				workspaceRegistry.bindSession(sessionId, sourceWorkspaceId);
-				json(res, 500, { error: err instanceof Error ? err.message : "Failed to bind target workspace" });
-				return true;
-			}
-		}
-
 		const files = transferWorkspaceFiles({ preview, sourceRoot, targetRoot, fileActions });
 		json(res, 200, {
 			switched: true,
@@ -1065,17 +1037,12 @@ export async function handleWorkspacesRoutes(
 		const targetWorkspace = await resolveWorkspace(requestedWorkspaceId);
 		if (!targetWorkspace) { json(res, 404, { error: "Workspace not found" }); return true; }
 		const workspaceId = targetWorkspace.id;
+		if (streamRegistry.getActiveForSession(sessionId)) {
+			json(res, 409, { error: "Cannot rebind a session with an active chat turn" });
+			return true;
+		}
 		const ok = workspaceRegistry.bindSession(sessionId, workspaceId);
 		if (!ok) { json(res, 404, { error: "Workspace not found" }); return true; }
-		// If the rebinding affects the currently active session, refresh agent cwd.
-		if (getCurrentSessionId() === sessionId) {
-			const sessionPath = sessionFileFromId(join(dataDir, "sessions"), sessionId);
-			if (sessionPath) {
-				releaseQueueFromQuestionBlockedTurn(sessionId);
-				const applied = await runQueueOpWithTimeout(req, res, (signal) => applyWorkspaceCwd(sessionPath, { signal }));
-				if (applied === null) return true; // 409 session_busy already sent (or client gone)
-			}
-		}
 		json(res, 200, { sessionId, workspaceId });
 		return true;
 	}

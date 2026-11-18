@@ -18,8 +18,6 @@ set -euo pipefail
 #   --mode prod  backend only — serves the built web/dist
 #
 # Sandbox:
-#   --sandbox     start backend with pi-sandbox enabled
-#   --no-sandbox  start without sandbox (default)
 # ---------------------------------------------------------------------------
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +29,6 @@ WORKSPACE="${INNO_WORKSPACE:-./workspace}"
 PORT="${INNO_PORT:-3000}"
 WEB_PORT="${INNO_WEB_PORT:-5173}"
 MODE="${INNO_MODE:-dev}"            # dev | prod
-SANDBOX="${INNO_SANDBOX:-false}"    # true | false
 SKIP_BUILD=false
 TAIL_AFTER=false
 
@@ -52,8 +49,6 @@ Commands:
 
 Options:
   --mode dev|prod    dev (default): backend + Vite. prod: backend only (serves dist).
-  --sandbox          enable pi-sandbox in backend
-  --no-sandbox       disable pi-sandbox (default)
   --skip-build       skip build during restart
   --home <path>      runtime home dir          (default: ./runtime)
   --workspace <path> agent workspace dir       (default: ./workspace)
@@ -62,13 +57,12 @@ Options:
   --tail             after starting, follow server.log in foreground
   -h, --help         show this help
 
-Env vars: INNO_HOME, INNO_WORKSPACE, INNO_PORT, INNO_WEB_PORT, INNO_MODE, INNO_SANDBOX
+Env vars: INNO_HOME, INNO_WORKSPACE, INNO_PORT, INNO_WEB_PORT, INNO_MODE
 
 Examples:
   ./restart-dev.sh                            # build + dev mode (server + vite)
   ./restart-dev.sh --skip-build               # restart without rebuilding
   ./restart-dev.sh --mode prod --skip-build   # restart backend only against built dist
-  ./restart-dev.sh restart --sandbox          # rebuild and start with sandbox
   ./restart-dev.sh stop                       # stop everything
   ./restart-dev.sh status                     # show what's running
   ./restart-dev.sh logs server                # tail server.log
@@ -90,8 +84,6 @@ LOGS_TARGET="both"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--skip-build) SKIP_BUILD=true; shift ;;
-		--sandbox)    SANDBOX=true; shift ;;
-		--no-sandbox) SANDBOX=false; shift ;;
 		--mode)       MODE="$2"; shift 2 ;;
 		--home)       INNO_HOME="$2"; shift 2 ;;
 		--workspace)  WORKSPACE="$2"; shift 2 ;;
@@ -208,9 +200,8 @@ start_services() {
 
 	# Compose server args.
 	local server_args=(--home "$INNO_HOME" --workspace "$WORKSPACE" --port "$PORT")
-	[[ "$SANDBOX" == true ]] && server_args+=(--sandbox)
 
-	info "starting backend on :${PORT}  (mode=${MODE} sandbox=${SANDBOX})"
+	info "starting backend on :${PORT}  (mode=${MODE})"
 	info "  home=${INNO_HOME} workspace=${WORKSPACE}"
 	nohup npm run server -- "${server_args[@]}" >"$SERVER_LOG" 2>&1 &
 	echo $! >"$SERVER_PID_FILE"

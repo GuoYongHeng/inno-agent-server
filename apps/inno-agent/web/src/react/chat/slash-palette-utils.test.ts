@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildSlashPaletteEntries, slashQueryFromDraft } from "./slash-palette-utils.js";
-import type { SlashCommandItem } from "../../api/commands.js";
+import type { SlashCommandItem } from "./slash-command.js";
 
 const APP_ACTIONS = [
 	{ action: "new-chat" as const, name: "new", description: "Start a new chat" },

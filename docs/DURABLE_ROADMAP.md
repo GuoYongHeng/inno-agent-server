@@ -157,6 +157,29 @@ legacy 与 durable 此时仍并存：
 
 **退出标准**：`grep -r "pi-coding-agent" apps/` 无结果；构建与全部测试通过。
 
+**S4 实施结果（2026-11-18）**
+
+已删除的后端：`pi-runner`、`inno-extension`、`observability-extension`、`mcp-extension`、`question-bridge`、`permission-bridge`、`permission-system-config`、`web-access-config`、`provider-sync`、`legacy-tool-adapter`、`practice-tools`、`host-execution-policy`、`cli.ts`、`terminal/`、`mcp/`、`server/routes/{practice,commands}`、`agent-command-store`、`tenants/{legacy,migrate-legacy}`、`showcase/`（含导出路由与 `scripts/` 里的导出和预览脚本）、终端 WebSocket 与优雅关机里的 WS 处理、设置里的 MCP/权限/computer-use/codemode/web-access 接口、`config.ts` 的 `plugins`/`mcp`/`subagents`、`runtime.ts` 的 `PI_CODING_AGENT_*` 与 `--sandbox`。共用的纯类型搬到 `question-types.ts`、`permission-types.ts`，`resolvePluginFile` 搬到 `plugin-resolve.ts`。
+
+已重写：`routes/chat.ts`（约 1000 行 → 约 170 行，只剩 durable 分发）、`routes/sessions.ts`（只剩列表与创建，其余在 `durable-routes.ts`）、`routes/btw.ts`、`routes/jobs.ts`、`routes/workspaces.ts` 的会话换工作区、L3 索引（只索引 durable 会话的投影历史，删除 JSONL 读取）。
+
+前端：删除终端抽屉、运行按钮、`terminal-store`/`mcp-store`、MCP 设置页、权限模式控件、computer-use/codemode 开关、联网研究设置、代码块的"运行代码"、会话菜单里的"导出为回放案例"，以及对应的 i18n 文案。斜杠面板保留**应用动作**（新对话、模型、档案等），不再列出智能体命令。
+
+S4 期间发现并修复的回归：
+
+- 提醒类任务（`push_reminder`、`check_in_reminder`）被分配了 durable 会话后会被 `job-runner` 当成"durable 不支持提醒"而抛错。现在提醒文本作为助手通知写入该 durable 会话（`DurableJobExecution.notifyOnly`），并照常推送到渠道。
+- 补上 durable 会话的 `GET /api/sessions/:id/export.md`（原来只有 legacy 有）。
+
+**有意的取舍（可从 git 历史恢复）：**
+
+- **回放案例导出（showcase export）已移除**：它读取 legacy JSONL 会话。静态展示应用 `apps/showcase` 保留，但它的数据导出管线不再存在。
+- **L2 的 LLM 生成页面**（`summarizer`、`wiki-generator`、`wiki-linker`、`wiki-page-merge`、`overview` 叙述）在产品里已不可达：durable 的 L2 归档本来就是确定性的、没有模型。代码和测试保留，通过 `createL2Tools` 的 `richGeneration` 参数接入点留作后续。
+- `channels.json` 等会话元数据旁路文件仍在写，但已不再被读取，S5 一并清理。
+
+**验证**：构建通过；单元测试 112 个文件、877 个测试全绿（比 S3 少，因为删掉了只测 legacy 的测试）；真实服务器加假模型的端到端覆盖了流式与非流式对话、列表、上下文用量、导出 Markdown、BTW、换模型、工作区、提醒任务运行、归档与删除，已删接口全部 404。**集成测试（`test:integration`）已按新行为改写，但本机没有 PostgreSQL，没有运行过。**
+
+退出标准：`apps/` 下除 `apps/inno-agent/package.json` 的依赖声明外，已没有 `pi-coding-agent` 引用。
+
 ### S5 依赖、打包、文档收尾
 
 - 移除第 4 节所列依赖并重新生成 lockfile；清理 `web-access-config` 里的 jiti alias 与 root 旧版 `pi-ai`（核对后）。

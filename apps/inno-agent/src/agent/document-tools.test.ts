@@ -37,10 +37,10 @@ describe("parse_document", () => {
 		writeFileSync(filePath, "placeholder");
 		parser.parseDocument.mockResolvedValue({ pageCount: 1, text: "parsed", pages: [{ pageNumber: 1, text: "parsed" }] });
 
-		const tool = createDocumentTools()[0];
+		const tool = createDocumentTools({ workspaceDir })[0];
 		const result = await tool.execute(
 			{ filePath: "paper.pdf" },
-			{ callId: "test-call", innoLegacy: { cwd: workspaceDir }, output: () => undefined } as never,
+			{ callId: "test-call", output: () => undefined } as never,
 			{ abortSignal: undefined } as never,
 		);
 
@@ -53,11 +53,11 @@ describe("parse_document", () => {
 		makeWorkspace();
 		const outsidePath = join(tempRoot, "outside.pdf");
 		writeFileSync(outsidePath, "secret");
-		const tool = createDocumentTools({ restrictToWorkspace: true })[0];
+		const tool = createDocumentTools({ restrictToWorkspace: true, workspaceDir })[0];
 
 		const result = await tool.execute(
 			{ filePath: kind === "absolute" ? outsidePath : "../outside.pdf" },
-			{ callId: "test-call", innoLegacy: { cwd: workspaceDir }, output: () => undefined } as never,
+			{ callId: "test-call", output: () => undefined } as never,
 			{ abortSignal: undefined } as never,
 		);
 
@@ -70,11 +70,11 @@ describe("parse_document", () => {
 		const outsidePath = join(tempRoot, "outside.pdf");
 		writeFileSync(outsidePath, "secret");
 		symlinkSync(outsidePath, join(workspaceDir, "linked.pdf"));
-		const tool = createDocumentTools({ restrictToWorkspace: true })[0];
+		const tool = createDocumentTools({ restrictToWorkspace: true, workspaceDir })[0];
 
 		const result = await tool.execute(
 			{ filePath: "linked.pdf" },
-			{ callId: "test-call", innoLegacy: { cwd: workspaceDir }, output: () => undefined } as never,
+			{ callId: "test-call", output: () => undefined } as never,
 			{ abortSignal: undefined } as never,
 		);
 
@@ -87,11 +87,11 @@ describe("parse_document", () => {
 		const outsidePath = join(tempRoot, "outside.pdf");
 		writeFileSync(outsidePath, "local");
 		parser.parseDocument.mockResolvedValue({ pageCount: 1, text: "parsed", pages: [] });
-		const tool = createDocumentTools()[0];
+		const tool = createDocumentTools({ workspaceDir })[0];
 
 		const result = await tool.execute(
 			{ filePath: outsidePath },
-			{ callId: "test-call", innoLegacy: { cwd: workspaceDir }, output: () => undefined } as never,
+			{ callId: "test-call", output: () => undefined } as never,
 			{ abortSignal: undefined } as never,
 		);
 

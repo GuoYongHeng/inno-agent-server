@@ -4,7 +4,6 @@ import { BookOpen, Check, ClipboardList, FlaskConical, GraduationCap, Lightbulb,
 import type { PresetMeta } from "../../types/presets.js";
 import { matchesQuery } from "../../utils/category-grouping.js";
 import { Spinner } from "../ui/Spinner.js";
-import { TerminalDrawer } from "../terminal/TerminalDrawer.js";
 
 // preset.json `icon` values are lucide icon names.
 const PRESET_ICONS: Record<string, typeof Sparkles> = {
@@ -208,7 +207,6 @@ export function ChatWelcome({
 					{wsError ? <p className="mt-2 text-xs text-[var(--inno-danger)]">{wsError}</p> : null}
 				</div>
 			</div>
-			<TerminalDrawer />
 		</section>
 	);
 }

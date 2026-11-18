@@ -166,20 +166,12 @@ async function autoExecute(run: PendingDeferredRun): Promise<void> {
 		executing.add(key);
 		const createdSession = await cfg.createSession(job);
 		if (!createdSession) throw new Error("Deferred run could not create an owned session");
-		const sessionPath = typeof createdSession === "string" ? createdSession : createdSession.path;
-		const sessionId = typeof createdSession === "object" ? createdSession.id : undefined;
-		const sessionRuntime = typeof createdSession === "object" ? createdSession.runtime : undefined;
-		if (job.runtime === "durable" && sessionRuntime !== "durable") {
-			throw new Error("Durable deferred job did not create a durable session");
-		}
 		const result = await executeJob(job, cfg.jobStore, cfg.channelRegistry, "scheduled", cfg.checkInStore, {
-			sessionPath,
-			sessionId,
-			sessionRuntime,
+			sessionId: createdSession.id,
+			sessionRuntime: createdSession.runtime,
 			durableExecutor: cfg.durableExecutor,
 			scheduledAt,
 			occurrenceId,
-			allowSessionChannelInference: !cfg.durableClaims,
 		});
 		logger.info({ jobId: job.id, occurrenceId, runId: result.runId, success: result.success }, "Deferred scheduled run auto-executed");
 		if (!result.success) cfg.checkInStore?.releaseOccurrenceClaim(occurrenceId);

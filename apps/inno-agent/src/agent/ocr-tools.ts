@@ -331,7 +331,7 @@ export function createOcrTools(configHolder: ConfigHolder, options: OcrToolOptio
 						jobId = await submitJob(
 							cfg,
 							filePath,
-							options.workspaceDir ?? api.innoLegacy?.cwd ?? process.cwd(),
+							options.workspaceDir ?? process.cwd(),
 							requestSignal(signal),
 							Boolean(options.restrictToWorkspace),
 						);

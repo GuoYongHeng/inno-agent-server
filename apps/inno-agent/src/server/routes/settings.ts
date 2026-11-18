@@ -1,13 +1,8 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
-import { join } from "node:path";
 import { probeProviderModels } from "../../agent/model-probe.js";
-import {
-} from "../../agent/pi-runner.js";
 import {
 	deleteModel,
 	deleteProvider,
-	isCodemodeEnabled,
-	isComputerUseEnabled,
 	normalizeContentHubConfig,
 	normalizeSmartInputConfig,
 	normalizeUiConfig,
@@ -20,27 +15,14 @@ import {
 	type InnoSmartInputConfig,
 } from "../../config.js";
 import { logger } from "../../logger.js";
-import {
-	getWebAccessSettingsView,
-	updateWebAccessSettings,
-} from "../../agent/web-access-config.js";
-import { writePermissionPolicyConfig } from "../../agent/permission-system-config.js";
-import {
-	deleteManagedServer,
-	getMcpOverview,
-	setManagedServerDisabled,
-	upsertManagedServer,
-	type McpServerEntry,
-} from "../../mcp/mcp-config-store.js";
 import type { RuntimePaths } from "../../runtime.js";
 import { applyProviderProxyBypass } from "../../utils/proxy-bypass.js";
 import { getRequestTenant } from "../../tenants/http.js";
 import {
 	loadTenantConfig,
 	saveTenantConfig,
-	tenantConfigDir,
 } from "../../tenants/config.js";
-import { json, matchRoute, readBody } from "../http-helpers.js";
+import { json, readBody } from "../http-helpers.js";
 
 /**
  * Server state the settings routes touch. `config` is reassigned on every
@@ -126,21 +108,6 @@ function buildSafeSettings(config: InnoConfig) {
 		contentHub: config.contentHub
 			? { ...config.contentHub, token: maskSecret(config.contentHub.token) }
 			: undefined,
-		// Effective computer-use state for the settings UI: `enabled` resolves
-		// the INNO_DESKTOP default, `explicit` is the user's override (null =
-		// unset). Changes only take effect on server restart (the extension
-		// registers its tools at session init).
-		computerUse: {
-			enabled: isComputerUseEnabled(config),
-			explicit: config.plugins?.computerUse?.enabled ?? null,
-			isDesktop: process.env.INNO_DESKTOP === "1",
-		},
-		// Codemode toggle state for the settings UI. Like computer use, the
-		// change only takes effect on server restart (the extension registers
-		// at session init and defaultTools syncs at bootstrap).
-		codemode: {
-			enabled: isCodemodeEnabled(config),
-		},
 	};
 }
 
@@ -447,76 +414,6 @@ export async function handleSettingsRoutes(
 		return true;
 	}
 
-	// --- Computer use toggle. Persists plugins.computerUse.enabled. The
-	// extension registers its tools once per process (the extension factory
-	// runs at session init), so the change only takes effect on the next
-	// server restart — the response flags this so the UI can say so. ---
-	if (method === "PUT" && url === "/api/settings/computer-use") {
-		if (tenantScoped) return rejectSharedRuntime("Computer use");
-		const body = (await readBody(req)) as Record<string, unknown>;
-		if (typeof body.enabled !== "boolean") {
-			json(res, 400, { error: "enabled must be a boolean" });
-			return true;
-		}
-		config.plugins = { ...config.plugins, computerUse: { enabled: body.enabled } };
-		save(config);
-		sync();
-		json(res, 200, safeSettings());
-		return true;
-	}
-
-	// --- Codemode toggle. Persists plugins.codemode.enabled. Same restart
-	// semantics as computer use: the extension registers at session init and
-	// the defaultTools activation entry syncs at bootstrap. ---
-	if (method === "PUT" && url === "/api/settings/codemode") {
-		if (tenantScoped) return rejectSharedRuntime("Codemode");
-		const body = (await readBody(req)) as Record<string, unknown>;
-		if (typeof body.enabled !== "boolean") {
-			json(res, 400, { error: "enabled must be a boolean" });
-			return true;
-		}
-		config.plugins = { ...config.plugins, codemode: { enabled: body.enabled } };
-		save(config);
-		sync();
-		json(res, 200, safeSettings());
-		return true;
-	}
-
-	// --- Permission policy mode (default / auto / yolo). Rewrites the plugin's
-	// config file from the managed template, then triggers a resources reload —
-	// the plugin re-reads its config on resources_discover, so the switch takes
-	// effect without a server restart. ---
-	if (method === "PUT" && url === "/api/settings/permissions") {
-		if (tenantScoped) return rejectSharedRuntime("Permission policy overrides");
-		const body = (await readBody(req)) as Record<string, unknown>;
-		const mode = body.mode;
-		if (mode !== "default" && mode !== "auto" && mode !== "yolo") {
-			json(res, 400, { error: "mode must be one of: default, auto, yolo" });
-			return true;
-		}
-		config.plugins = {
-			...config.plugins,
-			permissionSystem: { ...config.plugins?.permissionSystem, mode },
-		};
-		save(config);
-		try {
-			writePermissionPolicyConfig(paths.configDir, mode);
-		} catch (err) {
-			logger.warn({ err }, "failed to write permission policy config");
-			json(res, 500, { error: "Failed to write permission policy config" });
-			return true;
-		}
-		ctx.scheduleSkillsReload();
-		sync();
-		json(res, 200, safeSettings());
-		return true;
-	}
-
-	// --- Smart Input (便捷输入): composer keyword bubbles + file bindings.
-	// Accepts the full settings object; rules are normalized (trimmed keywords,
-	// deduped, allowed/excluded extensions lowercased with a leading dot) before
-	// persisting so a partial or hand-edited payload can never produce a broken
-	// rule set. ---
 	if (method === "PUT" && url === "/api/settings/smart-input") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const next = normalizeSmartInputConfig(body as Partial<InnoSmartInputConfig>);
@@ -524,88 +421,6 @@ export async function handleSettingsRoutes(
 		save(config);
 		sync();
 		json(res, 200, safeSettings());
-		return true;
-	}
-
-	// --- MCP master switch. Takes effect on the next process start: the
-	// extension set is fixed at boot, so toggling loads/unloads the
-	// pi-mcp-adapter extension only after a restart. The UI compares
-	// `mcp.enabled` (config) against GET /api/mcp's `adapterLoaded`
-	// (runtime) to surface the restart hint.
-	if (method === "PUT" && url === "/api/settings/mcp") {
-		if (tenantScoped) return rejectSharedRuntime("MCP");
-		const body = (await readBody(req)) as Record<string, unknown>;
-		if (typeof body.enabled !== "boolean") {
-			json(res, 400, { error: "enabled must be a boolean" });
-			return true;
-		}
-		config.mcp = { enabled: body.enabled };
-		save(config);
-		sync();
-		json(res, 200, safeSettings());
-		return true;
-	}
-
-	// --- MCP server management (managed file: <configDir>/mcp-adapter.json) ---
-	if (method === "GET" && url === "/api/mcp") {
-		if (tenant) {
-			json(res, 200, {
-				enabled: false,
-				adapterLoaded: false,
-				configPath: join(tenantConfigDir(paths.dataDir, tenant.tenantId), "mcp-adapter.json"),
-				servers: [],
-				status: null,
-			});
-		} else {
-			json(res, 200, getMcpOverview(config, paths));
-		}
-		return true;
-	}
-
-	const mcpServerPutMatch = matchRoute("PUT", method, url, "/api/mcp/servers/:name");
-	if (mcpServerPutMatch) {
-		if (tenantScoped) return rejectSharedRuntime("MCP server settings");
-		const name = mcpServerPutMatch.name;
-		const body = (await readBody(req)) as McpServerEntry;
-		try {
-			upsertManagedServer(paths, name, body);
-		} catch (err) {
-			json(res, 400, { error: err instanceof Error ? err.message : "Invalid server definition" });
-			return true;
-		}
-		// Best-effort hot apply; if the runtime doesn't pick it up the UI
-		// tells the user to restart (same fire-and-forget pattern as skills).
-		ctx.scheduleSkillsReload();
-		json(res, 200, getMcpOverview(config, paths));
-		return true;
-	}
-
-	const mcpServerPatchMatch = matchRoute("PATCH", method, url, "/api/mcp/servers/:name");
-	if (mcpServerPatchMatch) {
-		if (tenantScoped) return rejectSharedRuntime("MCP server settings");
-		const body = (await readBody(req)) as Record<string, unknown>;
-		if (typeof body.disabled !== "boolean") {
-			json(res, 400, { error: "disabled must be a boolean" });
-			return true;
-		}
-		if (!setManagedServerDisabled(paths, mcpServerPatchMatch.name, body.disabled)) {
-			json(res, 404, { error: "Server not found in managed config (it may come from an external config file)" });
-			return true;
-		}
-		ctx.scheduleSkillsReload();
-		json(res, 200, getMcpOverview(config, paths));
-		return true;
-	}
-
-	const mcpServerDeleteMatch = matchRoute("DELETE", method, url, "/api/mcp/servers/:name");
-	if (mcpServerDeleteMatch) {
-		if (tenantScoped) return rejectSharedRuntime("MCP server settings");
-		if (!deleteManagedServer(paths, mcpServerDeleteMatch.name)) {
-			json(res, 404, { error: "Server not found in managed config (it may come from an external config file)" });
-			return true;
-		}
-		ctx.scheduleSkillsReload();
-		json(res, 200, getMcpOverview(config, paths));
 		return true;
 	}
 
@@ -673,32 +488,6 @@ export async function handleSettingsRoutes(
 		save(config);
 		sync();
 		json(res, 200, safeSettings());
-		return true;
-	}
-
-	// --- Web research settings (pi-web-access providers: web_research / source_check / fetch_content) ---
-	if (method === "GET" && url === "/api/settings/web-access") {
-		const configDir = tenant ? tenantConfigDir(paths.dataDir, tenant.tenantId) : paths.configDir;
-		json(res, 200, getWebAccessSettingsView(configDir));
-		return true;
-	}
-
-	if (method === "PUT" && url === "/api/settings/web-access") {
-		if (tenantScoped) return rejectSharedRuntime("Web-access provider settings");
-		const body = (await readBody(req)) as Record<string, unknown>;
-		if (body.provider !== undefined && typeof body.provider !== "string") {
-			json(res, 400, { error: "provider must be a string" });
-			return true;
-		}
-		if (body.values !== undefined && (typeof body.values !== "object" || body.values === null || Array.isArray(body.values))) {
-			json(res, 400, { error: "values must be an object keyed by provider id" });
-			return true;
-		}
-		const view = updateWebAccessSettings(paths.configDir, {
-			provider: body.provider as string | undefined,
-			values: body.values as Record<string, string> | undefined,
-		});
-		json(res, 200, view);
 		return true;
 	}
 

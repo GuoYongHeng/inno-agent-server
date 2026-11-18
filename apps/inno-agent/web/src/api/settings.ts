@@ -1,5 +1,5 @@
 import { apiFetch } from "./client.js";
-import type { InnoSettings, SmartInputSettings, UpsertProviderRequest, ChannelsSettingsPayload, WindowCloseBehavior, WebAccessSettings, WebAccessSettingsPayload, PermissionPolicyMode } from "../types/settings.js";
+import type { InnoSettings, SmartInputSettings, UpsertProviderRequest, ChannelsSettingsPayload, WindowCloseBehavior } from "../types/settings.js";
 
 export async function getSettings(): Promise<InnoSettings> {
 	return apiFetch<InnoSettings>("/api/settings");
@@ -66,38 +66,10 @@ export async function saveMemorySettings(patch: MemorySettingsPatch): Promise<In
 	});
 }
 
-export async function savePermissionMode(mode: PermissionPolicyMode): Promise<InnoSettings> {
-	return apiFetch<InnoSettings>("/api/settings/permissions", {
-		method: "PUT",
-		body: JSON.stringify({ mode }),
-	});
-}
-
-export async function saveComputerUseSettings(enabled: boolean): Promise<InnoSettings> {
-	return apiFetch<InnoSettings>("/api/settings/computer-use", {
-		method: "PUT",
-		body: JSON.stringify({ enabled }),
-	});
-}
-
-export async function saveCodemodeSettings(enabled: boolean): Promise<InnoSettings> {
-	return apiFetch<InnoSettings>("/api/settings/codemode", {
-		method: "PUT",
-		body: JSON.stringify({ enabled }),
-	});
-}
-
 export async function saveSmartInputSettings(payload: SmartInputSettings): Promise<InnoSettings> {
 	return apiFetch<InnoSettings>("/api/settings/smart-input", {
 		method: "PUT",
 		body: JSON.stringify(payload),
-	});
-}
-
-export async function saveMcpSettings(enabled: boolean): Promise<InnoSettings> {
-	return apiFetch<InnoSettings>("/api/settings/mcp", {
-		method: "PUT",
-		body: JSON.stringify({ enabled }),
 	});
 }
 
@@ -125,17 +97,6 @@ export async function saveTavilySettings(apiKey: string): Promise<InnoSettings> 
 	return apiFetch<InnoSettings>("/api/settings/tavily", {
 		method: "PUT",
 		body: JSON.stringify({ apiKey }),
-	});
-}
-
-export async function getWebAccessSettings(): Promise<WebAccessSettings> {
-	return apiFetch<WebAccessSettings>("/api/settings/web-access");
-}
-
-export async function saveWebAccessSettings(payload: WebAccessSettingsPayload): Promise<WebAccessSettings> {
-	return apiFetch<WebAccessSettings>("/api/settings/web-access", {
-		method: "PUT",
-		body: JSON.stringify(payload),
 	});
 }
 

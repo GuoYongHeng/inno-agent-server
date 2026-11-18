@@ -7,7 +7,6 @@ import { Maximize2, Minimize2, Terminal as TerminalIcon } from "lucide-react";
 import type { WorkspaceMode } from "../stores/app-store.js";
 import { getMaximumWorkspaceWidth, WORKSPACE_MAX_WIDTH, WORKSPACE_MIN_WIDTH, WORKSPACE_QUARTER_MIN_WIDTH } from "../stores/app-layout.js";
 import { appStore } from "../stores/app-store.js";
-import { terminalStore } from "../stores/terminal-store.js";
 import { workspaceStore } from "../stores/workspace-store.js";
 import type { WorkspaceTreeNode } from "../types/workspace.js";
 import { ensureWindowForPanel } from "../stores/window-expansion.js";
@@ -153,11 +152,6 @@ function WorkspacePanelContent({ mode, width, onModeChange, onWidthChange, onPre
 	const [hasOpenedWorkspace, setHasOpenedWorkspace] = useState(mode !== "collapsed");
 	const retryContent = useCallback(() => setContentRetryKey((key) => key + 1), []);
 
-	const terminalState = useStoreSnapshot(terminalStore, () => ({
-		isOpen: terminalStore.isOpen,
-		hostTerminalDisabled: terminalStore.hostTerminalDisabled,
-	}));
-	const terminalOpen = terminalState.isOpen;
 	const fileCount = useStoreSnapshot(workspaceStore, () => countTreeFiles(workspaceStore.tree?.children));
 
 	const commitResize = useCallback(async (nextWidth: number) => {
@@ -342,17 +336,6 @@ function WorkspacePanelContent({ mode, width, onModeChange, onWidthChange, onPre
 					<span className="whitespace-nowrap text-[11.5px] text-[var(--inno-text-subtle)]">{t("workspace.fileCount", { count: fileCount })}</span>
 				</div>
 				<div className="inno-workspace-header-actions">
-					{terminalState.hostTerminalDisabled ? null : (
-						<button
-							type="button"
-							className={`inno-workspace-header-button ${terminalOpen ? "is-active" : ""}`}
-							title={(terminalOpen ? t("terminal.collapse") : t("terminal.expand")) ?? ""}
-							aria-label={(terminalOpen ? t("terminal.collapse") : t("terminal.expand")) ?? ""}
-							onClick={() => terminalStore.setOpen(!terminalOpen)}
-						>
-							<TerminalIcon size={15} strokeWidth={1.8} />
-						</button>
-					)}
 					<button
 						type="button"
 						className={`inno-workspace-header-button ${mode === "full" ? "is-active" : ""} max-[960px]:hidden`}

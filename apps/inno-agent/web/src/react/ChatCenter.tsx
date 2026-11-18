@@ -50,11 +50,10 @@ import {
 	type SlashPaletteAction,
 	type SlashPaletteEntry,
 } from "./chat/slash-palette-utils.js";
-import { fetchSlashCommands, type SlashCommandItem } from "../api/commands.js";
+import type { SlashCommandItem } from "./chat/slash-command.js";
 import { WorkspaceSwitchConfirm } from "./chat/WorkspaceSwitchConfirm.js";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher.js";
 import { BtwPanel } from "./BtwPanel.js";
-import { PermissionModeControl } from "./chat/PermissionModeControl.js";
 import type { WorkspaceChoice } from "./WorkspaceSwitcher.js";
 import { DEFAULT_UPLOAD_MAX_BYTES, DEFAULT_UPLOAD_MAX_LABEL, getOversizedFiles } from "../utils/upload-limits.js";
 import {
@@ -125,6 +124,8 @@ function pendingUploadsFromRefs(refs: AttachmentRef[]): PendingUpload[] {
 	});
 }
 
+const NO_SLASH_COMMANDS: SlashCommandItem[] = [];
+
 export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProps) {
 	const { t } = useTranslation();
 	const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -163,20 +164,12 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	const [pasteBlocks, setPasteBlocks] = useState<PendingPasteBlock[]>([]);
 
 	// Slash-command palette (Codex-style): opens while the draft is a bare
-	// "/query". App actions (new chat, model picker) run locally; Agent
-	// commands come from GET /api/commands and become atomic bubbles when the
-	// feature is enabled, while the backend still receives their slash form.
-	const [slashCommands, setSlashCommands] = useState<SlashCommandItem[]>([]);
+	// "/query" and lists app actions (new chat, model picker, ...) that run
+	// locally. The agent publishes no commands of its own.
+	const slashCommands = NO_SLASH_COMMANDS;
 	const [slashActiveIndex, setSlashActiveIndex] = useState(0);
 	const [slashDismissedFor, setSlashDismissedFor] = useState<string | null>(null);
 
-	useEffect(() => {
-		let cancelled = false;
-		fetchSlashCommands()
-			.then((items) => { if (!cancelled) setSlashCommands(items); })
-			.catch(() => { /* palette simply stays limited to app actions */ });
-		return () => { cancelled = true; };
-	}, []);
 
 	// New-chat workspace selection is draft state until the first message creates
 	// a session. The active session path is bound in handleWorkspaceChange.
@@ -1475,7 +1468,6 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 					streaming={chat.isSending || chat.jobStreaming}
 					revision={`${chat.messages.length}:${chat.isLoadingHistory}:${sessions.contextUsageRevision}`}
 				/> : null}
-				permissionControl={<PermissionModeControl variant={isWelcome ? "pill" : "inline"} />}
 			workspaceControl={isWelcome ? workspaceContext : undefined}
 			modelPickerOpen={modelPickerOpen}
 			attachMenuOpen={attachMenuOpen}

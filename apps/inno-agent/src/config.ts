@@ -26,10 +26,6 @@ export interface InnoProviderConfig {
 	models: InnoModelConfig[];
 }
 
-export interface InnoSubagentsConfig {
-	enabled: boolean;
-}
-
 export interface InnoMemoryConfig {
 	/**
 	 * When true (default), the L1 learner profile is active: the per-turn
@@ -120,18 +116,6 @@ export const DEFAULT_SMART_INPUT_RULES: InnoSmartInputRule[] = [
 const DEFAULT_SMART_INPUT_RULE_IDS = new Set(DEFAULT_SMART_INPUT_RULES.map((rule) => rule.id));
 
 /**
- * MCP (Model Context Protocol) support via the pi-mcp-adapter extension.
- * Master switch (default OFF, opt-in). Server definitions live in the standard
- * MCP config file `<configDir>/mcp-adapter.json` (managed through the web UI or
- * edited by hand); the adapter also merges the usual shared locations (`.mcp.json` in
- * the workspace, `~/.config/mcp/mcp.json`, …). Changing `enabled` takes effect
- * on the next process start because the extension set is fixed at boot.
- */
-export interface InnoMcpConfig {
-	enabled: boolean;
-}
-
-/**
  * Scheduler defaults. `timezone` is the fallback IANA timezone for scheduled
  * jobs that don't pin their own — previously hardcoded to Asia/Shanghai in
  * several spots; now configurable for users in other regions.
@@ -142,15 +126,6 @@ export interface InnoSchedulerConfig {
 
 /** What should happen when the desktop window's close button is clicked. */
 export type InnoCloseBehavior = "ask" | "hide" | "quit";
-
-/**
- * Permission policy template selected via the settings UI. "default" asks on
- * bash commands outside the read-only allowlist; "auto" auto-approves all
- * bash; "yolo" auto-approves every surface (the plugin's yoloMode rewrites
- * ask → allow). All three keep the hard-deny floor (destructive commands,
- * credential paths) — yoloMode cannot rewrite a deny.
- */
-export type PermissionPolicyMode = "default" | "auto" | "yolo";
 
 export interface InnoUiConfig {
 	theme: string;
@@ -246,10 +221,8 @@ export interface InnoConfig {
 	};
 	/** Remote source for the skill library + preset workspaces. */
 	contentHub?: InnoContentHubConfig;
-	subagents?: InnoSubagentsConfig;
 	memory?: InnoMemoryConfig;
 	smartInput?: InnoSmartInputConfig;
-	mcp?: InnoMcpConfig;
 	ui?: InnoUiConfig;
 	scheduler?: InnoSchedulerConfig;
 	/**
@@ -269,58 +242,6 @@ export interface InnoConfig {
 	 */
 	tavily?: {
 		apiKey: string;
-	};
-	/**
-	 * Third-party PI extensions bundled with inno-agent. All default to
-	 * enabled; set `enabled: false` to opt out without uninstalling.
-	 *
-	 * - `todo` (@juicesharp/rpiv-todo): registers the `todo` task-list tool.
-	 *   TUI overlay/shortcuts activate only in CLI mode (ctx.hasUI).
-	 * - `webAccess` (pi-web-access): registers `fetch_content` +
-	 *   `get_search_content` (URL/GitHub/PDF/YouTube extraction). Its own
-	 *   `web_search`/`source_check` tools stay disabled via the managed
-	 *   `<configDir>/web-search.json` default so the built-in Tavily
-	 *   `web_search` remains the single search tool.
-	 * - `permissionSystem` (@gotgenes/pi-permission-system): allow/ask/deny
-	 *   policy gate for tool calls, bash commands, MCP, skills and file paths.
-	 *   Policy lives in `<configDir>/extensions/pi-permission-system/config.json`
-	 *   (managed default on first run). In server mode `ask` verdicts are
-	 *   answered by the web approval card via the `inno-web` authorizer link
-	 *   (permission-bridge.ts); no answer → deny (fail-closed). `mode` selects
-	 *   the managed policy template ("default" asks on non-allowlisted bash,
-	 *   "auto" auto-approves bash, "yolo" auto-approves every surface); the
-	 *   hard-deny floor (destructive commands, credential paths) applies in all
-	 *   three. Switching modes rewrites the plugin config file from the
-	 *   template — hand edits to that file are lost on a mode switch.
-	 * - `computerUse` (@injaneity/pi-computer-use): desktop GUI control
-	 *   tools (find_roots / observe_ui / search_ui / act_ui / browser tools).
-	 *   Drives the local screen, so unlike the other plugins it is NOT on by
-	 *   default everywhere: unset `enabled` means on only when INNO_DESKTOP=1
-	 *   (set by electron/main.js for the desktop app); `enabled: true` opts
-	 *   in anywhere (e.g. a local CLI run); `enabled: false` always wins.
-	 *   Online deployments (no INNO_DESKTOP) stay off unless explicitly
-	 *   enabled. On macOS the helper app (~/Applications/pi-computer-use.app)
-	 *   needs Accessibility + Screen Recording grants; headless sessions
-	 *   cannot prompt, so a missing grant surfaces as a tool error with
-	 *   grant instructions.
-	 * - `codemode` (PI built-in `codemode` tool): lets the model write JS
-	 *   scripts (QuickJS sandbox) that call the session's other tools, so
-	 *   batch work happens in one call and only the script's output reaches
-	 *   the model. Nested calls run through the normal tool pipeline, so
-	 *   permission checks and observability events still apply. Default OFF:
-	 *   the web trace timeline shows a codemode call as a single step (its
-	 *   nested calls are only visible in logs), which trades away some of the
-	 *   per-tool transparency inno's teaching loop relies on. Activation is
-	 *   managed via the `defaultTools` entry in PI's settings.json
-	 *   (`syncCodemodeDefaultTools` in pi-runner.ts) and takes effect on
-	 *   restart, like computer use.
-	 */
-	plugins?: {
-		todo?: { enabled?: boolean };
-		webAccess?: { enabled?: boolean };
-		permissionSystem?: { enabled?: boolean; mode?: PermissionPolicyMode };
-		computerUse?: { enabled?: boolean };
-		codemode?: { enabled?: boolean };
 	};
 }
 
@@ -488,13 +409,6 @@ export function normalizeSmartInputConfig(
 	};
 }
 
-export function normalizeMcpConfig(mcp: Partial<InnoMcpConfig> | undefined): InnoMcpConfig {
-	// MCP defaults OFF; only an explicit `true` enables it.
-	return {
-		enabled: mcp?.enabled === true,
-	};
-}
-
 export function normalizeSchedulerConfig(scheduler: Partial<InnoSchedulerConfig> | undefined): InnoSchedulerConfig {
 	const timezone = typeof scheduler?.timezone === "string" && scheduler.timezone.trim()
 		? scheduler.timezone.trim()
@@ -577,15 +491,12 @@ export function normalizeConfig(
 		bridge: config.bridge,
 		github: config.github,
 		contentHub: normalizeContentHubConfig(config.contentHub, config.github?.token),
-		subagents: config.subagents,
 		memory: normalizeMemoryConfig(config.memory),
 		smartInput: normalizeSmartInputConfig(config.smartInput),
-		mcp: normalizeMcpConfig(config.mcp),
 		ui: normalizeUiConfig(config.ui),
 		scheduler: normalizeSchedulerConfig(config.scheduler),
 		ocrApi: config.ocrApi,
 		tavily: config.tavily,
-		plugins: config.plugins,
 	} as InnoConfig;
 }
 
@@ -720,27 +631,6 @@ export function getConfiguredPort(config: InnoConfig, override?: number): number
 	return config.server?.port ?? 3000;
 }
 
-/**
- * Computer-use gate. Desktop GUI control only makes sense on a local install:
- * default-on under the Electron desktop app (INNO_DESKTOP=1, set by
- * electron/main.js), default-off everywhere else (online deployments, plain
- * server/CLI). `plugins.computerUse.enabled` overrides in both directions.
- */
-export function isComputerUseEnabled(config: InnoConfig): boolean {
-	const explicit = config.plugins?.computerUse?.enabled;
-	if (typeof explicit === "boolean") return explicit;
-	return process.env.INNO_DESKTOP === "1";
-}
-
-/**
- * Codemode gate. Unlike todo/webAccess this is default-OFF everywhere
- * (including the desktop app): it changes how tool work appears in the web
- * trace timeline, so it is an explicit opt-in. `plugins.codemode.enabled`
- * is the only switch.
- */
-export function isCodemodeEnabled(config: InnoConfig): boolean {
-	return config.plugins?.codemode?.enabled === true;
-}
 
 /**
  * Get the data directory path for the project.

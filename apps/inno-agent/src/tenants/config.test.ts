@@ -52,8 +52,6 @@ describe("tenant configuration", () => {
 		expect(config.providers).toEqual({});
 		expect(config.defaultProvider).toBe("");
 		expect(config.defaultModel).toBe("");
-		expect(config.plugins?.webAccess?.enabled).toBe(false);
-		expect(config.plugins?.permissionSystem?.mode).toBe("default");
 		expect(config.tavily).toBeUndefined();
 		expect(config.ocrApi).toBeUndefined();
 	});

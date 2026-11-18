@@ -28,15 +28,6 @@ export function createEmptyTenantConfig(): InnoConfig {
 		defaultProvider: "",
 		defaultModel: "",
 		providers: {},
-		subagents: { enabled: false },
-		mcp: { enabled: false },
-		plugins: {
-			todo: { enabled: true },
-			webAccess: { enabled: false },
-			permissionSystem: { enabled: true, mode: "default" },
-			computerUse: { enabled: false },
-			codemode: { enabled: false },
-		},
 	}, TENANT_CONFIG_OPTIONS);
 }
 

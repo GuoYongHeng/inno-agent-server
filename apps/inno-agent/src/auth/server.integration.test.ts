@@ -1,12 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import WebSocket from "ws";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readAuthRuntimeConfig } from "./config.js";
@@ -474,7 +473,7 @@ afterAll(async () => {
 });
 
 describe("server authentication boundary", () => {
-	it("protects HTTP and terminal WebSocket without blocking health or bridge auth", async () => {
+	it("protects HTTP without blocking health or bridge auth", async () => {
 		expect((await fetch(`${origin}/health`)).status).toBe(200);
 		const sessionProbe = await (await fetch(`${origin}/api/session`)).json() as { durableEnabled?: boolean; durableRequired?: boolean };
 		expect(sessionProbe.durableEnabled).toBe(true);
@@ -495,50 +494,11 @@ describe("server authentication boundary", () => {
 		// become a cookie-auth route or fall back to the legacy global channel.
 		expect((await fetch(`${origin}/api/bridge/messages`, { method: "POST" })).status).toBe(401);
 
-		const terminalSessionResponse = await api(cookie, "/api/sessions", {
-			method: "POST", body: JSON.stringify({ newWorkspace: { isTemp: true } }),
-		});
-		expect(terminalSessionResponse.status).toBe(201);
-		const terminalSession = await terminalSessionResponse.json() as { id: string };
-		const terminal = await fetch(`${origin}/api/terminal/sessions`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json", Cookie: cookie, Origin: origin },
-			body: JSON.stringify({ sessionId: terminalSession.id }),
-		});
-		expect(terminal.status).toBe(409);
-		const wsPath = "/api/terminal/sessions/host-terminal-disabled/ws";
-
-		const anonymousStatus = await new Promise<number>((resolveStatus, reject) => {
-			const ws = new WebSocket(`${origin.replace("http", "ws")}${wsPath}`, { headers: { Origin: origin } });
-			ws.once("unexpected-response", (_req, res) => resolveStatus(res.statusCode!));
-			ws.once("open", () => { ws.terminate(); reject(new Error("Anonymous WebSocket connected")); });
-			ws.once("error", () => {});
-		});
-		expect(anonymousStatus).toBe(401);
-
-		const authenticatedStatus = await new Promise<number>((resolveStatus, reject) => {
-			const ws = new WebSocket(`${origin.replace("http", "ws")}${wsPath}`, {
-				headers: { Cookie: cookie, Origin: origin },
-			});
-			ws.once("unexpected-response", (_req, res) => resolveStatus(res.statusCode!));
-			ws.once("open", () => { ws.terminate(); reject(new Error("Authenticated host WebSocket connected")); });
-			ws.once("error", () => {});
-		});
-		expect(authenticatedStatus).toBe(409);
-
-		const crossOriginStatus = await new Promise<number>((resolveStatus) => {
-			const ws = new WebSocket(`${origin.replace("http", "ws")}${wsPath}`, {
-				headers: { Cookie: cookie, Origin: "https://untrusted.example.com" },
-			});
-			ws.once("unexpected-response", (_req, res) => resolveStatus(res.statusCode!));
-			ws.once("error", () => {});
-		});
-		expect(crossOriginStatus).toBe(403);
 	});
 });
 
 describe("multi-user durable execution boundary", () => {
-	it("defaults new work to durable and keeps owned legacy history read-only", async () => {
+	it("defaults new work to durable and never executes a legacy-style session", async () => {
 		const cookie = await registerUser("durable-required@example.com");
 		expect((await api(cookie, "/api/sessions")).status).toBe(200);
 		await configureTestProvider(cookie, "durable-required-secret");
@@ -549,7 +509,7 @@ describe("multi-user durable execution boundary", () => {
 		expect(await created.json()).toMatchObject({ runtime: "durable" });
 		expect((await api(cookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "legacy" }),
-		})).status).toBe(409);
+		})).status).toBe(400);
 
 		const jobResponse = await api(cookie, "/api/jobs", {
 			method: "POST",
@@ -561,8 +521,9 @@ describe("multi-user durable execution boundary", () => {
 		expect((await api(cookie, "/api/jobs", {
 			method: "POST",
 			body: JSON.stringify({ name: "legacy job", cron: "0 9 * * *", taskType: "custom_prompt", prompt: "test", runtime: "legacy" }),
-		})).status).toBe(409);
+		})).status).toBe(400);
 
+		// A session id that is owned but has no durable record cannot be read or run.
 		const pool = new Pool({ connectionString: postgres.databaseUrl });
 		try {
 			const tenant = await pool.query<{ id: string }>(
@@ -576,35 +537,37 @@ describe("multi-user durable execution boundary", () => {
 		} finally {
 			await pool.end();
 		}
-		await writeFile(join(home, "data", "sessions", "legacy-read-only.jsonl"), `${JSON.stringify({
-			type: "session", version: 3, id: "legacy-read-only", timestamp: "2026-10-27T00:00:00.000Z", cwd: home,
-		})}\n`);
-		expect((await api(cookie, "/api/sessions/legacy-read-only.jsonl")).status).toBe(200);
+		expect((await api(cookie, "/api/sessions/legacy-read-only.jsonl")).status).toBe(404);
 		for (const [path, body] of [
 			["/api/chat", { sessionId: "legacy-read-only.jsonl", prompt: "must not run" }],
 			["/api/chat/stream", { sessionId: "legacy-read-only.jsonl", prompt: "must not run", clientRequestId: "legacy-read-only" }],
-			["/api/btw/bring-back", { sessionId: "legacy-read-only.jsonl", question: "q", answer: "a" }],
+			["/api/btw/bring-back", { sessionId: "legacy-read-only.jsonl", question: "q", answer: "a", clientRequestId: "legacy-btw" }],
 			[`/api/jobs/${job.id}/run`, { sessionId: "legacy-read-only.jsonl" }],
 			[`/api/jobs/${job.id}/run/stream`, { sessionId: "legacy-read-only.jsonl" }],
 		] as const) {
 			const response = await api(cookie, path, { method: "POST", body: JSON.stringify(body) });
-			expect(response.status, path).toBe(409);
-			expect(await response.json()).toMatchObject({ code: "durable_required" });
+			expect(response.status, path).toBe(404);
 		}
-		expect((await api(cookie, "/api/sessions/legacy-read-only.jsonl/activate", { method: "POST" })).status).toBe(409);
+		expect((await api(cookie, "/api/sessions/legacy-read-only.jsonl/activate", { method: "POST" })).status).toBe(404);
 	}, 30_000);
 });
 
-describe("session sidecar and showcase tenant isolation", () => {
-	it("scopes expired questions, BTW geometry and showcase exports without legacy profile leakage", async () => {
+describe("session sidecar tenant isolation", () => {
+	it("keeps BTW window state in each tenant's own data root", async () => {
 		const [cookieA, cookieB] = await Promise.all([
 			registerUser("sidecars-a@example.com"),
 			registerUser("sidecars-b@example.com"),
 		]);
-		const sessionA = "legacy-sidecar-a.jsonl";
-		const sessionB = "legacy-sidecar-b.jsonl";
-		expect((await api(cookieA, "/api/sessions")).status).toBe(200);
-		expect((await api(cookieB, "/api/sessions")).status).toBe(200);
+		const createSession = async (cookie: string): Promise<string> => {
+			const response = await api(cookie, "/api/sessions", {
+				method: "POST", body: JSON.stringify({ newWorkspace: { isTemp: true } }),
+			});
+			expect(response.status, await response.clone().text()).toBe(201);
+			return (await response.json() as { id: string }).id;
+		};
+		await Promise.all([configureTestProvider(cookieA, "sidecar-a-secret"), configureTestProvider(cookieB, "sidecar-b-secret")]);
+		const sessionA = await createSession(cookieA);
+		const sessionB = await createSession(cookieB);
 		const pool = new Pool({ connectionString: postgres.databaseUrl });
 		let tenantA: string;
 		let tenantB: string;
@@ -615,16 +578,6 @@ describe("session sidecar and showcase tenant isolation", () => {
 			);
 			tenantA = tenantRows.rows.find((row) => row.email === "sidecars-a@example.com")!.id;
 			tenantB = tenantRows.rows.find((row) => row.email === "sidecars-b@example.com")!.id;
-			const timestamp = "2026-10-27T00:00:00.000Z";
-			for (const [sessionId, tenantId] of [[sessionA, tenantA], [sessionB, tenantB]] as const) {
-				await writeFile(join(home, "data", "sessions", sessionId), `${JSON.stringify({
-					type: "session", version: 3, id: sessionId, timestamp, cwd: home,
-				})}\n`);
-				await pool.query(
-					"INSERT INTO resource_ownership (tenant_id, resource_type, resource_id) VALUES ($1, 'session', $2)",
-					[tenantId, sessionId],
-				);
-			}
 		} finally {
 			await pool.end();
 		}
@@ -645,69 +598,11 @@ describe("session sidecar and showcase tenant isolation", () => {
 		expect(await (await api(cookieB, `/api/btw/state/${sessionB}`)).json()).toMatchObject({
 			window: { x: 21, y: 22, width: 620, height: 480 }, minimized: false,
 		});
+		// One tenant cannot read or write the other's session state.
+		expect((await api(cookieB, `/api/btw/state/${sessionA}`)).status).toBe(404);
 		expect(existsSync(join(home, "data", "sessions", "btw.json"))).toBe(false);
 		expect(existsSync(join(home, "data", "tenants", tenantA, "sessions", "btw.json"))).toBe(true);
 		expect(existsSync(join(home, "data", "tenants", tenantB, "sessions", "btw.json"))).toBe(true);
-
-		const questionsPath = join(home, "data", "sessions", "questions.json");
-		const questionFixture = {
-			[sessionA]: { questionId: "victim-question", sessionId: sessionA, turnId: "victim-turn", params: {}, createdAt: new Date().toISOString() },
-			[sessionB]: { questionId: "other-question", sessionId: sessionB, turnId: "other-turn", params: {}, createdAt: new Date().toISOString() },
-		};
-		await writeFile(questionsPath, JSON.stringify(questionFixture));
-		const expiredResponse = (sessionId: string, turnId: string, questionId: string) => api(cookieB, "/api/chat/question-response", {
-			method: "POST",
-			body: JSON.stringify({ sessionId, turnId, questionId, result: { answers: [], cancelled: true } }),
-		});
-		expect((await expiredResponse(sessionB, "victim-turn", "victim-question")).status).toBe(409);
-		expect(JSON.parse(await readFile(questionsPath, "utf-8"))).toEqual(questionFixture);
-		expect((await api(cookieA, "/api/chat/question-response", {
-			method: "POST",
-			body: JSON.stringify({ sessionId: sessionA, turnId: "victim-turn", questionId: "victim-question", result: { answers: [], cancelled: true } }),
-		})).status).toBe(409);
-		expect(JSON.parse(await readFile(questionsPath, "utf-8"))).toEqual(questionFixture);
-
-		const probePath = join(home, "data", "sessions", "gate-probe.json");
-		await writeFile(probePath, "do-not-overwrite");
-		expect((await api(cookieA, `/api/sessions/${sessionA}/showcase-export`, {
-			method: "POST", body: JSON.stringify({ id: "../../sessions/gate-probe" }),
-		})).status).toBe(400);
-		expect((await api(cookieA, `/api/sessions/${sessionA}/showcase-export`, {
-			method: "POST", body: JSON.stringify({ id: "index" }),
-		})).status).toBe(400);
-		expect(await readFile(probePath, "utf-8")).toBe("do-not-overwrite");
-
-		await mkdir(join(home, "data", "learner"), { recursive: true });
-		await mkdir(join(home, "data", "tenants", tenantA, "learner"), { recursive: true });
-		await writeFile(join(home, "data", "learner", "profile.json"), JSON.stringify({ profile_summary: "legacy-global-secret" }));
-		await writeFile(join(home, "data", "tenants", tenantA, "learner", "profile.json"), JSON.stringify({ profile_summary: "tenant-a-profile-secret" }));
-		await appendFile(join(home, "data", "sessions", sessionA), `${JSON.stringify({
-			type: "message",
-			timestamp: "2026-10-27T00:00:00.000Z",
-			message: {
-				role: "assistant",
-				content: [{ type: "toolCall", id: "learning-call", name: "record_learning_event", arguments: { payload: { topic: "private milestone" } } }],
-				stopReason: "stop",
-			},
-		})}\n`);
-		for (const [cookie, sessionId, title] of [[cookieA, sessionA, "Tenant A case"], [cookieB, sessionB, "Tenant B case"]] as const) {
-			const response = await api(cookie, `/api/sessions/${sessionId}/showcase-export`, {
-				method: "POST", body: JSON.stringify({ id: "shared-case", title }),
-			});
-			expect(response.status).toBe(200);
-		}
-		const casesA = join(home, "data", "tenants", tenantA, "showcase-exports", "cases");
-		const casesB = join(home, "data", "tenants", tenantB, "showcase-exports", "cases");
-		const exportedA = await readFile(join(casesA, "shared-case.json"), "utf-8");
-		const exportedB = await readFile(join(casesB, "shared-case.json"), "utf-8");
-		expect(exportedA).toContain("Tenant A case");
-		expect(exportedA).toContain("tenant-a-profile-secret");
-		expect(exportedA).not.toContain("legacy-global-secret");
-		expect(exportedB).toContain("Tenant B case");
-		expect(exportedB).not.toContain("Tenant A case");
-		expect(await readFile(join(casesA, "index.json"), "utf-8")).toContain("Tenant A case");
-		expect(await readFile(join(casesB, "index.json"), "utf-8")).toContain("Tenant B case");
-		expect(existsSync(join(home, "data", "showcase-exports", "cases"))).toBe(false);
 	}, 30_000);
 });
 
@@ -775,23 +670,6 @@ describe("session and workspace tenant isolation", () => {
 			body: JSON.stringify({ sessionId: sessionA.id, prompt: "no model call", clientRequestId: "cross-tenant-test" }),
 		})).status).toBe(404);
 
-		const terminalResponse = await api(cookieA, "/api/terminal/sessions", {
-			method: "POST", body: JSON.stringify({ sessionId: sessionA.id }),
-		});
-		expect(terminalResponse.status).toBe(409);
-		expect((await api(cookieB, "/api/terminal/sessions", {
-			method: "POST", body: JSON.stringify({ sessionId: sessionA.id }),
-		})).status).toBe(409);
-		expect((await api(cookieB, `/api/runs?sessionId=${sessionA.id}`)).status).toBe(404);
-		const authenticatedWsStatus = await new Promise<number>((resolveStatus, reject) => {
-			const ws = new WebSocket(`${origin.replace("http", "ws")}/api/terminal/sessions/host-terminal-disabled/ws`, {
-				headers: { Cookie: cookieB, Origin: origin },
-			});
-			ws.once("unexpected-response", (_req, res) => resolveStatus(res.statusCode!));
-			ws.once("open", () => { ws.terminate(); reject(new Error("Authenticated host WebSocket connected")); });
-			ws.once("error", () => {});
-		});
-		expect(authenticatedWsStatus).toBe(409);
 		expect((await api(cookieB, `/api/workspace/file?workspaceId=${workspaceA.id}&path=private.txt`)).status).toBe(404);
 		expect((await api(cookieB, "/api/workspace/file", {
 			method: "PUT", body: JSON.stringify({ workspaceId: workspaceA.id, path: "private.txt", content: "stolen" }),
@@ -1035,20 +913,12 @@ describe("settings and model credential isolation", () => {
 		expect(providerRequests.find((request) => request.body.includes("tenant-b-side-question"))?.authorization).toBe("Bearer tenant-b-secret");
 
 		for (const [path, body] of [
-			["/api/settings/permissions", { mode: "yolo" }],
-			["/api/settings/mcp", { enabled: true }],
-			["/api/settings/computer-use", { enabled: true }],
-			["/api/settings/codemode", { enabled: true }],
-			["/api/settings/web-access", { values: { tavily: "must-not-be-shared" } }],
 			["/api/settings/content-hub", { token: "must-not-be-shared" }],
 			["/api/settings/github", { token: "must-not-be-shared" }],
-			["/api/mcp/servers/shared", { command: "node", args: ["server.js"] }],
 		] as const) {
 			const response = await api(cookieA, path, { method: "PUT", body: JSON.stringify(body) });
 			expect(response.status, path).toBe(409);
 		}
-		expect((await api(cookieA, "/api/mcp")).status).toBe(200);
-		expect(await (await api(cookieA, "/api/mcp")).json()).toMatchObject({ enabled: false, adapterLoaded: false, servers: [] });
 		expect((await api(cookieA, "/api/skills")).status).toBe(200);
 		expect((await api(cookieA, "/api/skills/reload", { method: "POST" })).status).toBe(409);
 		expect((await api(cookieA, "/api/skills/upload", {
@@ -1261,7 +1131,7 @@ describe("tenant background execution", () => {
 			configure(cookieA, "background-a-secret", "background-token-a", sidecarOriginA, "background-chat-a"),
 			configure(cookieB, "background-b-secret", "background-token-b", sidecarOriginB, "background-chat-b"),
 		]);
-		const createJob = async (cookie: string, name: string, prompt: string, runtime?: "legacy" | "durable") => {
+		const createJob = async (cookie: string, name: string, prompt: string, runtime?: "durable") => {
 			// Use the next UTC minute, not every minute. The test still exercises the
 			// real cron/deferred path without arming another slot during its cleanup.
 			const scheduled = new Date(Date.now() + 60_000);

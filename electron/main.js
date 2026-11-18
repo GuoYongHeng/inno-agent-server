@@ -53,7 +53,6 @@ function ensureConfig() {
       wechat: { enabled: false, mode: "bridge", sidecarBaseUrl: "http://127.0.0.1:4319" },
     },
     bridge: { token: "" },
-    subagents: { enabled: false },
     ui: { theme: "light", closeBehavior: "ask" },
   };
   writeFileSync(configPath, JSON.stringify(defaults, null, 2) + "\n", { mode: 0o600 });
@@ -443,8 +442,7 @@ async function startServer(onReady) {
   process.env.INNO_PORT = String(serverPort);
 
   serverProcess = spawn(process.execPath, [serverScript, "--server", "--port", String(serverPort)], {
-    // INNO_DESKTOP marks the desktop (Electron) runtime: gates desktop-only
-    // capabilities like computer-use (see plugins.computerUse in config.ts).
+    // INNO_DESKTOP marks the desktop (Electron) runtime.
     env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", INNO_DESKTOP: "1" },
     stdio: ["ignore", "pipe", "pipe"],
   });

@@ -8,7 +8,6 @@ import { sessionsStore } from "../stores/sessions-store.js";
 import { btwStore } from "../stores/btw-store.js";
 import { workspacesStore } from "../stores/workspaces-store.js";
 import { chatStore } from "../stores/chat-store.js";
-import { terminalStore } from "../stores/terminal-store.js";
 import { useStoreSnapshot } from "./hooks.js";
 import { InnoDndProvider } from "./ui/dnd-backend.js";
 import { ChatCenter } from "./ChatCenter.js";
@@ -102,12 +101,11 @@ export function App() {
 
 	// Re-arm live connections when a backgrounded page returns. Mobile browsers
 	// suspend timers and kill in-flight streams/sockets while hidden, so both
-	// the chat SSE stream and the terminal WebSocket get a resume hook.
+	// the chat SSE stream gets a resume hook.
 	useEffect(() => {
 		const onResume = () => {
 			if (document.visibilityState !== "visible") return;
 			void chatStore.handleAppResume();
-			terminalStore.handleAppResume();
 		};
 		document.addEventListener("visibilitychange", onResume);
 		window.addEventListener("pageshow", onResume);

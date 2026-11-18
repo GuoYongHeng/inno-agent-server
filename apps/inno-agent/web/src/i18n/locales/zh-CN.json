@@ -128,10 +128,7 @@
 		}
 	},
 	"sessions": {
-		"export": "导出为 Markdown",
-		"exportShowcase": "导出为回放案例",
-		"exportShowcaseDone": "已导出回放案例「{{title}}」\n\n案例目录：{{dir}}\n运行 npm run showcase:view 打开回放界面。",
-		"exportShowcaseFailed": "导出回放案例失败：{{message}}"
+		"export": "导出为 Markdown"
 	},
 	"nav": {
 		"newChat": "新建会话",
@@ -699,37 +696,6 @@
 			"title": "单美元符号行内公式",
 			"description": "允许用 $...$ 表示公式。默认关闭，避免价格和货币金额被误判；\\(...\\) 与 $$...$$ 不受影响。"
 		},
-		"computerUse": {
-			"title": "电脑控制",
-			"description": "允许 agent 查看并操作本机屏幕(点击、输入、浏览器控制)。macOS 首次使用需在系统设置中为 pi-computer-use.app 授予「辅助功能」与「屏幕录制」权限。",
-			"restartHint": "更改将在重启后生效。"
-		},
-		"codemode": {
-			"title": "代码模式 (Codemode)",
-			"description": "允许 agent 编写 JavaScript 脚本批量调用工具,只有脚本输出占用上下文,适合批量处理文件与资料。注意:聊天 trace 时间线只显示一次 codemode 调用,脚本内的子调用仅在日志中可见。",
-			"restartHint": "更改将在重启后生效。"
-		},
-		"permissions": {
-			"title": "工具权限",
-			"description": "控制 agent 执行命令前的审批粒度。危险命令与敏感文件在任何模式下都会被拒绝；切换后立即生效，无需重启。",
-			"modes": {
-				"default": "默认权限",
-				"auto": "自动审批",
-				"yolo": "完全权限"
-			},
-			"modeDesc": {
-				"default": "白名单外的命令会弹出审批卡片。",
-				"auto": "命令自动放行，不再弹审批卡片。",
-				"yolo": "所有操作免询问。仅建议配合沙箱模式使用。"
-			},
-			"denyFloorNote": "危险命令与敏感文件在任何模式下都会被拒绝。",
-			"risk": {
-				"title": "确认允许完全权限？",
-				"body": "开启完全权限后，AI 将减少确认步骤，并可直接执行更多操作，包括敏感操作、文件修改或外部命令。\n仅建议在您信任当前任务时使用。",
-				"checkbox": "我已了解风险，并愿意继续",
-				"confirm": "允许完全权限"
-			}
-		},
 		"tabs": {
 			"general": "通用",
 			"lab": "实验室",
@@ -737,7 +703,6 @@
 			"memory": "记忆",
 			"integrations": "集成",
 			"channels": "渠道",
-			"mcp": "MCP",
 			"about": "关于"
 		},
 		"sections": {
@@ -762,9 +727,6 @@
 			"channels": {
 				"desc": "飞书、微信等消息渠道接入"
 			},
-			"mcp": {
-				"desc": "MCP 服务器接入与开关"
-			},
 			"about": {
 				"desc": "服务状态与存储统计"
 			}
@@ -784,56 +746,6 @@
 			"advanced": "高级选项"
 		},
 		"editModel": "编辑模型",
-		"mcp": {
-			"masterTitle": "启用 MCP (Model Context Protocol)",
-			"masterOnDesc": "agent 可通过 mcp 代理工具按需发现并调用 MCP 服务器的能力，也支持多步调用的 mcpScript 工具。",
-			"masterOffDesc": "开启后可接入 MCP 生态（数据库、浏览器、各类 API）扩展 agent 能力。总开关变更需重启后生效。",
-			"restartHint": "总开关已修改，将在重启服务后生效",
-			"serversTitle": "MCP 服务器",
-			"serversDesc": "服务器定义保存在下方托管配置文件中；也会合并工作区 .mcp.json 与 ~/.config/mcp/mcp.json 等标准位置（外部来源只读）。",
-			"addServer": "添加服务器",
-			"editServer": "编辑服务器",
-			"deleteConfirm": "确定删除服务器 {{name}}？",
-			"empty": "尚未配置 MCP 服务器",
-			"configError": "托管配置文件解析失败：{{error}}",
-			"externalSource": "外部来源（只读）",
-			"namePlaceholder": "服务器名称（如 chrome-devtools）",
-			"transportStdio": "stdio（本地命令）",
-			"transportHttp": "HTTP（远程服务）",
-			"commandPlaceholder": "命令（如 npx）",
-			"argsPlaceholder": "参数，每行一个（如 -y 换行 some-mcp-server）",
-			"envPlaceholder": "环境变量，每行一个 KEY=VALUE（可选）",
-			"urlPlaceholder": "服务 URL（如 https://mcp.example.com/mcp）",
-			"headersPlaceholder": "请求头，每行一个 KEY=VALUE（可选）",
-			"lifecycleDefault": "生命周期：lazy（默认，用时才连接）",
-			"lifecycleEager": "生命周期：eager（启动即连接）",
-			"lifecycleKeepAlive": "生命周期：keep-alive（常驻 + 自动重连）",
-			"lifecycleLazyKeepAlive": "生命周期：lazy-keep-alive（首用后常驻）",
-			"directProxy": "工具暴露：代理模式（默认，省上下文）",
-			"directAll": "工具暴露：全部直接注册",
-			"jsonMode": "JSON 编辑",
-			"formMode": "表单编辑",
-			"toolCount": "{{count}} 个工具",
-			"footerHint": "服务器默认 lazy 连接：首次调用才启动，空闲自动断开。配置变更保存后自动尝试热加载，若未生效请重启服务。OAuth 认证在对话中通过 mcp 工具的 auth-start/auth-complete 完成。",
-			"status": {
-				"connected": "已连接",
-				"cached": "已缓存",
-				"failed": "连接失败",
-				"needs-auth": "需要认证",
-				"not-connected": "未连接",
-				"disabled": "已禁用"
-			}
-		},
-		"webResearch": {
-			"title": "深度调研 (web_research)",
-			"desc": "多角度、多源头联网调研与事实核查（source_check），支持 Tavily / Brave / Exa / Perplexity 等 20+ 搜索源；DuckDuckGo 免配置兜底。与上方 Tavily 快速搜索并存。",
-			"summary": "默认源: {{provider}} · 已配置 {{count}} 个源",
-			"defaultProvider": "默认搜索源",
-			"keyless": "免配置",
-			"clear": "清除",
-			"saved": "已保存",
-			"hint": "更多搜索源与高级选项可直接编辑配置目录下的 web-search.json。"
-		},
 		"smartInput": {
 			"title": "便捷输入",
 			"desc": "在输入框输入关键词即可转为文件气泡，把文件明确绑定到指代词",
@@ -1195,38 +1107,6 @@
 		"deleteWsWithSessions": "其中的 {{count}} 个会话将解绑(归入临时工作区),会话记录与文件不会被删除。",
 		"deleteWsEmpty": "该工作区当前没有会话,工作区记录将被移除。"
 	},
-	"terminal": {
-		"title": "终端",
-		"expand": "展开终端",
-		"collapse": "收起终端",
-		"history": "历史",
-		"restart": "重启终端",
-		"noSession": "请先打开或新建一个会话",
-		"status": {
-			"idle": "未连接",
-			"connecting": "连接中…",
-			"connected": "已连接",
-			"running": "运行中…",
-			"disconnected": "已断开",
-			"error": "错误"
-		},
-		"runs": {
-			"title": "运行历史",
-			"count": "{{count}} 条",
-			"empty": "暂无运行记录",
-			"incomplete": "未完成",
-			"loadFailed": "加载失败",
-			"loadDetailFailed": "加载详情失败",
-			"archiveFailed": "归档失败",
-			"archivedTo": "已归档为 {{path}}",
-			"archiving": "归档中…",
-			"archiveAsNote": "归档为笔记",
-			"noOutput": "(无输出)",
-			"selectRecord": "选择左侧一条记录查看详情",
-			"source": "源: {{file}}",
-			"noSource": "无源文件"
-		}
-	},
 	"files": {
 		"download": "下载",
 		"editing": "编辑中",
@@ -1284,7 +1164,6 @@
 		"generatingChart": "正在生成图表…",
 		"loadingPreview": "正在加载预览…",
 		"retryingRender": "正在恢复 Markdown 渲染…",
-		"runCode": "运行代码",
 		"collapseCode": "折叠代码",
 		"expandCode": "展开代码",
 		"codeFullscreen": "代码全屏查看",

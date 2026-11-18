@@ -128,10 +128,7 @@
 		}
 	},
 	"sessions": {
-		"export": "Export as Markdown",
-		"exportShowcase": "Export as replay case",
-		"exportShowcaseDone": "Replay case \"{{title}}\" exported.\n\nCases dir: {{dir}}\nRun npm run showcase:view to open the replay.",
-		"exportShowcaseFailed": "Failed to export replay case: {{message}}"
+		"export": "Export as Markdown"
 	},
 	"nav": {
 		"newChat": "New chat",
@@ -699,37 +696,6 @@
 			"title": "Single-dollar inline math",
 			"description": "Allow $...$ math. Off by default so prices remain plain text; \\(...\\) and $$...$$ still work."
 		},
-		"computerUse": {
-			"title": "Computer use",
-			"description": "Let the agent see and control this machine's screen (clicking, typing, browser control). On macOS, first use requires granting Accessibility and Screen Recording to pi-computer-use.app in System Settings.",
-			"restartHint": "Changes take effect after restart."
-		},
-		"codemode": {
-			"title": "Codemode",
-			"description": "Let the agent write JavaScript scripts that batch-call tools, so only the script output consumes context — useful for bulk file and document work. Note: the chat trace timeline shows a codemode call as a single step; nested calls are only visible in logs.",
-			"restartHint": "Changes take effect after restart."
-		},
-		"permissions": {
-			"title": "Tool permissions",
-			"description": "How strictly tool calls are approved. Dangerous commands and sensitive files are denied in every mode; changes apply immediately, no restart needed.",
-			"modes": {
-				"default": "Default",
-				"auto": "Auto-approve",
-				"yolo": "Full access"
-			},
-			"modeDesc": {
-				"default": "Commands outside the read-only allowlist ask for approval.",
-				"auto": "Commands run without approval cards.",
-				"yolo": "Nothing asks. Best paired with sandbox mode."
-			},
-			"denyFloorNote": "Dangerous commands and sensitive files stay denied in every mode.",
-			"risk": {
-				"title": "Allow full access?",
-				"body": "With full access, the AI skips confirmation steps and can directly perform more operations, including sensitive actions, file modifications, or external commands.\nOnly enable this when you trust the current task.",
-				"checkbox": "I understand the risks and want to continue",
-				"confirm": "Allow full access"
-			}
-		},
 		"tabs": {
 			"general": "General",
 			"lab": "Lab",
@@ -737,7 +703,6 @@
 			"memory": "Memory",
 			"integrations": "Integrations",
 			"channels": "Channels",
-			"mcp": "MCP",
 			"about": "About"
 		},
 		"sections": {
@@ -762,9 +727,6 @@
 			"channels": {
 				"desc": "Messaging channel integrations (Feishu, WeChat)"
 			},
-			"mcp": {
-				"desc": "MCP server integration and master switch"
-			},
 			"about": {
 				"desc": "Server status and storage stats"
 			}
@@ -784,56 +746,6 @@
 			"advanced": "Advanced options"
 		},
 		"editModel": "Edit model",
-		"mcp": {
-			"masterTitle": "Enable MCP (Model Context Protocol)",
-			"masterOnDesc": "The agent can discover and call MCP server tools on demand via the mcp proxy tool, plus multi-call mcpScript.",
-			"masterOffDesc": "Turn on to tap the MCP ecosystem (databases, browsers, APIs) and extend the agent. Toggling requires a restart.",
-			"restartHint": "Master switch changed — takes effect after a server restart",
-			"serversTitle": "MCP servers",
-			"serversDesc": "Server definitions live in the managed config file below; standard locations like workspace .mcp.json and ~/.config/mcp/mcp.json are also merged (external sources are read-only).",
-			"addServer": "Add server",
-			"editServer": "Edit server",
-			"deleteConfirm": "Delete server {{name}}?",
-			"empty": "No MCP servers configured yet",
-			"configError": "Failed to parse managed config file: {{error}}",
-			"externalSource": "External source (read-only)",
-			"namePlaceholder": "Server name (e.g. chrome-devtools)",
-			"transportStdio": "stdio (local command)",
-			"transportHttp": "HTTP (remote service)",
-			"commandPlaceholder": "Command (e.g. npx)",
-			"argsPlaceholder": "Arguments, one per line (e.g. -y, some-mcp-server)",
-			"envPlaceholder": "Environment variables, one KEY=VALUE per line (optional)",
-			"urlPlaceholder": "Service URL (e.g. https://mcp.example.com/mcp)",
-			"headersPlaceholder": "Headers, one KEY=VALUE per line (optional)",
-			"lifecycleDefault": "Lifecycle: lazy (default, connect on use)",
-			"lifecycleEager": "Lifecycle: eager (connect at startup)",
-			"lifecycleKeepAlive": "Lifecycle: keep-alive (resident + reconnect)",
-			"lifecycleLazyKeepAlive": "Lifecycle: lazy-keep-alive (resident after first use)",
-			"directProxy": "Tool exposure: proxy mode (default, saves context)",
-			"directAll": "Tool exposure: register all directly",
-			"jsonMode": "Edit JSON",
-			"formMode": "Edit form",
-			"toolCount": "{{count}} tools",
-			"footerHint": "Servers are lazy by default: they connect on first call and disconnect when idle. Changes are hot-reloaded on save; restart the server if they do not take effect. OAuth is completed in chat via the mcp tool's auth-start/auth-complete actions.",
-			"status": {
-				"connected": "connected",
-				"cached": "cached",
-				"failed": "failed",
-				"needs-auth": "needs auth",
-				"not-connected": "not connected",
-				"disabled": "disabled"
-			}
-		},
-		"webResearch": {
-			"title": "Web Research (web_research)",
-			"desc": "Multi-angle, multi-provider web research and fact checking (source_check). Supports 20+ providers incl. Tavily / Brave / Exa / Perplexity; DuckDuckGo needs no key. Coexists with the Tavily quick search above.",
-			"summary": "Default: {{provider}} · {{count}} provider(s) configured",
-			"defaultProvider": "Default provider",
-			"keyless": "no key needed",
-			"clear": "Clear",
-			"saved": "Saved",
-			"hint": "More providers and advanced options can be edited directly in web-search.json under the config directory."
-		},
 		"smartInput": {
 			"title": "Smart Input",
 			"desc": "Type a keyword in the composer to turn it into a file bubble that binds files explicitly",
@@ -1195,38 +1107,6 @@
 		"deleteWsWithSessions": "Its {{count}} conversation(s) will be unbound (moved to the temp workspace); conversation records and files will not be deleted.",
 		"deleteWsEmpty": "This workspace has no conversations; the workspace record will be removed."
 	},
-	"terminal": {
-		"title": "Terminal",
-		"expand": "Expand terminal",
-		"collapse": "Collapse terminal",
-		"history": "History",
-		"restart": "Restart terminal",
-		"noSession": "Open or create a conversation first",
-		"status": {
-			"idle": "Not connected",
-			"connecting": "Connecting…",
-			"connected": "Connected",
-			"running": "Running…",
-			"disconnected": "Disconnected",
-			"error": "Error"
-		},
-		"runs": {
-			"title": "Run history",
-			"count": "{{count}} runs",
-			"empty": "No run records",
-			"incomplete": "Running",
-			"loadFailed": "Failed to load",
-			"loadDetailFailed": "Failed to load details",
-			"archiveFailed": "Failed to archive",
-			"archivedTo": "Archived to {{path}}",
-			"archiving": "Archiving…",
-			"archiveAsNote": "Archive as note",
-			"noOutput": "(no output)",
-			"selectRecord": "Select a record on the left to view details",
-			"source": "source: {{file}}",
-			"noSource": "no source file"
-		}
-	},
 	"files": {
 		"download": "Download",
 		"editing": "Editing",
@@ -1284,7 +1164,6 @@
 		"generatingChart": "Generating chart…",
 		"loadingPreview": "Loading preview…",
 		"retryingRender": "Restoring Markdown rendering…",
-		"runCode": "Run code",
 		"collapseCode": "Collapse code",
 		"expandCode": "Expand code",
 		"codeFullscreen": "Code fullscreen",

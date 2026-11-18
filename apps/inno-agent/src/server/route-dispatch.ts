@@ -4,7 +4,7 @@ type RouteHandler = (req: IncomingMessage, res: ServerResponse, method: string, 
 
 export type RouteHandlers = Record<
 	| "checkins" | "jobs" | "channels" | "skills" | "sessions" | "wiki" | "learner"
-	| "workspaces" | "presets" | "practice" | "settings" | "commands" | "btw" | "chat",
+	| "workspaces" | "presets" | "settings" | "btw" | "chat",
 	RouteHandler
 >;
 
@@ -27,11 +27,7 @@ export function createRouteDispatcher(handlers: RouteHandlers) {
 		{ prefix: "/api/sessions", handler: handlers.workspaces },
 		{ prefix: "/api/presets", handler: handlers.presets },
 		{ prefix: "/api/preset-library", handler: handlers.presets },
-		{ prefix: "/api/terminal", handler: handlers.practice },
-		{ prefix: "/api/runs", handler: handlers.practice },
 		{ prefix: "/api/settings", handler: handlers.settings },
-		{ prefix: "/api/mcp", handler: handlers.settings },
-		{ prefix: "/api/commands", handler: handlers.commands },
 		{ prefix: "/api/btw", handler: handlers.btw },
 		{ prefix: "/api/chat", handler: handlers.chat },
 	];

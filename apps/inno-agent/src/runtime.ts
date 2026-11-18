@@ -25,7 +25,6 @@ export interface RuntimeCliOptions {
 	dataDir?: string;
 	home?: string;
 	port?: number;
-	sandbox?: boolean;
 	skillsDir?: string;
 	workspaceDir?: string;
 }
@@ -93,10 +92,6 @@ export function parseRuntimeArgs(args: string[]): ParsedRuntimeArgs {
 			const port = parsePort(readValue("--port"));
 			if (!port) throw new Error(`Invalid port: ${arg}`);
 			options.port = port;
-		} else if (arg === "--sandbox") {
-			options.sandbox = true;
-		} else if (arg === "--no-sandbox") {
-			options.sandbox = false;
 		} else {
 			rest.push(arg);
 		}
@@ -145,7 +140,4 @@ export function applyRuntimeEnvironment(paths: RuntimePaths): void {
 	process.env.INNO_DATA_DIR = paths.dataDir;
 	process.env.INNO_SKILLS_DIR = paths.skillsDir;
 	process.env.INNO_WORKSPACE_DIR = paths.workspaceDir;
-	process.env.PI_CODING_AGENT_SESSION_DIR = paths.sessionDir;
-	// Redirect PI agent dir so pi-sandbox reads sandbox.json from configDir
-	process.env.PI_CODING_AGENT_DIR = paths.configDir;
 }

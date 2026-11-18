@@ -13,7 +13,6 @@ import {
 	Pin,
 	PinOff,
 	Download,
-	Clapperboard,
 	ChevronRight,
 	Search,
 	X,
@@ -45,7 +44,6 @@ import { themeStore } from "../stores/theme-store.js";
 import { setLocale } from "../i18n/index.js";
 import type { WorkspaceMeta } from "../api/workspaces.js";
 import { triggerDownload } from "../api/workspace.js";
-import { exportSessionShowcase } from "../api/sessions.js";
 import type { SessionChannel, SessionMeta } from "../api/sessions.js";
 import { useStoreSnapshot, useTitleMarquee } from "./hooks.js";
 import { Spinner } from "./ui/Spinner.js";
@@ -423,7 +421,6 @@ function SessionCard({
 	onTogglePin,
 	onDelete,
 	onExport,
-	onExportShowcase,
 }: {
 	session: SessionMeta;
 	active: boolean;
@@ -442,7 +439,6 @@ function SessionCard({
 	onTogglePin: () => void;
 	onDelete: () => void;
 	onExport: () => void;
-	onExportShowcase: () => void;
 }) {
 	const { t } = useTranslation();
 	const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
@@ -464,10 +460,6 @@ function SessionCard({
 		{
 			label: menuLabel(<Download size={14} aria-hidden="true" />, t("sessions.export", "导出为 Markdown")),
 			onSelect: onExport,
-		},
-		{
-			label: menuLabel(<Clapperboard size={14} aria-hidden="true" />, t("sessions.exportShowcase", "导出为回放案例")),
-			onSelect: onExportShowcase,
 		},
 		{
 			label: menuLabel(
@@ -1021,17 +1013,6 @@ export function SessionSidebar({ collapsed }: SessionSidebarProps) {
 		triggerDownload(`/api/sessions/${encodeURIComponent(session.id)}/export.md`);
 	}, []);
 
-	const handleExportShowcase = useCallback((session: SessionMeta) => {
-		void (async () => {
-			try {
-				const result = await exportSessionShowcase(session.id);
-				window.alert(t("sessions.exportShowcaseDone", { title: result.title, dir: result.casesDir }));
-			} catch (err) {
-				window.alert(t("sessions.exportShowcaseFailed", { message: err instanceof Error ? err.message : String(err) }));
-			}
-		})();
-	}, [t]);
-
 	const handleDelete = useCallback((session: SessionMeta) => {
 		const confirmed = typeof window === "undefined" ? true : window.confirm(t("sidebar.confirmDeleteSession", { name: session.name }));
 		if (!confirmed) return;
@@ -1366,7 +1347,6 @@ export function SessionSidebar({ collapsed }: SessionSidebarProps) {
 													onTogglePin={() => togglePinned(session.id)}
 												onDelete={() => handleDelete(session)}
 												onExport={() => handleExport(session)}
-												onExportShowcase={() => handleExportShowcase(session)}
 												/>
 											))}
 										</motion.div>

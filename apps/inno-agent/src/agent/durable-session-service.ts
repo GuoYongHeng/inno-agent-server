@@ -39,8 +39,8 @@ import { DurablePermissionStore, type PendingDurablePermission } from "./durable
 import { DurableQuestionStore } from "./durable-questions.js";
 import { DurableStreamStore } from "./durable-stream-store.js";
 import { DurableSessionRuntime } from "./durable-runtime.js";
-import type { PersistedQuestion, QuestionBridgeResult, QuestionResponseStatus } from "./question-bridge.js";
-import type { PermissionDecision, PermissionResponseStatus } from "./permission-bridge.js";
+import type { PersistedQuestion, QuestionBridgeResult, QuestionResponseStatus } from "./question-types.js";
+import type { PermissionDecision, PermissionResponseStatus } from "./permission-types.js";
 import { INNO_SYSTEM_PROMPT } from "./system-prompt.js";
 import { buildWorkspaceContextSections } from "./workspace-context.js";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
@@ -727,7 +727,7 @@ export class DurableSessionService {
 		try {
 			const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
 			if (config.memory?.l3Enabled === false || !prompt.trim()) return "";
-			const scoped = new ScopedL3Memory(this.options.dataDir, join(this.options.dataDir, "sessions"));
+			const scoped = new ScopedL3Memory(this.options.dataDir);
 			const tenant = getRequestTenant(req);
 			if (tenant && !this.options.tenantStore) throw new Error("Authenticated durable L3 recall requires a tenant store");
 			const recall = () => scoped.recall(prompt, id);
@@ -748,7 +748,7 @@ export class DurableSessionService {
 		revision: number,
 	): Promise<void> {
 		// Indexing continues while recall is disabled so re-enabling L3 has no gap.
-		const scoped = new ScopedL3Memory(this.options.dataDir, join(this.options.dataDir, "sessions"));
+		const scoped = new ScopedL3Memory(this.options.dataDir);
 		const tenant = getRequestTenant(req);
 		try {
 			if (tenant) {
@@ -851,7 +851,7 @@ export class DurableSessionService {
 						const workspaceDir = this.options.resolveWorkspaceDir(id, record.workspaceId);
 						if (!workspaceDir) throw new Error(`Durable session workspace not found: ${record.workspaceId}`);
 						const tenantDataRoot = resolveRequestTenantDataRoot(req, this.options.dataDir);
-						const scopedL3 = new ScopedL3Memory(this.options.dataDir, join(this.options.dataDir, "sessions"));
+						const scopedL3 = new ScopedL3Memory(this.options.dataDir);
 						const l3Memory = tenant
 							? {
 								recall: (query: string, excludeSessionId?: string) => runInTenantContext(

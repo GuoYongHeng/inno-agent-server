@@ -4,8 +4,8 @@ import { join } from "node:path";
 import type { JsonValue } from "@earendil-works/chord";
 import { defineTool, type ToolRegistration } from "@earendil-works/pi-durable";
 import { writeJson } from "../storage/file-store.js";
-import type { PersistedQuestion, QuestionBridgeResult, QuestionResponseStatus } from "./question-bridge.js";
-import { resolvePluginFile } from "./permission-system-config.js";
+import type { PersistedQuestion, QuestionBridgeResult, QuestionResponseStatus } from "./question-types.js";
+import { resolvePluginFile } from "./plugin-resolve.js";
 
 export interface DurableQuestionBinding {
 	turnId: string;

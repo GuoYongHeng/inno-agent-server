@@ -1,6 +1,6 @@
 import type { SmartInputRule } from "../../../types/settings.js";
 import type { AttachmentBinding, AttachmentRef } from "../../../types/chat.js";
-import type { SlashCommandItem } from "../../../api/commands.js";
+import type { SlashCommandItem } from "../slash-command.js";
 import { KIND_COLORS, activeRules, kindFromName, kindFromRule, nameMatchesRule, sameRuleFormat } from "./kinds.js";
 import {
 	analyzeKeywords,

@@ -7,7 +7,7 @@ import type {
 	AuthorizerVerdict,
 	PermissionDecision,
 	PermissionResponseStatus,
-} from "./permission-bridge.js";
+} from "./permission-types.js";
 
 export interface DurablePermissionBinding {
 	turnId: string;

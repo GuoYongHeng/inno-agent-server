@@ -59,13 +59,13 @@ describe("TenantCronScheduler", () => {
 			name: "legacy", cron: "* * * * *", timezone: "UTC", enabled: true,
 			taskType: "push_reminder", prompt: "must-not-run",
 		});
-		const sessions: Array<{ tenantId: string | null; path: string }> = [];
+		const sessions: Array<{ tenantId: string | null; id: string }> = [];
 		const scheduler = new TenantCronScheduler(tenantStore, jobs, new ChannelRegistry(), new CheckInStore(join(dir, "checkins"), "UTC", jobs), {
 			createSession: async () => {
 				const tenantId = getCurrentTenant()?.tenantId ?? null;
-				const path = join(dir, `${tenantId}.jsonl`);
-				sessions.push({ tenantId, path });
-				return path;
+				const id = `durable-${tenantId}`;
+				sessions.push({ tenantId, id });
+				return { id, runtime: "durable" as const };
 			},
 		});
 		schedulers.push(scheduler);
@@ -80,8 +80,8 @@ describe("TenantCronScheduler", () => {
 		expect(sessions.map((entry) => entry.tenantId).sort()).toEqual(["tenant-a", "tenant-b"]);
 		for (const call of vi.mocked(executeJob).mock.calls) {
 			const options = call[5];
-			expect(options?.sessionPath).toMatch(/tenant-[ab]\.jsonl$/);
-			expect(options?.allowSessionChannelInference).toBe(false);
+			expect(options?.sessionId).toMatch(/^durable-tenant-[ab]$/);
+			expect(options?.sessionRuntime).toBe("durable");
 			expect(options?.occurrenceId).toContain(`${call[0].id}:`);
 		}
 		expect(vi.mocked(executeJob).mock.calls.some((call) => call[0].prompt === "must-not-run")).toBe(false);

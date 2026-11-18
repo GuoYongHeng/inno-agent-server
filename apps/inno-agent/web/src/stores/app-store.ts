@@ -10,7 +10,7 @@ export type RightPanelTab = "preview";
 /** Top-level main-area pages (new IA): chat plus the workbench feature pages. */
 export type AppPage = "chat" | "notebook" | "skills" | "learner" | "jobs";
 export type WorkspaceMode = "collapsed" | "quarter" | "half" | "full";
-export type SettingsTab = "general" | "lab" | "models" | "memory" | "integrations" | "channels" | "mcp" | "about";
+export type SettingsTab = "general" | "lab" | "models" | "memory" | "integrations" | "channels" | "about";
 
 interface AppStoreEvents {
 	change: void;

@@ -2,7 +2,7 @@
 // pino-caller call sites map back to the original TS source locations.
 import "source-map-support/register.js";
 
-import { createServer, type IncomingMessage as HttpReq, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage as HttpReq } from "node:http";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -13,23 +13,12 @@ import { loadConfig, type InnoConfig } from "./config.js";
 import { installFetchLogger } from "./utils/fetch-logger.js";
 import { applyProviderProxyBypass } from "./utils/proxy-bypass.js";
 import { ensureDir, readJson, readText, writeJson, writeText } from "./storage/file-store.js";
-import {
-	createNewSession,
-	getCurrentSessionId,
-	getSession,
-	getActivePromptToken,
-	isQueueTaskCancelled,
-	setPromptEventObserver,
-	setWorkspaceCwdResolver,
-} from "./agent/pi-runner.js";
-import { completePromptOnce, runPromptSerialized, runPromptStreamingInSession, runPromptInSession, abortPromptForTurnToken, abortJobPromptInSession } from "./agent/pi-runner.js";
 import { closeDeferredRuns, configureDeferredRuns } from "./scheduler/deferred-runs.js";
 import { DurableSessionService } from "./agent/durable-session-service.js";
 import { runDurableJobPrompt } from "./agent/durable-job-runner.js";
 import { executeJob, type CreatedJobSession, type DurableJobExecution, type DurableJobExecutor } from "./scheduler/job-runner.js";
 import type { ScheduledJob } from "./scheduler/types.js";
 import { ChannelRegistry } from "./channels/channel.js";
-import type { ChannelStreamEvent } from "./channels/channel.js";
 import { FeishuChannel } from "./channels/feishu/feishu-channel.js";
 import { PersonalChannelDispatcher, type PersonalChannelDispatcherOptions, type StreamEventCallback } from "./channels/personal-dispatcher.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
@@ -40,7 +29,6 @@ import { WeChatChannel } from "./channels/wechat/wechat-channel.js";
 import type { PersonalBridgeChannelConfig } from "./config.js";
 import { ScopedJobStore } from "./scheduler/scoped-job-store.js";
 import { CheckInStore } from "./checkins/check-in-store.js";
-import { seedManagedMcpConfig } from "./mcp/mcp-config-store.js";
 import { CronScheduler } from "./scheduler/cron-scheduler.js";
 import { TenantCronScheduler } from "./scheduler/tenant-cron-scheduler.js";
 import { HttpError, json } from "./server/http-helpers.js";
@@ -63,45 +51,25 @@ import { handleWikiRoutes } from "./server/routes/wiki.js";
 import { handlePresetsRoutes } from "./server/routes/presets.js";
 import { loadSkillsFromDir } from "./agent/skills.js";
 import { createSchedulerTools } from "./scheduler/scheduler-tools.js";
-import { handlePracticeRoutes } from "./server/routes/practice.js";
 import { handleChatRoutes } from "./server/routes/chat.js";
-import { handleCommandsRoutes } from "./server/routes/commands.js";
 import { handleBtwRoutes } from "./server/routes/btw.js";
-import { mergeSessionAgentCommands } from "./server/agent-command-store.js";
-import { recordToolWorkspaceActivity } from "./server/workspace-activity-store.js";
-import { fallbackTopicFromMessages, generateSessionTopicWithCompletion } from "./server/session-topic.js";
 import {
 	mergeChannels,
-	selectActiveSessionEntries,
-	TOPIC_UPGRADE_MESSAGE_THRESHOLD,
 	type SessionChannel,
 	type SessionChannelMetadata,
-	type SessionMessageSummary,
-	type SessionQuestionMetadata,
-	type SessionSummary,
-	type SessionTopicMetadata,
 } from "./server/session-model.js";
 import { logger } from "./logger.js";
 import { applyRuntimeEnvironment, parseRuntimeArgs, resolveRuntimePaths } from "./runtime.js";
 import { createGracefulShutdownHandler, installProcessFallbacks } from "./utils/process-fallback.js";
-import { questionBridge } from "./agent/question-bridge.js";
-import { permissionBridge } from "./agent/permission-bridge.js";
-import { HOST_TERMINAL_DISABLED_ERROR } from "./agent/host-execution-policy.js";
-import { streamRegistry } from "./chat/stream-registry.js";
 import { DEFAULT_WORKSPACE_ID, WorkspaceRegistry, type WorkspaceMeta } from "./workspace/workspace-registry.js";
 import type { RemoteContentSource } from "./content-source/index.js";
 import { ContentHubCatalog } from "./content-source/catalog-service.js";
-import { RunRecordStore } from "./terminal/run-record-store.js";
-import { writeRunFile } from "./terminal/run-file.js";
-import { TerminalSessionManager } from "./terminal/terminal-session-manager.js";
-import type { ClientTerminalEvent, ServerTerminalEvent } from "./terminal/terminal-types.js";
-import { WebSocketServer, type WebSocket } from "ws";
 import { readAuthRuntimeConfig, readListenConfig } from "./auth/config.js";
 import { assertSignUpAllowed, isPublicApiRequest, isTrustedOrigin, requireSession } from "./auth/http.js";
 import { createAuthRuntime } from "./auth/runtime.js";
-import { createBackgroundRequest, ownsRequestResource, setRequestTenant } from "./tenants/http.js";
+import { createBackgroundRequest, setRequestTenant } from "./tenants/http.js";
 import { forwardDurableTenantRequest, readDurableShardConfig } from "./tenants/durable-tenant-router.js";
-import { resolveCurrentTenantDataDir, resolveCurrentTenantDataRoot } from "./tenants/paths.js";
+import { resolveCurrentTenantDataRoot } from "./tenants/paths.js";
 import { getCurrentTenant, getCurrentTenantStore, runWithoutTenantContext } from "./tenants/current.js";
 
 // ---------------------------------------------------------------------------
@@ -158,8 +126,6 @@ let jobStore!: ScopedJobStore;
 let checkInStore!: CheckInStore;
 let channelRegistry!: ChannelRegistry;
 let workspaceRegistry!: WorkspaceRegistry;
-let runRecordStore!: RunRecordStore;
-let terminalManager!: TerminalSessionManager;
 let feishuChannel: FeishuChannel | null = null;
 let wechatChannel: WeChatChannel | null = null;
 let dispatcher: PersonalChannelDispatcher | null = null;
@@ -170,34 +136,6 @@ let scheduledSessionFactory: ((job: ScheduledJob, request?: HttpReq) => Promise<
 let bootstrapped = false;
 let bootstrapPromise: Promise<void> | null = null;
 let bridgeToken: string | undefined;
-
-/** Convert a raw PI SDK event to a ChannelStreamEvent for channel streaming replies. */
-function piEventToChannelStreamEvent(event: any): ChannelStreamEvent | null {
-	switch (event.type) {
-		case "message_update": {
-			const ev = event.assistantMessageEvent;
-			if (ev.type === "text_delta") return { type: "text_delta", delta: ev.delta };
-			if (ev.type === "thinking_delta") return { type: "thinking_delta", delta: ev.delta };
-			if (ev.type === "error") return { type: "error", message: ev.error?.errorMessage || "LLM API error" };
-			return null;
-		}
-		case "message_end": {
-			const msg = event.message;
-			if (msg && typeof msg === "object" && "stopReason" in msg && msg.stopReason === "error") {
-				return { type: "error", message: msg.errorMessage || "The model request failed." };
-			}
-			return null;
-		}
-		case "tool_execution_start":
-			return { type: "tool_start", toolCallId: event.toolCallId, toolName: event.toolName };
-		case "tool_execution_end": {
-			const summary = typeof event.result === "string" ? event.result.slice(0, 80) : undefined;
-			return { type: "tool_end", toolCallId: event.toolCallId, toolName: event.toolName, isError: event.isError, summary };
-		}
-		default:
-			return null;
-	}
-}
 
 /**
  * One-shot lazy bootstrap. Idempotent — concurrent requests while the first
@@ -213,10 +151,6 @@ async function ensureBootstrapped(): Promise<void> {
 		// ---- config (loaded lazily, not at process start) ----
 		config = loadConfig(paths.configPath);
 		applyProviderProxyBypass(config);
-
-		// First-run MCP template: seeds <configDir>/mcp-adapter.json with a disabled
-		// reference server when the file doesn't exist yet. No-op afterwards.
-		seedManagedMcpConfig(paths);
 
 		// ---- data directories ----
 		ensureDir(paths.learnerDataDir);
@@ -243,35 +177,6 @@ async function ensureBootstrapped(): Promise<void> {
 			logger.warn({ err }, "[sessions] unbound-session migration failed");
 		}
 
-		runRecordStore = new RunRecordStore(() => resolveCurrentTenantDataDir(dataDir, "runs"));
-		terminalManager = new TerminalSessionManager(workspaceRegistry, runRecordStore);
-
-		// Resolve agent cwd per session based on its workspace binding.
-		setWorkspaceCwdResolver((sessionPath: string) => {
-			const id = basename(sessionPath);
-			const workspaceId = workspaceRegistry.getSessionWorkspaceId(id);
-			return workspaceRegistry.resolveWorkspaceDir(workspaceId);
-		});
-		setPromptEventObserver((event, sessionPath) => {
-			if (event.type !== "tool_execution_start" && event.type !== "tool_execution_update") return;
-			// Progress events normally omit args; the start event is the source of
-			// truth in that case, so do not turn a harmless update into an
-			// incomplete-tracking warning.
-			if (event.type === "tool_execution_update" && event.args === undefined) return;
-			const sessionId = sessionPath ? basename(sessionPath) : getCurrentSessionId();
-			if (!sessionId) return;
-			const workspaceId = workspaceRegistry.getSessionWorkspaceId(sessionId);
-			const workspaceRoot = workspaceRegistry.resolveWorkspaceDir(workspaceId);
-			if (!workspaceRoot) return;
-			recordToolWorkspaceActivity(dataDir, {
-				sessionId,
-				workspaceId,
-				workspaceRoot,
-				toolName: event.toolName,
-				args: event.args,
-			});
-		});
-
 		migrateLegacyPiSkills();
 
 		// ---- channels ----
@@ -288,19 +193,25 @@ async function ensureBootstrapped(): Promise<void> {
 			}
 		}
 
-		const sharedDispatcherOptions: Omit<PersonalChannelDispatcherOptions, "channelRegistry" | "channelsDataDir"> = {
-			runPrompt: runPromptSerialized,
-			runPromptInSession,
-			runPromptStreamingInSession: (sessionPath, prompt, onEvent, images) => {
-				return runPromptStreamingInSession(sessionPath, prompt, (piEvent: any) => {
-					const channelEvent = piEventToChannelStreamEvent(piEvent);
-					if (channelEvent) onEvent(channelEvent);
-				}, images);
-			},
-			createNewSession: () => createNewSession(),
-			getCurrentSessionId,
-			recordSessionChannel: (ch, sid?) => recordCurrentSessionChannel(ch as SessionChannel, sid, { setOriginIfEmpty: true }),
-			maybeAutoGenerateTopic,
+		const runDurableChannelPrompt = (
+			sessionId: string,
+			prompt: string,
+			onEvent?: StreamEventCallback,
+			images?: ImageContent[],
+		) => {
+			const turnId = `channel-${randomUUID()}`;
+			return runDurableJobPrompt(backgroundTenantRequest(), durableSessions, sessionId, prompt, {
+				requestId: `channel-request-${randomUUID()}`,
+				turnId,
+				onEvent,
+				images,
+				noUi: true,
+			});
+		};
+		const dispatcherOptions: Omit<PersonalChannelDispatcherOptions, "channelRegistry" | "channelsDataDir"> = {
+			runPrompt: async () => { throw new Error("Channel prompts require an owned durable session"); },
+			getCurrentSessionId: () => "",
+			recordSessionChannel: (ch, sid?) => recordSessionChannel(ch as SessionChannel, sid, { setOriginIfEmpty: true }),
 			onSessionCreated: async (sessionId, channel) => {
 				const tenant = getCurrentTenant();
 				if (tenant) {
@@ -319,26 +230,6 @@ async function ensureBootstrapped(): Promise<void> {
 				}
 			},
 			sessionDir: join(dataDir, "sessions"),
-		};
-
-		const runDurableChannelPrompt = (
-			sessionId: string,
-			prompt: string,
-			onEvent?: StreamEventCallback,
-			images?: ImageContent[],
-		) => {
-			const turnId = `channel-${randomUUID()}`;
-			return runDurableJobPrompt(backgroundTenantRequest(), durableSessions, sessionId, prompt, {
-				requestId: `channel-request-${randomUUID()}`,
-				turnId,
-				onEvent,
-				images,
-				noUi: true,
-			});
-		};
-		const tenantDispatcherOptions: typeof sharedDispatcherOptions = {
-			...sharedDispatcherOptions,
-			runPrompt: async () => { throw new Error("Multi-user channel prompts require an owned durable session"); },
 			runPromptInSession: (sessionId, prompt, images) => runDurableChannelPrompt(sessionId, prompt, undefined, images),
 			runPromptStreamingInSession: (sessionId, prompt, onEvent, images) => runDurableChannelPrompt(sessionId, prompt, onEvent, images),
 			createNewSession: async (channel = "web") => {
@@ -353,7 +244,6 @@ async function ensureBootstrapped(): Promise<void> {
 				return summary.id;
 			},
 			resolveSessionTarget: async (sessionId) => durableSessions.get(backgroundTenantRequest(), sessionId) ? sessionId : null,
-			maybeAutoGenerateTopic: undefined,
 		};
 
 		if (auth.mode === "local") {
@@ -385,7 +275,7 @@ async function ensureBootstrapped(): Promise<void> {
 			tenantChannelManager = new TenantChannelManager({
 				dataDir,
 				tenantStore: auth.tenantStore!,
-				dispatcher: tenantDispatcherOptions,
+				dispatcher: dispatcherOptions,
 				createChannels: ({ config: tenantConfig, channelsDataDir: tenantChannelsDir, registry, dispatch }) => {
 					const tenantDataDir = dirname(tenantChannelsDir);
 					let tenantFeishu: FeishuChannel | null = null;
@@ -434,7 +324,7 @@ async function ensureBootstrapped(): Promise<void> {
 			const channelsDataDir = join(dataDir, "channels");
 			ensureDir(channelsDataDir);
 			dispatcher = new PersonalChannelDispatcher({
-				...tenantDispatcherOptions,
+				...dispatcherOptions,
 				channelRegistry,
 				channelsDataDir,
 			});
@@ -581,16 +471,6 @@ async function reloadFeishuChannel(): Promise<void> {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-function sessionRevision(filePath: string): string {
-	try {
-		const stat = statSync(filePath);
-		return `${stat.size}:${stat.mtimeMs}`;
-	} catch {
-		return "missing";
-	}
-}
-
-
 // ---------------------------------------------------------------------------
 // Static file serving (web/dist/)
 // ---------------------------------------------------------------------------
@@ -600,46 +480,6 @@ const webDistDir = paths.webDistDir;
 // ---------------------------------------------------------------------------
 // Local data helpers
 // ---------------------------------------------------------------------------
-
-function sessionFileFromId(sessionDir: string, id: string): string | null {
-	const fileName = basename(id);
-	if (fileName !== id || !fileName.endsWith(".jsonl")) return null;
-	return safeJoinReal(sessionDir, fileName);
-}
-
-function textFromContent(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((part) => {
-			if (!part || typeof part !== "object") return "";
-			const record = part as Record<string, unknown>;
-			return record.type === "text" && typeof record.text === "string" ? record.text : "";
-		})
-		.filter(Boolean)
-		.join("\n")
-		.trim();
-}
-
-function imagesFromContent(content: unknown): Array<{ previewUrl: string; mimeType: string }> {
-	if (!Array.isArray(content)) return [];
-	const result: Array<{ previewUrl: string; mimeType: string }> = [];
-	for (const part of content) {
-		if (!part || typeof part !== "object") continue;
-		const record = part as Record<string, unknown>;
-		if (
-			record.type === "image" &&
-			typeof record.data === "string" &&
-			typeof record.mimeType === "string"
-		) {
-			result.push({
-				previewUrl: `data:${record.mimeType};base64,${record.data}`,
-				mimeType: record.mimeType,
-			});
-		}
-	}
-	return result;
-}
 
 function parseSkillFrontmatter(content: string): Record<string, string | boolean> {
 	const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -1072,248 +912,20 @@ function scheduleSkillsReload(): void {
 	// the next time they are reopened.
 }
 
-function sessionTopicMetadataPath(): string {
-	return join(resolveCurrentTenantDataRoot(dataDir), "sessions", "meta.json");
-}
-
-function readSessionTopicMetadata(): SessionTopicMetadata {
-	return readJson<SessionTopicMetadata>(sessionTopicMetadataPath(), {});
-}
-
-function writeSessionTopic(id: string, topic: string, generated = false, extra?: { upgraded?: boolean }): void {
-	const metadata = readSessionTopicMetadata();
-	metadata[id] = { topic, generated, updatedAt: new Date().toISOString(), ...(extra?.upgraded ? { upgraded: true } : {}) };
-	writeJson(sessionTopicMetadataPath(), metadata);
-}
-
-function parseSessionFile(filePath: string): { summary: SessionSummary; messages: SessionMessageSummary[] } | null {
-	try {
-		const raw = readFileSync(filePath, "utf-8");
-		const lines = raw.split("\n").filter((line) => line.trim().length > 0);
-		const entries = selectActiveSessionEntries(lines.map((line) => JSON.parse(line) as Record<string, unknown>));
-		const messages: SessionMessageSummary[] = [];
-		const channels = new Set<SessionChannel>();
-		let createdAt = "";
-		let lastMessageAt = "";
-
-		// Aggregator for the in-progress assistant turn. PI splits one assistant
-		// turn into multiple JSONL entries (thinking + toolCalls + toolResults
-		// + final text), so we merge them back into a single bubble.
-		let pendingAssistant: SessionMessageSummary | null = null;
-		const finalizeAssistant = () => {
-			if (pendingAssistant) {
-				messages.push(pendingAssistant);
-				pendingAssistant = null;
-			}
-		};
-		const ensureAssistant = (timestamp: number, entryId?: string): SessionMessageSummary => {
-			if (!pendingAssistant) {
-				pendingAssistant = { role: "assistant", content: "", timestamp, entryId };
-			} else if (entryId) {
-				pendingAssistant.entryId = entryId;
-			}
-			return pendingAssistant;
-		};
-
-		for (const entry of entries) {
-			const timestamp = typeof entry.timestamp === "string" ? entry.timestamp : "";
-			if (!createdAt && timestamp) createdAt = timestamp;
-			// Detect channel ONLY from structured JSON fields written by the system
-			// (message.channel / message.source / message.api / message.model).
-			// We intentionally do NOT substring-match the raw line for natural-language
-			// keywords like "飞书" / "scheduled" — those appear in ordinary user/assistant
-			// text and would falsely tag a web session as a feishu/scheduler session.
-			// Verified on unmodified code: a learner asking "飞书的英文名?" (user text)
-			// or a reply that merely mentions "飞书" (assistant text) both got mislabeled
-			// as channel=feishu even though origin stayed web. The authoritative channel
-			// record lives in channels.json (via recordCurrentSessionChannel); this
-			// detection is only a best-effort hint for legacy sessions that predate it.
-			let entryChannel: SessionChannel | undefined;
-			const msgObj = entry.type === "message" && entry.message && typeof entry.message === "object"
-				? entry.message as Record<string, unknown>
-				: undefined;
-			const channelField = typeof msgObj?.channel === "string" ? (msgObj.channel as string) : "";
-			const sourceField = typeof msgObj?.source === "string" ? (msgObj.source as string) : "";
-			const apiField = typeof msgObj?.api === "string" ? (msgObj.api as string) : "";
-			const modelField = typeof msgObj?.model === "string" ? (msgObj.model as string) : "";
-			if (channelField === "feishu") {
-				channels.add("feishu");
-				entryChannel = "feishu";
-			}
-			if (channelField === "wechat" || channelField === "wecom") {
-				channels.add("wechat");
-				entryChannel = entryChannel ?? "wechat";
-			}
-			if (channelField === "qq") {
-				channels.add("qq");
-				entryChannel = entryChannel ?? "qq";
-			}
-			if (sourceField === "web" || channelField === "web") {
-				channels.add("web");
-				entryChannel = entryChannel ?? "web";
-			}
-			// Scheduler-authored assistant messages carry a synthetic api/model marker.
-			if (apiField === "inno-background" || modelField === "scheduler") {
-				channels.add("scheduler");
-				entryChannel = entryChannel ?? "scheduler";
-			}
-
-			if (!msgObj) continue;
-			if (timestamp) lastMessageAt = timestamp;
-			const message = msgObj;
-			const role = message.role;
-			const ts = timestamp ? Date.parse(timestamp) : Date.now();
-
-			if (role === "user") {
-				finalizeAssistant();
-				const content = textFromContent(message.content);
-				if (!content) continue;
-				const images = imagesFromContent(message.content);
-				const msg: SessionMessageSummary = {
-					role: "user",
-					content,
-					timestamp: ts,
-					channel: entryChannel,
-					entryId: typeof entry.id === "string" ? entry.id : undefined,
-					parentEntryId: typeof entry.parentId === "string" ? entry.parentId : null,
-				};
-				if (images.length > 0) msg.images = images;
-				messages.push(msg);
-				continue;
-			}
-
-			if (role === "assistant") {
-				const pending = ensureAssistant(ts, typeof entry.id === "string" ? entry.id : undefined);
-				if (entryChannel && !pending.channel) pending.channel = entryChannel;
-				const content = message.content;
-				if (Array.isArray(content)) {
-					for (const part of content) {
-						if (!part || typeof part !== "object") continue;
-						const block = part as Record<string, unknown>;
-						if (block.type === "text" && typeof block.text === "string") {
-							pending.content = pending.content
-								? `${pending.content}\n${block.text}`
-								: block.text;
-						} else if (block.type === "thinking" && typeof block.thinking === "string") {
-							pending.thinking = pending.thinking
-								? `${pending.thinking}\n${block.thinking}`
-								: block.thinking;
-						} else if (block.type === "toolCall") {
-							const toolCallId = typeof block.id === "string" ? block.id : "";
-							const toolName = typeof block.name === "string" ? block.name : "tool";
-							const args = block.arguments;
-							pending.tools = pending.tools ?? [];
-							pending.tools.push({
-								toolCallId,
-								toolName,
-								args,
-								contentOffset: pending.content.length,
-							});
-						}
-					}
-				} else if (typeof content === "string" && content) {
-					pending.content = pending.content ? `${pending.content}\n${content}` : content;
-				}
-				pending.timestamp = ts;
-				if (typeof message.stopReason === "string") pending.stopReason = message.stopReason;
-				// If this assistant entry ended the turn (stopReason "stop"), finalize.
-				if (typeof message.stopReason === "string" && message.stopReason !== "toolUse") {
-					finalizeAssistant();
-				}
-				continue;
-			}
-
-			if (role === "toolResult") {
-				const pending = ensureAssistant(ts);
-				const toolCallId = typeof message.toolCallId === "string" ? message.toolCallId : "";
-				const toolName = typeof message.toolName === "string" ? message.toolName : "tool";
-				// PI keeps a tool's structured details alongside its text content. Keep
-				// those details in session history so completed questionnaires can be
-				// rendered with the selected options, and the todo widget can rebuild
-				// its task list, after the session is reopened.
-				const result = (toolName === "ask_user_question" || toolName === "todo") && message.details !== undefined
-					? message.details
-					: textFromContent(message.content) || message.content;
-				const isError = Boolean(message.isError);
-				pending.tools = pending.tools ?? [];
-				const existing = pending.tools.find((t) => t.toolCallId === toolCallId);
-				if (existing) {
-					existing.result = result;
-					existing.isError = isError;
-				} else {
-					pending.tools.push({ toolCallId, toolName, args: undefined, result, isError });
-				}
-				continue;
-			}
-		}
-		finalizeAssistant();
-
-		// Filter out empty assistant entries (no text, no thinking, no tools).
-		const filtered = messages.filter((m) =>
-			m.role === "user" ? !!m.content : (m.content || m.thinking || (m.tools && m.tools.length > 0)),
-		);
-
-		const displayMessages = mergeSessionAgentCommands(dataDir, basename(filePath), filtered);
-		const firstUser = displayMessages.find((message) => message.role === "user");
-		const preview = firstUser?.content.trim() ?? "";
-		const name = preview ? (preview.length > 48 ? `${preview.slice(0, 45)}...` : preview) : basename(filePath);
-		const stat = statSync(filePath);
-		const fallbackTime = stat.mtime.toISOString();
-		return {
-			summary: {
-				id: basename(filePath),
-				name,
-				createdAt: createdAt || fallbackTime,
-				updatedAt: lastMessageAt || createdAt || fallbackTime,
-				messageCount: filtered.length,
-				preview,
-				channels: channels.size > 0 ? Array.from(channels) : [],
-			},
-			messages: displayMessages,
-		};
-	} catch (err) {
-		return null;
-	}
-}
-
 function sessionChannelMetadataPath(): string {
 	return join(resolveCurrentTenantDataRoot(dataDir), "sessions", "channels.json");
-}
-
-// --- Pending question persistence (survives process restart) ---
-function sessionQuestionMetadataPath(): string {
-	return join(dataDir, "sessions", "questions.json");
-}
-
-/** In-memory cache of questions.json — read once, updated on every write.
- *  Avoids a synchronous readFileSync on every session-detail request. */
-let _questionMetadataCache: SessionQuestionMetadata | null = null;
-
-function readSessionQuestionMetadata(): SessionQuestionMetadata {
-	if (_questionMetadataCache === null) {
-		_questionMetadataCache = readJson<SessionQuestionMetadata>(sessionQuestionMetadataPath(), {});
-	}
-	return _questionMetadataCache;
-}
-
-function writeSessionQuestionMetadata(meta: SessionQuestionMetadata): void {
-	_questionMetadataCache = meta;
-	writeJson(sessionQuestionMetadataPath(), meta);
 }
 
 function readSessionChannelMetadata(): SessionChannelMetadata {
 	return readJson<SessionChannelMetadata>(sessionChannelMetadataPath(), {});
 }
 
-function recordCurrentSessionChannel(
+function recordSessionChannel(
 	channel: SessionChannel,
 	explicitSessionId?: string,
 	options?: { setOriginIfEmpty?: boolean },
 ): void {
-	const id = explicitSessionId || (() => {
-		const sessionFile = getSession().sessionFile;
-		return sessionFile ? basename(sessionFile) : "";
-	})();
+	const id = explicitSessionId;
 	if (!id) return;
 	const metadata = readSessionChannelMetadata();
 	const prev = metadata[id];
@@ -1349,10 +961,6 @@ function recordJobRunSession(sessionId: string, req?: HttpReq): void {
 	writeJson(sessionChannelMetadataPath(), metadata);
 }
 
-async function generateSessionTopic(summary: SessionSummary, messages: SessionMessageSummary[]): Promise<string> {
-	return generateSessionTopicWithCompletion(summary, messages, completePromptOnce);
-}
-
 /**
  * Auto-generate a topic for a session if it doesn't already have one.
  * Runs asynchronously — fire and forget.
@@ -1366,115 +974,9 @@ async function generateSessionTopic(summary: SessionSummary, messages: SessionMe
  *    TOPIC_UPGRADE_MESSAGE_THRESHOLD messages — generate a richer summary
  *    once there is enough context.
  */
-const _pendingAutoTopics = new Set<string>();
-
-function maybeAutoGenerateTopic(sessionId: string): void {
-	const claimKey = `${getCurrentTenant()?.tenantId ?? "local"}:${sessionId}`;
-	if (!sessionId || _pendingAutoTopics.has(claimKey)) return;
-	const existing = readSessionTopicMetadata()[sessionId];
-	if (existing && (!existing.generated || existing.upgraded)) return;
-
-	const sessionPath = sessionFileFromId(join(dataDir, "sessions"), sessionId);
-	if (!sessionPath || !existsSync(sessionPath)) return;
-
-	_pendingAutoTopics.add(claimKey);
-	void (async () => {
-		try {
-			const parsed = parseSessionFile(sessionPath);
-			if (!parsed || parsed.messages.length < 2) return;
-			if (existing && parsed.messages.length < TOPIC_UPGRADE_MESSAGE_THRESHOLD) return;
-			const topic = existing
-				? await generateSessionTopic(parsed.summary, parsed.messages)
-				: fallbackTopicFromMessages(parsed.messages, parsed.summary);
-			writeSessionTopic(sessionId, topic, true, existing ? { upgraded: true } : undefined);
-			logger.info(`[auto-topic] ${sessionId} → ${topic}${existing ? " (upgraded)" : ""}`);
-		} catch (err) {
-			logger.warn({ err }, `auto-topic generation failed for ${sessionId}`);
-		} finally {
-			_pendingAutoTopics.delete(claimKey);
-		}
-	})();
-}
-
 // ---------------------------------------------------------------------------
 // HTTP Server
 // ---------------------------------------------------------------------------
-
-/**
- * The prompt currently holding the shared serial queue, if any. Only prompts
- * hold queue slots for a meaningful duration; switch/create are instant.
- */
-function getQueueBlocker(): { sessionId: string; turnId: string; questionPending: boolean } | null {
-	const token = getActivePromptToken();
-	if (!token) return null;
-	const state = streamRegistry.getByTurn(token);
-	if (!state || (state.status !== "queued" && state.status !== "running")) return null;
-	const pending = questionBridge.pendingInfo();
-	const pendingPermission = permissionBridge.pendingInfo();
-	return {
-		sessionId: state.sessionId,
-		turnId: state.turnId,
-		// A permission card parks the agent loop exactly like a question card.
-		questionPending: pending?.turnId === state.turnId || pendingPermission?.turnId === state.turnId,
-	};
-}
-
-/**
- * Session-retention policy (issue #124): a turn parked on a question card can
- * never progress without the user, yet it holds the shared prompt queue for
- * up to the 30-minute question timeout — blocking every session switch /
- * creation behind it. Navigating to a DIFFERENT session implicitly abandons
- * the card, so abort that turn to release the queue. Turns that are actively
- * generating are left alone (they end on their own; the user can still stop
- * them explicitly via the scoped abort endpoint).
- *
- * Mirrors the scoped abort route: cancel the registry state, resolve the
- * parked question (session.abort() alone cannot wake it), then abort.
- */
-function releaseQueueFromQuestionBlockedTurn(targetSessionId: string): void {
-	const blocker = getQueueBlocker();
-	if (!blocker || !blocker.questionPending || blocker.sessionId === targetSessionId) return;
-	const state = streamRegistry.getByTurn(blocker.turnId);
-	if (!state) return;
-	logger.info({ blockedSession: blocker.sessionId, turnId: blocker.turnId, targetSessionId }, "auto-aborting question-blocked turn to release the prompt queue");
-	streamRegistry.requestCancel(state);
-	questionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: "switched_away" });
-	permissionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: "switched_away" });
-	if (state.status === "running") void abortPromptForTurnToken(state.turnId);
-}
-
-/**
- * Run an enqueue-backed operation with a hard wait bound. If the queue is
- * held by a long turn the caller gets a 409 with blocker details instead of
- * hanging for minutes; a client disconnect cancels the still-queued task so
- * it never executes out from under a user who already gave up.
- */
-async function runQueueOpWithTimeout<T>(
-	_req: HttpReq,
-	res: ServerResponse,
-	op: (signal: AbortSignal) => Promise<T>,
-	timeoutMs = 8_000,
-): Promise<T | null> {
-	const aborter = new AbortController();
-	// res "close" with the response unfinished = the client went away. (req
-	// "close" is unusable here: it fires as soon as the request body is fully
-	// received, long before we answer.)
-	res.on("close", () => { if (!res.writableFinished) aborter.abort(); });
-	const timer = setTimeout(() => aborter.abort(), timeoutMs);
-	try {
-		return await op(aborter.signal);
-	} catch (err) {
-		if (isQueueTaskCancelled(err)) {
-			if (!res.writableFinished && !res.destroyed) {
-				json(res, 409, { error: "session_busy", blocking: getQueueBlocker() ?? undefined });
-			}
-			return null;
-		}
-		throw err;
-	} finally {
-		clearTimeout(timer);
-	}
-}
 
 const durableSessions = new DurableSessionService({
 	dataDir,
@@ -1513,6 +1015,11 @@ function backgroundTenantRequest(): HttpReq {
 }
 
 async function executeDurableJob(req: HttpReq, execution: DurableJobExecution): Promise<string> {
+	// A reminder is recorded as a notice in the run's conversation; no model turn.
+	if (execution.notifyOnly) {
+		await durableSessions.appendAssistantNotification(req, execution.sessionId, execution.prompt, execution.requestId);
+		return execution.prompt;
+	}
 	if (activeDurableJobTurns.has(execution.sessionId)) {
 		throw new Error("Durable session already has an active job run");
 	}
@@ -1535,14 +1042,9 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		jobStore,
 		channelRegistry,
 		checkInStore,
-		resolveSession: (sessionId) => {
-			if (durableSessions.get(req, sessionId)) return { id: sessionId, runtime: "durable" };
-			const sessionPath = sessionFileFromId(paths.sessionDir, sessionId);
-			return sessionPath && existsSync(sessionPath) ? { id: sessionId, path: sessionPath, runtime: "legacy" } : null;
-		},
+		resolveSession: (sessionId) => durableSessions.get(req, sessionId) ? { id: sessionId, runtime: "durable" } : null,
 		createSession: async (request, job) => scheduledSessionFactory?.(job, request) ?? null,
 		durableExecutor: executeDurableJob,
-		durableRequired: true,
 		disconnectJobRun: (sessionId, turnId) => {
 			if (activeDurableJobTurns.get(sessionId) === turnId) {
 				durableSessions.cancelPermissionTurn(req, sessionId, turnId);
@@ -1553,13 +1055,9 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		tenantStore: auth.tenantStore,
 		abortJobRun: async (sessionId) => {
 			const durableTurnId = activeDurableJobTurns.get(sessionId);
-			if (durableTurnId && durableSessions.get(req, sessionId)) {
-				await durableSessions.abort(req, sessionId, durableTurnId);
-				return true;
-			}
-			const sessionPath = sessionFileFromId(paths.sessionDir, sessionId);
-			if (!sessionPath || !existsSync(sessionPath)) return false;
-			return abortJobPromptInSession(sessionPath);
+			if (!durableTurnId || !durableSessions.get(req, sessionId)) return false;
+			await durableSessions.abort(req, sessionId, durableTurnId);
+			return true;
 		},
 	}),
 
@@ -1619,15 +1117,8 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 
 	// --- Sessions API (extracted to server/routes/sessions.ts) ---
 	sessions: (req, res, method, url) => handleSessionsRoutes(req, res, method, url, {
-		workspaceRegistry, dataDir, paths, getContentSource, tenantStore: auth.tenantStore, durableSessions,
-		durableRequired: true,
+		workspaceRegistry, paths, getContentSource, tenantStore: auth.tenantStore, durableSessions,
 		getCachedPresetAvailability: (presetId) => contentHubCatalog.getCachedPresetAvailability(presetId),
-		parseSessionFile, sessionRevision,
-		readSessionChannelMetadata, sessionChannelMetadataPath,
-		readSessionTopicMetadata, sessionTopicMetadataPath, writeSessionTopic,
-		readSessionQuestionMetadata, writeSessionQuestionMetadata,
-		recordCurrentSessionChannel, generateSessionTopic,
-		sessionFileFromId, releaseQueueFromQuestionBlockedTurn, runQueueOpWithTimeout,
 	}),
 
 	// --- Wiki + L2 raw upload API (extracted to server/routes/wiki.ts) ---
@@ -1639,21 +1130,13 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	// --- Workspace API + registry + session binding (extracted to server/routes/workspaces.ts) ---
 	workspaces: (req, res, method, url) => handleWorkspacesRoutes(req, res, method, url, {
 		workspaceRegistry, dataDir, paths, tenantStore: auth.tenantStore,
-		installSkillZip, installSkillMarkdown, scheduleSkillsReload, importWorkspaceZip,
-		sessionFileFromId,
-		releaseQueueFromQuestionBlockedTurn, runQueueOpWithTimeout,
+		installSkillZip, installSkillMarkdown, scheduleSkillsReload, importWorkspaceZip, durableSessions,
 	}),
 
 	// --- Presets API (extracted to server/routes/presets.ts) ---
 	presets: (req, res, method, url) => handlePresetsRoutes(req, res, method, url, { paths, listPresetLibrary }),
 
-	// --- Terminal sessions + Runs (extracted to server/routes/practice.ts) ---
-	practice: (req, res, method, url) => handlePracticeRoutes(req, res, method, url, {
-		workspaceRegistry, dataDir, terminalManager, runRecordStore, tenantStore: auth.tenantStore,
-		hostTerminalDisabled: auth.mode === "better-auth",
-	}),
-
-	// --- Settings + MCP API (extracted to server/routes/settings.ts) ---
+	// --- Settings API (extracted to server/routes/settings.ts) ---
 	settings: (req, res, method, url) => handleSettingsRoutes(req, res, method, url, {
 		paths,
 		getConfig: () => config,
@@ -1666,24 +1149,15 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		invalidateContentSource,
 	}),
 
-	// --- Slash commands API (extracted to server/routes/commands.ts) ---
-	commands: (req, res, method, url) => handleCommandsRoutes(req, res, method, url),
-
 	// --- Btw side-question API (extracted to server/routes/btw.ts) ---
 	btw: (req, res, method, url) => handleBtwRoutes(req, res, method, url, {
-		dataDir, sessionFileFromId, parseSessionFile, tenantStore: auth.tenantStore,
+		dataDir, tenantStore: auth.tenantStore,
 		durableSessions,
-		durableRequired: true,
 	}),
 
 	// --- Chat API (extracted to server/routes/chat.ts) ---
 	chat: (req, res, method, url) => handleChatRoutes(req, res, method, url, {
-		workspaceRegistry, dataDir, paths, tenantStore: auth.tenantStore, durableSessions,
-		durableRequired: true,
-		sessionFileFromId, releaseQueueFromQuestionBlockedTurn,
-		readSessionQuestionMetadata, writeSessionQuestionMetadata,
-		recordCurrentSessionChannel, maybeAutoGenerateTopic,
-		parseSessionFile, sessionRevision,
+		workspaceRegistry, tenantStore: auth.tenantStore, durableSessions,
 	}),
 });
 
@@ -1823,161 +1297,9 @@ const server = createServer(async (req, response) => {
 });
 
 // ---------------------------------------------------------------------------
-// Terminal WebSocket setup (the bindTerminalWs helper references the lazy
-// terminalManager, but the upgrade handler only fires AFTER the first successful
-// bootstrap — terminal WebSocket connections can't happen before then).
-// ---------------------------------------------------------------------------
-
-const wss = new WebSocketServer({ noServer: true });
-server.on("upgrade", (req, socket, head) => {
-	void (async () => {
-		const url = req.url ?? "";
-		const m = /^\/api\/terminal\/sessions\/([^/?]+)\/ws$/.exec(url.split("?")[0]);
-		if (!m) { socket.destroy(); return; }
-		if (auth.mode === "better-auth" && !isTrustedOrigin(req.headers.origin, authConfig)) {
-			socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-			socket.destroy();
-			return;
-		}
-		const session = auth.mode === "better-auth" ? await auth.getSession(req) : null;
-		if (auth.mode === "better-auth" && !session) {
-			socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-			socket.destroy();
-			return;
-		}
-		if (auth.mode === "better-auth") {
-			const body = JSON.stringify({ error: HOST_TERMINAL_DISABLED_ERROR });
-			socket.write(`HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
-			socket.destroy();
-			return;
-		}
-		if (session && auth.tenantStore) {
-			const tenant = await auth.tenantStore.ensurePersonalTenant(session.principal.userId);
-			setRequestTenant(req, tenant, auth.tenantStore);
-		}
-		if (!bootstrapped) { socket.destroy(); return; }
-		const terminalId = decodeURIComponent(m[1]);
-		const ts = terminalManager.get(terminalId);
-		if (!ts || !await ownsRequestResource(req, auth.tenantStore, "terminal", terminalId)
-			|| !await ownsRequestResource(req, auth.tenantStore, "session", ts.sessionId)) {
-			socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-			socket.destroy();
-			return;
-		}
-		wss.handleUpgrade(req, socket, head, (ws) => {
-			bindTerminalWs(ws, terminalId);
-		});
-	})().catch((err) => {
-		logger.warn({ err }, "Terminal WebSocket authentication failed");
-		socket.destroy();
-	});
-});
-
-function sendTerminal(ws: WebSocket, event: ServerTerminalEvent): void {
-	if (ws.readyState === ws.OPEN) {
-		ws.send(JSON.stringify(event));
-	}
-}
-
-function bindTerminalWs(ws: WebSocket, terminalId: string): void {
-	const ts = terminalManager.get(terminalId);
-	if (!ts) {
-		sendTerminal(ws, { type: "error", message: "Terminal not found" });
-		ws.close();
-		return;
-	}
-
-	sendTerminal(ws, { type: "ready", sessionId: ts.sessionId, cwd: ts.cwd, workspaceId: ts.workspaceId });
-
-	const offData = ts.pty.onData((chunk: string) => {
-		const { cleaned, finishedRun } = terminalManager.processOutput(ts, chunk);
-		if (cleaned) {
-			terminalManager.recordOutput(ts, cleaned);
-			sendTerminal(ws, { type: "output", data: cleaned });
-		}
-		if (finishedRun) {
-			const run = terminalManager.finishActiveRun(ts, finishedRun.exitCode);
-			sendTerminal(ws, { type: "exit", code: finishedRun.exitCode, runId: run?.id });
-		}
-	});
-	const offExit = ts.pty.onExit(({ exitCode, signal }) => {
-		const run = terminalManager.finishActiveRun(ts, exitCode, signal ? String(signal) : undefined);
-		sendTerminal(ws, { type: "exit", code: exitCode, signal: signal ? String(signal) : undefined, runId: run?.id });
-		ws.close();
-	});
-
-	ws.on("message", (raw) => {
-		let event: ClientTerminalEvent;
-		try {
-			event = JSON.parse(raw.toString()) as ClientTerminalEvent;
-		} catch (err) {
-			sendTerminal(ws, { type: "error", message: "Invalid JSON" });
-			return;
-		}
-		switch (event.type) {
-			case "input":
-				if (typeof event.data === "string") ts.pty.write(event.data);
-				break;
-			case "resize":
-				if (typeof event.cols === "number" && typeof event.rows === "number") {
-					ts.pty.resize(event.cols, event.rows);
-				}
-				break;
-			case "run": {
-				if (typeof event.command !== "string" || !event.command.trim()) break;
-				if (event.command.length > 4096) {
-					sendTerminal(ws, { type: "error", message: "Command too long" });
-					break;
-				}
-				// Long sources (e.g. a model-generated code block) travel as file
-				// content instead of an inlined command, which would hit the 4096
-				// limit above. The file lands in the terminal's cwd before the run.
-				if (typeof event.content === "string" && event.content && event.sourceFile) {
-					try {
-						writeRunFile(ts.cwd, event.sourceFile, event.content);
-					} catch (err) {
-						sendTerminal(ws, { type: "error", message: err instanceof Error ? err.message : "Failed to write run file" });
-						break;
-					}
-				}
-				const record = terminalManager.startRun(ts, event.command, event.sourceFile);
-				sendTerminal(ws, { type: "run_started", runId: record.id, command: event.command });
-				break;
-			}
-			case "close":
-				ws.close();
-				break;
-		}
-	});
-
-	ws.on("close", () => {
-		offData();
-		offExit();
-		terminalManager.finishActiveRun(ts, null);
-	});
-}
-
-// ---------------------------------------------------------------------------
 // Start listening immediately — /health and static files work right away.
 // All other endpoints call ensureBootstrapped() lazily on first request.
 // ---------------------------------------------------------------------------
-
-// Inject persistence callbacks into questionBridge so pending question cards
-// survive a full process restart.
-questionBridge.setPersistence({
-	save: (sessionId, question) => {
-		const meta = readSessionQuestionMetadata();
-		meta[sessionId] = question;
-		writeSessionQuestionMetadata(meta);
-	},
-	remove: (sessionId) => {
-		const meta = readSessionQuestionMetadata();
-		if (sessionId in meta) {
-			delete meta[sessionId];
-			writeSessionQuestionMetadata(meta);
-		}
-	},
-});
 
 // Process-level last resort: a stray rejection or an exception escaping a
 // catch block would otherwise kill the process silently (or via a secondary
@@ -1988,13 +1310,11 @@ questionBridge.setPersistence({
 installProcessFallbacks({
 	onFatal: () => {
 		try { server.close(); } catch { /* best effort */ }
-		try { wss.close(); } catch { /* best effort */ }
 	},
 });
 
 const gracefulShutdown = createGracefulShutdownHandler({
 	server,
-	wss,
 	exit: (code) => process.exit(code),
 	onClose: async () => {
 		scheduler?.stop();

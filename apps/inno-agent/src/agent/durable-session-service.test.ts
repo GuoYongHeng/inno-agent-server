@@ -260,7 +260,7 @@ describe("DurableSessionService", () => {
 			expect(duplicate.messages).toEqual(first.messages);
 			expect(duplicate.revision).toBe(first.revision);
 			expect(faux.state.callCount).toBe(0);
-			const memory = new ScopedL3Memory(base, join(base, "sessions"));
+			const memory = new ScopedL3Memory(base);
 			expect((await memory.recall("闭包", "another-session")).some((result) => result.sessionId === session.id)).toBe(true);
 		});
 	});
@@ -341,7 +341,7 @@ describe("DurableSessionService", () => {
 				await lease.runtime.waitForSubmission(submission.id);
 			} finally { await lease.release(); }
 			await service.snapshot(req, session.id);
-			const memory = new ScopedL3Memory(base, join(base, "sessions"));
+			const memory = new ScopedL3Memory(base);
 			const recalled = await memory.recall("机器学习", "durable-current");
 			expect(recalled.some((result) => result.sessionId === session.id)).toBe(true);
 			expect(await memory.recall("机器学习", session.id)).toEqual([]);

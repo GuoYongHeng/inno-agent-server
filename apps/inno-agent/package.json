@@ -3,20 +3,15 @@
 	"version": "0.7.0",
 	"description": "Personal learning agent built on PI SDK with three-layer memory system",
 	"type": "module",
-	"bin": {
-		"inno": "dist/cli.js"
-	},
 	"main": "./dist/index.js",
 	"scripts": {
 		"build": "tsc",
 		"dev": "tsc --watch",
-		"start": "node dist/cli.js",
 		"server": "node dist/server.js",
 		"web:dev": "npm --workspace inno-agent-web run dev",
 		"web:build": "npm --workspace inno-agent-web run build",
 		"auth:migrate": "tsx src/auth/migrate.ts",
-		"auth:schema": "tsx src/auth/migrate.ts --print",
-		"tenants:legacy": "tsx src/tenants/migrate-legacy.ts"
+		"auth:schema": "tsx src/auth/migrate.ts --print"
 	},
 	"dependencies": {
 		"@better-auth/core": "1.7.12",

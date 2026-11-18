@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -14,17 +14,8 @@ let postgres: TemporaryPostgres;
 let pool: Pool;
 let store: TenantStore;
 let dataDir: string;
-let sessionDir: string;
 let tenantA: TenantContext;
 let tenantB: TenantContext;
-
-function writeSession(id: string, text: string): void {
-	writeFileSync(join(sessionDir, `${id}.jsonl`), JSON.stringify({
-		type: "message",
-		timestamp: "2026-10-25T10:00:00Z",
-		message: { role: "user", content: [{ type: "text", text }] },
-	}) + "\n");
-}
 
 beforeAll(async () => {
 	postgres = await startTemporaryPostgres();
@@ -48,11 +39,12 @@ beforeAll(async () => {
 	await store.claimResource(tenantA, "session", "session-a");
 	await store.claimResource(tenantB, "session", "session-b");
 	dataDir = mkdtempSync(join(tmpdir(), "inno-tenant-l3-"));
-	sessionDir = join(dataDir, "sessions");
-	mkdirSync(sessionDir, { recursive: true });
-	writeSession("session-a", "机器学习 tenant-a-private-memory");
-	writeSession("session-b", "烹饪食谱 tenant-b-private-memory");
-	writeSession("legacy-unowned", "机器学习 legacy-unowned-memory");
+	const index = async (tenant: TenantContext, sessionId: string, text: string) => {
+		enterTenantContext(tenant, store);
+		await new ScopedL3Memory(dataDir).indexMessages(sessionId, [{ role: "user", content: text, timestamp: 1 }], 1);
+	};
+	await index(tenantA, "session-a", "机器学习 tenant-a-private-memory");
+	await index(tenantB, "session-b", "烹饪食谱 tenant-b-private-memory");
 });
 
 afterAll(async () => {
@@ -66,17 +58,17 @@ afterAll(async () => {
 });
 
 describe("agent-scoped L3 memory", () => {
-	it("indexes only owned sessions and revokes visibility after ownership release", async () => {
-		const memory = new ScopedL3Memory(dataDir, sessionDir);
+	it("keeps each tenant's index separate and revokes visibility after ownership release", async () => {
+		const memory = new ScopedL3Memory(dataDir);
 		enterTenantContext(tenantA, store);
 		const resultsA = await memory.recall("机器学习");
-		expect(resultsA.map((result) => result.sessionId)).toEqual(["session-a.jsonl"]);
+		expect(resultsA.map((result) => result.sessionId)).toEqual(["session-a"]);
 		expect(resultsA[0].text).toContain("tenant-a-private-memory");
 
 		enterTenantContext(tenantB, store);
 		expect(await memory.recall("机器学习")).toEqual([]);
 		const resultsB = await memory.recall("烹饪食谱");
-		expect(resultsB.map((result) => result.sessionId)).toEqual(["session-b.jsonl"]);
+		expect(resultsB.map((result) => result.sessionId)).toEqual(["session-b"]);
 
 		await store.releaseResource(tenantA, "session", "session-a");
 		enterTenantContext(tenantA, store);

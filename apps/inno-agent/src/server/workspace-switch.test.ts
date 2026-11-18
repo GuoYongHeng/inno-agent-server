@@ -10,7 +10,6 @@ let dir: string;
 let dataDir: string;
 let workspaceDir: string;
 let registry: WorkspaceRegistry;
-let sessionPath: string;
 let sourceRoot: string;
 let targetRoot: string;
 
@@ -25,9 +24,6 @@ beforeEach(() => {
 	registry.bindSession("session-1.jsonl", source.id);
 	sourceRoot = registry.resolveWorkspaceDir(source.id)!;
 	targetRoot = registry.resolveWorkspaceDir(target.id)!;
-	sessionPath = join(dataDir, "sessions", "session-1.jsonl");
-	mkdirSync(join(dataDir, "sessions"), { recursive: true });
-	writeFileSync(sessionPath, "history\n");
 	resetWorkspaceActivityStoreForTests();
 });
 
@@ -42,7 +38,7 @@ function preview() {
 	return buildWorkspaceSwitchPreview({
 		dataDir,
 		sessionId: "session-1.jsonl",
-		sessionPath,
+		hasSessionHistory: true,
 		workspaceRegistry: registry,
 		targetWorkspaceId: target.id,
 	});

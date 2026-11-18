@@ -1,11 +1,13 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
 import type { UserInput } from "@earendil-works/pi-durable";
+import { contentDispositionAttachment } from "./file-helpers.js";
+import { sessionToMarkdown } from "./session-markdown.js";
 import { DurableBranchError } from "../agent/durable-runtime.js";
 import { DurableModelNotFoundError, DurableRuntimeDisabledError, DurableSessionBusyError, type DurableSessionService, type DurableSessionSummary, type PreparedDurableAttachments, type PreparedDurableImages } from "../agent/durable-session-service.js";
 import { DurableSseProjector } from "../agent/durable-projection.js";
 import type { DurableStreamStore } from "../agent/durable-stream-store.js";
-import type { QuestionBridgeResult } from "../agent/question-bridge.js";
-import type { PermissionDecision } from "../agent/permission-bridge.js";
+import type { QuestionBridgeResult } from "../agent/question-types.js";
+import type { PermissionDecision } from "../agent/permission-types.js";
 import {
 	hasCompleteTurnAfterBaseline,
 	streamRegistry,
@@ -152,6 +154,17 @@ export async function handleDurableSessionResourceRoutes(
 		}
 		if (name) summary = ctx.service.rename(req, id, name.slice(0, 120));
 		json(res, 200, summary);
+		return true;
+	}
+	if (matchRoute("GET", method, url, "/api/sessions/:id/export.md")) {
+		const detail = await ctx.service.snapshot(req, id);
+		const baseName = (detail.summary.name?.trim() || id).replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+		res.writeHead(200, {
+			"Content-Type": "text/markdown; charset=utf-8",
+			"Content-Disposition": contentDispositionAttachment(`${baseName}.md`),
+			"Cache-Control": "no-store",
+		});
+		res.end(sessionToMarkdown(detail.summary, detail.messages));
 		return true;
 	}
 	if (matchRoute("POST", method, url, "/api/sessions/:id/branch-before-message")) {

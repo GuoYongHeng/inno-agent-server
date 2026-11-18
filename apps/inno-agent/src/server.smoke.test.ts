@@ -214,13 +214,22 @@ describe("server smoke", () => {
 		expect(await missing.json()).toMatchObject({ code: "entry_not_found" });
 	}, 60_000);
 
-	it("POST /api/sessions/:id/archive + unarchive round-trips", async () => {
-		const archive = await fetch(`http://127.0.0.1:${port}/api/sessions/some-session.jsonl/archive`, { method: "POST" });
+	it("POST /api/sessions/:id/archive + unarchive round-trips on a durable session", async () => {
+		const created = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+			method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}),
+		});
+		const { id } = (await created.json()) as { id: string };
+		const archive = await fetch(`http://127.0.0.1:${port}/api/sessions/${id}/archive`, { method: "POST" });
 		expect(archive.status).toBe(200);
-		expect((await archive.json()) as { archived: boolean }).toEqual({ id: "some-session.jsonl", archived: true });
-		const unarchive = await fetch(`http://127.0.0.1:${port}/api/sessions/some-session.jsonl/unarchive`, { method: "POST" });
+		expect((await archive.json()) as { archived: boolean }).toMatchObject({ id, archived: true });
+		const unarchive = await fetch(`http://127.0.0.1:${port}/api/sessions/${id}/unarchive`, { method: "POST" });
 		expect(unarchive.status).toBe(200);
-		expect((await unarchive.json()) as { archived: boolean }).toEqual({ id: "some-session.jsonl", archived: false });
+		expect((await unarchive.json()) as { archived: boolean }).toMatchObject({ id, archived: false });
+	}, 60_000);
+
+	it("archiving an unknown session returns 404", async () => {
+		const res = await fetch(`http://127.0.0.1:${port}/api/sessions/some-session.jsonl/archive`, { method: "POST" });
+		expect(res.status).toBe(404);
 	});
 
 	it("GET /api/jobs returns 200", async () => {
@@ -300,22 +309,6 @@ describe("server smoke", () => {
 			body: JSON.stringify({ l2Enabled: "yes" }),
 		});
 		expect(res.status).toBe(400);
-	});
-
-	it("GET /api/mcp returns 200 with the adapter overview", async () => {
-		const res = await api("/api/mcp");
-		expect(res.status).toBe(200);
-	});
-
-	it("practice: runs list 400 without sessionId, run detail 404, terminal create 400 without sessionId", async () => {
-		expect((await api("/api/runs?limit=5")).status).toBe(400);
-		expect((await api("/api/runs/run_missing")).status).toBe(404);
-		const term = await fetch(`http://127.0.0.1:${port}/api/terminal/sessions`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({}),
-		});
-		expect(term.status).toBe(400);
 	});
 
 	it("GET /api/channels returns 200 with an empty list (no channels configured)", async () => {
@@ -580,7 +573,6 @@ describe("server smoke", () => {
 		["GET", "/api/sessions/%"],
 		["PATCH", "/api/jobs/%GG"],
 		["GET", "/api/skills/%E0%A4%A/content"],
-		["PATCH", "/api/mcp/servers/%C3%28"],
 		["GET", "/api/chat/status/%"],
 		["GET", "/api/sessions/%/workspace"],
 		["DELETE", "/api/workspaces/%F4%90%80%80"],

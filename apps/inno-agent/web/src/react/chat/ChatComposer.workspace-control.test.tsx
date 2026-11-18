@@ -67,33 +67,29 @@ function baseProps(overrides: Partial<ChatComposerProps> = {}): ChatComposerProp
 	};
 }
 
-describe("ChatComposer workspace/permission controls", () => {
+describe("ChatComposer workspace control", () => {
 	it("does not render the workspace control inside an active conversation", () => {
 		render(
 			<ChatComposer
 				{...baseProps({
 					conversationMode: true,
 					workspaceControl: <div data-testid="ws-switcher">工作区选择器</div>,
-					permissionControl: <div data-testid="perm-control">权限</div>,
 				})}
 			/>,
 		);
 		expect(screen.queryByTestId("ws-switcher")).toBeNull();
-		expect(screen.getByTestId("perm-control")).toBeTruthy();
 	});
 
-	it("keeps both controls on the welcome sub-pill row", () => {
+	it("keeps the workspace control on the welcome sub-pill row", () => {
 		const { container } = render(
 			<ChatComposer
 				{...baseProps({
 					conversationMode: false,
 					workspaceControl: <div data-testid="ws-switcher">工作区选择器</div>,
-					permissionControl: <div data-testid="perm-control">权限</div>,
 				})}
 			/>,
 		);
 		const subrow = container.querySelector(".inno-composer-subrow");
 		expect(subrow?.contains(screen.getByTestId("ws-switcher"))).toBe(true);
-		expect(subrow?.contains(screen.getByTestId("perm-control"))).toBe(true);
 	});
 });

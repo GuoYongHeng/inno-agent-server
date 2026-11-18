@@ -1,4 +1,4 @@
-import type { SlashCommandItem } from "../../api/commands.js";
+import type { SlashCommandItem } from "./slash-command.js";
 
 /**
  * Pure helpers for the composer slash-command palette. Kept free of React so

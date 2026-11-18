@@ -44,17 +44,21 @@ function fakeMemory(root: string): L2Memory {
 	} as unknown as L2Memory;
 }
 
+/** Model access handed to the tools under test; set per call by executeTool. */
+let richForCall: { model: unknown; modelRegistry: unknown } | undefined;
+const richProvider = () => richForCall as never;
+
 function executeTool(
 	tool: ReturnType<typeof createL2Tools>[number],
 	callId: string,
 	params: Record<string, unknown>,
-	legacy: { model?: unknown; modelRegistry?: unknown } = {},
+	rich: { model?: unknown; modelRegistry?: unknown } = {},
 ) {
+	richForCall = rich.model && rich.modelRegistry ? { model: rich.model, modelRegistry: rich.modelRegistry } : undefined;
 	return (tool.execute as (...args: any[]) => Promise<any>)(
 		params,
 		{
 			callId,
-			innoLegacy: legacy,
 			output: vi.fn(),
 			details: vi.fn(async () => undefined),
 		},
@@ -63,7 +67,7 @@ function executeTool(
 }
 
 async function archive(root: string, content: string) {
-	const tool = createL2Tools(root, undefined, fakeMemory(root))[0];
+	const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
 	return executeTool(
 		tool,
 		"call-1",
@@ -129,7 +133,7 @@ describe("l2_archive", () => {
 
 	it("keeps durable archive deterministic even when a model context is available", async () => {
 		const root = makeTempDir();
-		const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, true)[0];
+		const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, true, richProvider)[0];
 		await executeTool(
 			tool,
 			"durable-call-1",
@@ -235,7 +239,7 @@ describe("l2_archive", () => {
 	it("records a partial rich write as retryable after source/index metadata has been updated", async () => {
 		const root = makeTempDir();
 		const memory = fakeMemory(root);
-		const tool = createL2Tools(root, undefined, memory)[0];
+		const tool = createL2Tools(root, undefined, memory, undefined, false, false, richProvider)[0];
 		summarizeContentMock.mockResolvedValue({ analysis: "analysis", sourceContext: "source", chunked: false });
 		generateRichWikiPagesMock.mockResolvedValue({
 			created: ["wiki/sources/学习资料.md"],
@@ -262,7 +266,7 @@ describe("l2_archive", () => {
 
 	it("returns rich-ingest warnings and review counts to the caller", async () => {
 		const root = makeTempDir();
-		const tool = createL2Tools(root, undefined, fakeMemory(root))[0];
+		const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
 		summarizeContentMock.mockResolvedValue({ analysis: "analysis", sourceContext: "source", chunked: false });
 		generateRichWikiPagesMock.mockResolvedValue({
 			created: ["wiki/sources/学习资料.md"],
@@ -291,7 +295,7 @@ describe("l2_archive", () => {
 
 	it("adds a deterministic ingest log when rich generation omits wiki/log.md", async () => {
 		const root = makeTempDir();
-		const tool = createL2Tools(root, undefined, fakeMemory(root))[0];
+		const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
 		summarizeContentMock.mockResolvedValue({ analysis: "analysis", sourceContext: "source", chunked: false });
 		generateRichWikiPagesMock.mockResolvedValue({
 			created: ["wiki/sources/学习资料.md"],
@@ -316,7 +320,7 @@ describe("l2_archive", () => {
 
 	it("does not register a missing rich source fallback in the manifest", async () => {
 		const root = makeTempDir();
-		const tool = createL2Tools(root, undefined, fakeMemory(root))[0];
+		const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
 		summarizeContentMock.mockResolvedValue({ analysis: "analysis", sourceContext: "source", chunked: false });
 		generateRichWikiPagesMock.mockResolvedValue({
 			created: ["wiki/concepts/kept.md"],
@@ -357,7 +361,7 @@ describe("l2_archive", () => {
 		const previousWorkspace = process.env.INNO_WORKSPACE_DIR;
 		process.env.INNO_WORKSPACE_DIR = fallbackWorkspace;
 		try {
-			const tool = createL2Tools(root, undefined, fakeMemory(root), () => activeWorkspace)[0];
+			const tool = createL2Tools(root, undefined, fakeMemory(root), () => activeWorkspace, false, false, richProvider)[0];
 			await executeTool(
 				tool,
 				"call-file",
@@ -389,8 +393,8 @@ describe("l2_archive", () => {
 				pages: [{ pageNumber: 1, text: "第二篇资料" }],
 			});
 
-		const firstTool = createL2Tools(root, undefined, fakeMemory(root))[0];
-		const secondTool = createL2Tools(root, undefined, fakeMemory(root))[0];
+		const firstTool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
+		const secondTool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
 		const firstArchive = archiveFile(firstTool, "call-first", "第一篇", firstFile);
 		await vi.waitFor(() => expect(parseDocumentMock).toHaveBeenCalledTimes(1));
 
@@ -416,8 +420,8 @@ describe("l2_archive", () => {
 		vi.mocked(memory.indexPageByPath)
 			.mockImplementationOnce(() => firstIndex.promise)
 			.mockResolvedValue(undefined);
-		const firstTool = createL2Tools(root, undefined, memory)[0];
-		const secondTool = createL2Tools(root, undefined, memory)[0];
+		const firstTool = createL2Tools(root, undefined, memory, undefined, false, false, richProvider)[0];
+		const secondTool = createL2Tools(root, undefined, memory, undefined, false, false, richProvider)[0];
 
 		const firstArchive = executeTool(
 			firstTool,
