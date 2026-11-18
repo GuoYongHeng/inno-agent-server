@@ -7,7 +7,7 @@
  */
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ModelAuthProvider } from "./model-auth.js";
 
 import { parseFrontmatter } from "./wiki-maintainer.js";
 import { isWikiLlmResponseAccepted, withWikiLlmPayloadAlignment } from "./wiki-llm-compat.js";
@@ -78,7 +78,7 @@ export async function mergeWikiPageContent(
 	incomingContent: string,
 	sourceName: string,
 	model: Model<any>,
-	modelRegistry: ModelRegistry,
+	modelRegistry: ModelAuthProvider,
 	signal?: AbortSignal,
 ): Promise<{ content: string; usedFallback: boolean }> {
 	throwIfAborted(signal);

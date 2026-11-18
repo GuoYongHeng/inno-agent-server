@@ -27,7 +27,12 @@ import {
 import { clearWorkspaceActivity, markWorkspaceTrackingIncomplete, recordWorkspaceAttachmentActivity, recordWorkspaceFileAccess } from "../server/workspace-activity-store.js";
 import { buildImagePathsHint, parseInlineImages, persistInlineImages } from "../server/inline-images.js";
 import { fallbackTopicFromMessages, generateSessionTopicWithCompletion } from "../server/session-topic.js";
-import { completeConfiguredDurablePrompt, createConfiguredDurableModels } from "./durable-models.js";
+import {
+	completeConfiguredDurableChat,
+	completeConfiguredDurablePrompt,
+	createConfiguredDurableModels,
+	type DurableChatTurn,
+} from "./durable-models.js";
 import { buildDurableInstructions } from "./durable-memory.js";
 import { durableEntriesToMessages } from "./durable-projection.js";
 import { DurablePermissionStore, type PendingDurablePermission } from "./durable-permissions.js";
@@ -38,6 +43,12 @@ import type { PersistedQuestion, QuestionBridgeResult, QuestionResponseStatus } 
 import type { PermissionDecision, PermissionResponseStatus } from "./permission-bridge.js";
 import { INNO_SYSTEM_PROMPT } from "./system-prompt.js";
 import { buildWorkspaceContextSections } from "./workspace-context.js";
+import type { ToolRegistration } from "@earendil-works/pi-durable";
+import { buildDurableContextUsage, unavailableContextUsage, type UsageMessage } from "./context-usage.js";
+import type { SessionContextUsage } from "../shared/context-usage.js";
+import { createDocumentTools } from "./document-tools.js";
+import { buildGlobalSkillsSection } from "./skills.js";
+import { createTavilyTools } from "./tavily-tools.js";
 import { formatRecallForPrompt, ScopedL3Memory } from "../memory/l3/l3-tools.js";
 import { logger } from "../logger.js";
 
@@ -57,11 +68,16 @@ export interface DurableSessionRecord {
 	topicUpgraded?: boolean;
 	origin?: "web" | "scheduler";
 	archived: boolean;
+	/** The conversation the session continues in after an earlier message was
+	 * edited. Omitted: the root conversation. */
+	conversationId?: string;
 }
 
 export interface DurableSessionSummary extends SessionSummary {
 	runtime: "durable";
 	archived: boolean;
+	/** The model this session currently uses. */
+	model: { provider: string; id: string };
 }
 
 export interface DurableSessionLease {
@@ -103,9 +119,30 @@ export interface DurableSessionServiceOptions {
 	resolveWorkspaceDir: (sessionId: string, fallbackWorkspaceId: string) => string | undefined;
 	/** Lazy because the server's channel registry is built during agent bootstrap. */
 	getChannelRegistry?: () => ChannelRegistry | undefined;
+	/** Shared skills directory. Enabled skills are listed in every session's
+	 * instructions and read through the session's `read` tool. */
+	skillsDir?: string;
+	/** Lazy for the same reason: job stores are created during server bootstrap. */
+	getSchedulerTools?: () => ToolRegistration[];
 	tenantStore?: TenantStore | null;
 	openRuntime?: typeof DurableSessionRuntime.open;
 	completeTopic?: typeof completeConfiguredDurablePrompt;
+	completeChat?: typeof completeConfiguredDurableChat;
+}
+
+/** Re-enter the verified tenant for tools that read tenant-scoped stores, since
+ * pi-durable may resume a tool outside the original HTTP request's async context. */
+function bindToolsToTenant(
+	tools: ToolRegistration[],
+	tenant: ReturnType<typeof getRequestTenant>,
+	tenantStore: TenantStore | null | undefined,
+): ToolRegistration[] {
+	if (!tenant) return tools;
+	if (!tenantStore) throw new Error("Authenticated durable tools require a tenant store");
+	return tools.map((tool) => ({
+		...tool,
+		execute: (params, api, context) => runInTenantContext(tenant, tenantStore, () => tool.execute(params, api, context)),
+	}));
 }
 
 function bindChannelRegistry(
@@ -126,9 +163,23 @@ function bindChannelRegistry(
 	} as ChannelRegistry;
 }
 
+const SIDE_QUESTION_SYSTEM_PROMPT = [
+	"你是学习对话的“旁注问答”通道。学生正在主线学习对话中,临时向你提了一个顺带的问题。",
+	"规则:基于提供的对话片段回答;简洁直接,不要把回答扩展成一节新课;不要声称自己查阅了资料或运行了程序(你没有工具);",
+	"如果问题与对话片段无关,直接回答问题本身即可;如果片段缺失或不足,明说“主对话里还没有相关信息”。",
+	"用中文回答,除非学生用其他语言提问。",
+].join("\n");
+
+export class DurableModelNotFoundError extends Error {
+	constructor(provider: string, modelId: string) {
+		super(`Configured model not found: ${provider}/${modelId}`);
+		this.name = "DurableModelNotFoundError";
+	}
+}
+
 export class DurableRuntimeDisabledError extends Error {
 	constructor() {
-		super("Durable sessions are disabled. Set INNO_DURABLE_ENABLED=true to enable explicit opt-in.");
+		super("Durable sessions are disabled.");
 		this.name = "DurableRuntimeDisabledError";
 	}
 }
@@ -170,6 +221,7 @@ function toSummary(record: DurableSessionRecord): DurableSessionSummary {
 			&& record.messageCount >= TOPIC_UPGRADE_MESSAGE_THRESHOLD,
 		runtime: "durable",
 		archived: record.archived,
+		model: { provider: record.provider, id: record.modelId },
 	};
 }
 
@@ -370,6 +422,122 @@ export class DurableSessionService {
 			topicUpgraded: false,
 			updatedAt: new Date().toISOString(),
 		}));
+	}
+
+	/** Switch the model of one session. The catalog record is the source of truth
+	 * when a runtime opens, so it changes first; an open runtime is then told to
+	 * use the new model from its next request. A failure restores the old model. */
+	async setModel(
+		req: IncomingMessage,
+		id: string,
+		selection: { provider: string; modelId: string },
+	): Promise<DurableSessionSummary> {
+		const before = this.get(req, id);
+		if (!before) throw new Error("Durable session not found");
+		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
+		const provider = config.providers[selection.provider];
+		if (!provider?.models.some((model) => model.id === selection.modelId)) {
+			throw new DurableModelNotFoundError(selection.provider, selection.modelId);
+		}
+		if (before.provider === selection.provider && before.modelId === selection.modelId) return toSummary(before);
+		const next = this.update(req, id, { provider: selection.provider, modelId: selection.modelId });
+		try {
+			const lease = await this.lease(req, id);
+			try {
+				await lease.runtime.setModel({ provider: selection.provider, modelId: selection.modelId });
+			} finally {
+				await lease.release();
+			}
+		} catch (error) {
+			this.update(req, id, { provider: before.provider, modelId: before.modelId });
+			throw error;
+		}
+		return toSummary(next);
+	}
+
+	/**
+	 * Edit an earlier user message: continue the session in a fork that holds
+	 * everything before it. The abandoned replies stay in the earlier conversation
+	 * but leave the visible history. A pending question or approval of the
+	 * abandoned branch is cancelled. If the process dies between creating the fork
+	 * and recording it here, the session simply keeps its previous conversation.
+	 */
+	async branchBeforeMessage(
+		req: IncomingMessage,
+		id: string,
+		entryId: string,
+	): Promise<{ sessionId: string; replacedEntryId: string; branchMarkerId: string; sessionRevision: string }> {
+		if (!this.get(req, id)) throw new Error("Durable session not found");
+		const pendingQuestion = this.questionStore(req, id).pendingQuestion();
+		const pendingPermission = this.permissionStore(req, id).pendingPermission();
+		const lease = await this.lease(req, id);
+		let branched: { conversationId: string; replacedEntryId: string };
+		try {
+			// Validate and fork first: a rejected edit must not cancel anything.
+			branched = await lease.runtime.branchBeforeUserMessage(entryId);
+			if (pendingQuestion) this.questionStore(req, id).cancelTurn(pendingQuestion.turnId);
+			if (pendingPermission) this.permissionStore(req, id).cancelTurn(pendingPermission.turnId);
+			this.update(req, id, { conversationId: branched.conversationId, updatedAt: new Date().toISOString() });
+		} finally {
+			await lease.release();
+		}
+		const detail = await this.snapshot(req, id);
+		return {
+			sessionId: id,
+			replacedEntryId: branched.replacedEntryId,
+			branchMarkerId: branched.conversationId,
+			sessionRevision: detail.revision,
+		};
+	}
+
+	/** Answer a "by the way" side question with the session's own model, outside
+	 * the transcript and without tools. Returns "" when the model cannot answer. */
+	async completeSideQuestion(
+		req: IncomingMessage,
+		id: string,
+		input: {
+			contextDigest: string;
+			thread: ReadonlyArray<{ question: string; answer: string }>;
+			question: string;
+			signal?: AbortSignal;
+		},
+	): Promise<string> {
+		const record = this.get(req, id);
+		if (!record) throw new Error("Durable session not found");
+		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
+		const complete = this.options.completeChat ?? completeConfiguredDurableChat;
+		const turns: DurableChatTurn[] = [];
+		if (input.contextDigest) turns.push({ role: "user", text: input.contextDigest });
+		for (const exchange of input.thread) {
+			turns.push({ role: "user", text: exchange.question }, { role: "assistant", text: exchange.answer });
+		}
+		turns.push({ role: "user", text: input.question });
+		return complete(config, { provider: record.provider, modelId: record.modelId }, {
+			systemPrompt: SIDE_QUESTION_SYSTEM_PROMPT,
+			turns,
+			...(input.signal ? { signal: input.signal } : {}),
+		});
+	}
+
+	/** Context-window usage for one session, from the committed conversation. */
+	async contextUsage(req: IncomingMessage, id: string): Promise<SessionContextUsage> {
+		const record = this.get(req, id);
+		if (!record) throw new Error("Durable session not found");
+		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
+		const model = config.providers[record.provider]?.models.find((candidate) => candidate.id === record.modelId);
+		if (!model) return unavailableContextUsage(id, "unavailable");
+		const lease = await this.lease(req, id);
+		try {
+			const messages = await lease.runtime.contextMessages();
+			return buildDurableContextUsage(id, {
+				contextWindow: model.contextWindow,
+				instructions: lease.runtime.contextInfo.instructions,
+				tools: lease.runtime.contextInfo.tools,
+				messages: messages as readonly UsageMessage[],
+			});
+		} finally {
+			await lease.release();
+		}
 	}
 
 	setArchived(req: IncomingMessage, id: string, archived: boolean): DurableSessionSummary {
@@ -718,10 +886,12 @@ export class DurableSessionService {
 						const runtime = await this.openRuntime({
 							storagePath: this.storagePath(req, id),
 							...selection,
+							...(record.conversationId ? { conversationId: record.conversationId } : {}),
 							instructions: [
 								buildDurableInstructions(INNO_SYSTEM_PROMPT, memory),
+								buildGlobalSkillsSection(this.options.skillsDir),
 								...buildWorkspaceContextSections(workspaceDir),
-							].join("\n\n"),
+							].filter((section): section is string => Boolean(section)).join("\n\n"),
 							workspaceDir,
 							workspaceTools: true,
 							permissions: this.permissionStore(req, id),
@@ -732,6 +902,11 @@ export class DurableSessionService {
 								store: this.questionStore(req, id),
 								workspaceDir,
 							},
+							extraTools: [
+								...createDocumentTools({ restrictToWorkspace: true, workspaceDir }),
+								...createTavilyTools({ current: config }),
+								...bindToolsToTenant(this.options.getSchedulerTools?.() ?? [], tenant, this.options.tenantStore),
+							],
 						});
 						return { runtime, ...(storageLock ? { storageLock } : {}) };
 					} catch (error) {

@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ConfigHolder } from "./inno-extension.js";
+import type { ConfigHolder } from "./config-holder.js";
 import { createOcrTools } from "./ocr-tools.js";
 
 function config(): ConfigHolder {

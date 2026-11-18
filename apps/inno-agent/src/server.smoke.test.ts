@@ -165,10 +165,10 @@ describe("server smoke", () => {
 		expect(await res.json()).toEqual({ status: "ok" });
 	});
 
-	it("GET /api/session reports that durable is disabled by default", async () => {
+	it("GET /api/session reports that durable is always enabled and required", async () => {
 		const res = await api("/api/session");
 		expect(res.status).toBe(200);
-		expect(await res.json()).toMatchObject({ mode: "local", durableEnabled: false });
+		expect(await res.json()).toMatchObject({ mode: "local", durableEnabled: true, durableRequired: true });
 	});
 
 	it("GET /api/settings returns 200 with provider API keys redacted", async () => {
@@ -193,46 +193,25 @@ describe("server smoke", () => {
 		expect(res.status).toBe(404);
 	});
 
-	it("editing a user message branches before it and hides the abandoned replies", async () => {
-		const sessionId = "edit-branch-smoke.jsonl";
-		const sessionDir = join(home, "data", "sessions");
-		mkdirSync(sessionDir, { recursive: true });
-		const timestamp = new Date().toISOString();
-		const assistant = (text: string) => ({
-			role: "assistant",
-			content: [{ type: "text", text }],
-			api: "openai-completions",
-			provider: "dummy",
-			model: "dummy-model",
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-			stopReason: "stop",
-			timestamp: Date.now(),
-		});
-		const entries = [
-			{ type: "session", version: 3, id: "edit-branch-smoke", timestamp, cwd: workspace },
-			{ type: "message", id: "setup-user", parentId: null, timestamp, message: { role: "user", content: [{ type: "text", text: "Test my arithmetic" }], timestamp: Date.now() } },
-			{ type: "message", id: "arithmetic-question", parentId: "setup-user", timestamp, message: assistant("36 / (9 - 3) * 2 = ?") },
-			{ type: "message", id: "answer-12", parentId: "arithmetic-question", timestamp, message: { role: "user", content: [{ type: "text", text: "12" }], timestamp: Date.now() } },
-			{ type: "message", id: "choice-question", parentId: "answer-12", timestamp, message: assistant("Correct. Which option is an equation?") },
-		];
-		writeFileSync(join(sessionDir, sessionId), `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf-8");
-
-		const branched = await fetch(`http://127.0.0.1:${port}/api/sessions/${sessionId}/branch-before-message`, {
+	it("branch-before-message validates its input on a durable session", async () => {
+		const created = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ entryId: "answer-12" }),
+			body: JSON.stringify({}),
 		});
-		const branchedBody = await branched.json() as { error?: string };
-		expect(branched.status, branchedBody.error).toBe(200);
+		expect(created.status).toBe(201);
+		const { id: sessionId } = (await created.json()) as { id: string };
+		expect(sessionId.startsWith("durable-")).toBe(true);
 
-		const detail = await api(`/api/sessions/${sessionId}`);
-		expect(detail.status).toBe(200);
-		const body = (await detail.json()) as { messages: Array<{ role: string; content: string; entryId?: string }> };
-		expect(body.messages.map((message) => message.content)).toEqual([
-			"Test my arithmetic",
-			"36 / (9 - 3) * 2 = ?",
-		]);
-		expect(body.messages.some((message) => message.entryId === "answer-12")).toBe(false);
+		const branch = (body: unknown) => fetch(`http://127.0.0.1:${port}/api/sessions/${sessionId}/branch-before-message`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		expect((await branch({})).status).toBe(400);
+		const missing = await branch({ entryId: "123456" });
+		expect(missing.status).toBe(404);
+		expect(await missing.json()).toMatchObject({ code: "entry_not_found" });
 	}, 60_000);
 
 	it("POST /api/sessions/:id/archive + unarchive round-trips", async () => {

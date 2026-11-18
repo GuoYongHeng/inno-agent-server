@@ -2,7 +2,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
-import { isComputerUseEnabled, saveConfig, setDefaultModel, type InnoConfig } from "../config.js";
+import { isComputerUseEnabled, saveConfig, setDefaultModel } from "../config.js";
 import { createLearnerTools } from "../memory/learner/learner-tools.js";
 import { isProfileEmpty, loadProfile, loadRecentEvents } from "../memory/learner/profile-store.js";
 import { buildContextPack, formatContextPackForPrompt } from "../memory/learner/context-pack.js";
@@ -17,6 +17,7 @@ import { createPracticeTools } from "./practice-tools.js";
 import { createDocumentTools } from "./document-tools.js";
 import { createOcrTools } from "./ocr-tools.js";
 import { createLegacyToolDefinitions } from "./legacy-tool-adapter.js";
+import type { ConfigHolder } from "./config-holder.js";
 import { createTavilyTools } from "./tavily-tools.js";
 import { ensureWebAccessConfig, resolvePiAiJitiAliases } from "./web-access-config.js";
 import { ensurePermissionSystemConfig, INNO_WEB_AUTHORIZER_NAME, resolvePluginFile, writePermissionPolicyConfig } from "./permission-system-config.js";
@@ -50,9 +51,7 @@ const INNO_VERSION = "0.0.1";
  * 5. Injects L1 context into system prompt before each agent turn
  * 6. Customizes the startup header to show "inno" branding
  */
-export interface ConfigHolder {
-	current: InnoConfig;
-}
+export type { ConfigHolder } from "./config-holder.js";
 
 export interface InnoExtensionDeps {
 	workspaceRegistry?: WorkspaceRegistry;
@@ -270,7 +269,7 @@ export function createInnoExtension(
 		// 3. Register scheduler tools
 		const jobStore = new ScopedJobStore(paths.dataDir, paths.jobsDir, configHolder.current.scheduler?.timezone);
 		const checkInStore = new CheckInStore(() => resolveCurrentTenantDataRoot(paths.dataDir), configHolder.current.scheduler?.timezone, jobStore);
-		const schedulerTools = createSchedulerTools(jobStore, channelRegistry, checkInStore);
+		const schedulerTools = createLegacyToolDefinitions(createSchedulerTools(jobStore, channelRegistry, checkInStore));
 		for (const tool of schedulerTools) {
 			pi.registerTool(tool);
 		}
@@ -322,7 +321,7 @@ export function createInnoExtension(
 		void l3Memory.backfill();
 
 		// 4b. Register document parsing tools
-		const documentTools = createDocumentTools({ restrictToWorkspace: deps?.sharedExtensionsDisabled });
+		const documentTools = createLegacyToolDefinitions(createDocumentTools({ restrictToWorkspace: deps?.sharedExtensionsDisabled }));
 		for (const tool of documentTools) {
 			pi.registerTool(tool);
 		}
@@ -337,7 +336,7 @@ export function createInnoExtension(
 
 		// 4d. Register web search tool (Tavily). Default internet search
 		// capability; reads the API key live from configHolder.
-		const tavilyTools = createTavilyTools(configHolder);
+		const tavilyTools = createLegacyToolDefinitions(createTavilyTools(configHolder));
 		for (const tool of tavilyTools) {
 			pi.registerTool(tool);
 		}

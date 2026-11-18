@@ -39,16 +39,14 @@ describe("parse_document", () => {
 
 		const tool = createDocumentTools()[0];
 		const result = await tool.execute(
-			"test-call",
 			{ filePath: "paper.pdf" },
-			undefined,
-			undefined,
-			{ cwd: workspaceDir } as never,
+			{ callId: "test-call", innoLegacy: { cwd: workspaceDir }, output: () => undefined } as never,
+			{ abortSignal: undefined } as never,
 		);
 
 		expect(parser.parseDocument).toHaveBeenCalledWith(filePath);
 		expect(result.details).toMatchObject({ filePath });
-		expect(result.content[0]).toMatchObject({ type: "text" });
+		expect(result.output?.[0]).toMatchObject({ type: "text" });
 	});
 
 	it.each(["absolute", "parent"])("rejects authenticated %s paths outside the workspace", async (kind) => {
@@ -58,11 +56,9 @@ describe("parse_document", () => {
 		const tool = createDocumentTools({ restrictToWorkspace: true })[0];
 
 		const result = await tool.execute(
-			"test-call",
 			{ filePath: kind === "absolute" ? outsidePath : "../outside.pdf" },
-			undefined,
-			undefined,
-			{ cwd: workspaceDir } as never,
+			{ callId: "test-call", innoLegacy: { cwd: workspaceDir }, output: () => undefined } as never,
+			{ abortSignal: undefined } as never,
 		);
 
 		expect(result.details).toMatchObject({ error: "outside_workspace" });
@@ -77,11 +73,9 @@ describe("parse_document", () => {
 		const tool = createDocumentTools({ restrictToWorkspace: true })[0];
 
 		const result = await tool.execute(
-			"test-call",
 			{ filePath: "linked.pdf" },
-			undefined,
-			undefined,
-			{ cwd: workspaceDir } as never,
+			{ callId: "test-call", innoLegacy: { cwd: workspaceDir }, output: () => undefined } as never,
+			{ abortSignal: undefined } as never,
 		);
 
 		expect(result.details).toMatchObject({ error: "outside_workspace" });
@@ -96,11 +90,9 @@ describe("parse_document", () => {
 		const tool = createDocumentTools()[0];
 
 		const result = await tool.execute(
-			"test-call",
 			{ filePath: outsidePath },
-			undefined,
-			undefined,
-			{ cwd: workspaceDir } as never,
+			{ callId: "test-call", innoLegacy: { cwd: workspaceDir }, output: () => undefined } as never,
+			{ abortSignal: undefined } as never,
 		);
 
 		expect(result.details).toMatchObject({ filePath: outsidePath, pageCount: 1 });

@@ -52,7 +52,8 @@ describe("auth runtime config", () => {
 			multiUserEnabled: true,
 		});
 		expect(() => readAuthRuntimeConfig({ INNO_MULTI_USER_ENABLED: "true" })).toThrow("requires INNO_AUTH_MODE=better-auth");
-		expect(() => readAuthRuntimeConfig(authEnv({ INNO_MULTI_USER_ENABLED: "true" }))).toThrow("requires INNO_DURABLE_ENABLED=true");
+		// Durable is the only runtime, so multi-user mode needs no separate durable switch.
+		expect(readAuthRuntimeConfig(authEnv({ INNO_MULTI_USER_ENABLED: "true" }))).toMatchObject({ multiUserEnabled: true });
 	});
 
 	it("rejects invalid mode and boolean values", () => {

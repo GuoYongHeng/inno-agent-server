@@ -1,7 +1,7 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
-import { unavailableContextUsage } from "../agent/context-usage.js";
 import type { UserInput } from "@earendil-works/pi-durable";
-import { DurableRuntimeDisabledError, DurableSessionBusyError, type DurableSessionService, type PreparedDurableAttachments, type PreparedDurableImages } from "../agent/durable-session-service.js";
+import { DurableBranchError } from "../agent/durable-runtime.js";
+import { DurableModelNotFoundError, DurableRuntimeDisabledError, DurableSessionBusyError, type DurableSessionService, type DurableSessionSummary, type PreparedDurableAttachments, type PreparedDurableImages } from "../agent/durable-session-service.js";
 import { DurableSseProjector } from "../agent/durable-projection.js";
 import type { DurableStreamStore } from "../agent/durable-stream-store.js";
 import type { QuestionBridgeResult } from "../agent/question-bridge.js";
@@ -104,7 +104,7 @@ export async function handleDurableSessionResourceRoutes(
 ): Promise<boolean> {
 	if (url.includes("/workspace")) return false;
 	if (matchRoute("GET", method, url, "/api/sessions/:id/context-usage")) {
-		json(res, 200, unavailableContextUsage(id, "unavailable"));
+		json(res, 200, await ctx.service.contextUsage(req, id));
 		return true;
 	}
 	if (matchRoute("GET", method, url, "/api/sessions/:id")) {
@@ -134,8 +134,44 @@ export async function handleDurableSessionResourceRoutes(
 	if (matchRoute("PATCH", method, url, "/api/sessions/:id")) {
 		const body = await readBody(req) as Record<string, unknown>;
 		const name = typeof body.name === "string" ? body.name.trim() : "";
-		if (!name) { json(res, 400, { error: "Missing session topic" }); return true; }
-		json(res, 200, ctx.service.rename(req, id, name.slice(0, 120)));
+		const provider = typeof body.provider === "string" ? body.provider.trim() : "";
+		const modelId = typeof body.modelId === "string" ? body.modelId.trim() : "";
+		if ((provider && !modelId) || (!provider && modelId)) {
+			json(res, 400, { error: "provider and modelId must be given together" });
+			return true;
+		}
+		if (!name && !provider) { json(res, 400, { error: "Missing session topic or model" }); return true; }
+		let summary: DurableSessionSummary | undefined;
+		if (provider) {
+			try {
+				summary = await ctx.service.setModel(req, id, { provider, modelId });
+			} catch (error) {
+				if (error instanceof DurableModelNotFoundError) { json(res, 400, { error: error.message }); return true; }
+				throw error;
+			}
+		}
+		if (name) summary = ctx.service.rename(req, id, name.slice(0, 120));
+		json(res, 200, summary);
+		return true;
+	}
+	if (matchRoute("POST", method, url, "/api/sessions/:id/branch-before-message")) {
+		restoreDurableStream(req, ctx.service, id);
+		if (streamRegistry.getActiveForSession(id)) {
+			json(res, 409, { error: "Cannot edit a message while the session is generating" });
+			return true;
+		}
+		const body = await readBody(req) as Record<string, unknown>;
+		const entryId = typeof body.entryId === "string" ? body.entryId.trim() : "";
+		if (!entryId) { json(res, 400, { error: "Missing message entryId" }); return true; }
+		try {
+			json(res, 200, await ctx.service.branchBeforeMessage(req, id, entryId));
+		} catch (error) {
+			if (error instanceof DurableBranchError) {
+				json(res, error.code === "entry_not_found" ? 404 : 409, { error: error.message, code: error.code });
+				return true;
+			}
+			throw error;
+		}
 		return true;
 	}
 	if (matchRoute("POST", method, url, "/api/sessions/:id/activate")) {

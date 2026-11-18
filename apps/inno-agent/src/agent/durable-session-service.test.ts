@@ -13,7 +13,8 @@ import { closeL3Memory, ScopedL3Memory } from "../memory/l3/l3-tools.js";
 import { ChannelRegistry } from "../channels/channel.js";
 import { setRequestTenant } from "../tenants/http.js";
 import type { DurableStorageLock, TenantContext, TenantStore } from "../tenants/store.js";
-import { DurableRuntimeDisabledError, DurableSessionService } from "./durable-session-service.js";
+import { createSchedulerTools } from "../scheduler/scheduler-tools.js";
+import { DurableModelNotFoundError, DurableRuntimeDisabledError, DurableSessionService } from "./durable-session-service.js";
 import { DurableSessionRuntime, type DurableSessionRuntimeOptions } from "./durable-runtime.js";
 
 const roots: string[] = [];
@@ -519,6 +520,253 @@ describe("DurableSessionService", () => {
 		expect(acquisitions).toBe(2);
 		await second.release();
 		expect({ closes, releases }).toEqual({ closes: 2, releases: 2 });
+	});
+
+	it("switches the model of one session from its next request and keeps it after reopen", async () => {
+		await runWithoutTenantContext(async () => {
+			const base = root();
+			const faux = fauxProvider({
+				provider: "faux-configured",
+				models: [{ id: "faux-a" }, { id: "faux-b" }],
+			});
+			faux.setResponses([
+				(_context, _options, _state, model) => fauxAssistantMessage(`answered by ${model.id}`),
+				(_context, _options, _state, model) => fauxAssistantMessage(`answered by ${model.id}`),
+				(_context, _options, _state, model) => fauxAssistantMessage(`answered by ${model.id}`),
+			]);
+			const twoModels = normalizeConfig({
+				defaultProvider: "faux-configured",
+				defaultModel: "faux-a",
+				providers: {
+					"faux-configured": {
+						baseUrl: "http://faux.invalid/v1",
+						apiKey: "local",
+						models: ["faux-a", "faux-b"].map((id) => ({ id, name: id, reasoning: false, input: ["text"], contextWindow: 8_000, maxTokens: 1_000 })),
+					},
+				},
+			});
+			const service = new DurableSessionService({
+				dataDir: base,
+				getLocalConfig: () => twoModels,
+				enabled: true,
+				resolveWorkspaceDir: () => base,
+				openRuntime: async (options) => {
+					const models = createModels();
+					models.setProvider(faux.provider);
+					return DurableSessionRuntime.open({ ...options, models });
+				},
+			});
+			services.push(service);
+			const req = { headers: {} } as IncomingMessage;
+			const session = service.create(req, { workspaceId: "workspace" });
+			expect(session.model).toEqual({ provider: "faux-configured", id: "faux-a" });
+
+			const ask = async (text: string, requestId: string) => {
+				const lease = await service.lease(req, session.id);
+				try {
+					const submission = await lease.runtime.submit(text, requestId);
+					const result = await lease.runtime.waitForSubmission(submission.id);
+					return result.status === "done" ? result.text : result.reason;
+				} finally {
+					await lease.release();
+				}
+			};
+
+			expect(await ask("q1", "r1")).toBe("answered by faux-a");
+
+			const switched = await service.setModel(req, session.id, { provider: "faux-configured", modelId: "faux-b" });
+			expect(switched.model).toEqual({ provider: "faux-configured", id: "faux-b" });
+			expect(await ask("q2", "r2")).toBe("answered by faux-b");
+
+			// Context usage comes from the committed conversation of the active model.
+			const usage = await service.contextUsage(req, session.id);
+			expect(usage).toMatchObject({ sessionId: session.id, status: "ready", contextWindow: 8_000 });
+			expect(usage.tokens).toBeGreaterThan(0);
+			expect(usage.breakdown.find((part) => part.id === "tools")!.tokens).toBeGreaterThan(0);
+
+			// A model that is not configured is rejected and changes nothing.
+			await expect(service.setModel(req, session.id, { provider: "faux-configured", modelId: "missing" }))
+				.rejects.toBeInstanceOf(DurableModelNotFoundError);
+			expect(service.get(req, session.id)?.modelId).toBe("faux-b");
+
+			// The runtime was closed on release; reopening keeps the switched model.
+			expect(await ask("q3", "r3")).toBe("answered by faux-b");
+		});
+	});
+
+	it("answers side questions through the session's own model without touching the transcript", async () => {
+		await runWithoutTenantContext(async () => {
+			const base = root();
+			const calls: Array<{ selection: { provider: string; modelId: string }; systemPrompt: string; turns: Array<{ role: string; text: string }> }> = [];
+			const service = new DurableSessionService({
+				dataDir: base,
+				getLocalConfig: () => config("local"),
+				enabled: true,
+				resolveWorkspaceDir: () => base,
+				completeChat: async (_config, selection, input) => {
+					calls.push({ selection, systemPrompt: input.systemPrompt, turns: [...input.turns] });
+					return "旁注答案";
+				},
+			});
+			services.push(service);
+			const req = { headers: {} } as IncomingMessage;
+			const session = service.create(req, { workspaceId: "workspace" });
+
+			const answer = await service.completeSideQuestion(req, session.id, {
+				contextDigest: "主对话摘要",
+				thread: [{ question: "上一个问题", answer: "上一个回答" }],
+				question: "这个怎么理解？",
+			});
+
+			expect(answer).toBe("旁注答案");
+			expect(calls).toHaveLength(1);
+			expect(calls[0]!.selection).toEqual({ provider: "faux-configured", modelId: "faux-model" });
+			expect(calls[0]!.systemPrompt).toContain("旁注问答");
+			expect(calls[0]!.turns).toEqual([
+				{ role: "user", text: "主对话摘要" },
+				{ role: "user", text: "上一个问题" },
+				{ role: "assistant", text: "上一个回答" },
+				{ role: "user", text: "这个怎么理解？" },
+			]);
+			expect(service.get(req, session.id)?.messageCount).toBe(0);
+		});
+	});
+
+	it("edits an earlier message by continuing in a fork that drops it and the replies after it", async () => {
+		await runWithoutTenantContext(async () => {
+			const base = root();
+			const faux = fauxProvider({ provider: "faux-configured", models: [{ id: "faux-a" }] });
+			const seen: string[][] = [];
+			const reply = (label: string) => (context: { messages: ReadonlyArray<{ role: string; content: unknown }> }) => {
+				seen.push(context.messages.map((message) => message.role === "user"
+					? String((message.content as Array<{ text?: string }>)[0]?.text ?? message.content)
+					: `[${message.role}]`));
+				return fauxAssistantMessage(label);
+			};
+			faux.setResponses([reply("a1"), reply("a2"), reply("a2-edited"), reply("fresh")] as never);
+			const cfg = normalizeConfig({
+				defaultProvider: "faux-configured",
+				defaultModel: "faux-a",
+				providers: {
+					"faux-configured": {
+						baseUrl: "http://faux.invalid/v1",
+						apiKey: "local",
+						models: [{ id: "faux-a", name: "faux-a", reasoning: false, input: ["text"], contextWindow: 8_000, maxTokens: 1_000 }],
+					},
+				},
+			});
+			const service = new DurableSessionService({
+				dataDir: base,
+				getLocalConfig: () => cfg,
+				enabled: true,
+				resolveWorkspaceDir: () => base,
+				openRuntime: async (options) => {
+					const models = createModels();
+					models.setProvider(faux.provider);
+					return DurableSessionRuntime.open({ ...options, models });
+				},
+			});
+			services.push(service);
+			const req = { headers: {} } as IncomingMessage;
+			const session = service.create(req, { workspaceId: "workspace" });
+			const ask = async (text: string, requestId: string) => {
+				const lease = await service.lease(req, session.id);
+				try {
+					const submission = await lease.runtime.submit(text, requestId);
+					await lease.runtime.waitForSubmission(submission.id);
+				} finally {
+					await lease.release();
+				}
+			};
+			const visible = async () => (await service.snapshot(req, session.id)).messages.map((message) => `${message.role}:${message.content}`);
+
+			await ask("first question", "r1");
+			await ask("second question", "r2");
+			expect(await visible()).toEqual(["user:first question", "assistant:a1", "user:second question", "assistant:a2"]);
+
+			const before = await service.snapshot(req, session.id);
+			const secondUser = before.messages.find((message) => message.content === "second question")!;
+			const branched = await service.branchBeforeMessage(req, session.id, secondUser.entryId!);
+			expect(branched).toMatchObject({ sessionId: session.id, replacedEntryId: secondUser.entryId });
+			expect(branched.sessionRevision).toMatch(/^durable:/);
+			expect(await visible()).toEqual(["user:first question", "assistant:a1"]);
+
+			// The edited message goes to a model that no longer sees the abandoned turn.
+			await ask("second question, edited", "r3");
+			expect(await visible()).toEqual([
+				"user:first question", "assistant:a1", "user:second question, edited", "assistant:a2-edited",
+			]);
+			expect(seen[2]).toEqual(["[system]", "first question", "[assistant]", "second question, edited"]);
+
+			// The branch survives the runtime being closed and reopened.
+			expect(await visible()).toHaveLength(4);
+
+			// Editing the very first message starts the conversation over.
+			const first = (await service.snapshot(req, session.id)).messages[0]!;
+			await service.branchBeforeMessage(req, session.id, first.entryId!);
+			expect(await visible()).toEqual([]);
+			await ask("brand new", "r4");
+			expect(await visible()).toEqual(["user:brand new", "assistant:fresh"]);
+			expect(seen[3]).toEqual(["[system]", "brand new"]);
+
+			// Only user messages can be edited; unknown entries are rejected and change nothing.
+			const assistantEntry = (await service.snapshot(req, session.id)).messages.find((message) => message.role === "assistant")!;
+			await expect(service.branchBeforeMessage(req, session.id, assistantEntry.entryId!))
+				.rejects.toMatchObject({ code: "entry_not_found" });
+			await expect(service.branchBeforeMessage(req, session.id, "999999"))
+				.rejects.toMatchObject({ code: "entry_not_found" });
+			expect(await visible()).toEqual(["user:brand new", "assistant:fresh"]);
+		});
+	});
+
+	it("offers document, web search and scheduler tools to durable sessions", async () => {
+		await runWithoutTenantContext(async () => {
+		const base = root();
+		let captured: DurableSessionRuntimeOptions | undefined;
+		const skillsDir = join(base, "global-skills");
+		for (const name of ["demo-skill", "off-skill"]) {
+			mkdirSync(join(skillsDir, name), { recursive: true });
+			writeFileSync(join(skillsDir, name, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} description\n---\n`);
+		}
+		writeFileSync(join(skillsDir, ".ignore"), "off-skill/\n");
+		const service = new DurableSessionService({
+			dataDir: base,
+			getLocalConfig: () => config("local"),
+			enabled: true,
+			resolveWorkspaceDir: () => base,
+			skillsDir,
+			getSchedulerTools: () => createSchedulerTools(
+				{ defaultTimezone: "UTC" } as never,
+				undefined,
+				undefined,
+				{ runMode: "unavailable" },
+			),
+			openRuntime: async (options) => {
+				captured = options;
+				return { close: async () => undefined } as unknown as DurableSessionRuntime;
+			},
+		});
+		services.push(service);
+		const req = { headers: {} } as IncomingMessage;
+		const session = service.create(req, { workspaceId: "workspace" });
+		const lease = await service.lease(req, session.id);
+		await lease.release();
+
+		expect(captured?.instructions).toContain("<name>demo-skill</name>");
+		expect(captured?.instructions).not.toContain("<name>off-skill</name>");
+		const names = (captured?.extraTools ?? []).map((tool) => tool.name);
+		expect(names).toEqual(expect.arrayContaining([
+			"parse_document",
+			"web_search",
+			"create_scheduled_job",
+			"list_scheduled_jobs",
+			"update_scheduled_job",
+			"delete_scheduled_job",
+			"run_scheduled_job",
+		]));
+		// Non-replayable by default: a crash yields `interrupted`, never a silent rerun.
+		expect((captured?.extraTools ?? []).every((tool) => tool.replay !== "safe")).toBe(true);
+			});
 	});
 
 	it("requires the explicit runtime gate and leaves legacy JSONL untouched", async () => {

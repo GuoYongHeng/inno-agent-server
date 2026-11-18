@@ -8,7 +8,7 @@ import { basename, dirname, join, normalize } from "node:path";
 import { existsSync } from "node:fs";
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ModelAuthProvider } from "./model-auth.js";
 
 import { ensureDir, readJsonl, readText, writeJsonl, writeText } from "../../storage/file-store.js";
 import { logger } from "../../logger.js";
@@ -593,7 +593,7 @@ async function writeGeneratedFileBlocks(
 	sourcePagePath: string,
 	routing: WikiSchemaRouting,
 	model: Model<any>,
-	modelRegistry: ModelRegistry,
+	modelRegistry: ModelAuthProvider,
 	signal?: AbortSignal,
 ): Promise<RichWriteResult> {
 	const created: string[] = [];
@@ -699,7 +699,7 @@ export async function generateRichWikiPages(
 	sourceContent: string,
 	context: { schema: string; purpose?: string; index: string; overview?: string; sourceIdentity?: string },
 	model: Model<any>,
-	modelRegistry: ModelRegistry,
+	modelRegistry: ModelAuthProvider,
 	signal?: AbortSignal,
 ): Promise<RichGenerationResult | null> {
 	try {

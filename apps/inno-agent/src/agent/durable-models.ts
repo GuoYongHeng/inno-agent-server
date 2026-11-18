@@ -104,3 +104,61 @@ export async function completeConfiguredDurablePrompt(
 		clearTimeout(timer);
 	}
 }
+
+export interface DurableChatTurn {
+	role: "user" | "assistant";
+	text: string;
+}
+
+/** Stateless, tool-less completion with a system prompt and prior turns through
+ * the session's configured model. Returns "" on failure, timeout or abort. */
+export async function completeConfiguredDurableChat(
+	config: InnoConfig,
+	selection: { provider: string; modelId: string },
+	input: {
+		systemPrompt: string;
+		turns: readonly DurableChatTurn[];
+		maxTokens?: number;
+		timeoutMs?: number;
+		signal?: AbortSignal;
+	},
+): Promise<string> {
+	if (input.signal?.aborted) return "";
+	const { models } = await createConfiguredDurableModels(config, selection);
+	const model = models.getModel(selection.provider, selection.modelId);
+	if (!model) return "";
+	const timeoutMs = input.timeoutMs ?? 60_000;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	const abortFromCaller = () => controller.abort(input.signal?.reason);
+	input.signal?.addEventListener("abort", abortFromCaller, { once: true });
+	try {
+		const now = Date.now();
+		const response = await models.completeSimple(model, {
+			systemPrompt: input.systemPrompt,
+			messages: input.turns.map((turn) => turn.role === "user"
+				? { role: "user" as const, content: [{ type: "text" as const, text: turn.text }], timestamp: now }
+				: {
+					role: "assistant" as const,
+					content: [{ type: "text" as const, text: turn.text }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					stopReason: "stop" as const,
+					timestamp: now,
+				}),
+		}, { maxTokens: input.maxTokens ?? 2048, signal: controller.signal, timeoutMs });
+		if (response.stopReason === "error" || response.stopReason === "aborted") return "";
+		return response.content
+			.filter((item): item is { type: "text"; text: string } => item.type === "text")
+			.map((item) => item.text)
+			.join("\n")
+			.trim();
+	} catch {
+		return "";
+	} finally {
+		clearTimeout(timer);
+		input.signal?.removeEventListener("abort", abortFromCaller);
+	}
+}

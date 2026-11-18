@@ -1,20 +1,24 @@
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { existsSync } from "node:fs";
 import { resolve, isAbsolute } from "node:path";
 import { parseDocument, screenshotDocument, DocumentParseError } from "../memory/l2/document-parser.js";
 import { logger } from "../logger.js";
 import { checkWorkspaceMutationPath } from "./workspace-path-guard.js";
+import { defineInnoTool } from "./inno-tool.js";
 
 export interface DocumentToolOptions {
 	restrictToWorkspace?: boolean;
+	/** Session workspace. Durable sessions pass it explicitly; the legacy adapter
+	 * supplies the session cwd instead. */
+	workspaceDir?: string;
 }
 
 /**
  * Create document parsing tools for the Inno Agent.
  */
-export function createDocumentTools(options: DocumentToolOptions = {}): ToolDefinition[] {
-	const parseDocumentTool = defineTool({
+export function createDocumentTools(options: DocumentToolOptions = {}): ToolRegistration[] {
+	const parseDocumentTool = defineInnoTool({
 		name: "parse_document",
 		label: "解析文档",
 		description:
@@ -34,18 +38,11 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolDefi
 				}),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-			const typed = params as {
-				filePath: string;
-				includePageDetails?: boolean;
-				includeScreenshots?: boolean;
-			};
-			const reportProgress = (text: string, phase: string): void => {
+		async execute(params, api) {
+			const typed = params;
+			const reportProgress = (text: string, _phase: string): void => {
 				try {
-					onUpdate?.({
-						content: [{ type: "text" as const, text }],
-						details: { phase, filePath: typed.filePath },
-					});
+					api.output(text);
 				} catch {
 					// Progress reporting is best-effort and must never fail parsing.
 				}
@@ -54,7 +51,7 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolDefi
 			// The tool context is session-scoped. The process environment points at
 			// the runtime's default workspace and can be different from the
 			// workspace bound to the current chat session.
-			const workspaceDir = ctx.cwd || process.env.INNO_WORKSPACE_DIR || process.cwd();
+			const workspaceDir = options.workspaceDir || api.innoLegacy?.cwd || process.env.INNO_WORKSPACE_DIR || process.cwd();
 			const pathCheck = options.restrictToWorkspace
 				? checkWorkspaceMutationPath(workspaceDir, typed.filePath)
 				: {
@@ -141,7 +138,6 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolDefi
 			return {
 				content,
 				details: {
-					error: undefined as string | undefined,
 					filePath: resolvedPath,
 					pageCount: parsed.pageCount,
 					textLength: parsed.text.length,

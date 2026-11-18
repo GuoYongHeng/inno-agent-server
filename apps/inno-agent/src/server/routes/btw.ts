@@ -237,8 +237,9 @@ export async function handleBtwRoutes(
 			return true;
 		}
 		let digest = "";
-		if (ctx.durableSessions?.get(req, sessionId)) {
-			const snapshot = await ctx.durableSessions.snapshot(req, sessionId);
+		const durable = ctx.durableSessions?.get(req, sessionId) ? ctx.durableSessions : undefined;
+		if (durable) {
+			const snapshot = await durable.snapshot(req, sessionId);
 			digest = buildBtwContextDigest(snapshot.messages);
 		} else {
 			const sessionPath = sessionPathFor(ctx, sessionId);
@@ -251,7 +252,9 @@ export async function handleBtwRoutes(
 		}
 		const requestAbort = attachAbortSignal(req, res);
 		try {
-			const answer = await completeSideQuestion({ contextDigest: digest, thread, question, signal: requestAbort.signal });
+			const answer = durable
+				? await durable.completeSideQuestion(req, sessionId, { contextDigest: digest, thread, question, signal: requestAbort.signal })
+				: await completeSideQuestion({ contextDigest: digest, thread, question, signal: requestAbort.signal });
 			if (requestAbort.signal.aborted) return true;
 			if (!answer) {
 				json(res, 502, { error: "Side question completion failed or timed out" });

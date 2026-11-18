@@ -82,3 +82,12 @@
 7. 测试：切换后下一轮使用新模型；切换不影响进行中的 turn；SIGKILL 重启后仍用新模型；不存在的模型和不满足图片模态的模型被拒绝；跨租户切换他人会话返回 404。
 
 **放入阶段**：S3（所有入口切到 durable）。依赖 S2 完成后才能删除 legacy 的 `switchModel`。
+
+## 7. S2 期间发现的更正与新增缺口
+
+- **G8（新增，已在 S2 解决）**：durable 路径原先**没有注册文档解析（`parse_document`）、Tavily `web_search` 和调度工具**；它们只在 legacy 的 `inno-extension.ts` 里注册。S1 只比对了路由，没有比对工具清单。S2 已将它们改为原生工具并注册到 durable 会话（见 `DURABLE_ROADMAP.md` S2 结果）。
+- **更正（G6 之外，影响 S3）**：第 4.1 节写"上下文用量已覆盖"不准确。durable 的 `/api/sessions/:id/context-usage` 目前**固定返回 `unavailable`**（`server/durable-routes.ts` 调用 `unavailableContextUsage`），并没有真正的用量。S3 仍需基于 durable 快照实现，S2 已把 `estimateMessageTokens` 自写出来可复用。
+
+## 8. G9 已在 S3 解决
+
+编辑历史消息并重发已在 durable 上实现（分叉到新对话），设计和验证见 `DURABLE_ROADMAP.md` 的“G9 实现”。S1 清单里的缺口 G1–G9 至此全部关闭或已有明确去向（G6 斜杠命令面板、G7 `initSession` 随 S4 删除）。

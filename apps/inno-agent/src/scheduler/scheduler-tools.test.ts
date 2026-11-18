@@ -29,7 +29,8 @@ afterEach(() => {
 
 async function execute(toolIndex: number, params: Record<string, unknown>, channelRegistry?: ChannelRegistry) {
 	const tool = createSchedulerTools(jobs, channelRegistry)[toolIndex];
-	return (tool.execute as (...args: any[]) => Promise<any>)("call", params, undefined, undefined, {});
+	const result = await (tool.execute as (...args: any[]) => Promise<any>)(params, { callId: "call" }, { abortSignal: undefined });
+	return { content: result.output ?? [], details: result.details ?? {} };
 }
 
 describe("tenant-scoped scheduler tools", () => {
@@ -69,5 +70,21 @@ describe("tenant-scoped scheduler tools", () => {
 		expect(result.details.error).toBeUndefined();
 		expect(job?.target).toEqual({ channel: "feishu", chatId: "tenant-chat" });
 		expect(tenantStore.claimResource).toHaveBeenCalledWith(tenantA, "job", job?.id);
+	});
+
+	it("refuses to run a job when the runtime has no durable job executor", async () => {
+		const job = jobs.create({ name: "demo", cron: "0 9 * * *", timezone: "UTC", enabled: true, taskType: "custom_prompt", prompt: "hi" } as never);
+		const tool = createSchedulerTools(jobs, new ChannelRegistry(), undefined, { runMode: "unavailable" })[4];
+		const result = await (tool.execute as (...args: any[]) => Promise<any>)({ id: job.id }, { callId: "call" }, { abortSignal: undefined });
+		expect(result.details).toMatchObject({ error: "run_unavailable" });
+	});
+
+	it("runs a job through an injected runner instead of the legacy global runner", async () => {
+		const job = jobs.create({ name: "demo", cron: "0 9 * * *", timezone: "UTC", enabled: true, taskType: "custom_prompt", prompt: "hi" } as never);
+		const runJob = vi.fn().mockResolvedValue({ jobId: job.id, runId: "run-1", success: true, output: "done by durable" });
+		const tool = createSchedulerTools(jobs, undefined, undefined, { runJob })[4];
+		const result = await (tool.execute as (...args: any[]) => Promise<any>)({ id: job.id }, { callId: "call" }, { abortSignal: undefined });
+		expect(runJob).toHaveBeenCalledWith(expect.objectContaining({ id: job.id }));
+		expect(result.output[0].text).toContain("done by durable");
 	});
 });

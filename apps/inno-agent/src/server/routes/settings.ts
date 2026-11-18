@@ -2,11 +2,6 @@ import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
 import { join } from "node:path";
 import { probeProviderModels } from "../../agent/model-probe.js";
 import {
-	getAvailableModels,
-	getSession,
-	refreshConfiguredProviders,
-	switchModel,
-	syncConfig,
 } from "../../agent/pi-runner.js";
 import {
 	deleteModel,
@@ -83,28 +78,18 @@ function providerModelToRuntimeModel(model: InnoModelConfig, provider: string, b
 	};
 }
 
-function buildSafeSettings(config: InnoConfig, tenantScoped = false) {
-	// The singleton session may currently belong to another tenant. Authenticated
-	// views are derived only from this tenant's persisted config.
-	const currentModel = tenantScoped ? null : getSession().model;
+function buildSafeSettings(config: InnoConfig) {
+	// Durable sessions pin their own model, so the settings view is derived only
+	// from the persisted config; there is no process-wide "current model".
 	const configuredModels = Object.entries(config.providers).flatMap(([providerId, providerConfig]) =>
 		providerConfig.models.map((model) => providerModelToRuntimeModel(model, providerId, providerConfig.baseUrl)),
 	);
-	const availableModels = tenantScoped ? configuredModels : getAvailableModels().map((model) => ({
-		id: model.id,
-		name: model.name,
-		provider: model.provider,
-		reasoning: model.reasoning,
-		input: model.input,
-		contextWindow: model.contextWindow,
-		maxTokens: model.maxTokens,
-		baseUrl: model.baseUrl,
-	}));
+	const availableModels = configuredModels;
 
 	return {
 		...config,
-		defaultProvider: currentModel?.provider ?? config.defaultProvider,
-		defaultModel: currentModel?.id ?? config.defaultModel,
+		defaultProvider: config.defaultProvider,
+		defaultModel: config.defaultModel,
 		configuredModels,
 		availableModels,
 		providers: Object.fromEntries(
@@ -246,13 +231,11 @@ export async function handleSettingsRoutes(
 			: saveConfig(paths.configPath, next);
 		if (!tenant) ctx.setConfig(config);
 	};
-	const sync = (): void => {
-		if (!tenantScoped) syncConfig(config);
-	};
-	const refreshProviders = async (): Promise<void> => {
-		if (!tenantScoped) await refreshConfiguredProviders(config);
-	};
-	const safeSettings = () => buildSafeSettings(config, tenantScoped);
+	// Durable runtimes read the config when a session is opened, so there is no
+	// live process-wide registry to synchronise after a settings change.
+	const sync = (): void => {};
+	const refreshProviders = async (): Promise<void> => {};
+	const safeSettings = () => buildSafeSettings(config);
 	const rejectSharedRuntime = (feature: string): true => {
 		json(res, 409, { error: `${feature} is unavailable until its runtime is tenant-scoped` });
 		return true;
@@ -272,14 +255,8 @@ export async function handleSettingsRoutes(
 			return true;
 		}
 
-		if (!tenantScoped) await switchModel(provider, model);
 		save(setDefaultModel(config, provider, model));
-		sync();
-		const currentModel = tenantScoped ? null : getSession().model;
-		json(res, 200, {
-			defaultProvider: currentModel?.provider ?? provider,
-			defaultModel: currentModel?.id ?? model,
-		});
+		json(res, 200, { defaultProvider: provider, defaultModel: model });
 		return true;
 	}
 
@@ -297,8 +274,7 @@ export async function handleSettingsRoutes(
 		}));
 		if (!tenantScoped) applyProviderProxyBypass(config);
 		await refreshProviders();
-		if (payload.makeDefault && !tenantScoped) {
-			await switchModel(config.defaultProvider, config.defaultModel);
+		if (payload.makeDefault) {
 			save(setDefaultModel(config, config.defaultProvider, config.defaultModel));
 		}
 		json(res, 200, safeSettings());

@@ -191,18 +191,28 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	const [workspaceSwitchResult, setWorkspaceSwitchResult] = useState<WorkspaceSwitchResult | null>(null);
 	const workspaceSwitchRequestRef = useRef(0);
 
+	// An open session uses the model pinned to it; with no session open the picker
+	// edits the default that new sessions start with.
+	const openSession = useStoreSnapshot(sessionsStore, () => {
+		const session = sessionsStore.sessions.find((item) => item.id === sessionsStore.currentSessionId);
+		return {
+			id: session?.id ?? null,
+			provider: session?.model?.provider ?? null,
+			modelId: session?.model?.id ?? null,
+		};
+	});
 	const modelState = useStoreSnapshot(settingsStore, () => {
 		const settings = settingsStore.settings;
 		const models = settings?.availableModels ?? settings?.configuredModels ?? [];
-		const current = models.find((model) => model.provider === settings?.defaultProvider && model.id === settings?.defaultModel);
 		return {
 			models,
 			defaultProvider: settings?.defaultProvider ?? "",
 			defaultModel: settings?.defaultModel ?? "",
-			currentModelSupportsNativeImages: current?.input.includes("image") ?? true,
 			isSavingModel: settingsStore.isSavingModel,
 		};
 	});
+	const activeProvider = openSession.provider ?? modelState.defaultProvider;
+	const activeModelId = openSession.modelId ?? modelState.defaultModel;
 	const modelOptions = useMemo(() => {
 		const seen = new Set<string>();
 		return modelState.models.filter((model) => {
@@ -212,7 +222,8 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 			return true;
 		});
 	}, [modelState.models]);
-	const currentModel = modelOptions.find((model) => model.provider === modelState.defaultProvider && model.id === modelState.defaultModel);
+	const currentModel = modelOptions.find((model) => model.provider === activeProvider && model.id === activeModelId);
+	const currentModelSupportsNativeImages = currentModel?.input.includes("image") ?? true;
 
 	const [presets, setPresets] = useState<PresetMeta[]>(() => readCachedPresets() ?? []);
 	const [presetsLoaded, setPresetsLoaded] = useState(() => readCachedPresets() !== null);
@@ -312,9 +323,13 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	const toggleModelPicker = useCallback(() => setModelPickerOpen((open) => !open), []);
 	const handleModelSelect = useCallback((model: InnoModelInfo) => {
 		setModelPickerOpen(false);
-		if (model.provider === modelState.defaultProvider && model.id === modelState.defaultModel) return;
+		if (model.provider === activeProvider && model.id === activeModelId) return;
+		if (openSession.id && openSession.provider) {
+			void sessionsStore.setSessionModel(openSession.id, model.provider, model.id);
+			return;
+		}
 		void settingsStore.switchModel(model.provider, model.id);
-	}, [modelState.defaultModel, modelState.defaultProvider]);
+	}, [activeModelId, activeProvider, openSession.id, openSession.provider]);
 	const openModelSettings = useCallback(() => {
 		setModelPickerOpen(false);
 		appStore.openSettings("models");
@@ -1448,7 +1463,7 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 			inlineImages={inlineImages}
 			pasteBlocks={pasteBlocks}
 			uploadChips={uploadChips}
-				modelState={modelState}
+				modelState={{ ...modelState, defaultProvider: activeProvider, defaultModel: activeModelId, currentModelSupportsNativeImages }}
 				modelOptions={modelOptions}
 				currentModel={currentModel}
 				conversationMode={!isWelcome}

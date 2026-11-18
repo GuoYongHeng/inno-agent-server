@@ -1027,7 +1027,7 @@ export async function abortPromptForTurnToken(token: string): Promise<boolean> {
  * job streams; a queued/running chat turn owns a token and must not be hit.
  */
 export async function abortJobPromptInSession(sessionPath: string): Promise<boolean> {
-	if (_activePromptToken !== null) return false;
+	if (!_runtime || _activePromptToken !== null) return false;
 	const session = getSession();
 	const activeFile = session.sessionFile;
 	if (!activeFile || basename(activeFile) !== basename(sessionPath)) return false;
@@ -1039,6 +1039,8 @@ export async function abortJobPromptInSession(sessionPath: string): Promise<bool
  * Return current runtime session id.
  */
 export function getCurrentSessionId(): string {
+	// Durable is the only runtime, so there may be no legacy session at all.
+	if (!_runtime) return "";
 	const sessionFile = getSession().sessionFile;
 	return sessionFile ? basename(sessionFile) : "";
 }
@@ -1079,6 +1081,7 @@ export async function switchModel(provider: string, modelId: string): Promise<vo
  * This is a best-effort hint used by background jobs when channel is omitted.
  */
 export function getCurrentSessionChannelHint(): RuntimeChannelHint {
+	if (!_runtime) return "unknown";
 	const entries = getSession().sessionManager.getBranch();
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
@@ -1104,6 +1107,7 @@ export function getCurrentSessionChannelHint(): RuntimeChannelHint {
  * visible session history instead of creating a fake user prompt.
  */
 export function appendAssistantNotification(text: string): void {
+	if (!_runtime) return;
 	const session = getSession();
 	const message: AssistantMessage = {
 		role: "assistant",

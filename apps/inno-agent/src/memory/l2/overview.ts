@@ -11,7 +11,7 @@
 import { join } from "node:path";
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ModelAuthProvider } from "./model-auth.js";
 
 import { ensureDir, writeText } from "../../storage/file-store.js";
 import { serializeFrontmatter, rebuildIndex } from "./wiki-maintainer.js";
@@ -96,7 +96,7 @@ const NARRATIVE_PROMPT = `你是学习 Wiki 知识库的总览撰写助手。根
 
 async function generateNarrative(
 	model: Model<any>,
-	modelRegistry: ModelRegistry,
+	modelRegistry: ModelAuthProvider,
 	statsText: string,
 ): Promise<string> {
 	try {
@@ -135,7 +135,7 @@ async function generateNarrative(
 export async function regenerateOverview(
 	l2DataDir: string,
 	model?: Model<any>,
-	modelRegistry?: ModelRegistry,
+	modelRegistry?: ModelAuthProvider,
 ): Promise<string | null> {
 	try {
 		const stats = computeWikiGraphStats(buildWikiGraph(l2DataDir));

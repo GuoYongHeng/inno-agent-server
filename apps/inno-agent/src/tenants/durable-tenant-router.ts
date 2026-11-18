@@ -23,9 +23,8 @@ export function readDurableShardConfig(env: NodeJS.ProcessEnv): DurableShardConf
 	const rawTargets = env.INNO_DURABLE_SHARD_URLS?.trim() ?? "";
 	if (!localShardId && !rawTargets) return null;
 	if (env.INNO_AUTH_MODE?.trim() !== "better-auth"
-		|| !enabled(env.INNO_MULTI_USER_ENABLED)
-		|| !enabled(env.INNO_DURABLE_ENABLED)) {
-		throw new Error("Durable sharding requires Better Auth, INNO_MULTI_USER_ENABLED=true and INNO_DURABLE_ENABLED=true");
+		|| !enabled(env.INNO_MULTI_USER_ENABLED)) {
+		throw new Error("Durable sharding requires Better Auth and INNO_MULTI_USER_ENABLED=true");
 	}
 	if (!localShardId || !rawTargets) {
 		throw new Error("INNO_DURABLE_SHARD_ID and INNO_DURABLE_SHARD_URLS must be configured together");

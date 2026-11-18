@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildContextUsage } from "./context-usage.js";
+import { buildContextUsage, buildDurableContextUsage } from "./context-usage.js";
 
 type Input = Parameters<typeof buildContextUsage>[1];
 function fixture(overrides: Partial<Input> = {}): Input {
@@ -53,5 +53,51 @@ describe("buildContextUsage", () => {
 	it("handles no model and invalid totals", () => {
 		expect(buildContextUsage("s", fixture({ getContextUsage: () => undefined })).status).toBe("unavailable");
 		expect(buildContextUsage("s", fixture({ getContextUsage: () => ({ tokens: NaN, percent: NaN, contextWindow: 1000 }) })).status).toBe("unavailable");
+	});
+});
+
+describe("buildDurableContextUsage", () => {
+	const tools = [{ name: "read", description: "Read a file", parameters: {} }];
+	const assistant = (input: number, output: number, text = "ok") => ({
+		role: "assistant", content: [{ type: "text", text }], stopReason: "stop",
+		usage: { input, output, cacheRead: 0, cacheWrite: 0 },
+	});
+
+	it("follows the provider's last reported usage and adds what came after it", () => {
+		const trailing = { role: "user", content: "x".repeat(400) };
+		const result = buildDurableContextUsage("s", {
+			contextWindow: 10_000,
+			instructions: "System. <available_skills>skills</available_skills>",
+			tools,
+			messages: [{ role: "user", content: "hi" }, assistant(900, 100), trailing],
+		});
+		expect(result).toMatchObject({ status: "ready", source: "sdk", contextWindow: 10_000 });
+		// 900 + 100 reported, plus ceil(400 / 4) for the trailing user message.
+		expect(result.tokens).toBe(1100);
+		expect(result.breakdown.reduce((sum, part) => sum + part.tokens, 0)).toBe(1100);
+		expect(result.breakdown.find((part) => part.id === "skills")!.tokens).toBeGreaterThan(0);
+		expect(result.breakdown.find((part) => part.id === "mcp")!.tokens).toBe(0);
+	});
+
+	it("estimates from instructions, tools and messages before any response", () => {
+		const result = buildDurableContextUsage("s", {
+			contextWindow: 10_000,
+			instructions: "x".repeat(800),
+			tools,
+			messages: [{ role: "user", content: "y".repeat(400) }],
+		});
+		expect(result).toMatchObject({ status: "ready", source: "estimated" });
+		expect(result.tokens).toBeGreaterThan(300);
+	});
+
+	it("ignores failed or aborted responses when looking for reported usage", () => {
+		const failed = { ...assistant(5000, 5000), stopReason: "error" };
+		const result = buildDurableContextUsage("s", {
+			contextWindow: 10_000,
+			instructions: "s",
+			tools: [],
+			messages: [{ role: "user", content: "hi" }, failed],
+		});
+		expect(result.source).toBe("estimated");
 	});
 });

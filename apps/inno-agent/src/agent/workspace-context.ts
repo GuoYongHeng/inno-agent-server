@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { formatSkillsForPrompt, loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import { logger } from "../logger.js";
+import { formatSkillsForPrompt, loadSkillsFromDir } from "./skills.js";
 
 const WORKSPACE_AGENT_FILE = "agent.md";
 const WORKSPACE_SKILLS_DIR = ".skills";
@@ -28,7 +28,7 @@ export function buildWorkspaceContextSections(workspaceDir: string): string[] {
 	const skillsDir = join(workspaceDir, WORKSPACE_SKILLS_DIR);
 	if (existsSync(skillsDir)) {
 		try {
-			const { skills } = loadSkillsFromDir({ dir: skillsDir, source: "path" });
+			const { skills } = loadSkillsFromDir(skillsDir);
 			if (skills.length > 0) {
 				const block = formatSkillsForPrompt(skills);
 				if (block.trim()) {

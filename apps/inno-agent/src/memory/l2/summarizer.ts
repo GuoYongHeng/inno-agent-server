@@ -6,7 +6,7 @@
 import { logger } from "../../logger.js";
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ModelAuthProvider } from "./model-auth.js";
 import { splitSourceIntoSemanticChunks } from "./structural-chunker.js";
 import { computeWikiSourceBudget } from "./wiki-generator.js";
 import { fileExists, readJson, writeJson } from "../../storage/file-store.js";
@@ -108,7 +108,7 @@ export function buildChunkUserPrompt(
 
 async function completeSummary(
 	model: Model<any>,
-	modelRegistry: ModelRegistry,
+	modelRegistry: ModelAuthProvider,
 	systemPrompt: string,
 	userPrompt: string,
 	maxTokens: number,
@@ -164,7 +164,7 @@ async function completeSummary(
  */
 export async function summarizeContent(
 	model: Model<any>,
-	modelRegistry: ModelRegistry,
+	modelRegistry: ModelAuthProvider,
 	title: string,
 	content: string,
 	wikiContext = "（知识库为空）",

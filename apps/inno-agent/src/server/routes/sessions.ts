@@ -346,11 +346,12 @@ export async function handleSessionsRoutes(
 		const channelMetadata = readSessionChannelMetadata();
 		const topicMetadata = readSessionTopicMetadata();
 		const archiveMetadata = readJson<Record<string, boolean>>(sessionArchiveMetadataPath(dataDir), {});
-		const currentSessionId = getCurrentSessionId();
+		// Durable is the only runtime; legacy JSONL history is no longer listed.
+		const currentSessionId = durableRequired ? "" : getCurrentSessionId();
 		const tenant = getRequestTenant(req);
 		if (!tenantStore && tenant) throw new Error("Tenant store is required for an authenticated request");
 		const ownedSessionIds = tenant ? await tenantStore!.listResourceIds(tenant, "session") : null;
-		const legacySessions = existsSync(sessionDir)
+		const legacySessions = !durableRequired && existsSync(sessionDir)
 			? readdirSync(sessionDir)
 					.filter((file) => file.endsWith(".jsonl"))
 					.map((file) => parseSessionFile(join(sessionDir, file))?.summary)

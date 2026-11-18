@@ -18,7 +18,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
-import type { ConfigHolder } from "./inno-extension.js";
+import type { ConfigHolder } from "./config-holder.js";
 import { defineInnoTool } from "./inno-tool.js";
 import { logger } from "../logger.js";
 import { writeJson } from "../storage/file-store.js";

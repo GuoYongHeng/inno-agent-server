@@ -5,7 +5,7 @@ import { wikiPathJoin } from "./wiki-paths.js";
 
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ModelAuthProvider } from "./model-auth.js";
 
 import { ensureDir, readText, writeText } from "../../storage/file-store.js";
 import type { ManifestEntry, WikiPageFrontmatter } from "./types.js";
@@ -183,7 +183,7 @@ function parseLinkedItemsJson(text: string): LinkedItem[] {
 
 async function extractLinkedItems(
 	model: Model<any> | undefined,
-	modelRegistry: ModelRegistry | undefined,
+	modelRegistry: ModelAuthProvider | undefined,
 	title: string,
 	content: string,
 ): Promise<LinkedItem[]> {
@@ -235,7 +235,7 @@ function linkedItemKey(item: LinkedItem): string {
 
 async function extractLinkedItemsAcrossChunks(
 	model: Model<any> | undefined,
-	modelRegistry: ModelRegistry | undefined,
+	modelRegistry: ModelAuthProvider | undefined,
 	title: string,
 	content: string,
 ): Promise<LinkedItem[]> {
@@ -525,7 +525,7 @@ export async function maintainLinkedWikiPages(
 	sourcePagePath: string,
 	sourcePageBody: string,
 	model?: Model<any>,
-	modelRegistry?: ModelRegistry,
+	modelRegistry?: ModelAuthProvider,
 ): Promise<WikiLinkMaintenanceResult> {
 	const result: WikiLinkMaintenanceResult = {
 		created: [],
@@ -713,7 +713,7 @@ function readExistingDefinition(l2DataDir: string, item: LinkedItem): string | u
 
 async function planLinkedItems(
 	model: Model<any> | undefined,
-	modelRegistry: ModelRegistry | undefined,
+	modelRegistry: ModelAuthProvider | undefined,
 	title: string,
 	summary: string,
 	candidates: PlanCandidate[],

@@ -98,6 +98,14 @@ legacy 与 durable 此时仍并存：
 
 **退出标准**：除 `pi-runner.ts`、`inno-extension.ts`、`observability-extension.ts`、`mcp-extension.ts`、`cli.ts` 外，没有文件再 import `pi-coding-agent`。
 
+**S2 实施结果（2026-11-18）**
+
+- 工具：`document-tools`、`tavily-tools`、`scheduler-tools` 改为 `defineInnoTool` 原生工具；legacy 通过既有的 `createLegacyToolDefinitions` 适配，行为不变。**同时把它们注册进 durable 会话**（新增 `extraTools` 选项、`getSchedulerTools`、`skillsDir`），这是 S1 漏掉的缺口 G8。durable 里调度工具的 `run_scheduled_job` 暂返回"不可用"（`runMode: "unavailable"`），待 S3 接入 durable 的任务执行器。`practice-tools` 随终端在 S4 删除，不移植。`ConfigHolder` 抽到 `agent/config-holder.ts`。
+- 技能：新增 `agent/skills.ts`（`loadSkillsFromDir`、`formatSkillsForPrompt`、`buildGlobalSkillsSection`），与 pi-coding-agent 原实现在含嵌套、忽略规则、禁用技能和非法名称的目录树上逐项对照一致；工作区 `.skills` 与**全局技能目录（含 `.ignore` 启停）**现在都会注入 durable 会话，G1 解决。
+- L2 后台 LLM 调用：没有改成 `CompleteFn`。五个文件只用到 `getApiKeyAndHeaders` 一个方法，且 durable 的 L2 归档本来就不调用模型，所以只引入窄接口 `ModelAuthProvider`（`memory/l2/model-auth.ts`），legacy 的 `ModelRegistry` 结构兼容。
+- 上下文用量：`context-usage.ts` 去掉对 `estimateTokens` 与 `AgentSession` 的依赖，自写 `estimateMessageTokens`（与原函数逐种消息类型对照一致）和本地结构类型。durable 的用量本身仍未实现，见 S3。
+- 退出标准达成情况：除 legacy 专属文件（`inno-extension`、`legacy-tool-adapter`、`mcp-extension`、`observability-extension`、`pi-runner`、`practice-tools`、`cli`）、`routes/chat.ts` 里 legacy 流式分支的一个内联类型、以及一个 legacy 测试外，没有文件再 import `pi-coding-agent`。这些都会在 S3/S4 随 legacy 一起删除。
+
 ### S3 所有入口切到 durable，legacy 变成不可达
 
 1. 会话创建默认且仅为 durable；`POST /api/sessions` 忽略/拒绝 `runtime` 字段。
@@ -108,6 +116,32 @@ legacy 与 durable 此时仍并存：
 6. 删除启动时 `initSession` 和"全局活动会话"概念，并同步前端依赖。
 
 **退出标准（合并门槛）**：把 `pi-runner.ts` 临时改为 `throw` 后，全部单元和集成测试仍通过，证明没有路径还在用它。
+
+**S3 实施结果（2026-11-18）**
+
+已完成：
+
+- durable 常开：服务端不再读 `INNO_DURABLE_ENABLED`，`/api/session` 固定报告 `durableEnabled: true`、`durableRequired: true`；`INNO_MULTI_USER_ENABLED` 与分片配置也不再要求该环境变量。路由层的 `durableRequired` 对所有模式生效，legacy 会话创建、legacy 提示执行和 legacy 手动运行都被拒绝；会话列表不再列出旧 JSONL 会话。
+- **去掉启动时的 `initSession`**，服务器不再创建 legacy `AgentSession`。这一步让一批隐藏依赖暴露出来并已修复：`/api/btw/ask`（原来静默返回 502，现改用会话自己的模型，新增 `completeConfiguredDurableChat` 与 `DurableSessionService.completeSideQuestion`）、全局技能列表与 trace（改用自写 `skills.ts`）、设置页的模型列表与默认模型（只由配置文件决定）、`getCurrentSessionId` 等几个未初始化即抛错的访问器（改为无运行时返回空）。
+- 渠道入站（本地模式）、调度创建会话、定时任务默认运行时全部走 durable；agent 工具 `run_scheduled_job` 在 durable 会话里改为"为任务新建一个 durable 会话并执行"。
+- **会话级换模型**：`PATCH /api/sessions/:id` 接受 `provider` + `modelId`，下一轮生效，重开后保持，非法模型 400；会话摘要新增 `model`；前端模型选择器在打开会话时改会话的模型，无会话时仍改"新会话默认模型"。
+- **durable 上下文用量**：改用提供方最近一次上报的用量加其后消息的估算，首轮前全部估算，并给出 system/tools/messages/skills 分项。
+
+用真实服务器加假 OpenAI 端点做了端到端验证：创建会话、流式与非流式对话、重启后历史仍在、会话换模型（回显的模型名从 m1 变 m2）、上下文用量、BTW 提问、新建并在 durable 会话里运行定时任务、读取会话工作区，均正常且服务日志无错误。
+
+**尚未完成（交给 S4 或需要决定）：**
+
+- ~~G9 编辑历史消息并重发~~：**已实现**，见下方“G9 实现”。
+- legacy 代码仍在仓库里但已不可达：`pi-runner.ts`、`inno-extension.ts` 等，以及路由里的 legacy 分支、`/api/commands`、MCP/终端/练习相关路由，留给 S4 删除。
+- `maybeAutoGenerateTopic` / `completePromptOnce` 仍被 legacy 流程引用，S4 一并清理。
+- 已存在的 durable 会话：全局技能写在 instructions 里，每次打开运行时都会重建；但新增工具（文档、搜索、调度）是否会加到早就创建的会话上**没有验证**：`harness.root(...)` 的 `agent.tools` 在会话已有根对话时是否重新应用，需要写一个“旧会话重开后能看到新工具”的测试来确认。
+
+**G9 实现（durable 编辑历史消息并重发）**
+
+- 做法：编辑某条用户消息时，在 pi-durable 里对当前对话 `fork(该消息的前一条 entry)`（若是第一条消息则新建空对话），会话之后在这个新对话里继续；被放弃的消息和回复留在原对话里，但不再出现在可见历史和模型上下文中。会话目录记录新增 `conversationId`，运行时打开时据此选择活动对话，并对 fork 重新应用最新的 agent 配置（模型、instructions、工具、工作区）。
+- 接口：`POST /api/sessions/:id/branch-before-message`，沿用原响应形状；会话正在生成时 409，找不到或不是用户消息 404（`code: entry_not_found`）。放弃分支上未回答的问题卡片和权限审批会被取消，但只在分叉成功之后才取消。
+- 一致性：分叉先提交，目录记录随后更新。两步之间进程崩溃时，会话仍停在原对话，只留下一个无人引用的 fork，没有可见影响。
+- 验证：服务层测试（可见历史、模型实际收到的消息、编辑第一条、拒绝助手消息和未知 entry）；冒烟测试覆盖路由校验；真实服务器加假模型做了端到端：编辑后模型只看到 `uau`，重启后仍在新分支上继续。
 
 ### S4 物理删除 legacy 与失去的能力
 

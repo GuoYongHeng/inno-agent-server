@@ -4,7 +4,6 @@ import { join } from "node:path";
 import {
 	abortPromptForTurnToken,
 	getCurrentSessionId,
-	getLoadedSkills,
 	persistCancelledQueuedTurn,
 	persistPendingUserTurn,
 	runPromptInSession,
@@ -12,7 +11,7 @@ import {
 	runPromptStreamingInSession,
 	type PromptRunOutcome,
 } from "../../agent/pi-runner.js";
-import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
+import { loadSkillsFromDir } from "../../agent/skills.js";
 import { expandInnoSlashCommand } from "../../agent/inno-extension.js";
 import { questionBridge, type QuestionBridgeResult } from "../../agent/question-bridge.js";
 import { permissionBridge, type PermissionDecision } from "../../agent/permission-bridge.js";
@@ -237,10 +236,10 @@ function traceSkillInfo(value: unknown, sourceFallback?: string): TraceSkillInfo
 	};
 }
 
-function loadedSkillsForTrace(workspaceRoot: string): TraceSkillInfo[] {
+function loadedSkillsForTrace(workspaceRoot: string, skillsDir: string): TraceSkillInfo[] {
 	const skills: TraceSkillInfo[] = [];
 	try {
-		const loaded = getLoadedSkills().skills;
+		const loaded = loadSkillsFromDir(skillsDir).skills;
 		if (Array.isArray(loaded)) {
 			for (const skill of loaded) {
 				const info = traceSkillInfo(skill, "global");
@@ -253,7 +252,7 @@ function loadedSkillsForTrace(workspaceRoot: string): TraceSkillInfo[] {
 	try {
 		const privateSkillsDir = join(workspaceRoot, ".skills");
 		if (existsSync(privateSkillsDir)) {
-			const privateSkills = loadSkillsFromDir({ dir: privateSkillsDir, source: "workspace" }).skills;
+			const privateSkills = loadSkillsFromDir(privateSkillsDir).skills;
 			for (const skill of privateSkills) {
 				const info = traceSkillInfo(skill, "workspace");
 				if (info) skills.push(info);
@@ -871,7 +870,7 @@ export async function handleChatRoutes(
 				isCancellationRequested: () => state.cancelRequested,
 				onStart: () => {
 					streamRegistry.publishStreamEvent(state, { type: "stream_state", status: "running" });
-					const traceSkills = loadedSkillsForTrace(streamWorkspaceRoot);
+					const traceSkills = loadedSkillsForTrace(streamWorkspaceRoot, ctx.paths.skillsDir);
 					streamRegistry.publishStreamEvent(state, {
 						type: "skill_loaded",
 						count: traceSkills.length,

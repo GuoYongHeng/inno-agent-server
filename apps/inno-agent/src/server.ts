@@ -16,12 +16,9 @@ import { ensureDir, readJson, readText, writeJson, writeText } from "./storage/f
 import {
 	createNewSession,
 	getCurrentSessionId,
-	getLoadedSkills,
 	getSession,
 	getActivePromptToken,
-	initSession,
 	isQueueTaskCancelled,
-	reloadResources,
 	setPromptEventObserver,
 	setWorkspaceCwdResolver,
 } from "./agent/pi-runner.js";
@@ -29,7 +26,7 @@ import { completePromptOnce, runPromptSerialized, runPromptStreamingInSession, r
 import { closeDeferredRuns, configureDeferredRuns } from "./scheduler/deferred-runs.js";
 import { DurableSessionService } from "./agent/durable-session-service.js";
 import { runDurableJobPrompt } from "./agent/durable-job-runner.js";
-import type { CreatedJobSession, DurableJobExecution, DurableJobExecutor } from "./scheduler/job-runner.js";
+import { executeJob, type CreatedJobSession, type DurableJobExecution, type DurableJobExecutor } from "./scheduler/job-runner.js";
 import type { ScheduledJob } from "./scheduler/types.js";
 import { ChannelRegistry } from "./channels/channel.js";
 import type { ChannelStreamEvent } from "./channels/channel.js";
@@ -64,6 +61,8 @@ import { handleSessionsRoutes } from "./server/routes/sessions.js";
 import { handleLearnerRoutes } from "./server/routes/learner.js";
 import { handleWikiRoutes } from "./server/routes/wiki.js";
 import { handlePresetsRoutes } from "./server/routes/presets.js";
+import { loadSkillsFromDir } from "./agent/skills.js";
+import { createSchedulerTools } from "./scheduler/scheduler-tools.js";
 import { handlePracticeRoutes } from "./server/routes/practice.js";
 import { handleChatRoutes } from "./server/routes/chat.js";
 import { handleCommandsRoutes } from "./server/routes/commands.js";
@@ -337,7 +336,7 @@ async function ensureBootstrapped(): Promise<void> {
 				noUi: true,
 			});
 		};
-		const tenantDispatcherOptions: typeof sharedDispatcherOptions = authConfig.multiUserEnabled ? {
+		const tenantDispatcherOptions: typeof sharedDispatcherOptions = {
 			...sharedDispatcherOptions,
 			runPrompt: async () => { throw new Error("Multi-user channel prompts require an owned durable session"); },
 			runPromptInSession: (sessionId, prompt, images) => runDurableChannelPrompt(sessionId, prompt, undefined, images),
@@ -345,17 +344,17 @@ async function ensureBootstrapped(): Promise<void> {
 			createNewSession: async (channel = "web") => {
 				const tenant = getCurrentTenant();
 				const store = getCurrentTenantStore();
-				if (!tenant || !store) throw new Error("Durable channel session creation requires a verified tenant");
+				if (tenant && !store) throw new Error("Durable channel session creation requires a tenant store");
 				const req = backgroundTenantRequest();
-				const workspace = workspaceRegistry.ensureChannelWorkspace(channel, tenant.tenantId);
-				await store.claimResource(tenant, "workspace", workspace.id);
+				const workspace = workspaceRegistry.ensureChannelWorkspace(channel, tenant?.tenantId);
+				if (tenant) await store!.claimResource(tenant, "workspace", workspace.id);
 				const summary = durableSessions.create(req, { workspaceId: workspace.id });
 				if (!workspaceRegistry.bindSession(summary.id, workspace.id)) throw new Error("Channel workspace not found");
 				return summary.id;
 			},
 			resolveSessionTarget: async (sessionId) => durableSessions.get(backgroundTenantRequest(), sessionId) ? sessionId : null,
 			maybeAutoGenerateTopic: undefined,
-		} : sharedDispatcherOptions;
+		};
 
 		if (auth.mode === "local") {
 			if (config.feishu?.appId && config.channels?.feishu?.enabled) {
@@ -430,24 +429,12 @@ async function ensureBootstrapped(): Promise<void> {
 		}
 
 		// ---- agent session ----
-		logger.info("[inno-server] initializing agent session...");
-		await initSession(config, paths, channelRegistry, {
-			sandbox: parsed.options.sandbox,
-			authenticated: auth.mode === "better-auth",
-			extensionDeps: {
-				workspaceRegistry,
-				runRecordStore,
-				getCurrentSessionId,
-				recordChannelInteraction: (channel) => recordCurrentSessionChannel(channel as SessionChannel),
-			},
-		});
-
 		// ---- post-init: dispatcher, channels, cron, WebSocket ----
 		if (auth.mode === "local") {
 			const channelsDataDir = join(dataDir, "channels");
 			ensureDir(channelsDataDir);
 			dispatcher = new PersonalChannelDispatcher({
-				...sharedDispatcherOptions,
+				...tenantDispatcherOptions,
 				channelRegistry,
 				channelsDataDir,
 			});
@@ -476,7 +463,7 @@ async function ensureBootstrapped(): Promise<void> {
 
 		async function createScheduledSession(job: ScheduledJob, request?: HttpReq): Promise<CreatedJobSession | null> {
 			try {
-				if (authConfig.multiUserEnabled || job.runtime === "durable") {
+				{
 					const req = request ?? backgroundTenantRequest();
 					const tenant = getCurrentTenant();
 					const store = getCurrentTenantStore();
@@ -495,21 +482,8 @@ async function ensureBootstrapped(): Promise<void> {
 						throw error;
 					}
 				}
-				const id = await createNewSession({});
-				const tenant = getCurrentTenant();
-				if (tenant) {
-					const store = getCurrentTenantStore();
-					if (!store) throw new Error("Scheduled session creation requires a tenant store");
-					await store.claimResource(tenant, "session", id);
-					const ws = workspaceRegistry.ensureChannelWorkspace("scheduler", tenant.tenantId);
-					await store.claimResource(tenant, "workspace", ws.id);
-					workspaceRegistry.bindSession(id, ws.id);
-				}
-				recordCurrentSessionChannel("scheduler", id, { setOriginIfEmpty: true });
-				const sessionPath = sessionFileFromId(paths.sessionDir, id);
-				return sessionPath && existsSync(sessionPath) ? sessionPath : null;
 			} catch (err) {
-				logger.error({ err, runtime: job.runtime ?? "legacy" }, "scheduled run session creation failed");
+				logger.error({ err, jobId: job.id }, "scheduled run session creation failed");
 				return null;
 			}
 		}
@@ -528,7 +502,7 @@ async function ensureBootstrapped(): Promise<void> {
 		});
 		if (auth.mode === "local") {
 			scheduler = new CronScheduler(jobStore, channelRegistry, checkInStore, {
-				createSession: (job) => job.runtime === "durable" ? createScheduledSession(job) : Promise.resolve(null),
+				createSession: createScheduledSession,
 				durableExecutor,
 			});
 		} else {
@@ -1048,7 +1022,7 @@ function writeDisabledSkillsIgnoreFile(disabled: Set<string>): void {
 function listProjectSkills(): unknown[] {
 	ensureDir(skillsDir);
 	const disabled = disabledSkillNames();
-	const loaded = getLoadedSkills();
+	const loaded = loadSkillsFromDir(skillsDir);
 	const loadedByPath = new Map(loaded.skills.map((skill) => [resolve(skill.filePath), skill]));
 	const diagnosticsByPath = new Map<string, string[]>();
 	for (const diagnostic of loaded.diagnostics) {
@@ -1093,9 +1067,9 @@ function listProjectSkills(): unknown[] {
  * upload UI stuck on "uploading". Fire-and-forget keeps the request snappy.
  */
 function scheduleSkillsReload(): void {
-	void reloadResources().catch((err) => {
-		logger.warn({ err }, "[inno-server] skills reload failed");
-	});
+	// Durable sessions list the shared skills when their runtime opens, so there
+	// is no process-wide skill cache to refresh. Open sessions pick up changes
+	// the next time they are reopened.
 }
 
 function sessionTopicMetadataPath(): string {
@@ -1505,11 +1479,26 @@ async function runQueueOpWithTimeout<T>(
 const durableSessions = new DurableSessionService({
 	dataDir,
 	getLocalConfig: () => config,
-	enabled: process.env.INNO_DURABLE_ENABLED === "true",
+	enabled: true,
 	resolveWorkspaceDir: (sessionId, fallbackWorkspaceId) => workspaceRegistry.resolveWorkspaceDir(
 		workspaceRegistry.getSessionWorkspaceId(sessionId) || fallbackWorkspaceId,
 	) ?? undefined,
 	getChannelRegistry: () => channelRegistry,
+	skillsDir,
+	getSchedulerTools: () => createSchedulerTools(jobStore, channelRegistry, checkInStore, {
+		// "Run this job now" from a conversation: give the run a durable session of its own.
+		runJob: async (job) => {
+			const created = await scheduledSessionFactory?.(job);
+			if (!created || typeof created === "string" || created.runtime !== "durable") {
+				throw new Error("Could not create a session for the scheduled job");
+			}
+			return executeJob(job, jobStore, channelRegistry, "manual", checkInStore, {
+				sessionId: created.id,
+				sessionRuntime: "durable",
+				durableExecutor: (execution) => executeDurableJob(backgroundTenantRequest(), execution),
+			});
+		},
+	}),
 	tenantStore: auth.tenantStore,
 });
 
@@ -1553,7 +1542,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		},
 		createSession: async (request, job) => scheduledSessionFactory?.(job, request) ?? null,
 		durableExecutor: executeDurableJob,
-		durableRequired: authConfig.multiUserEnabled,
+		durableRequired: true,
 		disconnectJobRun: (sessionId, turnId) => {
 			if (activeDurableJobTurns.get(sessionId) === turnId) {
 				durableSessions.cancelPermissionTurn(req, sessionId, turnId);
@@ -1631,7 +1620,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	// --- Sessions API (extracted to server/routes/sessions.ts) ---
 	sessions: (req, res, method, url) => handleSessionsRoutes(req, res, method, url, {
 		workspaceRegistry, dataDir, paths, getContentSource, tenantStore: auth.tenantStore, durableSessions,
-		durableRequired: authConfig.multiUserEnabled,
+		durableRequired: true,
 		getCachedPresetAvailability: (presetId) => contentHubCatalog.getCachedPresetAvailability(presetId),
 		parseSessionFile, sessionRevision,
 		readSessionChannelMetadata, sessionChannelMetadataPath,
@@ -1684,13 +1673,13 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	btw: (req, res, method, url) => handleBtwRoutes(req, res, method, url, {
 		dataDir, sessionFileFromId, parseSessionFile, tenantStore: auth.tenantStore,
 		durableSessions,
-		durableRequired: authConfig.multiUserEnabled,
+		durableRequired: true,
 	}),
 
 	// --- Chat API (extracted to server/routes/chat.ts) ---
 	chat: (req, res, method, url) => handleChatRoutes(req, res, method, url, {
 		workspaceRegistry, dataDir, paths, tenantStore: auth.tenantStore, durableSessions,
-		durableRequired: authConfig.multiUserEnabled,
+		durableRequired: true,
 		sessionFileFromId, releaseQueueFromQuestionBlockedTurn,
 		readSessionQuestionMetadata, writeSessionQuestionMetadata,
 		recordCurrentSessionChannel, maybeAutoGenerateTopic,
@@ -1748,7 +1737,7 @@ const server = createServer(async (req, response) => {
 				mode: auth.mode,
 				allowSignUp: auth.allowSignUp,
 				durableEnabled: durableSessions.enabled,
-				durableRequired: authConfig.multiUserEnabled,
+				durableRequired: true,
 				user: session?.principal ?? null,
 			});
 			return;

@@ -8,6 +8,7 @@ import {
 	getSession,
 	listSessions,
 	unarchiveSession as apiUnarchiveSession,
+	updateSessionModel,
 	updateSessionName,
 	type CreateSessionInput,
 	type SessionChannel,
@@ -476,6 +477,12 @@ export class SessionsStoreImpl extends EventEmitter<SessionsStoreEvents> {
 	async renameSession(id: string, name: string, generated = false): Promise<void> {
 		const updated = await updateSessionName(id, name, generated);
 		this.sessions = this.sessions.map((session) => session.id === id ? updated : session);
+		this.emit("change", undefined);
+	}
+
+	async setSessionModel(id: string, provider: string, modelId: string): Promise<void> {
+		const updated = await updateSessionModel(id, provider, modelId);
+		this.sessions = this.sessions.map((session) => session.id === id ? { ...session, ...updated } : session);
 		this.emit("change", undefined);
 	}
 

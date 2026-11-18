@@ -12,6 +12,8 @@ import {
 	type AgentEvent,
 	type AgentEventStream,
 	type Conversation,
+	type ConversationId,
+	type EntryId,
 	type ModelRef,
 	type Registry,
 	type SettledSubmissionRecord,
@@ -45,6 +47,7 @@ import {
 const WORKSPACE_EXTENSION_NAME = "inno.read-only";
 const MEMORY_EXTENSION_NAME = "inno.memory";
 const OCR_EXTENSION_NAME = "inno.ocr";
+const EXTRA_EXTENSION_NAME = "inno.extra";
 const CHANNEL_EXTENSION_NAME = "inno.channels";
 const QUESTION_EXTENSION_NAME = "inno.questions";
 export const DURABLE_RECOVERY_RECORD_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -53,11 +56,28 @@ export const DURABLE_RECOVERY_RECORD_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
  * one process; deployment routing must still prevent cross-process owners. */
 const openStoragePaths = new Set<string>();
 
+export type DurableBranchErrorCode = "entry_not_found" | "session_busy";
+
+export class DurableBranchError extends Error {
+	constructor(readonly code: DurableBranchErrorCode, message: string) {
+		super(message);
+		this.name = "DurableBranchError";
+	}
+}
+
 export class DurableStorageOwnerError extends Error {
 	constructor(readonly storagePath: string) {
 		super(`Durable storage already has an open owner: ${storagePath}`);
 		this.name = "DurableStorageOwnerError";
 	}
+}
+
+type AgentConfig = Parameters<Conversation["configure"]>[0];
+
+/** What a session sends to the model besides its messages, for context accounting. */
+export interface DurableContextInfo {
+	readonly instructions: string;
+	readonly tools: ReadonlyArray<{ name: string; description?: string; parameters?: unknown }>;
 }
 
 export interface DurableSessionRuntimeOptions {
@@ -78,6 +98,13 @@ export interface DurableSessionRuntimeOptions {
 	permissions?: DurablePermissionStore;
 	/** Restart-safe web questions; accepted answers persist before resumption. */
 	questions?: DurableQuestionToolOptions;
+	/** The conversation this session continues in. Omitted: the root conversation.
+	 * Editing an earlier message continues in a fork, and the catalog remembers it. */
+	conversationId?: string;
+	/** Additional native tools (document parsing, web search, scheduler). They keep
+	 * the default non-replayable policy: after a crash the model gets an
+	 * `interrupted` result instead of a silent re-execution. */
+	extraTools?: ToolRegistration[];
 	/** Completed recovery-record retention; cleanup runs only with no live work. */
 	recoveryRetentionMs?: number;
 	registry?: Registry;
@@ -124,6 +151,7 @@ function createSessionRegistry(
 	channels?: DurableChannelToolOptions,
 	questionTools: ToolRegistration[] = [],
 	permissions?: DurablePermissionStore,
+	extraTools: ToolRegistration[] = [],
 ): Registry {
 	const registry = createRegistry();
 	if (workspaceTools) {
@@ -156,6 +184,12 @@ function createSessionRegistry(
 			tools: questionTools,
 		}));
 	}
+	if (extraTools.length > 0) {
+		registry.install(defineExtension({
+			name: EXTRA_EXTENSION_NAME,
+			tools: extraTools,
+		}));
+	}
 	return registry;
 }
 
@@ -167,10 +201,12 @@ export class DurableSessionRuntime {
 	private constructor(
 		readonly storagePath: string,
 		private readonly harness: Harness,
-		private readonly rootConversation: Conversation,
+		private rootConversation: Conversation,
 		private readonly ownsStoragePath: string,
 		private readonly permissions?: DurablePermissionStore,
 		private readonly questions?: DurableQuestionStore,
+		readonly contextInfo: DurableContextInfo = { instructions: "", tools: [] },
+		private readonly agentConfig: AgentConfig = {},
 	) {}
 
 	static async open(options: DurableSessionRuntimeOptions): Promise<DurableSessionRuntime> {
@@ -185,11 +221,11 @@ export class DurableSessionRuntime {
 			const questionTools = options.questions
 				? await createDurableQuestionRegistrations(options.questions)
 				: [];
-			const registry = options.registry ?? createSessionRegistry(workspaceTools, options.memory, options.ocr, options.channels, questionTools, options.permissions);
+			const registry = options.registry ?? createSessionRegistry(workspaceTools, options.memory, options.ocr, options.channels, questionTools, options.permissions, options.extraTools);
 			const memoryTools = options.memory ? createDurableMemoryRegistrations(options.memory) : [];
 			const ocrTools = options.ocr ? createDurableOcrRegistrations(options.ocr) : [];
 			const channelTools = options.channels ? createDurableChannelRegistrations(options.channels) : [];
-			const tools = [...memoryTools, ...ocrTools, ...channelTools, ...questionTools];
+			const tools = [...memoryTools, ...ocrTools, ...channelTools, ...questionTools, ...(options.extraTools ?? [])];
 			const harness = await Harness.open(
 				await openNodeSqliteStorage(storagePath),
 				{
@@ -202,14 +238,22 @@ export class DurableSessionRuntime {
 				BACKGROUND_CONTEXT,
 			);
 			try {
-				const rootConversation = await harness.root(BACKGROUND_CONTEXT, {
-					agent: {
-						model: options.model,
-						instructions: options.instructions,
-						cwd: options.workspaceDir,
-						...(workspaceTools ? { tools: [...createWorkspaceFileTools(options.permissions), ...tools] } : { tools }),
-					},
-				});
+				const agentConfig = {
+					model: options.model,
+					instructions: options.instructions,
+					cwd: options.workspaceDir,
+					...(workspaceTools ? { tools: [...createWorkspaceFileTools(options.permissions), ...tools] } : { tools }),
+				};
+				const root = await harness.root(BACKGROUND_CONTEXT, { agent: agentConfig });
+				let rootConversation = root;
+				if (options.conversationId) {
+					const active = await harness.conversation(Number(options.conversationId) as ConversationId, BACKGROUND_CONTEXT);
+					if (!active) throw new Error(`Durable conversation not found: ${options.conversationId}`);
+					// A fork keeps its parent's agent as of the fork point; bring it up to date
+					// with this open (model, instructions, workspace, tools).
+					await active.configure(agentConfig, BACKGROUND_CONTEXT);
+					rootConversation = active;
+				}
 				const inspection = await harness.inspect(BACKGROUND_CONTEXT);
 				if (inspection.tasks.length === 0 && inspection.submissions.length === 0) {
 					const retentionMs = Math.max(0, options.recoveryRetentionMs ?? DURABLE_RECOVERY_RECORD_RETENTION_MS);
@@ -226,7 +270,24 @@ export class DurableSessionRuntime {
 					}
 				}
 				harness.resume();
-				return new DurableSessionRuntime(storagePath, harness, rootConversation, storagePath, options.permissions, options.questions?.store);
+				const contextTools = [...(workspaceTools ? createWorkspaceFileTools(options.permissions) : []), ...tools];
+				return new DurableSessionRuntime(
+					storagePath,
+					harness,
+					rootConversation,
+					storagePath,
+					options.permissions,
+					options.questions?.store,
+					{
+						instructions: options.instructions ?? "",
+						tools: contextTools.map((tool) => ({
+							name: tool.name,
+							description: tool.description,
+							parameters: tool.parameters,
+						})),
+					},
+					agentConfig,
+				);
 			} catch (error) {
 				await harness.close(BACKGROUND_CONTEXT).catch(() => undefined);
 				throw error;
@@ -327,6 +388,57 @@ export class DurableSessionRuntime {
 	 * idle. Reopening the storage will not resume this aborted submission. */
 	async abort(context: Context = BACKGROUND_CONTEXT): Promise<void> {
 		await this.rootConversation.abort(context);
+	}
+
+	/** Persist a model change for this conversation. pi-durable fixes a request's
+	 * model when the request is prepared, so a running turn is unaffected and the
+	 * new model applies from the next request. */
+	async setModel(model: ModelRef, context: Context = BACKGROUND_CONTEXT): Promise<void> {
+		await this.rootConversation.configure({ model }, context);
+	}
+
+	/** The conversation's committed model messages (user, assistant, tool results),
+	 * for context accounting. */
+	async contextMessages(): Promise<readonly unknown[]> {
+		const snapshot = await this.snapshot();
+		return snapshot.entries.flatMap((entry) => entry.model?.[0] ? [entry.model[0]] : []);
+	}
+
+	/** The conversation this runtime currently continues in. */
+	get conversationId(): string {
+		return String(this.rootConversation.id);
+	}
+
+	/**
+	 * Continue the session in a new conversation that holds everything before the
+	 * given user message, so that message and the replies after it are no longer
+	 * part of the visible history or the model's context. The earlier conversation
+	 * is left untouched. Refuses while the session has live work.
+	 */
+	async branchBeforeUserMessage(entryId: string): Promise<{ conversationId: string; replacedEntryId: string }> {
+		const inspection = await this.harness.inspect(BACKGROUND_CONTEXT);
+		if (inspection.tasks.length > 0 || inspection.submissions.length > 0) {
+			throw new DurableBranchError("session_busy", "Cannot edit a message while the session is generating");
+		}
+		const stream = await watchEvents(this.harness, this.rootConversation.id, BACKGROUND_CONTEXT);
+		let entries: SnapshotEvent["entries"];
+		try {
+			entries = stream.snapshot.entries;
+		} finally {
+			await stream.stop();
+		}
+		const index = entries.findIndex((entry) => String(entry.id) === entryId);
+		const target = index >= 0 ? entries[index] : undefined;
+		if (!target || target.model?.[0]?.role !== "user") {
+			throw new DurableBranchError("entry_not_found", "Message entry not found");
+		}
+		const parent = index > 0 ? entries[index - 1] : undefined;
+		const options = { ownership: { kind: "ownerless" as const }, agent: this.agentConfig };
+		const next = parent
+			? await this.rootConversation.fork(parent.id as EntryId, options, BACKGROUND_CONTEXT)
+			: await this.harness.createConversation(options, BACKGROUND_CONTEXT);
+		this.rootConversation = next;
+		return { conversationId: String(next.id), replacedEntryId: entryId };
 	}
 
 	async snapshot(): Promise<SnapshotEvent> {

@@ -1,6 +1,6 @@
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import type { InnoConfig } from "../config.js";
-import type { ConfigHolder } from "./inno-extension.js";
+import type { ConfigHolder } from "./config-holder.js";
 import { createOcrTools } from "./ocr-tools.js";
 
 export interface DurableOcrToolOptions {
