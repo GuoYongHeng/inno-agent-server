@@ -69,7 +69,16 @@ export interface SandboxCreateOptions {
 	envs?: Record<string, string>;
 }
 
+export interface ManagedSandboxInfo {
+	id: string;
+	createdAt: number;
+	metadata: Record<string, string>;
+	state: "running" | "paused";
+}
+
 export interface SandboxProvider {
+	/** Every sandbox this application created (running or paused), found by its metadata. */
+	listManaged(): Promise<ManagedSandboxInfo[]>;
 	create(options?: SandboxCreateOptions): Promise<SandboxBackend>;
 	/** Reconnect to (and resume, if paused) an earlier sandbox; null when it no longer exists. */
 	connect(sandboxId: string, options?: { timeoutMs?: number }): Promise<SandboxBackend | null>;

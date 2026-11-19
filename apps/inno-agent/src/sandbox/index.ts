@@ -15,6 +15,7 @@ export function createSandboxManager(config: InnoSandboxConfig, quota?: SandboxQ
 		timeoutMs: config.timeoutMinutes * 60_000,
 		defaultCommandTimeoutMs: config.commandTimeoutSeconds * 1000,
 		allowInternetAccess: config.allowInternetAccess,
+		allowedDomains: config.allowedDomains,
 		requestTimeoutMs: 60_000,
 	}), config, quota);
 }

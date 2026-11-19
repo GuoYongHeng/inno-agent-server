@@ -323,18 +323,20 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - 运行时：有沙箱时注册 pi-durable 的 `bash` 工具；审批用新增的 `withDurableCommandPermission`（决定按稳定调用 ID 持久化，工具保持不可重放）。提示词加入沙箱说明，技能与工作区路径改写成沙箱路径。
 - 配置：`sandbox` 段与 `INNO_SANDBOX_ENABLED`/`E2B_API_KEY`，平台级，不读租户配置。指标：`inno_sandbox_{created,resumed,paused,destroyed}_total`、各类 `*_errors_total`、`inno_sandbox_bind_ms`、`inno_sandbox_sync_{uploaded,downloaded,skipped}_total`。
 
-**测试**（单元 123 个文件 954 个测试通过，集成 7 个文件 42 个通过，另有 1 个仅在设置 `E2B_API_KEY` 时运行的真实 E2B 用例）：`sandbox-env.test.ts`（一致性 14 项）、`workspace-sync.test.ts`、`e2b-backend.test.ts`（mock SDK：退出码、超时、取消、错误映射、创建参数、重连）、`sandbox-config.test.ts`，以及 `durable-sandbox.test.ts`：用真实的 `DurableSessionService` 与 faux 模型验证 bash 在沙箱里执行、双向同步、宿主编辑下一轮可见、同一沙箱在重新打开时被重连、沙箱丢失后自动重建并重新播种、会话删除时销毁沙箱、无法询问时拒绝需审批的命令。
+**测试**（单元 126 个文件 972 个测试通过，集成 7 个文件 42 个通过，另有 1 个仅在设置 `E2B_API_KEY` 时运行的真实 E2B 用例）：`sandbox-env.test.ts`（一致性 14 项）、`workspace-sync.test.ts`、`e2b-backend.test.ts`（mock SDK：退出码、超时、取消、错误映射、创建参数、重连）、`sandbox-config.test.ts`，以及 `durable-sandbox.test.ts`：用真实的 `DurableSessionService` 与 faux 模型验证 bash 在沙箱里执行、双向同步、宿主编辑下一轮可见、同一沙箱在重新打开时被重连、沙箱丢失后自动重建并重新播种、会话删除时销毁沙箱、无法询问时拒绝需审批的命令。
 
 **未验证**：没有在真实 E2B 账号上跑过。`e2b-live.integration.test.ts` 会在有密钥时验证真实的 create/run/超时/取消/暂停/恢复/销毁，并跑一致性用例；`E2B_API_KEY=... npm run test:integration -- e2b-live`。上线前必须跑一次，并实测以下与云服务相关的数值：暂停与恢复耗时、冷启动耗时、`files.list` 的深度行为、国内访问延迟。
 
 **每租户配额（已补）**：`sandbox.limits` 三项（同时运行数默认 3、拥有总数默认 20、每 UTC 日运行分钟默认 480，0 为不限）。超限时会话照常打开、历史可看，沙箱被 `GuardedSandboxBackend` 关闭，工具返回超限原因，每一轮重试，容量释放或次日重置后自动恢复。认证模式账目在 PG（`sandbox_leases`、`sandbox_usage`，租户级咨询锁内判定，12 个并发打开恰好放行上限数；崩溃 worker 的租约 10 分钟无心跳即回收并按最后心跳计时），本地模式在进程内。指标：`inno_sandbox_quota_denied_{concurrent,time,sandboxes}_total`。取舍：一轮进行中不打断，时长可能超一轮；配额为软上限，不替代云账号侧的用量上限，仍应在 E2B 控制台设置账号级预算。
 
+**H2 收尾（已补）**：
+- **孤儿沙箱清理**：`SandboxProvider.listManaged()`（E2B 按 `metadata.app=inno-agent` 列出运行中与已暂停的，跨页）、`sandbox-audit.ts` 的 `findOrphanSandboxes`/`removeOrphanSandboxes`（只处理无会话记录引用且超过宽限期的）、命令 `npm run sandbox:fsck [-- --repair]`。
+- **网络出站白名单**：`sandbox.allowedDomains`，E2B 侧为 `denyOut: 0.0.0.0/0` 加 `allowOut`；断网（`allowInternetAccess:false`）优先；提示词同步告知模型。
+- **设置界面**：设置页"集成"里的"云端沙箱"卡片（启用、密钥、审批、联网与白名单、三项配额、超时、自部署域名与模板），后端 `PUT /api/settings/sandbox`（严格校验，掩码密钥表示保留，启用必须有密钥，保存后重建沙箱管理器）。仅本地模式可编辑；认证模式下租户看不到也改不了。顺带修了一个泄露隐患：设置接口原先会把 `config.sandbox.apiKey` 原样随配置展开返回，现在统一掩码（有测试）。
+
 **已知限制与后续**：
 - 一轮中途崩溃，该轮在沙箱里的改动要等下次打开会话时的同步才回到宿主；网页文件面板有一轮延迟。
 - 宿主侧删除不传到沙箱；符号链接、超大文件、被忽略的目录不同步。
-- 孤儿沙箱（会话记录已无，沙箱还在计费）没有清理命令，只能靠沙箱自身的 `timeoutMinutes` 过期；需要一个按 `metadata.app` 列出并比对目录的清理命令。
-- 网络出站只有开/关；没有域名白名单。
-- 沙箱设置没有网页界面，只能改 `config.json`/环境变量。
 - 每次 `bash` 都经 E2B 往返，长输出不做截断以外的处理（pi-durable 的 bash 工具自己做输出窗口）。
 
 ### H3 记忆、OCR、发件箱、恢复记录迁出本地文件（约 4–6 周）

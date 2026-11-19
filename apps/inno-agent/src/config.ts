@@ -266,6 +266,11 @@ export interface InnoSandboxConfig {
 	/** Upper bound for one shell command, in seconds. */
 	commandTimeoutSeconds: number;
 	allowInternetAccess: boolean;
+	/**
+	 * When non-empty (and internet access is on), outbound traffic is limited to these
+	 * hosts, wildcards or CIDR blocks and everything else is denied.
+	 */
+	allowedDomains: string[];
 	/** Ask the user before each shell command. Headless runs cannot ask, so they are denied. */
 	requireApproval: "always" | "never";
 	/** Per-tenant limits; 0 means unlimited. */
@@ -284,6 +289,9 @@ export function normalizeSandboxConfig(raw: (Omit<Partial<InnoSandboxConfig>, "l
 		timeoutMinutes: positive(raw?.timeoutMinutes, 30),
 		commandTimeoutSeconds: positive(raw?.commandTimeoutSeconds, 600),
 		allowInternetAccess: raw?.allowInternetAccess !== false,
+		allowedDomains: Array.isArray(raw?.allowedDomains)
+			? [...new Set(raw.allowedDomains.filter((entry): entry is string => typeof entry === "string").map((entry) => entry.trim()).filter(Boolean))]
+			: [],
 		requireApproval: raw?.requireApproval === "never" ? "never" : "always",
 		limits: {
 			maxConcurrent: nonNegative(raw?.limits?.maxConcurrent, DEFAULT_SANDBOX_LIMITS.maxConcurrent),

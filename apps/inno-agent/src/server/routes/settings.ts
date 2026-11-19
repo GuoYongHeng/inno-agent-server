@@ -9,6 +9,7 @@ import {
 	saveConfig,
 	setDefaultModel,
 	upsertProvider,
+	normalizeSandboxConfig,
 	type InnoConfig,
 	type InnoModelConfig,
 	type InnoProviderConfig,
@@ -37,6 +38,8 @@ export interface SettingsRouteContext {
 	syncChannelOwnership?: (previous: InnoConfig, next: InnoConfig) => Promise<void>;
 	scheduleSkillsReload: () => void;
 	invalidateContentSource: () => void;
+	/** Drop the cached sandbox manager so the next session open reads the new settings. */
+	invalidateSandbox?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +107,10 @@ function buildSafeSettings(config: InnoConfig) {
 			: undefined,
 		tavily: config.tavily
 			? { apiKey: maskSecret(config.tavily.apiKey) }
+			: undefined,
+		// The spread above would otherwise carry the sandbox API key through unmasked.
+		sandbox: config.sandbox
+			? { ...config.sandbox, apiKey: maskSecret(config.sandbox.apiKey) }
 			: undefined,
 		contentHub: config.contentHub
 			? { ...config.contentHub, token: maskSecret(config.contentHub.token) }
@@ -202,7 +209,12 @@ export async function handleSettingsRoutes(
 	// live process-wide registry to synchronise after a settings change.
 	const sync = (): void => {};
 	const refreshProviders = async (): Promise<void> => {};
-	const safeSettings = () => buildSafeSettings(config);
+	const safeSettings = () => {
+		const view = buildSafeSettings(config);
+		// The sandbox is platform-level: a tenant neither sees nor edits it.
+		if (tenantScoped) return { ...view, sandbox: undefined, sandboxEditable: false };
+		return { ...view, sandboxEditable: true, sandboxEnvKey: Boolean(process.env.E2B_API_KEY?.trim()) };
+	};
 	const rejectSharedRuntime = (feature: string): true => {
 		json(res, 409, { error: `${feature} is unavailable until its runtime is tenant-scoped` });
 		return true;
@@ -466,6 +478,66 @@ export async function handleSettingsRoutes(
 		}
 		save(config);
 		sync();
+		json(res, 200, safeSettings());
+		return true;
+	}
+
+	// --- Sandbox settings (platform-level; local mode only) ---
+	if (method === "PUT" && url === "/api/settings/sandbox") {
+		if (tenantScoped) {
+			json(res, 403, { error: "Sandbox settings are managed by the server operator" });
+			return true;
+		}
+		const body = (await readBody(req)) as Record<string, unknown>;
+		const current = config.sandbox ?? {};
+		const bad = (message: string): true => { json(res, 400, { error: message }); return true; };
+		const next: NonNullable<InnoConfig["sandbox"]> = { ...current };
+		if ("enabled" in body) { if (typeof body.enabled !== "boolean") return bad("enabled must be a boolean"); next.enabled = body.enabled; }
+		if ("apiKey" in body) {
+			if (typeof body.apiKey !== "string") return bad("apiKey must be a string");
+			const incoming = body.apiKey.trim();
+			// A masked value (e.g. "****abcd") means "keep the existing key".
+			if (!incoming.startsWith("****")) next.apiKey = incoming || undefined;
+		}
+		for (const key of ["domain", "template"] as const) {
+			if (key in body) {
+				if (typeof body[key] !== "string") return bad(`${key} must be a string`);
+				const value = (body[key] as string).trim();
+				next[key] = value || undefined;
+			}
+		}
+		for (const key of ["timeoutMinutes", "commandTimeoutSeconds"] as const) {
+			if (key in body) {
+				const value = body[key];
+				if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return bad(`${key} must be a positive number`);
+				next[key] = value;
+			}
+		}
+		if ("allowInternetAccess" in body) { if (typeof body.allowInternetAccess !== "boolean") return bad("allowInternetAccess must be a boolean"); next.allowInternetAccess = body.allowInternetAccess; }
+		if ("requireApproval" in body) { if (body.requireApproval !== "always" && body.requireApproval !== "never") return bad("requireApproval must be 'always' or 'never'"); next.requireApproval = body.requireApproval; }
+		if ("allowedDomains" in body) {
+			if (!Array.isArray(body.allowedDomains) || body.allowedDomains.some((entry) => typeof entry !== "string")) return bad("allowedDomains must be an array of strings");
+			next.allowedDomains = body.allowedDomains as string[];
+		}
+		if ("limits" in body) {
+			const limits = body.limits as Record<string, unknown> | null;
+			if (!limits || typeof limits !== "object") return bad("limits must be an object");
+			const merged = { ...(current.limits ?? {}) } as Record<string, number>;
+			for (const key of ["maxConcurrent", "maxSandboxes", "maxActiveMinutesPerDay"]) {
+				if (key in limits) {
+					const value = limits[key];
+					if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return bad(`limits.${key} must be a number >= 0`);
+					merged[key] = Math.floor(value);
+				}
+			}
+			next.limits = merged;
+		}
+		if (normalizeSandboxConfig(next).enabled && !normalizeSandboxConfig(next).apiKey) {
+			return bad("Enabling the sandbox needs an API key (here or in the E2B_API_KEY environment variable)");
+		}
+		config.sandbox = next;
+		save(config);
+		ctx.invalidateSandbox?.();
 		json(res, 200, safeSettings());
 		return true;
 	}

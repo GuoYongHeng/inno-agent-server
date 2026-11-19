@@ -18,6 +18,13 @@ vi.mock("e2b", async (importOriginal) => {
 			if (fake.connectError) throw fake.connectError;
 			return fake.instance;
 		}
+		static listCalls: unknown[] = [];
+		static list(opts: unknown) {
+			FakeSandbox.listCalls.push(opts);
+			const pages = [[{ sandboxId: "a", startedAt: new Date(1000), metadata: { app: "inno-agent" }, state: "running" }], [{ sandboxId: "b", startedAt: new Date(2000), metadata: { app: "inno-agent", sessionId: "s" }, state: "paused" }]];
+			let index = 0;
+			return { get hasNext() { return index < pages.length; }, async nextItems() { return pages[index++]!; } };
+		}
 		static async kill(id: string) {
 			fake.killed.push(id);
 			if (fake.connectError) throw fake.connectError;
@@ -109,6 +116,26 @@ describe("E2BSandboxProvider", () => {
 		const backend = await provider.create({ metadata: { sessionId: "s" } });
 		expect(backend.id).toBe("sbx-1");
 		expect(fake.created[0]).toEqual(["tpl", expect.objectContaining({ apiKey: "k", timeoutMs: 1234, metadata: { sessionId: "s" }, allowInternetAccess: false })]);
+	});
+
+	it("lists every sandbox this application created, across pages, filtered by metadata", async () => {
+		const provider = new E2BSandboxProvider({ apiKey: "k" });
+		expect(await provider.listManaged()).toEqual([
+			{ id: "a", createdAt: 1000, metadata: { app: "inno-agent" }, state: "running" },
+			{ id: "b", createdAt: 2000, metadata: { app: "inno-agent", sessionId: "s" }, state: "paused" },
+		]);
+	});
+
+	it("restricts egress to the allowlist and leaves it open without one", async () => {
+		fake.created.length = 0;
+		fake.instance = fakeSandbox();
+		await new E2BSandboxProvider({ apiKey: "k", allowedDomains: ["pypi.org", "*.github.com"] }).create();
+		expect(fake.created[0]).toEqual([expect.objectContaining({ network: { denyOut: ["0.0.0.0/0"], allowOut: ["pypi.org", "*.github.com"] } })]);
+		await new E2BSandboxProvider({ apiKey: "k" }).create();
+		expect((fake.created[1] as Array<Record<string, unknown>>)[0]).not.toHaveProperty("network");
+		await new E2BSandboxProvider({ apiKey: "k", allowInternetAccess: false, allowedDomains: ["pypi.org"] }).create();
+		expect((fake.created[2] as Array<Record<string, unknown>>)[0]).toMatchObject({ allowInternetAccess: false });
+		expect((fake.created[2] as Array<Record<string, unknown>>)[0]).not.toHaveProperty("network");
 	});
 
 	it("connect returns null for a sandbox that is gone and rethrows other failures", async () => {

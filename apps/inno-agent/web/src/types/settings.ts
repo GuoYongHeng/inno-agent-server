@@ -73,6 +73,19 @@ export interface ChannelsSettingsPayload {
 
 export type WindowCloseBehavior = "ask" | "hide" | "quit";
 
+export interface SandboxSettings {
+	enabled?: boolean;
+	apiKey?: string; // masked
+	domain?: string;
+	template?: string;
+	timeoutMinutes?: number;
+	commandTimeoutSeconds?: number;
+	allowInternetAccess?: boolean;
+	allowedDomains?: string[];
+	requireApproval?: "always" | "never";
+	limits?: { maxConcurrent?: number; maxSandboxes?: number; maxActiveMinutesPerDay?: number };
+}
+
 export interface InnoSettings {
 	defaultProvider: string;
 	defaultModel: string;
@@ -97,6 +110,12 @@ export interface InnoSettings {
 	tavily?: {
 		apiKey: string; // masked
 	};
+	/** Remote sandbox (platform-level). Absent for tenants. */
+	sandbox?: SandboxSettings;
+	/** False in authenticated mode: the operator manages the sandbox, tenants cannot. */
+	sandboxEditable?: boolean;
+	/** True when the server has E2B_API_KEY in its environment. */
+	sandboxEnvKey?: boolean;
 	contentHub?: {
 		type: "github" | "bundle";
 		owner: string;

@@ -184,7 +184,11 @@ export class SandboxManager {
 				"# 沙箱执行环境",
 				`你的 bash、read、write、edit 都运行在一个隔离的云端沙箱里，不是用户的电脑。工作目录是 ${SANDBOX_WORKSPACE_ROOT}，它与用户的工作区同步：用户新增或修改的文件会在你下一轮对话前出现在这里，你创建或修改的文件会在本轮结束后回到用户的工作区。`,
 				"沙箱里装的软件和依赖只在沙箱里有效；不要假设用户的电脑上有同样的环境。",
-				this.config.allowInternetAccess ? "沙箱可以访问互联网。" : "沙箱不能访问互联网。",
+				!this.config.allowInternetAccess
+					? "沙箱不能访问互联网。"
+					: this.config.allowedDomains.length
+						? `沙箱只能访问这些地址：${this.config.allowedDomains.join("、")}；其他网络请求会失败。`
+						: "沙箱可以访问互联网。",
 				"沙箱可能因为用量上限暂时不可用；此时工具会返回原因，请如实告诉用户，不要反复重试。",
 			].join("\n"),
 		};

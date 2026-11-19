@@ -1,5 +1,5 @@
 import { EventEmitter } from "./event-emitter.js";
-import { getSettings, switchBackendModel, upsertProvider, deleteProviderApi, deleteModelApi, saveChannelsSettings, saveMemorySettings, saveSmartInputSettings, saveCloseBehavior, saveMarkdownSettings, saveGithubSettings, saveOcrSettings, saveTavilySettings, saveContentHubSettings, type MemorySettingsPatch, type ContentHubPayload, type OcrSettingsPayload } from "../api/settings.js";
+import { getSettings, switchBackendModel, upsertProvider, deleteProviderApi, deleteModelApi, saveChannelsSettings, saveMemorySettings, saveSmartInputSettings, saveCloseBehavior, saveMarkdownSettings, saveGithubSettings, saveOcrSettings, saveTavilySettings, saveSandboxSettings, saveContentHubSettings, type MemorySettingsPatch, type ContentHubPayload, type OcrSettingsPayload, type SandboxSettingsPayload } from "../api/settings.js";
 import type { WindowCloseBehavior } from "../types/settings.js";
 import type { InnoSettings, SmartInputSettings, UpsertProviderRequest, ChannelsSettingsPayload } from "../types/settings.js";
 
@@ -17,6 +17,7 @@ class SettingsStoreImpl extends EventEmitter<SettingsStoreEvents> {
 	isSavingGithub = false;
 	isSavingOcr = false;
 	isSavingTavily = false;
+	isSavingSandbox = false;
 	isSavingContentHub = false;
 	isSavingSmartInput = false;
 	isSavingCloseBehavior = false;
@@ -235,6 +236,22 @@ class SettingsStoreImpl extends EventEmitter<SettingsStoreEvents> {
 			throw err;
 		} finally {
 			this.isSavingTavily = false;
+			this.emit("change", undefined);
+		}
+	}
+
+	async saveSandbox(payload: SandboxSettingsPayload): Promise<void> {
+		this.isSavingSandbox = true;
+		this.error = null;
+		this.emit("change", undefined);
+		try {
+			this.settings = await saveSandboxSettings(payload);
+		} catch (err) {
+			this.error = err instanceof Error ? err.message : "Failed to save sandbox settings";
+			this.emit("change", undefined);
+			throw err;
+		} finally {
+			this.isSavingSandbox = false;
 			this.emit("change", undefined);
 		}
 	}

@@ -78,6 +78,7 @@
 		"timeoutMinutes": 30,
 		"commandTimeoutSeconds": 600,
 		"allowInternetAccess": true,
+		"allowedDomains": [],
 		"limits": {
 			"maxConcurrent": 3,
 			"maxSandboxes": 20,

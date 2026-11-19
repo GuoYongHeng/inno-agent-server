@@ -1171,6 +1171,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 			: undefined,
 		scheduleSkillsReload,
 		invalidateContentSource,
+		invalidateSandbox: () => { sandboxManager = undefined; },
 	}),
 
 	// --- Btw side-question API (extracted to server/routes/btw.ts) ---

@@ -7,6 +7,7 @@ import {
 	SandboxFsError,
 	SandboxRunError,
 	type SandboxBackend,
+	type ManagedSandboxInfo,
 	type SandboxCreateOptions,
 	type SandboxEntry,
 	type SandboxProvider,
@@ -23,6 +24,8 @@ export class LocalDirSandbox implements SandboxBackend {
 	killed = false;
 	paused = false;
 	keepAlives: number[] = [];
+	createdAt = Date.now();
+	metadata: Record<string, string> = {};
 	constructor(readonly id: string, readonly root: string) {}
 
 	private host(path: string): string {
@@ -186,6 +189,7 @@ export class LocalDirSandboxProvider implements SandboxProvider {
 		const root = join(this.base, id);
 		mkdirSync(root, { recursive: true });
 		const sandbox = new LocalDirSandbox(id, root);
+		sandbox.metadata = options?.metadata ?? {};
 		this.sandboxes.set(id, sandbox);
 		return sandbox;
 	}
@@ -195,6 +199,15 @@ export class LocalDirSandboxProvider implements SandboxProvider {
 		if (!sandbox || sandbox.killed) return null;
 		sandbox.paused = false;
 		return sandbox;
+	}
+
+	async listManaged(): Promise<ManagedSandboxInfo[]> {
+		return [...this.sandboxes.values()].filter((sandbox) => !sandbox.killed).map((sandbox) => ({
+			id: sandbox.id,
+			createdAt: sandbox.createdAt,
+			metadata: sandbox.metadata,
+			state: sandbox.paused ? "paused" as const : "running" as const,
+		}));
 	}
 
 	async destroy(sandboxId: string): Promise<void> {

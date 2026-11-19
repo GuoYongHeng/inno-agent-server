@@ -19,6 +19,7 @@
 		"build": "npm --workspace inno-agent run build && npm --workspace inno-agent-web run build",
 		"server": "npm --workspace inno-agent run server --",
 		"durable:fsck": "npm --workspace inno-agent run durable:fsck --",
+		"sandbox:fsck": "npm --workspace inno-agent run sandbox:fsck --",
 		"web:dev": "npm --workspace inno-agent-web run dev",
 		"dev:server": "npm --workspace inno-agent run server --",
 		"restart": "bash restart-dev.sh",

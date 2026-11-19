@@ -12,6 +12,7 @@ import {
 	SandboxFsError,
 	SandboxRunError,
 	type SandboxBackend,
+	type ManagedSandboxInfo,
 	type SandboxCreateOptions,
 	type SandboxEntry,
 	type SandboxFsErrorCode,
@@ -30,6 +31,8 @@ export interface E2BProviderOptions {
 	defaultCommandTimeoutMs?: number;
 	/** Block outbound network access from the sandbox. Default: allowed. */
 	allowInternetAccess?: boolean;
+	/** Limit outbound traffic to these hosts/CIDRs and deny the rest. Ignored when internet access is off. */
+	allowedDomains?: string[];
 	requestTimeoutMs?: number;
 }
 
@@ -216,6 +219,9 @@ export class E2BSandboxProvider implements SandboxProvider {
 			...(options.metadata ? { metadata: options.metadata } : {}),
 			...(options.envs ? { envs: options.envs } : {}),
 			...(this.options.allowInternetAccess === false ? { allowInternetAccess: false } : {}),
+			...(this.options.allowInternetAccess !== false && this.options.allowedDomains?.length
+				? { network: { denyOut: ["0.0.0.0/0"], allowOut: this.options.allowedDomains } }
+				: {}),
 		};
 		const sandbox = template ? await Sandbox.create(template, opts) : await Sandbox.create(opts);
 		return new E2BSandboxBackend(sandbox, this.options);
@@ -233,6 +239,21 @@ export class E2BSandboxProvider implements SandboxProvider {
 			if (error instanceof NotFoundError || error instanceof SandboxNotFoundError) return null;
 			throw error;
 		}
+	}
+
+	async listManaged(): Promise<ManagedSandboxInfo[]> {
+		const found: ManagedSandboxInfo[] = [];
+		const paginator = Sandbox.list({
+			...this.connection(),
+			query: { metadata: { app: "inno-agent" }, state: ["running", "paused"] },
+			limit: 100,
+		});
+		while (paginator.hasNext) {
+			for (const item of await paginator.nextItems()) {
+				found.push({ id: item.sandboxId, createdAt: item.startedAt.getTime(), metadata: item.metadata, state: item.state });
+			}
+		}
+		return found;
 	}
 
 	async destroy(sandboxId: string): Promise<void> {

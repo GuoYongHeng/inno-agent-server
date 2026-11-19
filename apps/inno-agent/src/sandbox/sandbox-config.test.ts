@@ -7,6 +7,7 @@ describe("normalizeSandboxConfig", () => {
 		expect(normalizeSandboxConfig(undefined, {})).toEqual({
 			enabled: false, provider: "e2b", timeoutMinutes: 30, commandTimeoutSeconds: 600, allowInternetAccess: true, requireApproval: "always",
 			limits: { maxConcurrent: 3, maxSandboxes: 20, maxActiveMinutesPerDay: 480 },
+			allowedDomains: [],
 		});
 	});
 
@@ -26,6 +27,11 @@ describe("normalizeSandboxConfig", () => {
 	it("reads per-tenant limits, treating 0 as unlimited and ignoring invalid values", () => {
 		expect(normalizeSandboxConfig({ limits: { maxConcurrent: 0, maxSandboxes: 5, maxActiveMinutesPerDay: -1 } }, {}).limits)
 			.toEqual({ maxConcurrent: 0, maxSandboxes: 5, maxActiveMinutesPerDay: 480 });
+	});
+
+	it("normalizes the egress allowlist: trims, drops blanks and non-strings, removes duplicates", () => {
+		expect(normalizeSandboxConfig({ allowedDomains: [" pypi.org ", "", "pypi.org", 3 as never, "*.github.com"] }, {}).allowedDomains)
+			.toEqual(["pypi.org", "*.github.com"]);
 	});
 
 	it("refuses to build a manager without credentials", () => {

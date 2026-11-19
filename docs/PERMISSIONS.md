@@ -41,11 +41,11 @@ durable 会话只注册三个文件工具：`read`、`write`、`edit`。它们�
 
 ```json
 { "sandbox": { "enabled": true, "apiKey": "e2b_...", "requireApproval": "always",
-  "timeoutMinutes": 30, "commandTimeoutSeconds": 600, "allowInternetAccess": true,
+  "timeoutMinutes": 30, "commandTimeoutSeconds": 600, "allowInternetAccess": true, "allowedDomains": [],
   "limits": { "maxConcurrent": 3, "maxSandboxes": 20, "maxActiveMinutesPerDay": 480 } } }
 ```
 
-也可用 `INNO_SANDBOX_ENABLED=true` 加 `E2B_API_KEY`。启用但没有密钥时，服务在启动引导阶段直接报错。`domain` 可指向自部署的 e2b 兼容服务，`template` 指定镜像。改配置需要重启。
+也可用 `INNO_SANDBOX_ENABLED=true` 加 `E2B_API_KEY`，或在设置页"集成"里的"云端沙箱"卡片编辑（仅本地模式；认证模式下租户看不到也改不了，API Key 在接口里始终是掩码）。保存后服务会重建沙箱管理器，之后新打开的会话使用新设置。启用但没有密钥时，服务在启动引导阶段直接报错。`domain` 可指向自部署的 e2b 兼容服务，`template` 指定镜像。改配置需要重启。
 
 **行为**
 - 沙箱在会话第一次打开时创建，ID 记在会话目录里；运行时关闭（会话空闲）时暂停，再次使用时恢复；会话被删除时销毁。已不存在的沙箱会自动重建并重新同步。
@@ -53,6 +53,16 @@ durable 会话只注册三个文件工具：`read`、`write`、`edit`。它们�
 - 全局技能目录同步到沙箱的 `/home/user/.inno/skills`，提示词里的路径相应改写。
 - **审批**：`requireApproval` 为 `always`（默认）时每条 shell 命令都要在网页上批准（"本会话允许"只对完全相同的命令生效）；`never` 时不询问。非流式或无头运行（定时任务、IM 渠道）无法询问，在 `always` 下 shell 会被拒绝。
 - **崩溃恢复**：`bash` 不可重放，进程崩溃后该次调用返回 `interrupted`，不会重复执行；审批卡片未决时崩溃，模型需要重新发起。
+
+**网络出站**：`allowInternetAccess: false` 完全断网；`allowedDomains` 非空（域名、通配符如 `*.github.com` 或 CIDR）时只允许访问这些地址，其余全部拒绝（对 E2B 用 `denyOut: 0.0.0.0/0` 加 `allowOut` 实现），提示词里会告诉模型哪些地址可用。留空表示不限制。
+
+**孤儿沙箱清理**：会话记录已没有、但沙箱还在计费的沙箱（删除时销毁失败，或创建后、记录 ID 前崩溃）可以用下面的命令查找和销毁。只处理本应用创建的沙箱（按元数据 `app=inno-agent` 过滤），且只处理创建超过宽限期（默认 60 分钟）的，避免误伤刚创建、记录还没写完的。会话记录来自 PostgreSQL（设置了 `DATABASE_URL`）或本地的 `sessions.json`。
+
+```bash
+npm run sandbox:fsck                       # 只列出
+npm run sandbox:fsck -- --repair           # 销毁
+npm run sandbox:fsck -- --grace-minutes 180
+```
 
 **每租户配额**（`sandbox.limits`，0 表示不限；本地模式把整个本机当作一个租户）：
 - `maxConcurrent`：同一租户同时运行的沙箱数（每个打开的会话占一个），默认 3。

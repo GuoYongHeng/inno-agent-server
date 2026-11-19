@@ -1,5 +1,5 @@
 import { apiFetch } from "./client.js";
-import type { InnoSettings, SmartInputSettings, UpsertProviderRequest, ChannelsSettingsPayload, WindowCloseBehavior } from "../types/settings.js";
+import type { InnoSettings, SandboxSettings, SmartInputSettings, UpsertProviderRequest, ChannelsSettingsPayload, WindowCloseBehavior } from "../types/settings.js";
 
 export async function getSettings(): Promise<InnoSettings> {
 	return apiFetch<InnoSettings>("/api/settings");
@@ -97,6 +97,15 @@ export async function saveTavilySettings(apiKey: string): Promise<InnoSettings> 
 	return apiFetch<InnoSettings>("/api/settings/tavily", {
 		method: "PUT",
 		body: JSON.stringify({ apiKey }),
+	});
+}
+
+export type SandboxSettingsPayload = Omit<SandboxSettings, "apiKey"> & { apiKey?: string };
+
+export async function saveSandboxSettings(payload: SandboxSettingsPayload): Promise<InnoSettings> {
+	return apiFetch<InnoSettings>("/api/settings/sandbox", {
+		method: "PUT",
+		body: JSON.stringify(payload),
 	});
 }
 
