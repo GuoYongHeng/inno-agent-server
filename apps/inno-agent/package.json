@@ -8,6 +8,7 @@
 		"build": "tsc",
 		"dev": "tsc --watch",
 		"server": "node dist/server.js",
+		"durable:fsck": "node dist/durable-fsck.js",
 		"web:dev": "npm --workspace inno-agent-web run dev",
 		"web:build": "npm --workspace inno-agent-web run build",
 		"auth:migrate": "tsx src/auth/migrate.ts",

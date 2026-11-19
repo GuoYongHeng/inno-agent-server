@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { incCounter, observeMs } from "../utils/metrics.js";
 
 const held = new Map<string, number>();
 const sleeper = new Int32Array(new SharedArrayBuffer(4));
@@ -41,6 +42,7 @@ export function withFileLock<T>(lockPath: string, operation: () => T): T {
 		try { return operation(); } finally { held.set(lockPath, depth); }
 	}
 	mkdirSync(dirname(lockPath), { recursive: true });
+	const startedWaiting = performance.now();
 	const deadline = Date.now() + WAIT_LIMIT_MS;
 	for (;;) {
 		try {
@@ -49,13 +51,18 @@ export function withFileLock<T>(lockPath: string, operation: () => T): T {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			if (lockIsStale(lockPath)) {
+				incCounter("inno_file_lock_stale_broken_total");
 				rmSync(lockPath, { recursive: true, force: true });
 				continue;
 			}
-			if (Date.now() > deadline) throw new Error(`Timed out waiting for lock ${lockPath}`);
+			if (Date.now() > deadline) {
+				incCounter("inno_file_lock_timeouts_total");
+				throw new Error(`Timed out waiting for lock ${lockPath}`);
+			}
 			Atomics.wait(sleeper, 0, 0, 5);
 		}
 	}
+	observeMs("inno_file_lock_wait_ms", performance.now() - startedWaiting);
 	try {
 		writeFileSync(join(lockPath, "owner"), String(process.pid));
 		held.set(lockPath, 1);

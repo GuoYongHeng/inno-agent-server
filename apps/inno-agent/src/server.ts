@@ -2,6 +2,8 @@
 // pino-caller call sites map back to the original TS source locations.
 import "source-map-support/register.js";
 
+import { auditDurableData } from "./agent/durable-audit.js";
+import { renderPrometheus } from "./utils/metrics.js";
 import { createServer, type IncomingMessage as HttpReq } from "node:http";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -1198,6 +1200,19 @@ const server = createServer(async (req, response) => {
 			return;
 		}
 
+		// Process metrics for local scraping only: counters expose tenant-agnostic
+		// totals, but there is no auth here, so non-loopback callers get 404.
+		if (method === "GET" && path === "/metrics") {
+			const remote = req.socket.remoteAddress ?? "";
+			if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote)) {
+				json(res, 404, { error: "Not found" });
+				return;
+			}
+			res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
+			res.end(renderPrometheus());
+			return;
+		}
+
 		// Better Auth must receive the untouched request body and must not
 		// initialize the agent just to sign in or register.
 		if (path === "/api/auth" || path.startsWith("/api/auth/")) {
@@ -1330,4 +1345,18 @@ process.on("SIGINT", gracefulShutdown);
 server.listen(port, listenConfig.host, () => {
 	console.log(`[inno-server] listening on http://${listenConfig.host}:${port}`);
 	console.log(`[inno-server] config: ${paths.configPath}`);
+	// Report-only orphan audit; repair is an explicit offline step (durable-fsck).
+	setImmediate(() => {
+		try {
+			for (const audit of auditDurableData(paths.dataDir)) {
+				if (audit.error) logger.warn({ owner: audit.owner, error: audit.error }, "durable data audit failed");
+				else if (audit.orphans.length) {
+					logger.warn({ owner: audit.owner, orphans: audit.orphans.map((o) => o.sessionId) },
+						"orphaned durable session data found; run `npm run durable:fsck -- --repair` to remove it");
+				}
+			}
+		} catch (err) {
+			logger.warn({ err }, "durable data audit crashed");
+		}
+	});
 });

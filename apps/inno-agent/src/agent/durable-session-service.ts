@@ -1,3 +1,4 @@
+import { incCounter, observeMs, setGauge, timed } from "../utils/metrics.js";
 import { withFileLock } from "../storage/file-lock.js";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
@@ -358,8 +359,10 @@ export class DurableSessionService {
 	}
 
 	private catalog(req: IncomingMessage): DurableSessionRecord[] {
-		const value = readJson<unknown>(this.catalogPath(req), []);
-		return Array.isArray(value) ? value.filter(isRecord) : [];
+		const value = timed("inno_catalog_read_ms", () => readJson<unknown>(this.catalogPath(req), []));
+		const records = Array.isArray(value) ? value.filter(isRecord) : [];
+		setGauge("inno_catalog_sessions", records.length);
+		return records;
 	}
 
 	/** Cross-process critical section for catalog read-modify-write. */
@@ -368,7 +371,7 @@ export class DurableSessionService {
 	}
 
 	private writeCatalog(req: IncomingMessage, records: DurableSessionRecord[]): void {
-		writeJson(this.catalogPath(req), records);
+		timed("inno_catalog_write_ms", () => writeJson(this.catalogPath(req), records));
 	}
 
 	get(req: IncomingMessage, id: string): DurableSessionRecord | undefined {
@@ -847,8 +850,14 @@ export class DurableSessionService {
 					let storageLock: DurableStorageLock | undefined;
 					if (tenant) {
 						if (!this.options.tenantStore) throw new Error("Authenticated durable storage requires a tenant store");
+						const lockStarted = performance.now();
 						storageLock = await this.options.tenantStore.acquireDurableStorageLock(tenant, id) ?? undefined;
-						if (!storageLock) throw new DurableSessionBusyError("Durable session is owned by another worker");
+						observeMs("inno_advisory_lock_acquire_ms", performance.now() - lockStarted);
+						if (!storageLock) {
+							incCounter("inno_advisory_lock_busy_total");
+							throw new DurableSessionBusyError("Durable session is owned by another worker");
+						}
+						incCounter("inno_advisory_lock_acquired_total");
 					}
 					try {
 						const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
@@ -941,6 +950,7 @@ export class DurableSessionService {
 				this.runtimes.set(key, entry);
 				const openedEntry = entry;
 				opened.storageLock?.onLost(() => {
+					incCounter("inno_advisory_lock_lost_total");
 					if (this.runtimes.get(key) !== openedEntry) return;
 					this.runtimes.delete(key);
 					void this.closeRuntimeEntry(openedEntry).catch((error) => {

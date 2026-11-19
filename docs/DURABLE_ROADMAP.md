@@ -237,7 +237,7 @@ S4 期间发现并修复的回归：
 | 10,000 | 4.6 MB | 11.8 ms | 18.5 ms |
 | 100,000 | 45.6 MB | 125.6 ms | 224.9 ms |
 
-每次改名、模型切换、话题生成和 `get` 都会读整个文件，1 万会话以内可接受，10 万会话时单次更新 200ms 以上。**尚未做**：每租户磁盘占用、advisory lock 获取/丢失次数的指标（需要在服务里埋点，放到 H1 前一起做）。
+每次改名、模型切换、话题生成和 `get` 都会读整个文件，1 万会话以内可接受，10 万会话时单次更新 200ms 以上。**指标与孤儿自检（已完成）**：`utils/metrics.ts` 提供进程内计数器、仪表和耗时汇总，经仅限回环地址的 `GET /metrics`（Prometheus 文本）暴露：`inno_catalog_read_ms`/`inno_catalog_write_ms`、`inno_catalog_sessions`、`inno_advisory_lock_{acquired,busy,lost}_total`、`inno_advisory_lock_acquire_ms`、`inno_file_lock_{wait_ms,timeouts_total,stale_broken_total}`、`inno_durable_orphan_sessions`、`inno_durable_disk_bytes`、`inno_durable_tenants`。启动后异步做一次只读孤儿审计并写 warn 日志；离线命令 `npm run durable:fsck [-- --data-dir <dir>] [-- --repair]` 输出各根（本地与每租户）的孤儿和磁盘占用，`--repair` 才删除，目录读不出来时拒绝判定孤儿。磁盘占用只在审计时遍历计算（启动一次或手动 fsck），不是每次抓取都扫。指标是单进程的，多 worker 需分别抓取；`/metrics` 无鉴权，所以只接受回环地址。
 
 ### H1 会话目录迁移到 PostgreSQL（约 2–3 周，依赖 S3）
 

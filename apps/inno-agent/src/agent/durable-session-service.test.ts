@@ -13,6 +13,7 @@ import { closeL3Memory, ScopedL3Memory } from "../memory/l3/l3-tools.js";
 import { ChannelRegistry } from "../channels/channel.js";
 import { setRequestTenant } from "../tenants/http.js";
 import type { DurableStorageLock, TenantContext, TenantStore } from "../tenants/store.js";
+import { metricsSnapshot, resetMetricsForTests } from "../utils/metrics.js";
 import { createSchedulerTools } from "../scheduler/scheduler-tools.js";
 import { DurableModelNotFoundError, DurableRuntimeDisabledError, DurableSessionService } from "./durable-session-service.js";
 import { DurableSessionRuntime, type DurableSessionRuntimeOptions } from "./durable-runtime.js";
@@ -475,6 +476,7 @@ describe("DurableSessionService", () => {
 	});
 
 	it("invalidates a runtime when its cross-process storage lock is lost", async () => {
+		resetMetricsForTests();
 		const base = root();
 		const context = tenant("tenant-a");
 		saveTenantConfig(base, context.tenantId, config("key-a"));
@@ -520,6 +522,12 @@ describe("DurableSessionService", () => {
 		expect(acquisitions).toBe(2);
 		await second.release();
 		expect({ closes, releases }).toEqual({ closes: 2, releases: 2 });
+		const { counters, summaries, gauges } = metricsSnapshot();
+		expect(counters.inno_advisory_lock_acquired_total).toBe(2);
+		expect(counters.inno_advisory_lock_lost_total).toBe(1);
+		expect(summaries.inno_advisory_lock_acquire_ms?.count).toBe(2);
+		expect(summaries.inno_catalog_write_ms?.count).toBeGreaterThan(0);
+		expect(gauges.inno_catalog_sessions).toBe(1);
 	});
 
 	it("switches the model of one session from its next request and keeps it after reopen", async () => {
