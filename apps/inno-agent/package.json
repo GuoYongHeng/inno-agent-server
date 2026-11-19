@@ -25,6 +25,7 @@
 		"@tavily/core": "^0.7.6",
 		"better-auth": "1.7.12",
 		"cron-parser": "^5.5.0",
+		"e2b": "^2.64.0",
 		"graphology": "^0.26.0",
 		"graphology-communities-louvain": "^2.0.2",
 		"pg": "8.23.1",

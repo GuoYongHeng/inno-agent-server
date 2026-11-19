@@ -243,6 +243,45 @@ export interface InnoConfig {
 	tavily?: {
 		apiKey: string;
 	};
+	sandbox?: Partial<InnoSandboxConfig>;
+}
+
+/**
+ * Remote sandbox for shell and file tools (E2B-compatible). Platform-level: it is
+ * read from the server's own config and environment, never from a tenant's
+ * config, so a tenant cannot point the server at a sandbox endpoint of its choosing.
+ */
+export interface InnoSandboxConfig {
+	enabled: boolean;
+	provider: "e2b";
+	/** Falls back to the E2B_API_KEY environment variable. */
+	apiKey?: string;
+	/** Self-hosted or regional E2B domain; the E2B cloud when omitted. */
+	domain?: string;
+	/** Template (image) to boot; the provider default when omitted. */
+	template?: string;
+	/** Sandbox lifetime between uses, in minutes. */
+	timeoutMinutes: number;
+	/** Upper bound for one shell command, in seconds. */
+	commandTimeoutSeconds: number;
+	allowInternetAccess: boolean;
+	/** Ask the user before each shell command. Headless runs cannot ask, so they are denied. */
+	requireApproval: "always" | "never";
+}
+
+export function normalizeSandboxConfig(raw: Partial<InnoSandboxConfig> | undefined, env: NodeJS.ProcessEnv = process.env): InnoSandboxConfig {
+	const positive = (value: unknown, fallback: number) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback);
+	return {
+		enabled: raw?.enabled ?? env.INNO_SANDBOX_ENABLED === "true",
+		provider: "e2b",
+		...(raw?.apiKey?.trim() || env.E2B_API_KEY?.trim() ? { apiKey: raw?.apiKey?.trim() || env.E2B_API_KEY!.trim() } : {}),
+		...(raw?.domain?.trim() ? { domain: raw.domain.trim() } : {}),
+		...(raw?.template?.trim() ? { template: raw.template.trim() } : {}),
+		timeoutMinutes: positive(raw?.timeoutMinutes, 30),
+		commandTimeoutSeconds: positive(raw?.commandTimeoutSeconds, 600),
+		allowInternetAccess: raw?.allowInternetAccess !== false,
+		requireApproval: raw?.requireApproval === "never" ? "never" : "always",
+	};
 }
 
 interface LegacyInnoConfig extends Partial<InnoConfig> {
@@ -497,6 +536,7 @@ export function normalizeConfig(
 		scheduler: normalizeSchedulerConfig(config.scheduler),
 		ocrApi: config.ocrApi,
 		tavily: config.tavily,
+		...(config.sandbox ? { sandbox: config.sandbox } : {}),
 	} as InnoConfig;
 }
 

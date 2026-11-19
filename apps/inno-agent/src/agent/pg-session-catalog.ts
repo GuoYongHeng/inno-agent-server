@@ -26,11 +26,12 @@ interface SessionRow {
 	topic_generated: boolean | null;
 	topic_upgraded: boolean | null;
 	conversation_id: string | null;
+	sandbox_id: string | null;
 	created_at: Date;
 	updated_at: Date;
 }
 
-const COLUMNS = "id, workspace_id, name, provider, model_id, origin, archived, message_count, preview, topic_generated, topic_upgraded, conversation_id, created_at, updated_at";
+const COLUMNS = "id, workspace_id, name, provider, model_id, origin, archived, message_count, preview, topic_generated, topic_upgraded, conversation_id, sandbox_id, created_at, updated_at";
 
 /** Patch field -> column. `id` is never patchable and `version` is bumped by every update. */
 const PATCH_COLUMNS: Record<keyof DurableSessionPatch, string> = {
@@ -47,6 +48,7 @@ const PATCH_COLUMNS: Record<keyof DurableSessionPatch, string> = {
 	origin: "origin",
 	archived: "archived",
 	conversationId: "conversation_id",
+	sandboxId: "sandbox_id",
 };
 
 function toRecord(row: SessionRow): DurableSessionRecord {
@@ -65,6 +67,7 @@ function toRecord(row: SessionRow): DurableSessionRecord {
 		...(row.topic_generated !== null ? { topicGenerated: row.topic_generated } : {}),
 		...(row.topic_upgraded !== null ? { topicUpgraded: row.topic_upgraded } : {}),
 		...(row.conversation_id !== null ? { conversationId: row.conversation_id } : {}),
+		...(row.sandbox_id !== null ? { sandboxId: row.sandbox_id } : {}),
 	};
 }
 
@@ -127,15 +130,15 @@ export class PgSessionCatalog implements SessionCatalog {
 				await client.query(
 					`INSERT INTO durable_sessions
 					   (id, tenant_id, workspace_id, name, provider, model_id, origin, archived, message_count, preview,
-					    topic_generated, topic_upgraded, conversation_id, created_at, updated_at)
-					 SELECT $2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz, $15::timestamptz
+					    topic_generated, topic_upgraded, conversation_id, sandbox_id, created_at, updated_at)
+					 SELECT $2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::timestamptz, $16::timestamptz
 					 WHERE EXISTS (SELECT 1 FROM resource_ownership
 					               WHERE tenant_id = $1 AND resource_type = 'session' AND resource_id = $2)
 					 ON CONFLICT (id) DO NOTHING`,
 					[
 						tenant.tenantId, record.id, record.workspaceId, record.name, record.provider, record.modelId,
 						record.origin ?? "web", record.archived, record.messageCount, record.preview,
-						record.topicGenerated ?? null, record.topicUpgraded ?? null, record.conversationId ?? null,
+						record.topicGenerated ?? null, record.topicUpgraded ?? null, record.conversationId ?? null, record.sandboxId ?? null,
 						record.createdAt, record.updatedAt,
 					],
 				);
@@ -189,12 +192,12 @@ export class PgSessionCatalog implements SessionCatalog {
 			await client.query(
 				`INSERT INTO durable_sessions
 				   (id, tenant_id, workspace_id, name, provider, model_id, origin, archived, message_count, preview,
-				    topic_generated, topic_upgraded, conversation_id, created_at, updated_at)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz, $15::timestamptz)`,
+				    topic_generated, topic_upgraded, conversation_id, sandbox_id, created_at, updated_at)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::timestamptz, $16::timestamptz)`,
 				[
 					record.id, tenant.tenantId, record.workspaceId, record.name, record.provider, record.modelId,
 					record.origin ?? "web", record.archived, record.messageCount, record.preview,
-					record.topicGenerated ?? null, record.topicUpgraded ?? null, record.conversationId ?? null,
+					record.topicGenerated ?? null, record.topicUpgraded ?? null, record.conversationId ?? null, record.sandboxId ?? null,
 					record.createdAt, record.updatedAt,
 				],
 			);

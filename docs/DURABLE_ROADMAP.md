@@ -310,6 +310,32 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 **退出标准**：`durable-env.test.ts` 加官方 `registerEnvConformance` 对本地与沙箱实现都通过；符号链接逃逸测试在沙箱下无法逃逸；沙箱服务宕机时工具调用 fail-closed 并可重试，不破坏会话。
 
+#### H2 结果（E2B 云沙箱已跑通，待真实账号验证）
+
+**决定**：数据可以放 E2B 云；先用云把整条链路跑通，沙箱接口按 e2b 的形状定义，后续可换成自建的 e2b 兼容后端而不动上层。
+
+**已实现**（`apps/inno-agent/src/sandbox/`）：
+- `sandbox-backend.ts`：e2b 形状的最小契约（文件读写/列表/重命名、`run`、`keepAlive`、`pause`、`kill`，以及 `SandboxProvider` 的 `create/connect/destroy`）。
+- `e2b-backend.ts`：用 `e2b` SDK 实现；非零退出码是结果不是异常；命令超时与取消会杀掉远端进程；`connect` 找不到沙箱返回 null。
+- `sandbox-env.ts`：把后端适配成 pi-durable 的 `ExecutionEnv`。**通过 pi-durable 自带的 `ExecutionEnv` 一致性用例**（跳过目录监听，harness 与本应用都不调用 `watch`），对象是目录支撑的测试替身；同一套用例也接入了真实 E2B 的集成测试。
+- `sandbox-session.ts`（`SandboxManager`）：每会话一个沙箱的创建、重连、暂停、销毁，沙箱 ID 存进会话目录（文件目录与 PG 表都加了 `sandbox_id` 列，PG 用 `ADD COLUMN IF NOT EXISTS` 平滑升级）。
+- `workspace-sync.ts`：宿主与沙箱工作区的增量双向同步（规则见 `docs/PERMISSIONS.md`），清单持久化，重启后不会整体重传。
+- 运行时：有沙箱时注册 pi-durable 的 `bash` 工具；审批用新增的 `withDurableCommandPermission`（决定按稳定调用 ID 持久化，工具保持不可重放）。提示词加入沙箱说明，技能与工作区路径改写成沙箱路径。
+- 配置：`sandbox` 段与 `INNO_SANDBOX_ENABLED`/`E2B_API_KEY`，平台级，不读租户配置。指标：`inno_sandbox_{created,resumed,paused,destroyed}_total`、各类 `*_errors_total`、`inno_sandbox_bind_ms`、`inno_sandbox_sync_{uploaded,downloaded,skipped}_total`。
+
+**测试**（单元 122 个文件 943 个测试通过，集成 6 个文件 38 个通过，另有 1 个仅在设置 `E2B_API_KEY` 时运行的真实 E2B 用例）：`sandbox-env.test.ts`（一致性 14 项）、`workspace-sync.test.ts`、`e2b-backend.test.ts`（mock SDK：退出码、超时、取消、错误映射、创建参数、重连）、`sandbox-config.test.ts`，以及 `durable-sandbox.test.ts`：用真实的 `DurableSessionService` 与 faux 模型验证 bash 在沙箱里执行、双向同步、宿主编辑下一轮可见、同一沙箱在重新打开时被重连、沙箱丢失后自动重建并重新播种、会话删除时销毁沙箱、无法询问时拒绝需审批的命令。
+
+**未验证**：没有在真实 E2B 账号上跑过。`e2b-live.integration.test.ts` 会在有密钥时验证真实的 create/run/超时/取消/暂停/恢复/销毁，并跑一致性用例；`E2B_API_KEY=... npm run test:integration -- e2b-live`。上线前必须跑一次，并实测以下与云服务相关的数值：暂停与恢复耗时、冷启动耗时、`files.list` 的深度行为、国内访问延迟。
+
+**已知限制与后续**：
+- 一轮中途崩溃，该轮在沙箱里的改动要等下次打开会话时的同步才回到宿主；网页文件面板有一轮延迟。
+- 宿主侧删除不传到沙箱；符号链接、超大文件、被忽略的目录不同步。
+- 孤儿沙箱（会话记录已无，沙箱还在计费）没有清理命令，只能靠沙箱自身的 `timeoutMinutes` 过期；需要一个按 `metadata.app` 列出并比对目录的清理命令。
+- 没有每租户的并发沙箱数与总时长配额；多用户上线前必须加。
+- 网络出站只有开/关；没有域名白名单。
+- 沙箱设置没有网页界面，只能改 `config.json`/环境变量。
+- 每次 `bash` 都经 E2B 往返，长输出不做截断以外的处理（pi-durable 的 bash 工具自己做输出窗口）。
+
 ### H3 记忆、OCR、发件箱、恢复记录迁出本地文件（约 4–6 周）
 
 按风险从低到高分批，每批独立开关：

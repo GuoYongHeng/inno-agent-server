@@ -313,3 +313,36 @@ export function withDurableWorkspacePermission(
 		},
 	};
 }
+
+/**
+ * Approval before a shell command runs in the sandbox. The decision is persisted
+ * by the stable call ID, like workspace approvals, but the tool stays
+ * non-replayable: a command is never silently run twice after a crash. If the
+ * process dies while the card is open, the call returns `interrupted` and the
+ * model may ask again. "Allow for this session" applies to the identical
+ * command only.
+ */
+export function withDurableCommandPermission(
+	tool: ToolRegistration,
+	store: DurablePermissionStore,
+): ToolRegistration {
+	return {
+		...tool,
+		async execute(args, api, context) {
+			const input = args as { command?: unknown };
+			const command = typeof input.command === "string" ? input.command : "";
+			const decision = await store.authorize(api.callId, {
+				toolName: tool.name,
+				path: command.slice(0, 500),
+				preview: command.slice(0, 4_000),
+			}, context.abortSignal ?? new AbortController().signal);
+			if (decision.kind === "deny") {
+				return {
+					output: [{ type: "text", text: decision.reason ?? "Command denied." }],
+					isError: true,
+				};
+			}
+			return tool.execute(args, api, context);
+		},
+	};
+}

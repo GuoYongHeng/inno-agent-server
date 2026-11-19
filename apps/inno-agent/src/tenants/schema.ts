@@ -43,10 +43,13 @@ CREATE TABLE IF NOT EXISTS durable_sessions (
 	topic_generated boolean,
 	topic_upgraded boolean,
 	conversation_id text,
+	sandbox_id text,
 	version integer NOT NULL DEFAULT 0,
 	created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE durable_sessions ADD COLUMN IF NOT EXISTS sandbox_id text;
 
 CREATE INDEX IF NOT EXISTS durable_sessions_tenant_updated_idx
 	ON durable_sessions (tenant_id, updated_at DESC);

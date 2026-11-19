@@ -23,7 +23,9 @@ import {
 	type UserInput,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { SandboxExecutionEnv } from "../sandbox/sandbox-env.js";
+import type { SandboxRuntimeBinding } from "../sandbox/sandbox-session.js";
 import { pruneCompletedChannelOutboxForIdleSession } from "../channels/channel-outbox.js";
 import { logger } from "../logger.js";
 import { WorkspaceFileEnv } from "./durable-env.js";
@@ -32,6 +34,7 @@ import { createDurableChannelRegistrations, type DurableChannelToolOptions } fro
 import { createDurableMemoryRegistrations, type DurableMemoryToolOptions } from "./durable-memory.js";
 import { createDurableOcrRegistrations, type DurableOcrToolOptions } from "./durable-ocr.js";
 import {
+	withDurableCommandPermission,
 	withDurableWorkspacePermission,
 	type DurablePermissionBinding,
 	type DurablePermissionStore,
@@ -108,6 +111,8 @@ export interface DurableSessionRuntimeOptions {
 	/** Completed recovery-record retention; cleanup runs only with no live work. */
 	recoveryRetentionMs?: number;
 	registry?: Registry;
+	/** Run shell and file tools inside this remote sandbox instead of on the host. */
+	sandbox?: SandboxRuntimeBinding;
 }
 
 export interface DurableSubmission {
@@ -134,14 +139,36 @@ function textFromAssistant(message: AssistantMessage): string {
 		.trim();
 }
 
-function createWorkspaceFileTools(permissions?: DurablePermissionStore) {
+function createWorkspaceFileTools(permissions?: DurablePermissionStore, sandbox?: SandboxRuntimeBinding) {
 	const write = createWriteTool();
 	const edit = createEditTool();
-	return [
+	const tools: ToolRegistration[] = [
 		createReadTool(),
 		permissions ? withDurableWorkspacePermission(write, permissions) : write,
 		permissions ? withDurableWorkspacePermission(edit, permissions) : edit,
 	];
+	if (sandbox) {
+		const bash = createBashTool();
+		tools.push(sandbox.requireApproval && permissions ? withDurableCommandPermission(bash, permissions) : bash);
+	}
+	return tools;
+}
+
+/** Tools that read or write the HOST workspace by path. With a sandbox, what the
+ * agent just made lives in the sandbox, so bring it to the host first. */
+const HOST_PATH_TOOLS = new Set(["parse_document", "l2_archive", "ocr_image", "send_file_to_channel"]);
+
+function pullBeforeHostPathTools(tools: ToolRegistration[], sandbox?: SandboxRuntimeBinding): ToolRegistration[] {
+	if (!sandbox) return tools;
+	return tools.map((tool) => HOST_PATH_TOOLS.has(tool.name)
+		? {
+			...tool,
+			async execute(args, api, context) {
+				await sandbox.pullToHost();
+				return tool.execute(args, api, context);
+			},
+		}
+		: tool);
 }
 
 function createSessionRegistry(
@@ -152,30 +179,31 @@ function createSessionRegistry(
 	questionTools: ToolRegistration[] = [],
 	permissions?: DurablePermissionStore,
 	extraTools: ToolRegistration[] = [],
+	sandbox?: SandboxRuntimeBinding,
 ): Registry {
 	const registry = createRegistry();
 	if (workspaceTools) {
 		registry.install(defineExtension({
 			name: WORKSPACE_EXTENSION_NAME,
-			tools: createWorkspaceFileTools(permissions),
+			tools: createWorkspaceFileTools(permissions, sandbox),
 		}));
 	}
 	if (memory) {
 		registry.install(defineExtension({
 			name: MEMORY_EXTENSION_NAME,
-			tools: createDurableMemoryRegistrations(memory),
+			tools: pullBeforeHostPathTools(createDurableMemoryRegistrations(memory), sandbox),
 		}));
 	}
 	if (ocr) {
 		registry.install(defineExtension({
 			name: OCR_EXTENSION_NAME,
-			tools: createDurableOcrRegistrations(ocr),
+			tools: pullBeforeHostPathTools(createDurableOcrRegistrations(ocr), sandbox),
 		}));
 	}
 	if (channels) {
 		registry.install(defineExtension({
 			name: CHANNEL_EXTENSION_NAME,
-			tools: createDurableChannelRegistrations(channels),
+			tools: pullBeforeHostPathTools(createDurableChannelRegistrations(channels), sandbox),
 		}));
 	}
 	if (questionTools.length > 0) {
@@ -187,7 +215,7 @@ function createSessionRegistry(
 	if (extraTools.length > 0) {
 		registry.install(defineExtension({
 			name: EXTRA_EXTENSION_NAME,
-			tools: extraTools,
+			tools: pullBeforeHostPathTools(extraTools, sandbox),
 		}));
 	}
 	return registry;
@@ -207,6 +235,7 @@ export class DurableSessionRuntime {
 		private readonly questions?: DurableQuestionStore,
 		readonly contextInfo: DurableContextInfo = { instructions: "", tools: [] },
 		private readonly agentConfig: AgentConfig = {},
+		private readonly sandbox?: SandboxRuntimeBinding,
 	) {}
 
 	static async open(options: DurableSessionRuntimeOptions): Promise<DurableSessionRuntime> {
@@ -221,19 +250,24 @@ export class DurableSessionRuntime {
 			const questionTools = options.questions
 				? await createDurableQuestionRegistrations(options.questions)
 				: [];
-			const registry = options.registry ?? createSessionRegistry(workspaceTools, options.memory, options.ocr, options.channels, questionTools, options.permissions, options.extraTools);
+			const registry = options.registry ?? createSessionRegistry(workspaceTools, options.memory, options.ocr, options.channels, questionTools, options.permissions, options.extraTools, options.sandbox);
 			const memoryTools = options.memory ? createDurableMemoryRegistrations(options.memory) : [];
 			const ocrTools = options.ocr ? createDurableOcrRegistrations(options.ocr) : [];
 			const channelTools = options.channels ? createDurableChannelRegistrations(options.channels) : [];
-			const tools = [...memoryTools, ...ocrTools, ...channelTools, ...questionTools, ...(options.extraTools ?? [])];
+			const tools = pullBeforeHostPathTools(
+				[...memoryTools, ...ocrTools, ...channelTools, ...questionTools, ...(options.extraTools ?? [])],
+				options.sandbox,
+			);
 			const harness = await Harness.open(
 				await openNodeSqliteStorage(storagePath),
 				{
 					models: withNativeImageFallback(options.models),
 					registry,
-					env: options.workspaceDir
-						? () => new WorkspaceFileEnv(options.workspaceDir!)
-						: undefined,
+					env: options.sandbox
+						? () => new SandboxExecutionEnv(options.sandbox!.backend, options.sandbox!.remoteRoot)
+						: options.workspaceDir
+							? () => new WorkspaceFileEnv(options.workspaceDir!)
+							: undefined,
 				},
 				BACKGROUND_CONTEXT,
 			);
@@ -241,8 +275,8 @@ export class DurableSessionRuntime {
 				const agentConfig = {
 					model: options.model,
 					instructions: options.instructions,
-					cwd: options.workspaceDir,
-					...(workspaceTools ? { tools: [...createWorkspaceFileTools(options.permissions), ...tools] } : { tools }),
+					cwd: options.sandbox?.remoteRoot ?? options.workspaceDir,
+					...(workspaceTools ? { tools: [...createWorkspaceFileTools(options.permissions, options.sandbox), ...tools] } : { tools }),
 				};
 				const root = await harness.root(BACKGROUND_CONTEXT, { agent: agentConfig });
 				let rootConversation = root;
@@ -272,7 +306,7 @@ export class DurableSessionRuntime {
 					}
 				}
 				harness.resume();
-				const contextTools = [...(workspaceTools ? createWorkspaceFileTools(options.permissions) : []), ...tools];
+				const contextTools = [...(workspaceTools ? createWorkspaceFileTools(options.permissions, options.sandbox) : []), ...tools];
 				return new DurableSessionRuntime(
 					storagePath,
 					harness,
@@ -289,6 +323,7 @@ export class DurableSessionRuntime {
 						})),
 					},
 					agentConfig,
+					options.sandbox,
 				);
 			} catch (error) {
 				await harness.close(BACKGROUND_CONTEXT).catch(() => undefined);
@@ -304,6 +339,7 @@ export class DurableSessionRuntime {
 	 * conversation returns the original durable submission. */
 	async submit(content: UserInput, requestId: string): Promise<DurableSubmission> {
 		if (!requestId.trim()) throw new Error("A durable requestId is required");
+		await this.sandbox?.beforeTurn();
 		const submission = await this.rootConversation.submit({
 			type: "input",
 			content,
@@ -346,6 +382,7 @@ export class DurableSessionRuntime {
 		const submission = await this.harness.submission(id, context);
 		if (!submission) throw new Error(`Durable submission not found: ${id}`);
 		const settled = await submission.wait(context);
+		await this.sandbox?.pullToHost();
 		if (settled.status === "unanswered") {
 			return {
 				id,
@@ -463,6 +500,7 @@ export class DurableSessionRuntime {
 			this.permissions?.unbindTurn();
 			this.questions?.unbindTurn();
 			await this.harness.close(BACKGROUND_CONTEXT);
+			await this.sandbox?.release();
 		} finally {
 			openStoragePaths.delete(this.ownsStoragePath);
 		}

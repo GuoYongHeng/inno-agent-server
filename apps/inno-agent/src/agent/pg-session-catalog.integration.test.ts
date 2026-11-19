@@ -67,7 +67,7 @@ afterAll(async () => {
 
 describe("PgSessionCatalog", () => {
 	it("writes ownership and the catalog row together and round-trips every field", async () => {
-		const full = record(uuid(1), { name: "Rust", topicGenerated: true, topicUpgraded: false, conversationId: "7", archived: true, origin: "scheduler", messageCount: 3, preview: "hi" });
+		const full = record(uuid(1), { name: "Rust", topicGenerated: true, topicUpgraded: false, conversationId: "7", sandboxId: "sbx-1", archived: true, origin: "scheduler", messageCount: 3, preview: "hi" });
 		await catalog.insert(reqA, full);
 		expect(await catalog.get(reqA, full.id)).toEqual(full);
 		expect(await store.ownsResource(a, "session", full.id)).toBe(true);
@@ -101,9 +101,10 @@ describe("PgSessionCatalog", () => {
 			catalog.update(reqA, id, { preview: "latest" }),
 			catalog.update(reqA, id, { provider: "p2", modelId: "m2" }),
 			catalog.update(reqA, id, { archived: true }),
+			catalog.update(reqA, id, { sandboxId: "sbx-9" }),
 		]);
-		expect(await catalog.get(reqA, id)).toMatchObject({ name: "renamed", messageCount: 9, preview: "latest", provider: "p2", modelId: "m2", archived: true });
-		expect((await pool.query("SELECT version FROM durable_sessions WHERE id = $1", [id])).rows[0].version).toBe(5);
+		expect(await catalog.get(reqA, id)).toMatchObject({ name: "renamed", messageCount: 9, preview: "latest", provider: "p2", modelId: "m2", archived: true, sandboxId: "sbx-9" });
+		expect((await pool.query("SELECT version FROM durable_sessions WHERE id = $1", [id])).rows[0].version).toBe(6);
 	});
 
 	it("keeps every session under concurrent creates", async () => {

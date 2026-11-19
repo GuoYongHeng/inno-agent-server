@@ -22,6 +22,8 @@ export interface DurableSessionRecord {
 	/** The conversation the session continues in after an earlier message was
 	 * edited. Omitted: the root conversation. */
 	conversationId?: string;
+	/** The remote sandbox this session runs shell and file tools in, once one exists. */
+	sandboxId?: string;
 }
 
 export const DURABLE_ID_PATTERN = /^durable-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

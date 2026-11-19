@@ -4,6 +4,8 @@ import "source-map-support/register.js";
 
 import { auditDurableData } from "./agent/durable-audit.js";
 import { PgSessionCatalog } from "./agent/pg-session-catalog.js";
+import { createSandboxManager } from "./sandbox/index.js";
+import type { SandboxManager } from "./sandbox/sandbox-session.js";
 import { renderPrometheus } from "./utils/metrics.js";
 import { createServer, type IncomingMessage as HttpReq } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -12,7 +14,7 @@ import { cpSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeF
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
-import { loadConfig, type InnoConfig } from "./config.js";
+import { loadConfig, normalizeSandboxConfig, type InnoConfig } from "./config.js";
 import { installFetchLogger } from "./utils/fetch-logger.js";
 import { applyProviderProxyBypass } from "./utils/proxy-bypass.js";
 import { ensureDir, readJson, readText, writeJson, writeText } from "./storage/file-store.js";
@@ -154,6 +156,7 @@ async function ensureBootstrapped(): Promise<void> {
 		// ---- config (loaded lazily, not at process start) ----
 		config = loadConfig(paths.configPath);
 		applyProviderProxyBypass(config);
+		getSandboxManager(); // fail fast on a sandbox config that cannot work
 
 		// ---- data directories ----
 		ensureDir(paths.learnerDataDir);
@@ -981,6 +984,17 @@ async function recordJobRunSession(sessionId: string, req?: HttpReq): Promise<vo
 // HTTP Server
 // ---------------------------------------------------------------------------
 
+// Platform-level sandbox, built on first use because the config is loaded lazily.
+let sandboxManager: SandboxManager | null | undefined;
+function getSandboxManager(): SandboxManager | undefined {
+	if (sandboxManager === undefined) {
+		const sandboxConfig = normalizeSandboxConfig(config?.sandbox);
+		sandboxManager = sandboxConfig.enabled ? createSandboxManager(sandboxConfig) : null;
+		if (sandboxManager) console.log(`[inno-server] sandbox enabled (${sandboxConfig.provider}, approval: ${sandboxConfig.requireApproval})`);
+	}
+	return sandboxManager ?? undefined;
+}
+
 const durableSessions = new DurableSessionService({
 	dataDir,
 	getLocalConfig: () => config,
@@ -1005,6 +1019,7 @@ const durableSessions = new DurableSessionService({
 		},
 	}),
 	tenantStore: auth.tenantStore,
+	getSandboxManager,
 	...(auth.tenantStore ? {
 		pgCatalog: new PgSessionCatalog(auth.tenantStore.database, (req) => join(resolveRequestTenantDataRoot(req, dataDir), "durable", "sessions.json")),
 	} : {}),

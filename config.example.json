@@ -69,5 +69,14 @@
 		"token": "",
 		"model": "PaddleOCR-VL-1.6",
 		"baseUrl": "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+	},
+	"sandbox": {
+		"enabled": false,
+		"provider": "e2b",
+		"apiKey": "",
+		"requireApproval": "always",
+		"timeoutMinutes": 30,
+		"commandTimeoutSeconds": 600,
+		"allowInternetAccess": true
 	}
 }

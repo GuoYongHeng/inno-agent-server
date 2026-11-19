@@ -1,4 +1,5 @@
 import { incCounter, observeMs } from "../utils/metrics.js";
+import type { SandboxManager, SandboxRuntimeBinding } from "../sandbox/sandbox-session.js";
 import {
 	DURABLE_ID_PATTERN,
 	FileSessionCatalog,
@@ -116,6 +117,8 @@ export interface DurableSessionServiceOptions {
 	tenantStore?: TenantStore | null;
 	/** PostgreSQL catalog for authenticated tenants; without it every scope uses `sessions.json`. */
 	pgCatalog?: SessionCatalog;
+	/** When set, every session runs its shell and file tools in a remote sandbox. */
+	getSandboxManager?: () => SandboxManager | undefined;
 	openRuntime?: typeof DurableSessionRuntime.open;
 	completeTopic?: typeof completeConfiguredDurablePrompt;
 	completeChat?: typeof completeConfiguredDurableChat;
@@ -856,15 +859,31 @@ export class DurableSessionService {
 							workspaceDir,
 							channelRegistry: bindChannelRegistry(req, baseChannelRegistry, this.options.tenantStore),
 						} : undefined;
+						const sandboxManager = this.options.getSandboxManager?.();
+						const sandbox: SandboxRuntimeBinding | undefined = sandboxManager
+							? await sandboxManager.bind({
+								sessionId: id,
+								...(tenant ? { tenantId: tenant.tenantId } : {}),
+								...(record.sandboxId ? { sandboxId: record.sandboxId } : {}),
+								hostWorkspaceDir: workspaceDir,
+								...(this.options.skillsDir ? { hostSkillsDir: this.options.skillsDir } : {}),
+								stateDir: join(this.root(req), "storage", id),
+								persistSandboxId: async (sandboxId) => { await this.update(req, id, { sandboxId }); },
+							})
+							: undefined;
 						const runtime = await this.openRuntime({
 							storagePath: this.storagePath(req, id),
 							...selection,
 							...(record.conversationId ? { conversationId: record.conversationId } : {}),
 							instructions: [
 								buildDurableInstructions(INNO_SYSTEM_PROMPT, memory),
-								buildGlobalSkillsSection(this.options.skillsDir),
-								...buildWorkspaceContextSections(workspaceDir),
+								sandbox?.promptSection,
+								sandbox
+									? sandbox.rebasePaths(buildGlobalSkillsSection(this.options.skillsDir) ?? "")
+									: buildGlobalSkillsSection(this.options.skillsDir),
+								...buildWorkspaceContextSections(workspaceDir).map((section) => sandbox ? sandbox.rebasePaths(section) : section),
 							].filter((section): section is string => Boolean(section)).join("\n\n"),
+							...(sandbox ? { sandbox } : {}),
 							workspaceDir,
 							workspaceTools: true,
 							permissions: this.permissionStore(req, id),
@@ -880,6 +899,9 @@ export class DurableSessionService {
 								...createTavilyTools({ current: config }),
 								...bindToolsToTenant(this.options.getSchedulerTools?.() ?? [], tenant, this.options.tenantStore),
 							],
+						}).catch(async (error: unknown) => {
+							await sandbox?.release().catch(() => undefined);
+							throw error;
 						});
 						return { runtime, ...(storageLock ? { storageLock } : {}) };
 					} catch (error) {
@@ -952,6 +974,9 @@ export class DurableSessionService {
 			this.runtimes.delete(key);
 			await this.closeRuntimeEntry(entry);
 		}
+		const sandboxId = (await this.get(req, id))?.sandboxId;
+		const sandboxManager = this.options.getSandboxManager?.();
+		if (sandboxId && sandboxManager) await sandboxManager.destroy(sandboxId);
 		await this.catalogFor(req).remove(req, id);
 		this.questionStores.delete(key);
 		this.permissionStores.delete(key);
