@@ -212,6 +212,33 @@ S4 期间发现并修复的回归：
 
 **退出标准**：上述测试进入 CI；产出已知问题清单和容量基线。
 
+#### H0 结果（已执行部分）
+
+测试在 `apps/inno-agent/src/agent/durable-h0-safety-net.test.ts`，已进入单元测试套件。标记为 `it.fails` 的用例钉住**已知缺陷**：缺陷修复后它们会开始失败，届时必须去掉标记。
+
+**已知问题清单**
+
+| # | 问题 | 证据 | 影响 | 归属 |
+|---|---|---|---|---|
+| K1 ✅已修复 | `WorkspaceFileEnv` 检查后按路径打开（TOCTOU）：检查通过后把文件换成指向工作区外的符号链接，读写都会逃逸 | 确定性用例（读、写各一）；压力探针 5 秒内 7813 次读取泄露 7 次 | 模型本身无法创建符号链接（没有 shell、写工具只写文件），所以需要工作区里已有并发修改文件的第二方（同工作区的另一进程、同步盘）；多租户下每租户独立工作区，风险限于同租户 | 已修：`readTextFile`/`readBinaryFile`/`writeFile` 改为解析真实路径后以 `O_NOFOLLOW` 打开，并校验 fd 与路径解析结果同一 inode 且仍在工作区内，写入在校验后才截断；回归测试含 1.5 秒翻转压力。未覆盖：行读取器/二进制读取器等次要读接口仍按路径打开，写入时父目录被换成链接可能在工作区外新建空文件（不会覆盖已有数据）；彻底隔离仍属 H2 |
+| K2 ✅已修复 | `sessions.json` 跨进程读改写会丢更新，且 `writeJson` 用固定的 `.tmp` 文件名，并发写会让 `rename` 抛 ENOENT | 4 个进程各 200 次追加，期望 800 条，实际 200 条，3 个进程崩溃 | 同一数据目录只能有一个进程写目录；Electron 与服务共用目录、多 worker 共享目录时都会触发 | 已修：`writeJson`/`writeJsonl`/`writeText` 用进程+计数的唯一临时文件名；目录的读改写走 `storage/file-lock.ts` 跨进程锁（mkdir 原子锁，死进程锁自动清理）。4 进程×60 次追加测试无丢失。锁只保护同机多进程；多机/多 worker 共享目录仍需 H1 |
+| K3 | `delete` 先写目录后删数据，中间崩溃留下孤儿目录（`storage/`、`questions/`、`permissions/`） | 用例模拟该窗口 | 磁盘泄漏，无数据正确性问题 | 已提供 `durable-orphans.ts`（`findOrphanedSessionData` 只读检查、`removeOrphanedSessionData` 修复）；尚未接入启动自检或运维命令 |
+
+同一进程内的目录操作是同步读改写，没有 `await` 穿插，40 个交错的 create/rename 与两个服务实例交替写都没有丢更新，所以"单进程"这个前提在代码里成立；失效的只有跨进程路径（K2）。
+
+**`replay: "safe"` 复核**：只读工具（`get_learner_context`、`assess_learning_prerequisites`、`review_learner_profile`、`l2_query`、`l2_lint`、`l3_recall`）无副作用；`record_learning_event`、`record_learning_evidence`、`patch_learner_profile`、`update_learner_profile` 用 session+toolCallId 的持久操作标记；`l2_archive` 靠内容哈希去重与可续写的 manifest 记录；提问与写入审批靠按稳定调用 ID 持久化的决定；`ocr_image` 与 `send_file_to_channel` 有 job-ID 检查点与外发队列，提交/外发窗口仍是至少一次。没有发现需要降级的工具。记忆工具集合已用测试钉住，新增 safe 工具必须在测试注释里写明依据。
+
+**容量基线**（`sessions.json`，每租户一份；单次同步读改写，会阻塞事件循环）：
+
+| 会话数 | 文件大小 | 读 | 更新（读+写） |
+|---|---|---|---|
+| 100 | 0.05 MB | 0.2 ms | 0.4 ms |
+| 1,000 | 0.45 MB | 1.0 ms | 1.9 ms |
+| 10,000 | 4.6 MB | 11.8 ms | 18.5 ms |
+| 100,000 | 45.6 MB | 125.6 ms | 224.9 ms |
+
+每次改名、模型切换、话题生成和 `get` 都会读整个文件，1 万会话以内可接受，10 万会话时单次更新 200ms 以上。**尚未做**：每租户磁盘占用、advisory lock 获取/丢失次数的指标（需要在服务里埋点，放到 H1 前一起做）。
+
 ### H1 会话目录迁移到 PostgreSQL（约 2–3 周，依赖 S3）
 
 归属与目录在同一事务内。表设计草案（字段以 `DurableSessionRecord` 为准）：

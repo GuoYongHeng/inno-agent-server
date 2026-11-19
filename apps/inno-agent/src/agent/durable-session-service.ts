@@ -1,3 +1,4 @@
+import { withFileLock } from "../storage/file-lock.js";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
@@ -361,6 +362,11 @@ export class DurableSessionService {
 		return Array.isArray(value) ? value.filter(isRecord) : [];
 	}
 
+	/** Cross-process critical section for catalog read-modify-write. */
+	private mutateCatalog<T>(req: IncomingMessage, operation: () => T): T {
+		return withFileLock(`${this.catalogPath(req)}.lock`, operation);
+	}
+
 	private writeCatalog(req: IncomingMessage, records: DurableSessionRecord[]): void {
 		writeJson(this.catalogPath(req), records);
 	}
@@ -401,18 +407,20 @@ export class DurableSessionService {
 			origin: input.origin ?? "web",
 			archived: false,
 		};
-		this.writeCatalog(req, [...this.catalog(req), record]);
+		this.mutateCatalog(req, () => this.writeCatalog(req, [...this.catalog(req), record]));
 		return toSummary(record);
 	}
 
 	private update(req: IncomingMessage, id: string, update: Partial<DurableSessionRecord>): DurableSessionRecord {
-		const records = this.catalog(req);
-		const index = records.findIndex((record) => record.id === id);
-		if (index < 0) throw new Error("Durable session not found");
-		const next = { ...records[index]!, ...update };
-		records[index] = next;
-		this.writeCatalog(req, records);
-		return next;
+		return this.mutateCatalog(req, () => {
+			const records = this.catalog(req);
+			const index = records.findIndex((record) => record.id === id);
+			if (index < 0) throw new Error("Durable session not found");
+			const next = { ...records[index]!, ...update };
+			records[index] = next;
+			this.writeCatalog(req, records);
+			return next;
+		});
 	}
 
 	rename(req: IncomingMessage, id: string, name: string): DurableSessionSummary {
@@ -978,7 +986,7 @@ export class DurableSessionService {
 			this.runtimes.delete(key);
 			await this.closeRuntimeEntry(entry);
 		}
-		this.writeCatalog(req, this.catalog(req).filter((record) => record.id !== id));
+		this.mutateCatalog(req, () => this.writeCatalog(req, this.catalog(req).filter((record) => record.id !== id)));
 		this.questionStores.delete(key);
 		this.permissionStores.delete(key);
 		const dataRoot = resolveRequestTenantDataRoot(req, this.options.dataDir);
