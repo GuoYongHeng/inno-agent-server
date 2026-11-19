@@ -866,6 +866,7 @@ export class DurableSessionService {
 								...(tenant ? { tenantId: tenant.tenantId } : {}),
 								...(record.sandboxId ? { sandboxId: record.sandboxId } : {}),
 								hostWorkspaceDir: workspaceDir,
+								countTenantSandboxes: async () => (await this.catalogFor(req).list(req)).filter((entry) => entry.sandboxId).length,
 								...(this.options.skillsDir ? { hostSkillsDir: this.options.skillsDir } : {}),
 								stateDir: join(this.root(req), "storage", id),
 								persistSandboxId: async (sandboxId) => { await this.update(req, id, { sandboxId }); },

@@ -1,9 +1,10 @@
 import type { InnoSandboxConfig } from "../config.js";
 import { E2BSandboxProvider } from "./e2b-backend.js";
+import type { SandboxQuotaStore } from "./sandbox-quota.js";
 import { SandboxManager } from "./sandbox-session.js";
 
 /** Build the sandbox manager for the server's platform config, or throw on a config that cannot work. */
-export function createSandboxManager(config: InnoSandboxConfig): SandboxManager {
+export function createSandboxManager(config: InnoSandboxConfig, quota?: SandboxQuotaStore): SandboxManager {
 	if (!config.apiKey) {
 		throw new Error("Sandbox is enabled but no API key is set: provide sandbox.apiKey in config.json or the E2B_API_KEY environment variable");
 	}
@@ -15,5 +16,5 @@ export function createSandboxManager(config: InnoSandboxConfig): SandboxManager 
 		defaultCommandTimeoutMs: config.commandTimeoutSeconds * 1000,
 		allowInternetAccess: config.allowInternetAccess,
 		requestTimeoutMs: 60_000,
-	}), config);
+	}), config, quota);
 }

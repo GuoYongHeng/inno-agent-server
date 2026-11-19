@@ -41,7 +41,8 @@ durable 会话只注册三个文件工具：`read`、`write`、`edit`。它们�
 
 ```json
 { "sandbox": { "enabled": true, "apiKey": "e2b_...", "requireApproval": "always",
-  "timeoutMinutes": 30, "commandTimeoutSeconds": 600, "allowInternetAccess": true } }
+  "timeoutMinutes": 30, "commandTimeoutSeconds": 600, "allowInternetAccess": true,
+  "limits": { "maxConcurrent": 3, "maxSandboxes": 20, "maxActiveMinutesPerDay": 480 } } }
 ```
 
 也可用 `INNO_SANDBOX_ENABLED=true` 加 `E2B_API_KEY`。启用但没有密钥时，服务在启动引导阶段直接报错。`domain` 可指向自部署的 e2b 兼容服务，`template` 指定镜像。改配置需要重启。
@@ -52,6 +53,13 @@ durable 会话只注册三个文件工具：`read`、`write`、`edit`。它们�
 - 全局技能目录同步到沙箱的 `/home/user/.inno/skills`，提示词里的路径相应改写。
 - **审批**：`requireApproval` 为 `always`（默认）时每条 shell 命令都要在网页上批准（"本会话允许"只对完全相同的命令生效）；`never` 时不询问。非流式或无头运行（定时任务、IM 渠道）无法询问，在 `always` 下 shell 会被拒绝。
 - **崩溃恢复**：`bash` 不可重放，进程崩溃后该次调用返回 `interrupted`，不会重复执行；审批卡片未决时崩溃，模型需要重新发起。
+
+**每租户配额**（`sandbox.limits`，0 表示不限；本地模式把整个本机当作一个租户）：
+- `maxConcurrent`：同一租户同时运行的沙箱数（每个打开的会话占一个），默认 3。
+- `maxSandboxes`：同一租户拥有的沙箱总数（含已暂停的），默认 20；超过后不再为新会话创建沙箱，删除会话即释放。
+- `maxActiveMinutesPerDay`：同一租户每个 UTC 日的沙箱运行分钟数，默认 480。
+- 超限时**会话照常打开、历史照常可看**，只是沙箱关闭：`bash` 和文件工具会返回超限原因，模型会如实告诉用户。之后每一轮都会重试，容量释放或次日重置后自动恢复，无需手动处理。一轮进行中不会被打断，所以时长可能超出上限一轮。
+- 认证模式下账目在 PostgreSQL（`sandbox_leases`、`sandbox_usage`），所有 worker 共享；每次判定在租户级咨询锁内进行，并发打开不会同时越过上限。持有租约的 worker 崩溃后，租约 10 分钟没有心跳即被回收，时长计到最后一次心跳。本地模式的账目在进程内。
 
 **限制**：沙箱内的文件修改要等一轮结束才回到宿主，所以网页的文件面板有一轮的延迟；一轮进行中崩溃，那一轮在沙箱里的修改要等下次打开会话时的同步才回到宿主；沙箱是云服务，工作区文件内容会离开本机。
 

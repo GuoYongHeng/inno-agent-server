@@ -54,6 +54,22 @@ ALTER TABLE durable_sessions ADD COLUMN IF NOT EXISTS sandbox_id text;
 CREATE INDEX IF NOT EXISTS durable_sessions_tenant_updated_idx
 	ON durable_sessions (tenant_id, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS sandbox_leases (
+	session_id text PRIMARY KEY,
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	started_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	heartbeat_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS sandbox_leases_tenant_idx ON sandbox_leases (tenant_id);
+
+CREATE TABLE IF NOT EXISTS sandbox_usage (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	day date NOT NULL,
+	active_ms bigint NOT NULL DEFAULT 0,
+	PRIMARY KEY (tenant_id, day)
+);
+
 CREATE TABLE IF NOT EXISTS job_run_claims (
 	occurrence_id text PRIMARY KEY,
 	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,

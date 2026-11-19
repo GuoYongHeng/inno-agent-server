@@ -1,3 +1,4 @@
+import { DEFAULT_SANDBOX_LIMITS, type SandboxLimits } from "./sandbox/sandbox-quota.js";
 import { chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { RuntimePaths } from "./runtime.js";
@@ -243,7 +244,7 @@ export interface InnoConfig {
 	tavily?: {
 		apiKey: string;
 	};
-	sandbox?: Partial<InnoSandboxConfig>;
+	sandbox?: Omit<Partial<InnoSandboxConfig>, "limits"> & { limits?: Partial<SandboxLimits> };
 }
 
 /**
@@ -267,9 +268,12 @@ export interface InnoSandboxConfig {
 	allowInternetAccess: boolean;
 	/** Ask the user before each shell command. Headless runs cannot ask, so they are denied. */
 	requireApproval: "always" | "never";
+	/** Per-tenant limits; 0 means unlimited. */
+	limits: SandboxLimits;
 }
 
-export function normalizeSandboxConfig(raw: Partial<InnoSandboxConfig> | undefined, env: NodeJS.ProcessEnv = process.env): InnoSandboxConfig {
+export function normalizeSandboxConfig(raw: (Omit<Partial<InnoSandboxConfig>, "limits"> & { limits?: Partial<SandboxLimits> }) | undefined, env: NodeJS.ProcessEnv = process.env): InnoSandboxConfig {
+	const nonNegative = (value: unknown, fallback: number) => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback);
 	const positive = (value: unknown, fallback: number) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback);
 	return {
 		enabled: raw?.enabled ?? env.INNO_SANDBOX_ENABLED === "true",
@@ -281,6 +285,11 @@ export function normalizeSandboxConfig(raw: Partial<InnoSandboxConfig> | undefin
 		commandTimeoutSeconds: positive(raw?.commandTimeoutSeconds, 600),
 		allowInternetAccess: raw?.allowInternetAccess !== false,
 		requireApproval: raw?.requireApproval === "never" ? "never" : "always",
+		limits: {
+			maxConcurrent: nonNegative(raw?.limits?.maxConcurrent, DEFAULT_SANDBOX_LIMITS.maxConcurrent),
+			maxSandboxes: nonNegative(raw?.limits?.maxSandboxes, DEFAULT_SANDBOX_LIMITS.maxSandboxes),
+			maxActiveMinutesPerDay: nonNegative(raw?.limits?.maxActiveMinutesPerDay, DEFAULT_SANDBOX_LIMITS.maxActiveMinutesPerDay),
+		},
 	};
 }
 

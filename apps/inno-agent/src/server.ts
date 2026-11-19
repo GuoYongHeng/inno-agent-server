@@ -5,6 +5,7 @@ import "source-map-support/register.js";
 import { auditDurableData } from "./agent/durable-audit.js";
 import { PgSessionCatalog } from "./agent/pg-session-catalog.js";
 import { createSandboxManager } from "./sandbox/index.js";
+import { PgSandboxQuotaStore } from "./sandbox/pg-sandbox-quota.js";
 import type { SandboxManager } from "./sandbox/sandbox-session.js";
 import { renderPrometheus } from "./utils/metrics.js";
 import { createServer, type IncomingMessage as HttpReq } from "node:http";
@@ -989,7 +990,9 @@ let sandboxManager: SandboxManager | null | undefined;
 function getSandboxManager(): SandboxManager | undefined {
 	if (sandboxManager === undefined) {
 		const sandboxConfig = normalizeSandboxConfig(config?.sandbox);
-		sandboxManager = sandboxConfig.enabled ? createSandboxManager(sandboxConfig) : null;
+		sandboxManager = sandboxConfig.enabled
+			? createSandboxManager(sandboxConfig, auth.tenantStore ? new PgSandboxQuotaStore(auth.tenantStore.database) : undefined)
+			: null;
 		if (sandboxManager) console.log(`[inno-server] sandbox enabled (${sandboxConfig.provider}, approval: ${sandboxConfig.requireApproval})`);
 	}
 	return sandboxManager ?? undefined;

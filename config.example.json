@@ -77,6 +77,11 @@
 		"requireApproval": "always",
 		"timeoutMinutes": 30,
 		"commandTimeoutSeconds": 600,
-		"allowInternetAccess": true
+		"allowInternetAccess": true,
+		"limits": {
+			"maxConcurrent": 3,
+			"maxSandboxes": 20,
+			"maxActiveMinutesPerDay": 480
+		}
 	}
 }
