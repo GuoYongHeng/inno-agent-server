@@ -47,13 +47,22 @@ export function directoryBytes(path: string): number {
  * Audit every durable root for orphaned session data and measure disk use.
  * Read-only unless `repair` is set. Updates the orphan/disk gauges.
  */
-export function auditDurableData(dataDir: string, options: { repair?: boolean } = {}): DurableRootAudit[] {
+export async function auditDurableData(
+	dataDir: string,
+	options: {
+		repair?: boolean;
+		/** Catalog contents for roots whose catalog is not `sessions.json` (the PostgreSQL
+		 * catalog of tenant roots). Return undefined to use the file. */
+		knownIds?: (owner: string) => Promise<Set<string> | undefined>;
+	} = {},
+): Promise<DurableRootAudit[]> {
 	const results: DurableRootAudit[] = [];
 	for (const { owner, root } of listDurableRoots(dataDir)) {
 		const result: DurableRootAudit = { owner, root, orphans: [], diskBytes: 0 };
 		try {
-			result.orphans = findOrphanedSessionData(root);
-			if (options.repair && result.orphans.length) result.removed = removeOrphanedSessionData(root);
+			const known = owner === "local" ? undefined : await options.knownIds?.(owner);
+			result.orphans = findOrphanedSessionData(root, known);
+			if (options.repair && result.orphans.length) result.removed = removeOrphanedSessionData(root, known);
 		} catch (error) {
 			result.error = error instanceof Error ? error.message : String(error);
 		}

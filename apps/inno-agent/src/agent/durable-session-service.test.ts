@@ -141,8 +141,8 @@ describe("DurableSessionService", () => {
 		services.push(service);
 		const a = tenant("tenant-a");
 		const b = tenant("tenant-b");
-		const boundA = inTenant(a, (req) => ({ req, summary: service.create(req, { workspaceId: "workspace-a" }) }));
-		const boundB = inTenant(b, (req) => ({ req, summary: service.create(req, { workspaceId: "workspace-b" }) }));
+		const boundA = await inTenant(a, async (req) => ({ req, summary: await service.create(req, { workspaceId: "workspace-a" }) }));
+		const boundB = await inTenant(b, async (req) => ({ req, summary: await service.create(req, { workspaceId: "workspace-b" }) }));
 		expect(boundA.summary.id).not.toBe(boundB.summary.id);
 		const [answerA, answerB] = await Promise.all([
 			inTenant(a, async () => {
@@ -164,8 +164,8 @@ describe("DurableSessionService", () => {
 		]);
 		expect(answerA).toMatchObject({ status: "done", text: "answer A" });
 		expect(answerB).toMatchObject({ status: "done", text: "answer B" });
-		expect(inTenant(a, () => service.list(boundA.req)).map((item) => item.id)).toEqual([boundA.summary.id]);
-		expect(inTenant(b, () => service.list(boundB.req)).map((item) => item.id)).toEqual([boundB.summary.id]);
+		expect((await inTenant(a, () => service.list(boundA.req))).map((item) => item.id)).toEqual([boundA.summary.id]);
+		expect((await inTenant(b, () => service.list(boundB.req))).map((item) => item.id)).toEqual([boundB.summary.id]);
 		expect(readFileSync(join(base, "tenants", "tenant-a", "durable", "sessions.json"), "utf-8")).toContain(boundA.summary.id);
 		expect(readFileSync(join(base, "tenants", "tenant-b", "durable", "sessions.json"), "utf-8")).not.toContain(boundA.summary.id);
 		const eventsA = loadEvents(join(base, "tenants", "tenant-a", "learner"));
@@ -204,7 +204,7 @@ describe("DurableSessionService", () => {
 		});
 		services.push(service);
 		const req = { headers: {} } as IncomingMessage;
-		const session = service.create(req, { workspaceId: "workspace" });
+		const session = await service.create(req, { workspaceId: "workspace" });
 		const submit = async () => {
 			const lease = await service.lease(req, session.id);
 			try {
@@ -246,7 +246,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+			const session = await service.create(req, { workspaceId: "workspace" });
 			const note = "📌 旁注问答\nQ: 什么是闭包？\nA: 闭包会保留词法环境。";
 
 			await service.appendAssistantNotification(req, session.id, note, "btw-exchange-request");
@@ -297,7 +297,7 @@ describe("DurableSessionService", () => {
 		services.push(service);
 		await runWithoutTenantContext(async () => {
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+			const session = await service.create(req, { workspaceId: "workspace" });
 			const reopen = async () => {
 				const lease = await service.lease(req, session.id);
 				await lease.release();
@@ -335,7 +335,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+			const session = await service.create(req, { workspaceId: "workspace" });
 			const lease = await service.lease(req, session.id);
 			try {
 				const submission = await lease.runtime.submit("之前学习了机器学习的基本概念", "durable-l3-index");
@@ -346,7 +346,7 @@ describe("DurableSessionService", () => {
 			const recalled = await memory.recall("机器学习", "durable-current");
 			expect(recalled.some((result) => result.sessionId === session.id)).toBe(true);
 			expect(await memory.recall("机器学习", session.id)).toEqual([]);
-			const next = service.create(req, { workspaceId: "workspace" });
+			const next = await service.create(req, { workspaceId: "workspace" });
 			const context = await service.prepareRecallContext(req, next.id, "机器学习");
 			expect(context).toContain("# 相关历史对话");
 			expect(context).toContain("之前学习了机器学习");
@@ -383,7 +383,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+			const session = await service.create(req, { workspaceId: "workspace" });
 			currentConfig = normalizeConfig({
 				...currentConfig,
 				defaultProvider: "other-provider",
@@ -403,12 +403,12 @@ describe("DurableSessionService", () => {
 					const submission = await lease.runtime.submit(prompt, requestId);
 					expect((await lease.runtime.waitForSubmission(submission.id)).status).toBe("done");
 				} finally { await lease.release(); }
-				service.noteSubmission(req, session.id, prompt);
+				await service.noteSubmission(req, session.id, prompt);
 				await service.snapshot(req, session.id);
 			};
 			await turn("学习 Rust 所有权", "topic-1");
 			await turn("理解借用检查器", "topic-2");
-			expect(service.list(req)[0]?.topicPendingUpgrade).toBe(false);
+			expect((await service.list(req))[0]?.topicPendingUpgrade).toBe(false);
 			await turn("练习生命周期标注", "topic-3");
 			await Promise.all([
 				service.maybeAutoGenerateTopic(req, session.id),
@@ -418,13 +418,13 @@ describe("DurableSessionService", () => {
 			expect(completions[0]).toMatchObject({ provider: "faux-configured", modelId: "faux-model" });
 			expect(completions[0]?.prompt).toContain("学习 Rust 所有权");
 			expect(completions[0]?.prompt).toContain("练习生命周期标注");
-			expect(service.list(req)[0]).toMatchObject({ name: "Rust 所有权入门", topicPendingUpgrade: false });
+			expect((await service.list(req))[0]).toMatchObject({ name: "Rust 所有权入门", topicPendingUpgrade: false });
 
-			service.rename(req, session.id, "我的手动标题");
+			await service.rename(req, session.id, "我的手动标题");
 			await turn("继续练习", "topic-4");
 			await service.maybeAutoGenerateTopic(req, session.id);
 			expect(completions).toHaveLength(1);
-			expect(service.list(req)[0]?.name).toBe("我的手动标题");
+			expect((await service.list(req))[0]?.name).toBe("我的手动标题");
 		});
 	});
 
@@ -453,14 +453,14 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+			const session = await service.create(req, { workspaceId: "workspace" });
 			for (const [index, prompt] of ["first", "second", "third"].entries()) {
 				const lease = await service.lease(req, session.id);
 				try {
 					const submission = await lease.runtime.submit(prompt, `rename-topic-${index}`);
 					await lease.runtime.waitForSubmission(submission.id);
 				} finally { await lease.release(); }
-				service.noteSubmission(req, session.id, prompt);
+				await service.noteSubmission(req, session.id, prompt);
 				await service.snapshot(req, session.id);
 			}
 			const generation = service.maybeAutoGenerateTopic(req, session.id);
@@ -468,10 +468,10 @@ describe("DurableSessionService", () => {
 				await new Promise((resolve) => setTimeout(resolve, 10));
 			}
 			expect(topicStarted).toBe(true);
-			service.rename(req, session.id, "手动保留");
+			await service.rename(req, session.id, "手动保留");
 			finishTopic!("不应覆盖");
 			await generation;
-			expect(service.list(req)[0]).toMatchObject({ name: "手动保留", topicPendingUpgrade: false });
+			expect((await service.list(req))[0]).toMatchObject({ name: "手动保留", topicPendingUpgrade: false });
 		});
 	});
 
@@ -511,7 +511,7 @@ describe("DurableSessionService", () => {
 			}) as unknown as DurableSessionRuntime,
 		});
 		services.push(service);
-		const bound = inTenant(context, (req) => ({ req, session: service.create(req, { workspaceId: "workspace" }) }));
+		const bound = await inTenant(context, async (req) => ({ req, session: await service.create(req, { workspaceId: "workspace" }) }));
 		const lease = async () => inTenant(context, () => service.lease(bound.req, bound.session.id));
 		const first = await lease();
 		expect(acquisitions).toBe(1);
@@ -566,7 +566,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+			const session = await service.create(req, { workspaceId: "workspace" });
 			expect(session.model).toEqual({ provider: "faux-configured", id: "faux-a" });
 
 			const ask = async (text: string, requestId: string) => {
@@ -595,7 +595,7 @@ describe("DurableSessionService", () => {
 			// A model that is not configured is rejected and changes nothing.
 			await expect(service.setModel(req, session.id, { provider: "faux-configured", modelId: "missing" }))
 				.rejects.toBeInstanceOf(DurableModelNotFoundError);
-			expect(service.get(req, session.id)?.modelId).toBe("faux-b");
+			expect((await service.get(req, session.id))?.modelId).toBe("faux-b");
 
 			// The runtime was closed on release; reopening keeps the switched model.
 			expect(await ask("q3", "r3")).toBe("answered by faux-b");
@@ -618,7 +618,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+			const session = await service.create(req, { workspaceId: "workspace" });
 
 			const answer = await service.completeSideQuestion(req, session.id, {
 				contextDigest: "主对话摘要",
@@ -636,7 +636,7 @@ describe("DurableSessionService", () => {
 				{ role: "assistant", text: "上一个回答" },
 				{ role: "user", text: "这个怎么理解？" },
 			]);
-			expect(service.get(req, session.id)?.messageCount).toBe(0);
+			expect((await service.get(req, session.id))?.messageCount).toBe(0);
 		});
 	});
 
@@ -676,7 +676,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+			const session = await service.create(req, { workspaceId: "workspace" });
 			const ask = async (text: string, requestId: string) => {
 				const lease = await service.lease(req, session.id);
 				try {
@@ -756,7 +756,7 @@ describe("DurableSessionService", () => {
 		});
 		services.push(service);
 		const req = { headers: {} } as IncomingMessage;
-		const session = service.create(req, { workspaceId: "workspace" });
+		const session = await service.create(req, { workspaceId: "workspace" });
 		const lease = await service.lease(req, session.id);
 		await lease.release();
 
@@ -787,7 +787,7 @@ describe("DurableSessionService", () => {
 		});
 		services.push(service);
 		const req = { headers: {} } as IncomingMessage;
-		expect(() => service.create(req, { workspaceId: "workspace" })).toThrow(DurableRuntimeDisabledError);
+		await expect(service.create(req, { workspaceId: "workspace" })).rejects.toBeInstanceOf(DurableRuntimeDisabledError);
 		const legacy = join(base, "sessions", "legacy.jsonl");
 		mkdirSync(join(base, "sessions"), { recursive: true });
 		writeFileSync(legacy, "{\"type\":\"session\"}\n");

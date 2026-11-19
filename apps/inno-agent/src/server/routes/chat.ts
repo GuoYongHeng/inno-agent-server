@@ -38,7 +38,7 @@ export async function handleChatRoutes(
 	const denySession = () => { json(res, 404, { error: "Session not found" }); return true; };
 	/** Hand the request to the durable handlers, or 404 for an unknown session. */
 	const toDurable = async (sessionId: string, body?: Record<string, unknown>): Promise<boolean> => {
-		if (!await ownsSession(sessionId) || !durableSessions.get(req, sessionId)) return denySession();
+		if (!await ownsSession(sessionId) || !await durableSessions.get(req, sessionId)) return denySession();
 		return handleDurableChatRoutes(req, res, method, url, durableContext, body);
 	};
 
@@ -97,7 +97,7 @@ export async function handleChatRoutes(
 
 	const chatAbortMatch = matchRoute("POST", method, url, "/api/chat/:sessionId/:turnId/abort");
 	if (chatAbortMatch) {
-		if (!await ownsSession(chatAbortMatch.sessionId) || !durableSessions.get(req, chatAbortMatch.sessionId)) return denySession();
+		if (!await ownsSession(chatAbortMatch.sessionId) || !await durableSessions.get(req, chatAbortMatch.sessionId)) return denySession();
 		const restored = restoreDurableStream(req, durableSessions, chatAbortMatch.sessionId, chatAbortMatch.turnId);
 		const state = restored?.state ?? streamRegistry.getByTurn(chatAbortMatch.turnId);
 		if (!state || state.sessionId !== chatAbortMatch.sessionId) {
@@ -125,7 +125,7 @@ export async function handleChatRoutes(
 	const chatStatusMatch = matchRoute("GET", method, url, "/api/chat/status/:sessionId");
 	if (chatStatusMatch) {
 		streamRegistry.cleanupExpiredTurns();
-		if (durableSessions.get(req, chatStatusMatch.sessionId)) {
+		if (await durableSessions.get(req, chatStatusMatch.sessionId)) {
 			restoreDurableStream(req, durableSessions, chatStatusMatch.sessionId);
 		}
 		const state = streamRegistry.getLatest(chatStatusMatch.sessionId);
@@ -145,7 +145,7 @@ export async function handleChatRoutes(
 			json(res, 400, { error: "turnId and a non-negative after value are required" });
 			return true;
 		}
-		const restored = durableSessions.get(req, sessionId)
+		const restored = await durableSessions.get(req, sessionId)
 			? restoreDurableStream(req, durableSessions, sessionId, turnId)
 			: undefined;
 		const state = restored?.state ?? streamRegistry.getByTurn(turnId);

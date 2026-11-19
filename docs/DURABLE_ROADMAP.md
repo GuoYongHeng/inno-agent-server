@@ -270,6 +270,35 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 **退出标准**：H0 的目录并发和孤儿测试在新实现上通过；10 万会话量级下列表/更新耗时有基线数据。
 
+#### H1 结果（已实现）
+
+**范围**：目标规模按"几千用户"设计。会话目录进 PG，多用户（认证）模式使用；本地/桌面模式没有 PG，继续用 `sessions.json`。
+
+- **接口隔离**：`agent/session-catalog.ts` 定义异步 `SessionCatalog`（`get/list/insert/update/remove`），`FileSessionCatalog`（原逻辑，带跨进程文件锁）和 `agent/pg-session-catalog.ts` 的 `PgSessionCatalog` 实现它。`DurableSessionService` 按请求是否带已验证租户选择实现；服务的 `get/list/create/rename/setArchived/markSchedulerOrigin/noteSubmission/prepareAttachments/prepareImages` 全部改为异步，调用方（路由、任务、server.ts、测试）同步改好。
+- **表**：`durable_sessions`（`tenants.id` 外键、级联删除；列覆盖 `DurableSessionRecord` 全部字段，外加乐观并发用的 `version`；索引 `(tenant_id, updated_at DESC)`），建表语句在 `tenants/schema.ts`，随现有迁移执行。
+- **原子性**：创建会话时在一个事务内校验成员关系、写 `resource_ownership` 并写目录行；ID 已被其他租户占用则整体回滚。删除同样一个事务删目录行和归属行。`session.sqlite` 仍在运行时首次打开时惰性创建。
+- **更新**：`UPDATE … WHERE id AND tenant_id`，只改补丁里的列并自增 `version`，不再整文件覆盖。不同字段的并发更新互不丢失（测试：5 个并发更新同一会话的不同字段，全部保留，`version` 为 5）。
+- **租户隔离**：每条语句都用请求里已验证的租户过滤，不接受调用方传入的租户 ID；跨租户的 `get/update/remove` 命中不到。
+- **迁移**：某租户首次访问目录时，若其旧 `sessions.json` 还在，则幂等导入到表（`ON CONFLICT DO NOTHING`，且只导入该租户在 `resource_ownership` 里已拥有的会话，手改文件无法把别人的会话挂到自己名下），导入后把文件改名为 `sessions.json.migrated`。两个 worker 同时导入结果一致；之后删除的会话不会被旧文件复活。旧文件不可解析时只记错误日志、原地保留、跳过导入。
+- **与草案的差异**：没有做"双写 + 读切换开关"。双写需要两套目录同时保持一致，而旧文件已被改名保留，回滚时只能退回导入时刻的快照，回滚后期间新建的会话不在其中。如果上线策略需要无损回滚，要补一个反向导出命令。
+- **孤儿自检跟进**：租户目录的目录内容在 PG 里，所以启动审计和 `durable:fsck`（设置 `DATABASE_URL`）改为对照 PG；有数据但找不到目录文件时报错，不再把所有会话目录当成孤儿，避免 `--repair` 误删。
+
+**基线**（PG 17，本机；22 万行 = 3000 租户 × 40 个会话 + 1 个 10 万会话的租户）：
+
+| 操作 | 文件目录（H0 基线） | PG |
+|---|---|---|
+| 典型租户（40 会话）列表 | <1 ms | 0.8 ms |
+| 按 ID 读取 | 同列表（读整个文件） | 0.2 ms |
+| 单会话更新 | 10 万会话 225 ms，且阻塞事件循环 | 1.2 ms（10 万会话租户 1.5 ms） |
+| 10 万会话租户列表 | 126 ms | 233 ms |
+| 200 个并发更新（10 连接） | 逐个串行 | 总计 38 ms |
+
+更新从随会话数线性增长变成与会话数无关，这是 H1 的主要收益；`list` 仍返回整个租户的全部会话，10 万会话的极端租户要 233ms，后续如需支持极端租户应给列表接口加分页。
+
+**测试**：`agent/pg-session-catalog.integration.test.ts`（8 个）：字段往返与归属同事务、跨租户隔离、归属冲突整体回滚、并发更新不丢字段、60 个并发创建不丢、排序与删除带走归属、旧文件导入（只导入已拥有会话、双 worker 竞态一致、不复活已删会话）、旧文件损坏时保留。集成套件共 6 个文件 38 个测试通过，其中认证模式下的真实服务测试已走 PG 目录。单元套件 117 个文件 907 个测试通过。
+
+**未做**：目录分页；反向导出（回滚）命令；`durable_sessions` 的指标（目前复用 `inno_catalog_pg_get` / `inno_catalog_pg_update` 两个耗时汇总，`inno_catalog_sessions` 仅在文件目录下更新）。
+
 ### H2 执行层隔离（约 3–5 周）
 
 `WorkspaceFileEnv` 已实现 pi-durable 的 `ExecutionEnv`。pi-durable 的 `env` 是**每次工具调用时的工厂**（`env: ({ cwd }) => ...`），自定义环境用 `id` 标识"同一套文件"，README 约定一个容器对应一个 id；README 还提到 pi-env 的 `RemoteExecutionEnv` 可作起点（是否随依赖安装、是否满足租户隔离，待验证）。包内带 `registerEnvConformance`（可选 `shell` / `symlinks` / `listFiles`）可直接验证新环境。

@@ -191,7 +191,7 @@ export async function handleBtwRoutes(
 	if (stateMatch) {
 		const sessionId = stateMatch.sessionId;
 		if (!await ownsSession(sessionId)) { json(res, 404, { error: "Session not found" }); return true; }
-		if (!ctx.durableSessions.get(req, sessionId)) {
+		if (!await ctx.durableSessions.get(req, sessionId)) {
 			json(res, 404, { error: "Session not found" });
 			return true;
 		}
@@ -224,7 +224,7 @@ export async function handleBtwRoutes(
 			json(res, 400, { error: `question too long (max ${MAX_QUESTION_LEN} chars)` });
 			return true;
 		}
-		if (!ctx.durableSessions.get(req, sessionId)) {
+		if (!await ctx.durableSessions.get(req, sessionId)) {
 			json(res, 404, { error: "Session not found" });
 			return true;
 		}
@@ -257,7 +257,7 @@ export async function handleBtwRoutes(
 			json(res, 400, { error: "Missing sessionId, question or answer" });
 			return true;
 		}
-		if (!ctx.durableSessions.get(req, sessionId)) {
+		if (!await ctx.durableSessions.get(req, sessionId)) {
 			json(res, 404, { error: "Session not found" });
 			return true;
 		}

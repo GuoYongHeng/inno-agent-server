@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -21,13 +21,13 @@ function seed(root: string, catalogIds: string[], dataIds: string[]) {
 }
 
 describe("durable data audit", () => {
-	it("audits the local root and every tenant root, measuring disk and gauges", () => {
+	it("audits the local root and every tenant root, measuring disk and gauges", async () => {
 		const data = dir();
 		seed(join(data, "durable"), ["durable-a"], ["durable-a", "durable-lost"]);
 		seed(join(data, "tenants", "t1", "durable"), ["durable-b"], ["durable-b"]);
 		seed(join(data, "tenants", "t2", "durable"), [], ["durable-c"]);
 
-		const audits = auditDurableData(data);
+		const audits = await auditDurableData(data);
 		expect(audits.map((a) => [a.owner, a.orphans.map((o) => o.sessionId)])).toEqual([
 			["local", ["durable-lost"]],
 			["t1", []],
@@ -40,19 +40,38 @@ describe("durable data audit", () => {
 		expect(gauges.inno_durable_disk_bytes).toBe(audits.reduce((n, a) => n + a.diskBytes, 0));
 	});
 
-	it("repairs only when asked and reports an unreadable catalog instead of deleting", () => {
+	it("repairs only when asked and reports an unreadable catalog instead of deleting", async () => {
 		const data = dir();
 		seed(join(data, "durable"), [], ["durable-x"]);
 		seed(join(data, "tenants", "bad", "durable"), [], ["durable-y"]);
 		writeFileSync(join(data, "tenants", "bad", "durable", "sessions.json"), "{oops");
 
-		expect(auditDurableData(data).find((a) => a.owner === "local")!.orphans).toHaveLength(1);
-		const repaired = auditDurableData(data, { repair: true });
+		expect((await auditDurableData(data)).find((a) => a.owner === "local")!.orphans).toHaveLength(1);
+		const repaired = await auditDurableData(data, { repair: true });
 		expect(repaired.find((a) => a.owner === "local")!.removed).toEqual(["durable-x"]);
 		const bad = repaired.find((a) => a.owner === "bad")!;
 		expect(bad.error).toMatch(/refusing to classify/);
-		expect(auditDurableData(data).find((a) => a.owner === "local")!.orphans).toEqual([]);
+		expect((await auditDurableData(data)).find((a) => a.owner === "local")!.orphans).toEqual([]);
 		expect(metricsSnapshot().counters.inno_durable_audit_errors_total).toBeGreaterThan(0);
+	});
+
+	it("uses the supplied catalog ids for tenant roots and never calls everything an orphan when the catalog file is gone", async () => {
+		const data = dir();
+		const root = join(data, "tenants", "pg", "durable");
+		seed(root, [], ["durable-live", "durable-dead"]);
+		rmSync(join(root, "sessions.json"));
+
+		const unguarded = await auditDurableData(data, { repair: true });
+		expect(unguarded[0]!.error).toMatch(/refusing to classify/);
+		expect(existsSync(join(root, "storage", "durable-live"))).toBe(true);
+
+		const guarded = await auditDurableData(data, {
+			repair: true,
+			knownIds: async (owner) => owner === "pg" ? new Set(["durable-live"]) : undefined,
+		});
+		expect(guarded[0]!.removed).toEqual(["durable-dead"]);
+		expect(existsSync(join(root, "storage", "durable-live"))).toBe(true);
+		expect(existsSync(join(root, "storage", "durable-dead"))).toBe(false);
 	});
 
 	it("directoryBytes counts regular files recursively", () => {

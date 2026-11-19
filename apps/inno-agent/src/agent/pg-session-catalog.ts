@@ -1,0 +1,244 @@
+import { existsSync, readFileSync, renameSync } from "node:fs";
+import type { IncomingMessage } from "node:http";
+import type { Pool } from "pg";
+import { logger } from "../logger.js";
+import { getRequestTenant } from "../tenants/http.js";
+import { ResourceOwnershipError, type TenantContext } from "../tenants/store.js";
+import { timedAsync } from "../utils/metrics.js";
+import {
+	SessionNotFoundError,
+	isSessionRecord,
+	type DurableSessionPatch,
+	type DurableSessionRecord,
+	type SessionCatalog,
+} from "./session-catalog.js";
+
+interface SessionRow {
+	id: string;
+	workspace_id: string;
+	name: string;
+	provider: string;
+	model_id: string;
+	origin: "web" | "scheduler";
+	archived: boolean;
+	message_count: number;
+	preview: string;
+	topic_generated: boolean | null;
+	topic_upgraded: boolean | null;
+	conversation_id: string | null;
+	created_at: Date;
+	updated_at: Date;
+}
+
+const COLUMNS = "id, workspace_id, name, provider, model_id, origin, archived, message_count, preview, topic_generated, topic_upgraded, conversation_id, created_at, updated_at";
+
+/** Patch field -> column. `id` is never patchable and `version` is bumped by every update. */
+const PATCH_COLUMNS: Record<keyof DurableSessionPatch, string> = {
+	workspaceId: "workspace_id",
+	name: "name",
+	createdAt: "created_at",
+	updatedAt: "updated_at",
+	messageCount: "message_count",
+	preview: "preview",
+	provider: "provider",
+	modelId: "model_id",
+	topicGenerated: "topic_generated",
+	topicUpgraded: "topic_upgraded",
+	origin: "origin",
+	archived: "archived",
+	conversationId: "conversation_id",
+};
+
+function toRecord(row: SessionRow): DurableSessionRecord {
+	return {
+		id: row.id,
+		workspaceId: row.workspace_id,
+		name: row.name,
+		createdAt: row.created_at.toISOString(),
+		updatedAt: row.updated_at.toISOString(),
+		messageCount: row.message_count,
+		preview: row.preview,
+		provider: row.provider,
+		modelId: row.model_id,
+		origin: row.origin,
+		archived: row.archived,
+		...(row.topic_generated !== null ? { topicGenerated: row.topic_generated } : {}),
+		...(row.topic_upgraded !== null ? { topicUpgraded: row.topic_upgraded } : {}),
+		...(row.conversation_id !== null ? { conversationId: row.conversation_id } : {}),
+	};
+}
+
+function requireTenant(req: IncomingMessage): TenantContext {
+	const tenant = getRequestTenant(req);
+	if (!tenant) throw new Error("The PostgreSQL session catalog requires a verified tenant");
+	return tenant;
+}
+
+/**
+ * Tenant-scoped session catalog in PostgreSQL. Every statement filters by the
+ * verified tenant taken from the request, never from a caller-supplied value.
+ * Creating a session writes its ownership row and catalog row in one
+ * transaction, so there is no window with an owned-but-unlisted session.
+ *
+ * Tenants that predate this table are imported lazily from their
+ * `sessions.json`, once per process on first access; the file is then renamed to
+ * `sessions.json.migrated` so a stale copy can never resurrect a deleted session.
+ */
+export class PgSessionCatalog implements SessionCatalog {
+	private readonly imports = new Map<string, Promise<void>>();
+
+	constructor(
+		private readonly pool: Pool,
+		/** Location of the tenant's legacy `sessions.json`. */
+		private readonly legacyCatalogPath: (req: IncomingMessage) => string,
+	) {}
+
+	private async ready(req: IncomingMessage): Promise<TenantContext> {
+		const tenant = requireTenant(req);
+		let pending = this.imports.get(tenant.tenantId);
+		if (!pending) {
+			pending = this.importLegacy(req, tenant).catch((error) => {
+				this.imports.delete(tenant.tenantId);
+				throw error;
+			});
+			this.imports.set(tenant.tenantId, pending);
+		}
+		await pending;
+		return tenant;
+	}
+
+	private async importLegacy(req: IncomingMessage, tenant: TenantContext): Promise<void> {
+		const path = this.legacyCatalogPath(req);
+		if (!existsSync(path)) return;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(readFileSync(path, "utf-8"));
+		} catch (error) {
+			logger.error({ err: error, path }, "legacy session catalog is unreadable; leaving it in place and skipping the import");
+			return;
+		}
+		const records = Array.isArray(parsed) ? parsed.filter(isSessionRecord) : [];
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			for (const record of records) {
+				// Only sessions this tenant already owns are imported, so a hand-edited
+				// file cannot attach another tenant's session to this one.
+				await client.query(
+					`INSERT INTO durable_sessions
+					   (id, tenant_id, workspace_id, name, provider, model_id, origin, archived, message_count, preview,
+					    topic_generated, topic_upgraded, conversation_id, created_at, updated_at)
+					 SELECT $2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz, $15::timestamptz
+					 WHERE EXISTS (SELECT 1 FROM resource_ownership
+					               WHERE tenant_id = $1 AND resource_type = 'session' AND resource_id = $2)
+					 ON CONFLICT (id) DO NOTHING`,
+					[
+						tenant.tenantId, record.id, record.workspaceId, record.name, record.provider, record.modelId,
+						record.origin ?? "web", record.archived, record.messageCount, record.preview,
+						record.topicGenerated ?? null, record.topicUpgraded ?? null, record.conversationId ?? null,
+						record.createdAt, record.updatedAt,
+					],
+				);
+			}
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+		try {
+			renameSync(path, `${path}.migrated`);
+		} catch (error) {
+			// Another worker may have renamed it first; the import itself is idempotent.
+			logger.debug({ err: error, path }, "legacy session catalog already renamed");
+		}
+		logger.info({ tenantId: tenant.tenantId, sessions: records.length }, "imported legacy session catalog into PostgreSQL");
+	}
+
+	async get(req: IncomingMessage, id: string): Promise<DurableSessionRecord | undefined> {
+		const tenant = await this.ready(req);
+		const result = await timedAsync("inno_catalog_pg_get", () => this.pool.query<SessionRow>(
+			`SELECT ${COLUMNS} FROM durable_sessions WHERE id = $1 AND tenant_id = $2`, [id, tenant.tenantId]));
+		return result.rows[0] ? toRecord(result.rows[0]) : undefined;
+	}
+
+	async list(req: IncomingMessage): Promise<DurableSessionRecord[]> {
+		const tenant = await this.ready(req);
+		const result = await this.pool.query<SessionRow>(
+			`SELECT ${COLUMNS} FROM durable_sessions WHERE tenant_id = $1 ORDER BY updated_at DESC`, [tenant.tenantId]);
+		return result.rows.map(toRecord);
+	}
+
+	async insert(req: IncomingMessage, record: DurableSessionRecord): Promise<void> {
+		const tenant = await this.ready(req);
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			const member = await client.query(
+				"SELECT 1 FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2", [tenant.tenantId, tenant.userId]);
+			if (member.rowCount !== 1) throw new ResourceOwnershipError("session", record.id);
+			await client.query(
+				`INSERT INTO resource_ownership (tenant_id, resource_type, resource_id)
+				 VALUES ($1, 'session', $2) ON CONFLICT (resource_type, resource_id) DO NOTHING`,
+				[tenant.tenantId, record.id],
+			);
+			const owner = await client.query<{ tenant_id: string }>(
+				"SELECT tenant_id FROM resource_ownership WHERE resource_type = 'session' AND resource_id = $1", [record.id]);
+			if (owner.rows[0]?.tenant_id !== tenant.tenantId) throw new ResourceOwnershipError("session", record.id);
+			await client.query(
+				`INSERT INTO durable_sessions
+				   (id, tenant_id, workspace_id, name, provider, model_id, origin, archived, message_count, preview,
+				    topic_generated, topic_upgraded, conversation_id, created_at, updated_at)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz, $15::timestamptz)`,
+				[
+					record.id, tenant.tenantId, record.workspaceId, record.name, record.provider, record.modelId,
+					record.origin ?? "web", record.archived, record.messageCount, record.preview,
+					record.topicGenerated ?? null, record.topicUpgraded ?? null, record.conversationId ?? null,
+					record.createdAt, record.updatedAt,
+				],
+			);
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
+	async update(req: IncomingMessage, id: string, patch: DurableSessionPatch): Promise<DurableSessionRecord> {
+		const tenant = await this.ready(req);
+		const sets: string[] = [];
+		const values: unknown[] = [id, tenant.tenantId];
+		for (const [key, value] of Object.entries(patch) as Array<[keyof DurableSessionPatch, unknown]>) {
+			const column = PATCH_COLUMNS[key];
+			if (!column || value === undefined) continue;
+			values.push(column === "origin" ? value ?? "web" : value);
+			sets.push(`${column} = $${values.length}${column.endsWith("_at") ? "::timestamptz" : ""}`);
+		}
+		sets.push("version = version + 1");
+		const result = await timedAsync("inno_catalog_pg_update", () => this.pool.query<SessionRow>(
+			`UPDATE durable_sessions SET ${sets.join(", ")} WHERE id = $1 AND tenant_id = $2 RETURNING ${COLUMNS}`, values));
+		if (!result.rows[0]) throw new SessionNotFoundError();
+		return toRecord(result.rows[0]);
+	}
+
+	async remove(req: IncomingMessage, id: string): Promise<void> {
+		const tenant = await this.ready(req);
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			await client.query("DELETE FROM durable_sessions WHERE id = $1 AND tenant_id = $2", [id, tenant.tenantId]);
+			await client.query(
+				"DELETE FROM resource_ownership WHERE tenant_id = $1 AND resource_type = 'session' AND resource_id = $2",
+				[tenant.tenantId, id]);
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+}

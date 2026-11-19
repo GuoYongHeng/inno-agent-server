@@ -152,7 +152,7 @@ export async function handleDurableSessionResourceRoutes(
 				throw error;
 			}
 		}
-		if (name) summary = ctx.service.rename(req, id, name.slice(0, 120));
+		if (name) summary = await ctx.service.rename(req, id, name.slice(0, 120));
 		json(res, 200, summary);
 		return true;
 	}
@@ -213,11 +213,11 @@ export async function handleDurableSessionResourceRoutes(
 		return true;
 	}
 	if (matchRoute("POST", method, url, "/api/sessions/:id/archive")) {
-		json(res, 200, ctx.service.setArchived(req, id, true));
+		json(res, 200, await ctx.service.setArchived(req, id, true));
 		return true;
 	}
 	if (matchRoute("POST", method, url, "/api/sessions/:id/unarchive")) {
-		json(res, 200, ctx.service.setArchived(req, id, false));
+		json(res, 200, await ctx.service.setArchived(req, id, false));
 		return true;
 	}
 	json(res, 400, { error: "This legacy session operation is not supported for durable sessions" });
@@ -330,7 +330,7 @@ async function streamDurableTurn(
 			submissionId = submission.id;
 			store.markAdmitted(state.sessionId, state.turnId, submissionId);
 		}
-		service.noteSubmission(req, state.sessionId, state.inputSnapshot.prompt);
+		await service.noteSubmission(req, state.sessionId, state.inputSnapshot.prompt);
 		// Cancellation can race durable admission. Re-apply the abort after the
 		// submission commits so an admitted queued input cannot escape it.
 		if (state.cancelRequested) await lease.runtime.abort();
@@ -519,8 +519,8 @@ export async function handleDurableChatRoutes(
 		const requestId = typeof body.clientRequestId === "string" && body.clientRequestId.trim()
 			? body.clientRequestId
 			: `http-${crypto.randomUUID()}`;
-		const attachments = ctx.service.prepareAttachments(req, sessionId, body.attachments);
-		const images = ctx.service.prepareImages(req, sessionId, body.images, requestId);
+		const attachments = await ctx.service.prepareAttachments(req, sessionId, body.attachments);
+		const images = await ctx.service.prepareImages(req, sessionId, body.images, requestId);
 		const recallContext = await ctx.service.prepareRecallContext(req, sessionId, prompt);
 		let lease: Awaited<ReturnType<DurableSessionService["lease"]>> | undefined;
 		try {
@@ -529,7 +529,7 @@ export async function handleDurableChatRoutes(
 			lease.runtime.bindPermissionTurn({ turnId: requestId, noUi: true });
 			ctx.service.recordTurnMetadata(req, sessionId, attachments, images, prompt, requestId);
 			const submission = await lease.runtime.submit(durableUserInput(prompt, attachments, images, recallContext), requestId);
-			ctx.service.noteSubmission(req, sessionId, prompt);
+			await ctx.service.noteSubmission(req, sessionId, prompt);
 			const result = await lease.runtime.waitForSubmission(submission.id);
 			if (result.status !== "done") throw new Error(`Durable submission was unanswered: ${result.reason}`);
 			await ctx.service.snapshot(req, sessionId);
@@ -562,8 +562,8 @@ export async function handleDurableChatRoutes(
 	const workspaceId = ctx.workspaceRegistry.getSessionWorkspaceId(sessionId);
 	const workspaceRoot = ctx.workspaceRegistry.resolveWorkspaceDir(workspaceId);
 	if (!workspaceRoot) { json(res, 404, { error: "Session workspace not found" }); return true; }
-	const attachments = ctx.service.prepareAttachments(req, sessionId, body.attachments);
-	const images = ctx.service.prepareImages(req, sessionId, body.images, clientRequestId);
+	const attachments = await ctx.service.prepareAttachments(req, sessionId, body.attachments);
+	const images = await ctx.service.prepareImages(req, sessionId, body.images, clientRequestId);
 	let baseline: Awaited<ReturnType<DurableSessionService["snapshot"]>>;
 	try {
 		baseline = await ctx.service.snapshot(req, sessionId);

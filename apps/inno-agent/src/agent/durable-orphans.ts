@@ -13,7 +13,14 @@ export interface OrphanedSessionData {
 
 function catalogIds(root: string): Set<string> {
 	const path = join(root, "sessions.json");
-	if (!existsSync(path)) return new Set();
+	if (!existsSync(path)) {
+		// A missing catalog is only "no sessions" when nothing is stored either;
+		// otherwise the catalog lives elsewhere (PostgreSQL) or was lost, and
+		// calling every directory an orphan would delete live data.
+		const hasData = SESSION_DIRS.some((dir) => existsSync(join(root, dir)) && readdirSync(join(root, dir)).length > 0);
+		if (hasData) throw new Error(`No session catalog at ${path} but session data exists; refusing to classify orphans`);
+		return new Set();
+	}
 	try {
 		const value = JSON.parse(readFileSync(path, "utf-8")) as unknown;
 		if (!Array.isArray(value)) return new Set();
@@ -31,10 +38,11 @@ function catalogIds(root: string): Set<string> {
 /**
  * Find per-session data whose catalog record is gone. Delete removes the catalog
  * record first and the data afterwards, so a crash in between leaves exactly
- * this. Read-only; use {@link removeOrphanedSessionData} to repair.
+ * this. Read-only; use {@link removeOrphanedSessionData} to repair. `knownIds` supplies the
+ * catalog contents when they are not in `sessions.json` (PostgreSQL catalog).
  */
-export function findOrphanedSessionData(root: string): OrphanedSessionData[] {
-	const known = catalogIds(root);
+export function findOrphanedSessionData(root: string, knownIds?: Set<string>): OrphanedSessionData[] {
+	const known = knownIds ?? catalogIds(root);
 	const byId = new Map<string, string[]>();
 	for (const dir of SESSION_DIRS) {
 		const base = join(root, dir);
@@ -49,8 +57,8 @@ export function findOrphanedSessionData(root: string): OrphanedSessionData[] {
 }
 
 /** Remove the orphans {@link findOrphanedSessionData} reports; returns the IDs removed. */
-export function removeOrphanedSessionData(root: string): string[] {
-	const orphans = findOrphanedSessionData(root);
+export function removeOrphanedSessionData(root: string, knownIds?: Set<string>): string[] {
+	const orphans = findOrphanedSessionData(root, knownIds);
 	for (const orphan of orphans) {
 		for (const path of orphan.paths) rmSync(path, { recursive: true, force: true });
 	}

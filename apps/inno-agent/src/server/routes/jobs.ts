@@ -170,11 +170,11 @@ export interface JobsRouteContext {
 	jobStore: JobStore;
 	channelRegistry: ChannelRegistry;
 	checkInStore?: CheckInStore;
-	resolveSession?: (sessionId: string) => JobSessionTarget | null;
+	resolveSession?: (sessionId: string) => Promise<JobSessionTarget | null>;
 	createSession?: (req: HttpReq, job: ScheduledJob) => Promise<CreatedJobSession | null>;
 	durableExecutor?: (req: HttpReq, execution: DurableJobExecution) => Promise<string>;
 	/** Tag the target session as scheduler-born so the sidebar badges it. */
-	recordJobRunSession?: (sessionId: string, req: HttpReq) => void;
+	recordJobRunSession?: (sessionId: string, req: HttpReq) => Promise<void>;
 	/** Abort the in-flight manual job run streaming into this session. */
 	abortJobRun?: (sessionId: string) => Promise<boolean>;
 	/** Release a durable question waiter when its only live view disconnects. */
@@ -202,7 +202,7 @@ export async function handleJobsRoutes(
 		json(res, 404, { error: "Session not found" });
 		return false;
 	};
-	const resolveSession = (sessionId: string): JobSessionTarget | null => ctx.resolveSession?.(sessionId) ?? null;
+	const resolveSession = async (sessionId: string): Promise<JobSessionTarget | null> => (await ctx.resolveSession?.(sessionId)) ?? null;
 	const durableExecutor = (execution: DurableJobExecution) => {
 		if (!ctx.durableExecutor) throw new Error("Durable job execution is unavailable");
 		return ctx.durableExecutor(req, execution);
@@ -307,7 +307,7 @@ export async function handleJobsRoutes(
 		// Resolve the target session BEFORE claiming the slot: a 404 here must
 		// not leak the claim, which would wedge the occurrence (auto-exec is
 		// blocked by isOccurrenceClaimed, manual retries 409) until restart.
-		const session = resolveSession(sessionId);
+		const session = await resolveSession(sessionId);
 		if (!session) {
 			json(res, 404, { error: "Session not found" });
 			return true;
@@ -334,7 +334,7 @@ export async function handleJobsRoutes(
 				}
 			}
 		}
-		ctx.recordJobRunSession?.(sessionId, req);
+		await ctx.recordJobRunSession?.(sessionId, req);
 
 		res.writeHead(200, {
 			"Content-Type": "text/event-stream",
@@ -423,7 +423,7 @@ export async function handleJobsRoutes(
 			return true;
 		}
 		if (sessionId && !await requireSessionOwnership(sessionId)) return true;
-		let session = sessionId ? resolveSession(sessionId) : null;
+		let session = sessionId ? await resolveSession(sessionId) : null;
 		if (sessionId && !session) {
 			json(res, 404, { error: "Session not found" });
 			return true;
@@ -441,7 +441,7 @@ export async function handleJobsRoutes(
 			session = created;
 		}
 		const targetSessionId = session?.id ?? "";
-		if (targetSessionId) ctx.recordJobRunSession?.(targetSessionId, req);
+		if (targetSessionId) await ctx.recordJobRunSession?.(targetSessionId, req);
 		if (occurrenceId) {
 			await cancelDeferredRun(occurrenceId);
 			if (isDeferredExecuting(occurrenceId)) {

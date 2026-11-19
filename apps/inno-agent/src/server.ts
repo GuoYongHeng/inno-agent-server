@@ -3,6 +3,7 @@
 import "source-map-support/register.js";
 
 import { auditDurableData } from "./agent/durable-audit.js";
+import { PgSessionCatalog } from "./agent/pg-session-catalog.js";
 import { renderPrometheus } from "./utils/metrics.js";
 import { createServer, type IncomingMessage as HttpReq } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -71,7 +72,7 @@ import { assertSignUpAllowed, isPublicApiRequest, isTrustedOrigin, requireSessio
 import { createAuthRuntime } from "./auth/runtime.js";
 import { createBackgroundRequest, setRequestTenant } from "./tenants/http.js";
 import { forwardDurableTenantRequest, readDurableShardConfig } from "./tenants/durable-tenant-router.js";
-import { resolveCurrentTenantDataRoot } from "./tenants/paths.js";
+import { resolveCurrentTenantDataRoot, resolveRequestTenantDataRoot } from "./tenants/paths.js";
 import { getCurrentTenant, getCurrentTenantStore, runWithoutTenantContext } from "./tenants/current.js";
 
 // ---------------------------------------------------------------------------
@@ -241,11 +242,11 @@ async function ensureBootstrapped(): Promise<void> {
 				const req = backgroundTenantRequest();
 				const workspace = workspaceRegistry.ensureChannelWorkspace(channel, tenant?.tenantId);
 				if (tenant) await store!.claimResource(tenant, "workspace", workspace.id);
-				const summary = durableSessions.create(req, { workspaceId: workspace.id });
+				const summary = await durableSessions.create(req, { workspaceId: workspace.id });
 				if (!workspaceRegistry.bindSession(summary.id, workspace.id)) throw new Error("Channel workspace not found");
 				return summary.id;
 			},
-			resolveSessionTarget: async (sessionId) => durableSessions.get(backgroundTenantRequest(), sessionId) ? sessionId : null,
+			resolveSessionTarget: async (sessionId) => await durableSessions.get(backgroundTenantRequest(), sessionId) ? sessionId : null,
 		};
 
 		if (auth.mode === "local") {
@@ -362,7 +363,7 @@ async function ensureBootstrapped(): Promise<void> {
 					if (tenant && !store) throw new Error("Scheduled session creation requires a tenant store");
 					const ws = workspaceRegistry.ensureChannelWorkspace("scheduler", tenant?.tenantId);
 					if (tenant) await store!.claimResource(tenant, "workspace", ws.id);
-					const summary = durableSessions.create(req, { workspaceId: ws.id, origin: "scheduler" });
+					const summary = await durableSessions.create(req, { workspaceId: ws.id, origin: "scheduler" });
 					try {
 						if (tenant) await store!.claimResource(tenant, "session", summary.id);
 						if (!workspaceRegistry.bindSession(summary.id, ws.id)) throw new Error("Workspace not found");
@@ -947,10 +948,10 @@ function recordSessionChannel(
  * the session's birthplace IS the scheduler. Override the "web" origin that
  * POST /api/sessions stamped at creation time so the sidebar can badge it.
  */
-function recordJobRunSession(sessionId: string, req?: HttpReq): void {
+async function recordJobRunSession(sessionId: string, req?: HttpReq): Promise<void> {
 	if (!sessionId) return;
-	if (req && durableSessions.get(req, sessionId)) {
-		durableSessions.markSchedulerOrigin(req, sessionId);
+	if (req && await durableSessions.get(req, sessionId)) {
+		await durableSessions.markSchedulerOrigin(req, sessionId);
 		return;
 	}
 	const metadata = readSessionChannelMetadata();
@@ -1004,6 +1005,9 @@ const durableSessions = new DurableSessionService({
 		},
 	}),
 	tenantStore: auth.tenantStore,
+	...(auth.tenantStore ? {
+		pgCatalog: new PgSessionCatalog(auth.tenantStore.database, (req) => join(resolveRequestTenantDataRoot(req, dataDir), "durable", "sessions.json")),
+	} : {}),
 });
 
 const activeDurableJobTurns = new Map<string, string>();
@@ -1044,7 +1048,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		jobStore,
 		channelRegistry,
 		checkInStore,
-		resolveSession: (sessionId) => durableSessions.get(req, sessionId) ? { id: sessionId, runtime: "durable" } : null,
+		resolveSession: async (sessionId) => await durableSessions.get(req, sessionId) ? { id: sessionId, runtime: "durable" } : null,
 		createSession: async (request, job) => scheduledSessionFactory?.(job, request) ?? null,
 		durableExecutor: executeDurableJob,
 		disconnectJobRun: (sessionId, turnId) => {
@@ -1057,7 +1061,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		tenantStore: auth.tenantStore,
 		abortJobRun: async (sessionId) => {
 			const durableTurnId = activeDurableJobTurns.get(sessionId);
-			if (!durableTurnId || !durableSessions.get(req, sessionId)) return false;
+			if (!durableTurnId || !await durableSessions.get(req, sessionId)) return false;
 			await durableSessions.abort(req, sessionId, durableTurnId);
 			return true;
 		},
@@ -1346,9 +1350,14 @@ server.listen(port, listenConfig.host, () => {
 	console.log(`[inno-server] listening on http://${listenConfig.host}:${port}`);
 	console.log(`[inno-server] config: ${paths.configPath}`);
 	// Report-only orphan audit; repair is an explicit offline step (durable-fsck).
-	setImmediate(() => {
+	setImmediate(async () => {
 		try {
-			for (const audit of auditDurableData(paths.dataDir)) {
+			const pool = auth.tenantStore?.database;
+			const audits = await auditDurableData(paths.dataDir, pool ? {
+				knownIds: async (tenantId) => new Set((await pool.query<{ id: string }>(
+					"SELECT id FROM durable_sessions WHERE tenant_id = $1", [tenantId])).rows.map((row) => row.id)),
+			} : {});
+			for (const audit of audits) {
 				if (audit.error) logger.warn({ owner: audit.owner, error: audit.error }, "durable data audit failed");
 				else if (audit.orphans.length) {
 					logger.warn({ owner: audit.owner, orphans: audit.orphans.map((o) => o.sessionId) },

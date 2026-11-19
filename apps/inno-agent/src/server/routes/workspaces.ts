@@ -362,8 +362,8 @@ export async function handleWorkspacesRoutes(
 		if (normalizedPath.startsWith("/") || /^[A-Za-z]:\//.test(normalizedPath)) return null;
 		return safeJoinReal(root, normalizedPath);
 	};
-	const switchableSession = (sessionId: string): { hasHistory: boolean } | null => {
-		const session = durableSessions.get(req, sessionId);
+	const switchableSession = async (sessionId: string): Promise<{ hasHistory: boolean } | null> => {
+		const session = await durableSessions.get(req, sessionId);
 		if (!session) {
 			json(res, 404, { error: "Session not found" });
 			return null;
@@ -906,7 +906,7 @@ export async function handleWorkspacesRoutes(
 	const sessionWorkspaceSwitchPreviewMatch = matchRoute("GET", method, url, "/api/sessions/:id/workspace/switch-preview");
 	if (sessionWorkspaceSwitchPreviewMatch) {
 		const sessionId = decodeURIComponent(sessionWorkspaceSwitchPreviewMatch.id);
-		const switchSession = switchableSession(sessionId);
+		const switchSession = await switchableSession(sessionId);
 		if (!switchSession) return true;
 		const requestedTargetWorkspaceId = new URL(url, "http://localhost").searchParams.get("targetWorkspaceId")?.trim() ?? "";
 		if (!requestedTargetWorkspaceId) {
@@ -942,7 +942,7 @@ export async function handleWorkspacesRoutes(
 	const sessionWorkspaceSwitchMatch = matchRoute("POST", method, url, "/api/sessions/:id/workspace/switch");
 	if (sessionWorkspaceSwitchMatch) {
 		const sessionId = decodeURIComponent(sessionWorkspaceSwitchMatch.id);
-		const switchSession = switchableSession(sessionId);
+		const switchSession = await switchableSession(sessionId);
 		if (!switchSession) return true;
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const requestedTargetWorkspaceId = typeof body.targetWorkspaceId === "string" ? body.targetWorkspaceId.trim() : "";

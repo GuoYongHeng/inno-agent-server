@@ -29,7 +29,7 @@ export async function runDurableJobPrompt(
 	if ((options.noUi || !options.onEvent) && service.pendingPermission(req, sessionId)) {
 		throw new Error("This session has a pending permission request; answer it through the streaming UI");
 	}
-	const images = service.prepareImages(req, sessionId, options.images, options.requestId);
+	const images = await service.prepareImages(req, sessionId, options.images, options.requestId);
 	const recallContext = await service.prepareRecallContext(req, sessionId, prompt);
 	let lease: Awaited<ReturnType<DurableSessionService["lease"]>> | undefined;
 	let stream: { stop(): Promise<unknown> } | undefined;
@@ -66,7 +66,7 @@ export async function runDurableJobPrompt(
 			: prompt;
 		service.recordTurnMetadata(req, sessionId, null, images, prompt, options.requestId);
 		const submission = await lease.runtime.submit(input, options.requestId);
-		service.noteSubmission(req, sessionId, prompt);
+		await service.noteSubmission(req, sessionId, prompt);
 		const result = await lease.runtime.waitForSubmission(submission.id);
 		if (result.status !== "done") throw new Error(`Durable submission was unanswered: ${result.reason}`);
 		if (stream) {

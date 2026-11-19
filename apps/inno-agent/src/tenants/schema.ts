@@ -29,6 +29,28 @@ CREATE TABLE IF NOT EXISTS resource_ownership (
 CREATE INDEX IF NOT EXISTS resource_ownership_tenant_type_idx
 	ON resource_ownership (tenant_id, resource_type);
 
+CREATE TABLE IF NOT EXISTS durable_sessions (
+	id text PRIMARY KEY,
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	workspace_id text NOT NULL,
+	name text NOT NULL,
+	provider text NOT NULL,
+	model_id text NOT NULL,
+	origin text NOT NULL DEFAULT 'web' CHECK (origin IN ('web', 'scheduler')),
+	archived boolean NOT NULL DEFAULT false,
+	message_count integer NOT NULL DEFAULT 0,
+	preview text NOT NULL DEFAULT '',
+	topic_generated boolean,
+	topic_upgraded boolean,
+	conversation_id text,
+	version integer NOT NULL DEFAULT 0,
+	created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS durable_sessions_tenant_updated_idx
+	ON durable_sessions (tenant_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS job_run_claims (
 	occurrence_id text PRIMARY KEY,
 	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,

@@ -46,7 +46,7 @@ export async function handleSessionsRoutes(
 			json(res, 404, { error: "Session not found" });
 			return true;
 		}
-		if (durableSessions.get(req, id)) {
+		if (await durableSessions.get(req, id)) {
 			return handleDurableSessionResourceRoutes(req, res, method, url, id, {
 				service: durableSessions,
 				workspaceRegistry,
@@ -59,7 +59,7 @@ export async function handleSessionsRoutes(
 		const tenant = getRequestTenant(req);
 		if (!tenantStore && tenant) throw new Error("Tenant store is required for an authenticated request");
 		const ownedSessionIds = tenant ? await tenantStore!.listResourceIds(tenant, "session") : null;
-		const sessions = durableSessions.list(req)
+		const sessions = (await durableSessions.list(req))
 			.filter((summary) => !ownedSessionIds || ownedSessionIds.has(summary.id))
 			.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
 		json(res, 200, sessions);
@@ -144,7 +144,7 @@ export async function handleSessionsRoutes(
 		let createdId = "";
 		let claimed = false;
 		try {
-			const summary = durableSessions.create(req, { workspaceId: workspace.id });
+			const summary = await durableSessions.create(req, { workspaceId: workspace.id });
 			createdId = summary.id;
 			if (!workspaceRegistry.bindSession(summary.id, workspace.id)) throw new Error("Workspace not found");
 			await claimRequestResource(req, tenantStore, "session", summary.id);

@@ -34,6 +34,16 @@ export function timed<T>(name: string, operation: () => T): T {
 	}
 }
 
+/** Time an async operation. */
+export async function timedAsync<T>(name: string, operation: () => Promise<T>): Promise<T> {
+	const start = performance.now();
+	try {
+		return await operation();
+	} finally {
+		observeMs(name, performance.now() - start);
+	}
+}
+
 export function metricsSnapshot() {
 	return {
 		counters: Object.fromEntries(counters),

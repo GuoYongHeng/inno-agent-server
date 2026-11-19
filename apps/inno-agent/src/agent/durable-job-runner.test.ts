@@ -87,7 +87,7 @@ describe("runDurableJobPrompt", () => {
 			workspaceId: "workspace-1",
 			workspaceRoot: "/tmp/workspace-1",
 		};
-		vi.mocked(service.prepareImages).mockReturnValue(prepared);
+		vi.mocked(service.prepareImages).mockResolvedValue(prepared);
 
 		await runDurableJobPrompt(req, service, "durable-session", "describe this", {
 			requestId: "channel-request", turnId: "channel-turn", images: [image], noUi: true,

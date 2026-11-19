@@ -1,5 +1,11 @@
-import { incCounter, observeMs, setGauge, timed } from "../utils/metrics.js";
-import { withFileLock } from "../storage/file-lock.js";
+import { incCounter, observeMs } from "../utils/metrics.js";
+import {
+	DURABLE_ID_PATTERN,
+	FileSessionCatalog,
+	type DurableSessionPatch,
+	type DurableSessionRecord,
+	type SessionCatalog,
+} from "./session-catalog.js";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
@@ -8,7 +14,6 @@ import { join } from "node:path";
 import type { InnoConfig } from "../config.js";
 import { deleteChannelOutboxForSession } from "../channels/channel-outbox.js";
 import type { ChannelRegistry } from "../channels/channel.js";
-import { readJson, writeJson } from "../storage/file-store.js";
 import { resolveCurrentTenantConfig } from "../tenants/config.js";
 import { runInTenantContext, runWithoutTenantContext } from "../tenants/current.js";
 import { getRequestTenant } from "../tenants/http.js";
@@ -54,26 +59,8 @@ import { createTavilyTools } from "./tavily-tools.js";
 import { formatRecallForPrompt, ScopedL3Memory } from "../memory/l3/l3-tools.js";
 import { logger } from "../logger.js";
 
-const DURABLE_ID_PATTERN = /^durable-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-export interface DurableSessionRecord {
-	id: string;
-	workspaceId: string;
-	name: string;
-	createdAt: string;
-	updatedAt: string;
-	messageCount: number;
-	preview: string;
-	provider: string;
-	modelId: string;
-	topicGenerated?: boolean;
-	topicUpgraded?: boolean;
-	origin?: "web" | "scheduler";
-	archived: boolean;
-	/** The conversation the session continues in after an earlier message was
-	 * edited. Omitted: the root conversation. */
-	conversationId?: string;
-}
+export type { DurableSessionRecord } from "./session-catalog.js";
 
 export interface DurableSessionSummary extends SessionSummary {
 	runtime: "durable";
@@ -127,6 +114,8 @@ export interface DurableSessionServiceOptions {
 	/** Lazy for the same reason: job stores are created during server bootstrap. */
 	getSchedulerTools?: () => ToolRegistration[];
 	tenantStore?: TenantStore | null;
+	/** PostgreSQL catalog for authenticated tenants; without it every scope uses `sessions.json`. */
+	pgCatalog?: SessionCatalog;
 	openRuntime?: typeof DurableSessionRuntime.open;
 	completeTopic?: typeof completeConfiguredDurablePrompt;
 	completeChat?: typeof completeConfiguredDurableChat;
@@ -193,20 +182,6 @@ export class DurableSessionBusyError extends Error {
 	}
 }
 
-function isRecord(value: unknown): value is DurableSessionRecord {
-	if (!value || typeof value !== "object") return false;
-	const record = value as Partial<DurableSessionRecord>;
-	return typeof record.id === "string" && DURABLE_ID_PATTERN.test(record.id)
-		&& typeof record.workspaceId === "string" && typeof record.name === "string"
-		&& typeof record.createdAt === "string" && typeof record.updatedAt === "string"
-		&& typeof record.messageCount === "number" && typeof record.preview === "string"
-		&& typeof record.provider === "string" && typeof record.modelId === "string"
-		&& (record.topicGenerated === undefined || typeof record.topicGenerated === "boolean")
-		&& (record.topicUpgraded === undefined || typeof record.topicUpgraded === "boolean")
-		&& (record.origin === undefined || record.origin === "web" || record.origin === "scheduler")
-		&& typeof record.archived === "boolean";
-}
-
 function toSummary(record: DurableSessionRecord): DurableSessionSummary {
 	return {
 		id: record.id,
@@ -231,6 +206,7 @@ function toSummary(record: DurableSessionRecord): DurableSessionSummary {
  * tenant-rooted metadata; committed conversation history stays in pi-durable
  * SQLite and is never represented as a legacy SessionManager JSONL file. */
 export class DurableSessionService {
+	private readonly fileCatalog = new FileSessionCatalog((req) => this.catalogPath(req));
 	private readonly runtimes = new Map<string, RuntimeEntry>();
 	private readonly openings = new Map<string, Promise<OpenedRuntime>>();
 	private readonly questionStores = new Map<string, DurableQuestionStore>();
@@ -358,33 +334,21 @@ export class DurableSessionService {
 		}
 	}
 
-	private catalog(req: IncomingMessage): DurableSessionRecord[] {
-		const value = timed("inno_catalog_read_ms", () => readJson<unknown>(this.catalogPath(req), []));
-		const records = Array.isArray(value) ? value.filter(isRecord) : [];
-		setGauge("inno_catalog_sessions", records.length);
-		return records;
+	private catalogFor(req: IncomingMessage): SessionCatalog {
+		return getRequestTenant(req) && this.options.pgCatalog ? this.options.pgCatalog : this.fileCatalog;
 	}
 
-	/** Cross-process critical section for catalog read-modify-write. */
-	private mutateCatalog<T>(req: IncomingMessage, operation: () => T): T {
-		return withFileLock(`${this.catalogPath(req)}.lock`, operation);
-	}
-
-	private writeCatalog(req: IncomingMessage, records: DurableSessionRecord[]): void {
-		timed("inno_catalog_write_ms", () => writeJson(this.catalogPath(req), records));
-	}
-
-	get(req: IncomingMessage, id: string): DurableSessionRecord | undefined {
+	async get(req: IncomingMessage, id: string): Promise<DurableSessionRecord | undefined> {
 		if (!DURABLE_ID_PATTERN.test(id)) return undefined;
-		return this.catalog(req).find((record) => record.id === id);
+		return this.catalogFor(req).get(req, id);
 	}
 
-	list(req: IncomingMessage): DurableSessionSummary[] {
-		return this.catalog(req).map(toSummary)
+	async list(req: IncomingMessage): Promise<DurableSessionSummary[]> {
+		return (await this.catalogFor(req).list(req)).map(toSummary)
 			.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
 	}
 
-	create(req: IncomingMessage, input: { workspaceId: string; origin?: "web" | "scheduler" }): DurableSessionSummary {
+	async create(req: IncomingMessage, input: { workspaceId: string; origin?: "web" | "scheduler" }): Promise<DurableSessionSummary> {
 		if (!this.options.enabled) throw new DurableRuntimeDisabledError();
 		if (this.closing) throw new Error("Durable session service is shutting down");
 		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
@@ -410,24 +374,16 @@ export class DurableSessionService {
 			origin: input.origin ?? "web",
 			archived: false,
 		};
-		this.mutateCatalog(req, () => this.writeCatalog(req, [...this.catalog(req), record]));
+		await this.catalogFor(req).insert(req, record);
 		return toSummary(record);
 	}
 
-	private update(req: IncomingMessage, id: string, update: Partial<DurableSessionRecord>): DurableSessionRecord {
-		return this.mutateCatalog(req, () => {
-			const records = this.catalog(req);
-			const index = records.findIndex((record) => record.id === id);
-			if (index < 0) throw new Error("Durable session not found");
-			const next = { ...records[index]!, ...update };
-			records[index] = next;
-			this.writeCatalog(req, records);
-			return next;
-		});
+	private async update(req: IncomingMessage, id: string, update: DurableSessionPatch): Promise<DurableSessionRecord> {
+		return this.catalogFor(req).update(req, id, update);
 	}
 
-	rename(req: IncomingMessage, id: string, name: string): DurableSessionSummary {
-		return toSummary(this.update(req, id, {
+	async rename(req: IncomingMessage, id: string, name: string): Promise<DurableSessionSummary> {
+		return toSummary(await this.update(req, id, {
 			name,
 			topicGenerated: false,
 			topicUpgraded: false,
@@ -443,7 +399,7 @@ export class DurableSessionService {
 		id: string,
 		selection: { provider: string; modelId: string },
 	): Promise<DurableSessionSummary> {
-		const before = this.get(req, id);
+		const before = await this.get(req, id);
 		if (!before) throw new Error("Durable session not found");
 		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
 		const provider = config.providers[selection.provider];
@@ -451,7 +407,7 @@ export class DurableSessionService {
 			throw new DurableModelNotFoundError(selection.provider, selection.modelId);
 		}
 		if (before.provider === selection.provider && before.modelId === selection.modelId) return toSummary(before);
-		const next = this.update(req, id, { provider: selection.provider, modelId: selection.modelId });
+		const next = await this.update(req, id, { provider: selection.provider, modelId: selection.modelId });
 		try {
 			const lease = await this.lease(req, id);
 			try {
@@ -460,7 +416,7 @@ export class DurableSessionService {
 				await lease.release();
 			}
 		} catch (error) {
-			this.update(req, id, { provider: before.provider, modelId: before.modelId });
+			await this.update(req, id, { provider: before.provider, modelId: before.modelId });
 			throw error;
 		}
 		return toSummary(next);
@@ -478,7 +434,7 @@ export class DurableSessionService {
 		id: string,
 		entryId: string,
 	): Promise<{ sessionId: string; replacedEntryId: string; branchMarkerId: string; sessionRevision: string }> {
-		if (!this.get(req, id)) throw new Error("Durable session not found");
+		if (!await this.get(req, id)) throw new Error("Durable session not found");
 		const pendingQuestion = this.questionStore(req, id).pendingQuestion();
 		const pendingPermission = this.permissionStore(req, id).pendingPermission();
 		const lease = await this.lease(req, id);
@@ -488,7 +444,7 @@ export class DurableSessionService {
 			branched = await lease.runtime.branchBeforeUserMessage(entryId);
 			if (pendingQuestion) this.questionStore(req, id).cancelTurn(pendingQuestion.turnId);
 			if (pendingPermission) this.permissionStore(req, id).cancelTurn(pendingPermission.turnId);
-			this.update(req, id, { conversationId: branched.conversationId, updatedAt: new Date().toISOString() });
+			await this.update(req, id, { conversationId: branched.conversationId, updatedAt: new Date().toISOString() });
 		} finally {
 			await lease.release();
 		}
@@ -513,7 +469,7 @@ export class DurableSessionService {
 			signal?: AbortSignal;
 		},
 	): Promise<string> {
-		const record = this.get(req, id);
+		const record = await this.get(req, id);
 		if (!record) throw new Error("Durable session not found");
 		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
 		const complete = this.options.completeChat ?? completeConfiguredDurableChat;
@@ -532,7 +488,7 @@ export class DurableSessionService {
 
 	/** Context-window usage for one session, from the committed conversation. */
 	async contextUsage(req: IncomingMessage, id: string): Promise<SessionContextUsage> {
-		const record = this.get(req, id);
+		const record = await this.get(req, id);
 		if (!record) throw new Error("Durable session not found");
 		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
 		const model = config.providers[record.provider]?.models.find((candidate) => candidate.id === record.modelId);
@@ -551,20 +507,20 @@ export class DurableSessionService {
 		}
 	}
 
-	setArchived(req: IncomingMessage, id: string, archived: boolean): DurableSessionSummary {
-		return toSummary(this.update(req, id, { archived, updatedAt: new Date().toISOString() }));
+	async setArchived(req: IncomingMessage, id: string, archived: boolean): Promise<DurableSessionSummary> {
+		return toSummary(await this.update(req, id, { archived, updatedAt: new Date().toISOString() }));
 	}
 
-	markSchedulerOrigin(req: IncomingMessage, id: string): DurableSessionSummary {
-		return toSummary(this.update(req, id, { origin: "scheduler", updatedAt: new Date().toISOString() }));
+	async markSchedulerOrigin(req: IncomingMessage, id: string): Promise<DurableSessionSummary> {
+		return toSummary(await this.update(req, id, { origin: "scheduler", updatedAt: new Date().toISOString() }));
 	}
 
-	noteSubmission(req: IncomingMessage, id: string, prompt: string): void {
-		const record = this.get(req, id);
+	async noteSubmission(req: IncomingMessage, id: string, prompt: string): Promise<void> {
+		const record = await this.get(req, id);
 		if (!record) throw new Error("Durable session not found");
 		const firstTopic = record.name === "新对话";
 		const firstMessage: SessionMessageSummary = { role: "user", content: prompt, timestamp: Date.now() };
-		this.update(req, id, {
+		await this.update(req, id, {
 			preview: prompt.trim().slice(0, 200),
 			name: firstTopic ? fallbackTopicFromMessages([firstMessage], toSummary(record)) : record.name,
 			...(firstTopic ? { topicGenerated: true, topicUpgraded: false } : {}),
@@ -579,12 +535,12 @@ export class DurableSessionService {
 	/** Upgrade only an automatic preview once the conversation has enough context.
 	 * The returned promise makes the fire-and-forget HTTP path deterministic in tests. */
 	async maybeAutoGenerateTopic(req: IncomingMessage, id: string): Promise<void> {
-		const record = this.get(req, id);
+		const record = await this.get(req, id);
 		if (!record || record.topicGenerated !== true || record.topicUpgraded === true
 			|| record.messageCount < TOPIC_UPGRADE_MESSAGE_THRESHOLD) return;
 		try {
 			await this.generateTopicInternal(req, id, true);
-			const current = this.get(req, id);
+			const current = await this.get(req, id);
 			if (current?.topicGenerated === true && current.topicUpgraded === true) {
 				logger.info(`[auto-topic] ${id} → ${current.name} (durable upgraded)`);
 			}
@@ -593,8 +549,8 @@ export class DurableSessionService {
 		}
 	}
 
-	private generateTopicInternal(req: IncomingMessage, id: string, automatic: boolean): Promise<DurableSessionSummary> {
-		const initial = this.get(req, id);
+	private async generateTopicInternal(req: IncomingMessage, id: string, automatic: boolean): Promise<DurableSessionSummary> {
+		const initial = await this.get(req, id);
 		if (!initial) throw new Error("Durable session not found");
 		const key = `${this.runtimeKey(req, id)}:topic`;
 		const pending = this.topicGenerations.get(key);
@@ -607,7 +563,7 @@ export class DurableSessionService {
 		let operation: Promise<DurableSessionSummary>;
 		operation = (async () => {
 			const detail = await this.snapshot(req, id);
-			const before = this.get(req, id);
+			const before = await this.get(req, id);
 			if (!before) throw new Error("Durable session not found");
 			if (automatic && (before.topicGenerated !== true || before.topicUpgraded === true)) {
 				return toSummary(before);
@@ -618,14 +574,14 @@ export class DurableSessionService {
 				detail.messages,
 				(prompt, maxTokens) => complete(config, { provider: before.provider, modelId: before.modelId }, prompt, maxTokens),
 			);
-			const current = this.get(req, id);
+			const current = await this.get(req, id);
 			if (!current) throw new Error("Durable session not found");
 			// A manual rename (or another writer) wins over an in-flight generation.
 			if (current.name !== expectedName
 				|| (automatic && (current.topicGenerated !== true || current.topicUpgraded === true))) {
 				return toSummary(current);
 			}
-			return toSummary(this.update(req, id, {
+			return toSummary(await this.update(req, id, {
 				name: topic,
 				topicGenerated: true,
 				topicUpgraded: true,
@@ -638,10 +594,10 @@ export class DurableSessionService {
 		return operation;
 	}
 
-	prepareAttachments(req: IncomingMessage, id: string, raw: unknown): PreparedDurableAttachments | null {
+	async prepareAttachments(req: IncomingMessage, id: string, raw: unknown): Promise<PreparedDurableAttachments | null> {
 		const parsed = parseChatAttachments(raw);
 		if (!parsed) return null;
-		const record = this.get(req, id);
+		const record = await this.get(req, id);
 		if (!record) throw new Error("Durable session not found");
 		const workspaceRoot = this.options.resolveWorkspaceDir(id, record.workspaceId);
 		if (!workspaceRoot) throw new Error(`Durable session workspace not found: ${record.workspaceId}`);
@@ -651,10 +607,10 @@ export class DurableSessionService {
 		return { attachments, context, workspaceId: record.workspaceId, workspaceRoot };
 	}
 
-	prepareImages(req: IncomingMessage, id: string, raw: unknown, requestId: string): PreparedDurableImages | null {
+	async prepareImages(req: IncomingMessage, id: string, raw: unknown, requestId: string): Promise<PreparedDurableImages | null> {
 		const parsed = parseInlineImages(raw);
 		if (parsed.length === 0) return null;
-		const record = this.get(req, id);
+		const record = await this.get(req, id);
 		if (!record) throw new Error("Durable session not found");
 		const workspaceRoot = this.options.resolveWorkspaceDir(id, record.workspaceId);
 		if (!workspaceRoot) throw new Error(`Durable session workspace not found: ${record.workspaceId}`);
@@ -734,7 +690,7 @@ export class DurableSessionService {
 	/** Build threshold-gated recall as separate model-only input. The visible
 	 * prompt stays untouched and the current durable session is always excluded. */
 	async prepareRecallContext(req: IncomingMessage, id: string, prompt: string): Promise<string> {
-		if (!this.get(req, id)) throw new Error("Durable session not found");
+		if (!await this.get(req, id)) throw new Error("Durable session not found");
 		try {
 			const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
 			if (config.memory?.l3Enabled === false || !prompt.trim()) return "";
@@ -799,13 +755,13 @@ export class DurableSessionService {
 				id,
 				durableEntriesToMessages(snapshot.entries),
 			);
-			const record = this.get(req, id);
+			const record = await this.get(req, id);
 			if (!record) throw new Error("Durable session not found");
 			const lastMessageAt = messages.at(-1)?.timestamp;
 			const updatedAt = lastMessageAt && lastMessageAt > Date.parse(record.updatedAt)
 				? new Date(lastMessageAt).toISOString()
 				: record.updatedAt;
-			const next = this.update(req, id, { messageCount: messages.length, updatedAt });
+			const next = await this.update(req, id, { messageCount: messages.length, updatedAt });
 			const lastEntryId = snapshot.entries.at(-1)?.id ?? 0;
 			await this.indexL3Snapshot(req, id, messages, lastEntryId);
 			const pendingQuestion = this.pendingQuestion(req, id);
@@ -838,7 +794,7 @@ export class DurableSessionService {
 	async lease(req: IncomingMessage, id: string): Promise<DurableSessionLease> {
 		if (!this.options.enabled) throw new DurableRuntimeDisabledError();
 		if (this.closing) throw new Error("Durable session service is shutting down");
-		const record = this.get(req, id);
+		const record = await this.get(req, id);
 		if (!record) throw new Error("Durable session not found");
 		const key = this.runtimeKey(req, id);
 		let entry = this.runtimes.get(key);
@@ -996,7 +952,7 @@ export class DurableSessionService {
 			this.runtimes.delete(key);
 			await this.closeRuntimeEntry(entry);
 		}
-		this.mutateCatalog(req, () => this.writeCatalog(req, this.catalog(req).filter((record) => record.id !== id)));
+		await this.catalogFor(req).remove(req, id);
 		this.questionStores.delete(key);
 		this.permissionStores.delete(key);
 		const dataRoot = resolveRequestTenantDataRoot(req, this.options.dataDir);

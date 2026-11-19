@@ -53,33 +53,33 @@ describe("session catalog concurrency (single process)", () => {
 		const service = makeService(root());
 		const ids = await Promise.all(Array.from({ length: 40 }, async (_, i) => {
 			await Promise.resolve();
-			return service.create(req, { workspaceId: `w${i}` }).id;
+			return (await service.create(req, { workspaceId: `w${i}` })).id;
 		}));
 		await Promise.all(ids.map(async (id, i) => {
 			await Promise.resolve();
-			service.rename(req, id, `name-${i}`);
+			await service.rename(req, id, `name-${i}`);
 		}));
-		const listed = service.list(req);
+		const listed = await service.list(req);
 		expect(new Set(listed.map((s) => s.id)).size).toBe(40);
 		expect(listed.map((s) => s.name).sort()).toEqual(ids.map((_, i) => `name-${i}`).sort());
 	});
 
-	it("two service instances over one data dir do not lose updates within a process", () => {
+	it("two service instances over one data dir do not lose updates within a process", async () => {
 		const base = root();
 		const a = makeService(base);
 		const b = makeService(base);
 		for (let i = 0; i < 20; i++) {
-			a.create(req, { workspaceId: "a" });
-			b.create(req, { workspaceId: "b" });
+			await a.create(req, { workspaceId: "a" });
+			await b.create(req, { workspaceId: "b" });
 		}
-		expect(a.list(req)).toHaveLength(40);
+		expect(await a.list(req)).toHaveLength(40);
 	});
 });
 
 describe("session create/delete crash windows", () => {
-	it("create writes only the catalog record; no storage exists until the runtime opens", () => {
+	it("create writes only the catalog record; no storage exists until the runtime opens", async () => {
 		const base = root();
-		const session = makeService(base).create(req, { workspaceId: "w" });
+		const session = await makeService(base).create(req, { workspaceId: "w" });
 		expect(existsSync(join(durableRoot(base), "storage", session.id))).toBe(false);
 		expect(findOrphanedSessionData(durableRoot(base))).toEqual([]);
 	});
@@ -87,20 +87,20 @@ describe("session create/delete crash windows", () => {
 	it("a completed delete leaves no orphan data", async () => {
 		const base = root();
 		const service = makeService(base);
-		const session = service.create(req, { workspaceId: "w" });
+		const session = await service.create(req, { workspaceId: "w" });
 		mkdirSync(join(durableRoot(base), "storage", session.id), { recursive: true });
 		writeFileSync(join(durableRoot(base), "storage", session.id, "session.sqlite"), "x");
 		mkdirSync(join(durableRoot(base), "questions", session.id), { recursive: true });
 		await service.delete(req, session.id);
-		expect(service.list(req)).toEqual([]);
+		expect(await service.list(req)).toEqual([]);
 		expect(findOrphanedSessionData(durableRoot(base))).toEqual([]);
 	});
 
-	it("a crash between the catalog write and data removal leaves an orphan that the checker finds and repairs", () => {
+	it("a crash between the catalog write and data removal leaves an orphan that the checker finds and repairs", async () => {
 		const base = root();
 		const service = makeService(base);
-		const keep = service.create(req, { workspaceId: "w" });
-		const gone = service.create(req, { workspaceId: "w" });
+		const keep = await service.create(req, { workspaceId: "w" });
+		const gone = await service.create(req, { workspaceId: "w" });
 		for (const id of [keep.id, gone.id]) {
 			mkdirSync(join(durableRoot(base), "storage", id), { recursive: true });
 			writeFileSync(join(durableRoot(base), "storage", id, "session.sqlite"), "x");
@@ -119,10 +119,10 @@ describe("session create/delete crash windows", () => {
 		expect(existsSync(join(durableRoot(base), "storage", keep.id))).toBe(true);
 	});
 
-	it("refuses to classify orphans when the catalog is unreadable", () => {
+	it("refuses to classify orphans when the catalog is unreadable", async () => {
 		const base = root();
 		const service = makeService(base);
-		const session = service.create(req, { workspaceId: "w" });
+		const session = await service.create(req, { workspaceId: "w" });
 		mkdirSync(join(durableRoot(base), "storage", session.id), { recursive: true });
 		writeFileSync(join(durableRoot(base), "sessions.json"), "{not json");
 		expect(() => findOrphanedSessionData(durableRoot(base))).toThrow(/refusing to classify/);

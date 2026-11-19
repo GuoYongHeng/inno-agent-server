@@ -131,6 +131,9 @@ class PostgresJobRunClaim implements JobRunClaim {
 export class TenantStore {
 	constructor(private readonly pool: Pool) {}
 
+	/** The shared pool, for stores that keep tenant-scoped rows in the same database. */
+	get database(): Pool { return this.pool; }
+
 	async ensurePersonalTenant(userId: string): Promise<TenantContext> {
 		const client = await this.pool.connect();
 		try {
