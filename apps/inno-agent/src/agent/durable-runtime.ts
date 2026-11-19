@@ -249,11 +249,13 @@ export class DurableSessionRuntime {
 				if (options.conversationId) {
 					const active = await harness.conversation(Number(options.conversationId) as ConversationId, BACKGROUND_CONTEXT);
 					if (!active) throw new Error(`Durable conversation not found: ${options.conversationId}`);
-					// A fork keeps its parent's agent as of the fork point; bring it up to date
-					// with this open (model, instructions, workspace, tools).
-					await active.configure(agentConfig, BACKGROUND_CONTEXT);
 					rootConversation = active;
 				}
+				// `harness.root()` applies `agent` only when it creates the root, and a fork keeps its
+				// parent's agent as of the fork point. Re-apply the current model, instructions,
+				// workspace and tools to the conversation this session continues in, so a session that
+				// already exists sees newly registered tools, refreshed skills and L1 context.
+				await rootConversation.configure(agentConfig, BACKGROUND_CONTEXT);
 				const inspection = await harness.inspect(BACKGROUND_CONTEXT);
 				if (inspection.tasks.length === 0 && inspection.submissions.length === 0) {
 					const retentionMs = Math.max(0, options.recoveryRetentionMs ?? DURABLE_RECOVERY_RECORD_RETENTION_MS);
