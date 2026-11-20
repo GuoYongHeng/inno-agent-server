@@ -52,7 +52,6 @@ import { handleSettingsRoutes } from "./server/routes/settings.js";
 import { handleSkillsRoutes } from "./server/routes/skills.js";
 import { handleWorkspacesRoutes } from "./server/routes/workspaces.js";
 import { handleSessionsRoutes } from "./server/routes/sessions.js";
-import { handleLearnerRoutes } from "./server/routes/learner.js";
 import { handleWikiRoutes } from "./server/routes/wiki.js";
 import { handlePresetsRoutes } from "./server/routes/presets.js";
 import { loadSkillsFromDir } from "./agent/skills.js";
@@ -160,7 +159,6 @@ async function ensureBootstrapped(): Promise<void> {
 		getSandboxManager(); // fail fast on a sandbox config that cannot work
 
 		// ---- data directories ----
-		ensureDir(paths.learnerDataDir);
 		ensureDir(paths.sessionDir);
 		ensureDir(paths.jobsDir);
 		ensureDir(paths.skillsDir);
@@ -1148,8 +1146,6 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	// --- Wiki + L2 raw upload API (extracted to server/routes/wiki.ts) ---
 	wiki: (req, res, method, url) => handleWikiRoutes(req, res, method, url, { l2DataDir, dataDir }),
 
-	// --- Learner profile API (extracted to server/routes/learner.ts) ---
-	learner: (req, res, method, url) => handleLearnerRoutes(req, res, method, url, { paths }),
 
 	// --- Workspace API + registry + session binding (extracted to server/routes/workspaces.ts) ---
 	workspaces: (req, res, method, url) => handleWorkspacesRoutes(req, res, method, url, {

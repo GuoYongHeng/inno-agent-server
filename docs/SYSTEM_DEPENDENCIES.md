@@ -49,7 +49,7 @@ apt-get update && apt-get install -y unzip zip bash && rm -rf /var/lib/apt/lists
 | `NODE_ENV` | `production` | 生产模式 |
 | `INNO_HOME` | `/var/lib/inno-agent`（Docker） | 主目录 |
 | `INNO_CONFIG_DIR` | `/etc/inno-agent`（Docker） | 配置文件目录 |
-| `INNO_DATA_DIR` | `<home>/data` | 数据目录（L1/L2/L3 + sessions + jobs） |
+| `INNO_DATA_DIR` | `<home>/data` | 数据目录（L2/L3 + sessions + jobs） |
 | `INNO_SKILLS_DIR` | `<home>/skills` | 技能包目录 |
 | `INNO_WORKSPACE_DIR` | `/srv/inno-workspace`（Docker） | 默认工作区目录 |
 | `INNO_PORT` | `3000` | HTTP 服务端口 |
@@ -61,8 +61,7 @@ apt-get update && apt-get install -y unzip zip bash && rm -rf /var/lib/apt/lists
 /etc/inno-agent/          # 配置文件目录（只读）
   └── config.json
 /var/lib/inno-agent/      # 数据主目录（读写）
-  ├── data/               # L1 学习者档案、L2 Wiki、L3 跨对话记忆、sessions、jobs
-  │   ├── learner/        # L1 学习者档案
+  ├── data/               # L2 Wiki、L3 跨对话记忆、sessions、jobs
   │   ├── l2/             # L2 Wiki 知识库
   │   ├── l3/             # L3 SQLite 跨对话索引
   │   ├── sessions/       # PI session JSONL 文件
@@ -209,7 +208,6 @@ ENV NODE_ENV=production \
 
 # 创建必要的目录结构
 RUN mkdir -p /etc/inno-agent \
-    /var/lib/inno-agent/data/learner \
     /var/lib/inno-agent/data/l2 \
     /var/lib/inno-agent/data/l3 \
     /var/lib/inno-agent/data/sessions \

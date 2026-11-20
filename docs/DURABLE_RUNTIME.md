@@ -112,9 +112,7 @@ The current durable slice supports:
   streaming turns emit `workspace_change` events and persist tenant-local file
   activity so the existing workspace UI refreshes written files. Writes and
   edits require a replay-safe approval through the existing permission card;
-- replay-safe, tenant-local L1 context/event/evidence tools, direct profile
-  patch/update mutations, and L2 archive, query, and lint tools;
-- tenant-local L1 profile/recent-event context in durable instructions;
+- replay-safe, tenant-local L2 archive, query, and lint tools;
 - explicit `l3_recall` and threshold-gated automatic recall over
   ownership-filtered legacy and committed durable history, with verified tenant
   ALS restored when durable work resumes outside the HTTP request;
@@ -183,26 +181,12 @@ five-argument tool adapter. Shared business logic stays unchanged; the legacy
 extension reaches these native definitions only through its own reverse
 adapter, which supplies legacy-only model/session context where required.
 
-Replay safety requires application-level idempotency. Durable L1 event and
-evidence operations use IDs namespaced by session and tool call. The event is
-appended first; all derived profile changes and an `applied_operation_ids`
-marker are then committed together through the existing atomic profile write.
-A retry with the marker returns the persisted result without reapplying it. A
-crash between the event append and profile commit instead reuses the persisted
-event and applies its signals once. This closes the event/profile crash gap
-within the single-process/single-owner boundary; it is not a general
-exactly-once guarantee for model calls or external effects.
-
-Direct `patch_learner_profile` and `update_learner_profile` use operation IDs
-namespaced by tool, session, and stable tool-call ID. Their pure profile mutation
-and `applied_operation_ids` marker are committed by the same atomic profile write,
-so replay cannot repeat append/delta operations or increment the version twice.
-Legacy callers retain the original non-durable mutation path.
+Replay safety requires application-level idempotency. The memory tools are either read-only (`l2_query`, `l2_lint`, `l3_recall`) or idempotent by construction (`l2_archive` resumes by content hash and manifest records), so all are declared `replay: "safe"`; this is not a general exactly-once guarantee for model calls or external effects. (An earlier learner-profile layer, L1, used per-session/tool-call operation markers for the same purpose; it was removed.)
 
 Durable L2 archive uses deterministic conversion and page generation, disabling
 nested summarization/rich-page model calls. Existing content-hash deduplication
 and manifest records resume incomplete archives. Durable query skips the legacy
-append-only query log. L1/L2 feature gates and tenant data roots are preserved;
+append-only query log. L2/L3 feature gates and tenant data roots are preserved;
 memory writes never use the legacy global tenant root in authenticated mode.
 
 Durable L3 recall reuses the tenant-scoped session index and excludes the
@@ -440,11 +424,10 @@ aliases, disabled shell/delete/rename/append behavior, workspace
 projection, inline-image retry path stability, provider-rejection OCR fallback
 in the same submission with capability caching and request-ID dedup,
 tenant-scoped attachment/image sidecar caching and request-ID dedup,
-replay-safe L1/L2 execution, explicit L3 recall, revision-idempotent durable-history
+replay-safe L2 execution, explicit L3 recall, revision-idempotent durable-history
 indexing with current-session exclusion and hidden automatic-recall projection,
-direct profile patch/update retry dedup,
 durable topic upgrade dedup, pinned-model selection, and manual-rename protection,
-L1 event/profile crash-gap recovery, deterministic L2 archive,
+interrupted-`l2_archive` replay, deterministic L2 archive,
 OCR completion caching and job-ID resume, channel payload/completion caching,
 verified tenant channel rebinding, proven-idle 30-day outbox/question/permission retention
 with live-recovery preservation and session-delete cleanup, legacy/durable
@@ -474,7 +457,7 @@ OCR Authorization headers, cross-tenant 404s, completed request-ID retries,
 lack of legacy JSONL creation, SSE disconnect/reconnect replay, HTTP SIGKILL/restart
 recovery of an admitted SSE turn with contiguous event IDs and no duplicate user
 history, tenant-local
-L1/L2/OCR writes, replay-safe direct profile patch/update, and tenant-scoped L3
+L2/OCR writes and tenant-scoped L3
 recall through the authenticated HTTP boundary, tenant-isolated explicit and
 automatic recall of previously committed durable sessions without exposing
 injected context as user history, automatic and manual durable

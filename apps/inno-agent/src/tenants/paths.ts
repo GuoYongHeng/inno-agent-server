@@ -13,7 +13,7 @@ export function resolveRequestTenantDataRoot(req: IncomingMessage, dataDir: stri
 export function resolveTenantDataDir(
 	req: IncomingMessage,
 	dataDir: string,
-	domain: "learner" | "l2" | "l3",
+	domain: "l2" | "l3",
 ): string {
 	const tenant = getRequestTenant(req);
 	return tenant ? join(dataDir, "tenants", tenant.tenantId, domain) : join(dataDir, domain);
@@ -26,7 +26,7 @@ export function resolveCurrentTenantDataRoot(dataDir: string): string {
 
 export function resolveCurrentTenantDataDir(
 	dataDir: string,
-	domain: "learner" | "l2" | "l3" | "runs",
+	domain: "l2" | "l3" | "runs",
 ): string {
 	const tenant = getCurrentTenant();
 	return tenant ? join(dataDir, "tenants", tenant.tenantId, domain) : join(dataDir, domain);

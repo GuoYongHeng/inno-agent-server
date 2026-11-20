@@ -1,6 +1,6 @@
 # Inno Agent
 
-基于 `pi-durable` 的个人学习 Agent 后端，支持 Web UI / 飞书 / 微信、三层记忆与定时任务；每个对话是独立的 per-session SQLite 运行时，可在崩溃后恢复，并提供可选的 Better Auth + PostgreSQL 多用户模式。
+基于 `pi-durable` 的个人学习 Agent 后端，支持 Web UI / 飞书 / 微信、两层记忆（L2 Wiki + L3 跨对话检索）与定时任务；每个对话是独立的 per-session SQLite 运行时，可在崩溃后恢复，并提供可选的 Better Auth + PostgreSQL 多用户模式。
 
 > 本文档聚焦后端开发与运行细节。项目整体介绍见仓库根目录的 [README.md](../../README.md)；多用户架构、隔离与恢复边界见 [docs/MULTI_USER_DURABLE.md](../../docs/MULTI_USER_DURABLE.md)，实现契约见 [docs/DURABLE_RUNTIME.md](../../docs/DURABLE_RUNTIME.md)。
 
@@ -93,8 +93,7 @@ src/                  # 后端 (Node.js)
 ├── agent/            # pi-durable 会话运行时、会话服务与原生工具
 ├── channels/         # 飞书 / 微信等渠道
 ├── scheduler/        # 定时任务
-├── memory/           # L1 学习者 + L2 Wiki + L3 跨对话检索记忆
-│   ├── learner/      # L1 学习者画像
+├── memory/           # L2 Wiki + L3 跨对话检索记忆
 │   ├── l2/           # L2 Wiki 知识库
 │   └── l3/           # L3 会话记录的 sqlite 索引与阈值召回
 └── storage/          # 文件存储

@@ -10,7 +10,8 @@ describe("pageFromSearch", () => {
 	it("reads the ?page= param for valid pages", () => {
 		expect(pageFromSearch("?page=notebook")).toBe("notebook");
 		expect(pageFromSearch("?page=skills")).toBe("skills");
-		expect(pageFromSearch("?page=learner")).toBe("learner");
+		// The learner profile page was removed together with L1 memory.
+		expect(pageFromSearch("?page=learner")).toBe("chat");
 		expect(pageFromSearch("?page=jobs")).toBe("jobs");
 		expect(pageFromSearch("?page=chat")).toBe("chat");
 	});
@@ -25,7 +26,7 @@ describe("pageFromSearch", () => {
 		expect(pageFromSearch("?tab=wiki")).toBe("notebook");
 		expect(pageFromSearch("?tab=graph")).toBe("notebook");
 		expect(pageFromSearch("?tab=skills")).toBe("skills");
-		expect(pageFromSearch("?tab=profile")).toBe("learner");
+		expect(pageFromSearch("?tab=profile")).toBe("chat");
 		expect(pageFromSearch("?tab=jobs")).toBe("jobs");
 	});
 

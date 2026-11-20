@@ -80,7 +80,7 @@ export interface WikiPageFrontmatter {
 	confidence: ConfidenceLevel;
 	contested?: boolean;
 	contradictions?: string[];
-	/** Stable concept identifier used by learner-state prerequisite resolution. */
+	/** Stable concept identifier. */
 	concept_id?: string;
 	/** Explicit teaching dependencies. Ordinary wikilinks remain non-directional relatedness. */
 	prerequisites?: WikiPrerequisite[];

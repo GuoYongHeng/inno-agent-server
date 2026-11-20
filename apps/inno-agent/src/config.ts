@@ -29,13 +29,6 @@ export interface InnoProviderConfig {
 
 export interface InnoMemoryConfig {
 	/**
-	 * When true (default), the L1 learner profile is active: the per-turn
-	 * context pack (profile + recent events) is injected into the system prompt
-	 * and the learner tools record/update the profile. When false, the profile
-	 * is neither read into the prompt nor written by tools.
-	 */
-	l1Enabled: boolean;
-	/**
 	 * When true (default), L2 Wiki memory is active: the `l2_archive` /
 	 * `l2_query` tools can write and read the knowledge base. When false, those
 	 * tools become no-ops that report L2 is disabled.
@@ -369,7 +362,6 @@ export function normalizeProviderConfig(provider: Partial<InnoProviderConfig>): 
 export function normalizeMemoryConfig(memory: Partial<InnoMemoryConfig> | undefined): InnoMemoryConfig {
 	// All three memory layers default to ON; only an explicit `false` disables one.
 	return {
-		l1Enabled: memory?.l1Enabled !== false,
 		l2Enabled: memory?.l2Enabled !== false,
 		l3Enabled: memory?.l3Enabled !== false,
 	};
@@ -698,13 +690,6 @@ export function getDataDir(projectDir: string): string {
 
 export function getRuntimeDataDir(paths: RuntimePaths): string {
 	return paths.dataDir;
-}
-
-/**
- * Get the learner data directory path.
- */
-export function getLearnerDataDir(projectDir: string): string {
-	return join(projectDir, "data", "learner");
 }
 
 /**

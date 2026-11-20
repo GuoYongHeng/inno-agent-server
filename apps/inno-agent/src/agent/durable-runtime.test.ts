@@ -12,7 +12,6 @@ import type { ModelRef, SubmissionId } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it } from "vitest";
 import { durableEntriesToMessages } from "./durable-projection.js";
 import { DurableSessionRuntime, DurableStorageOwnerError } from "./durable-runtime.js";
-import { loadEvents, loadProfile } from "../memory/learner/profile-store.js";
 import { readManifest } from "../memory/l2/manifest-store.js";
 import { ChannelRegistry } from "../channels/channel.js";
 import { DurableQuestionStore } from "./durable-questions.js";
@@ -278,15 +277,10 @@ describe("DurableSessionRuntime", () => {
 		expect(tools.find((call) => call.toolCallId === "escape-note")).toMatchObject({ toolName: "write", isError: true });
 	});
 
-	it("runs replay-safe tenant memory tools without duplicate writes after reopen", async () => {
+	it("runs the replay-safe l2_archive tool without duplicate writes after reopen", async () => {
 		const root = tempRoot();
 		const provider = fauxRuntime();
 		provider.faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("record_learning_event", {
-				event_type: "goal_declared",
-				context: { goal_id: "goal-rust" },
-				payload: { goal_description: "学习 Rust", action: "active" },
-			}, { id: "memory-event" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage(fauxToolCall("l2_archive", {
 				title: "Rust 所有权",
 				content: "所有权与借用基础",
@@ -297,20 +291,14 @@ describe("DurableSessionRuntime", () => {
 		const storagePath = join(root, "session.sqlite");
 		const memory = {
 			sessionId: "durable-memory-test",
-			learnerDataDir: join(root, "tenant", "learner"),
 			l2DataDir: join(root, "tenant", "l2"),
 			workspaceDir: root,
-			l1Enabled: true,
 			l2Enabled: true,
 		};
 		let runtime = await open({ storagePath, memory, ...provider });
 		const submission = await runtime.submit("remember this", "memory-request");
 		expect(await waitForText(runtime, submission.id)).toBe("memory complete");
-		expect(provider.faux.state.callCount).toBe(3);
-		expect(loadEvents(memory.learnerDataDir)).toHaveLength(1);
-		expect(loadProfile(memory.learnerDataDir).applied_operation_ids).toEqual([
-			"record_learning_event:durable-memory-test:memory-event",
-		]);
+		expect(provider.faux.state.callCount).toBe(2);
 		expect(readManifest(memory.l2DataDir)).toHaveLength(1);
 		await runtime.close();
 		openRuntimes.splice(openRuntimes.indexOf(runtime), 1);
@@ -319,8 +307,7 @@ describe("DurableSessionRuntime", () => {
 		const duplicate = await runtime.submit("remember this", "memory-request");
 		expect(duplicate.id).toBe(submission.id);
 		expect(await waitForText(runtime, duplicate.id)).toBe("memory complete");
-		expect(provider.faux.state.callCount).toBe(3);
-		expect(loadEvents(memory.learnerDataDir)).toHaveLength(1);
+		expect(provider.faux.state.callCount).toBe(2);
 		expect(readManifest(memory.l2DataDir)).toHaveLength(1);
 	});
 
@@ -426,7 +413,7 @@ describe("DurableSessionRuntime", () => {
 		expect(existsSync(questionPath)).toBe(false);
 	}, 20_000);
 
-	it("replays an interrupted memory tool without duplicating its event or profile signals", async () => {
+	it("replays an interrupted l2_archive without duplicating its source", async () => {
 		const root = tempRoot();
 		const storagePath = join(root, "memory-crash.sqlite");
 		const dataRoot = join(root, "tenant");
@@ -437,36 +424,23 @@ describe("DurableSessionRuntime", () => {
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		children.add(child);
-		const output = await waitForOutput(child, "event-applied-before-profile-commit");
+		const output = await waitForOutput(child, "archived-before-commit");
 		const submissionId = Number(/submission:(\d+)/.exec(output)?.[1]) as SubmissionId;
 		expect(Number.isInteger(submissionId)).toBe(true);
 		await once(child, "exit");
 		children.delete(child);
+		const l2DataDir = join(dataRoot, "l2");
+		expect(readManifest(l2DataDir)).toHaveLength(1);
 
 		const provider = fauxRuntime();
 		provider.faux.setResponses([fauxAssistantMessage("memory recovered")]);
-		const memory = {
-			sessionId: "durable-crash-memory",
-			learnerDataDir: join(dataRoot, "learner"),
-			l2DataDir: join(dataRoot, "l2"),
-			workspaceDir: dataRoot,
-			l1Enabled: true,
-			l2Enabled: true,
-		};
+		const memory = { sessionId: "durable-crash-memory", l2DataDir, workspaceDir: dataRoot, l2Enabled: true };
 		const runtime = await open({ storagePath, memory, ...provider });
 		const recovered = await runtime.waitForSubmission(submissionId);
 		expect(recovered).toMatchObject({ status: "done", text: "memory recovered" });
 		expect(provider.faux.state.callCount).toBe(1);
-		const events = loadEvents(memory.learnerDataDir);
-		const profile = loadProfile(memory.learnerDataDir);
-		expect(events).toHaveLength(1);
-		expect(profile.applied_operation_ids).toEqual([
-			"record_learning_event:durable-crash-memory:crash-memory-event",
-		]);
-		expect(profile.knowledge_states[0]).toMatchObject({
-			concept_id: "physics.force_decomposition",
-			evidence_ids: [events[0]!.event_id],
-		});
+		// The archive ran again on recovery and must have found its own earlier records.
+		expect(readManifest(l2DataDir)).toHaveLength(1);
 	}, 20_000);
 
 	it("resumes a submitted OCR job after SIGKILL without submitting it again", async () => {

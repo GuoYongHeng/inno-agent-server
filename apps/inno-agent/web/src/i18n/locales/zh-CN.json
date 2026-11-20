@@ -53,7 +53,6 @@
 		"tabs": {
 			"notebook": "笔记本",
 			"preview": "预览",
-			"profile": "学习者画像",
 			"skills": "技能",
 			"jobs": "定时任务"
 		},
@@ -134,7 +133,6 @@
 		"workbench": "工作台",
 		"notebook": "笔记本",
 		"skills": "技能仓库",
-		"learner": "学习者画像",
 		"jobs": "任务",
 		"workspaces": "工作区",
 		"theme": "主题",
@@ -270,90 +268,6 @@
 		"streamingWaiting": "等待模型开始输出…",
 		"streamingClose": "关闭生成预览"
 	},
-	"profile": {
-		"title": "学习者画像",
-		"subtitle": "由对话与学习事件自动累积，可手动编辑",
-		"refresh": "刷新",
-		"empty": "暂无画像数据，继续与 Agent 对话吧。",
-		"version": "版本 {{version}} · {{updated}}",
-		"sections": {
-			"summary": "概览",
-			"goals": "学习目标",
-			"knowledge": "知识状态",
-			"misconceptions": "误解记录",
-			"preferences": "学习偏好"
-		},
-		"summary": {
-			"placeholder": "Agent 对学习者的整体认知摘要…",
-			"activeGoals": "活跃目标",
-			"concepts": "已追踪概念",
-			"dueReviews": "待复习概念",
-			"openMisconceptions": "未解决的误解"
-		},
-		"goals": {
-			"addNew": "+ 新增目标",
-			"newTitle": "新建学习目标",
-			"newGoalDefault": "新目标",
-			"addFailed": "新增失败：{{message}}",
-			"namePlaceholder": "例如：掌握 Rust 所有权",
-			"empty": "暂无学习目标。点击上方按钮添加一个。",
-			"title": "标题",
-			"type": "类型",
-			"priority": "优先级",
-			"status": "状态",
-			"successCriteria": "成功标准",
-			"successCriteriaPlaceholder": "每行一条…",
-			"typeOptions": {
-				"skill": "技能",
-				"concept": "概念",
-				"project": "项目",
-				"exam": "考试",
-				"habit": "习惯"
-			},
-			"statusOptions": {
-				"active": "进行中",
-				"paused": "已暂停",
-				"completed": "已完成",
-				"archived": "已归档"
-			}
-		},
-		"knowledge": {
-			"empty": "暂未追踪任何概念。",
-			"concept": "概念",
-			"domain": "领域",
-			"mastery": "掌握度",
-			"due": "复习到期",
-			"diagnosis": "诊断",
-			"diagnosisPlaceholder": "对当前掌握程度的诊断…",
-			"nextActions": "下一步动作",
-			"nextActionsPlaceholder": "每行一条…",
-			"masteryState": {
-				"mastered": "已掌握",
-				"consolidating": "巩固中",
-				"needsReview": "待复习"
-			}
-		},
-		"misconceptions": {
-			"empty": "暂未发现误解，太棒了。",
-			"description": "描述",
-			"severity": "严重度",
-			"status": "状态",
-			"repair": "修复策略",
-			"statusOptions": {
-				"active": "存在",
-				"repairing": "修复中",
-				"resolved": "已解决",
-				"stale": "失效"
-			}
-		},
-		"preferences": {
-			"explanationStyle": "讲解风格",
-			"practiceStyle": "练习方式",
-			"feedbackTone": "反馈语气",
-			"avoid": "应避免",
-			"addPlaceholder": "回车添加…"
-		}
-	},
 	"jobs": {
 		"title": "定时任务",
 		"subtitle": "自动复习、推送提醒等周期任务",
@@ -448,7 +362,6 @@
 			"daily_review": "每日复盘",
 			"weekly_summary": "每周总结",
 			"graphify_update": "图谱更新",
-			"learner_profile_reflection": "画像反思",
 			"spaced_review": "间隔复习",
 			"check_in_reminder": "打卡提醒",
 			"push_reminder": "推送提醒",
@@ -546,11 +459,6 @@
 		"providers": "服务提供方",
 		"newProvider": "新增提供方",
 		"memorySection": "记忆分层",
-		"l1": {
-			"title": "学习者画像 (L1)",
-			"onDesc": "已开启：每轮注入学习者画像，并允许工具更新画像以实现个性化教学。",
-			"offDesc": "已关闭：不再将学习者画像注入提示，工具也不会更新画像。"
-		},
 		"l2": {
 			"title": "知识库 (L2)",
 			"onDesc": "已开启：允许归档资料到 Wiki 知识库并进行检索。",
@@ -834,7 +742,6 @@
 			"newChatDesc": "开始新会话",
 			"modelDesc": "切换模型",
 			"empty": "没有匹配 \"/{{query}}\" 的命令",
-			"profileDesc": "查看学习者画像",
 			"jobsDesc": "查看定时任务",
 			"skillsDesc": "管理技能",
 			"settingsDesc": "打开设置"

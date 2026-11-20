@@ -8,7 +8,7 @@ import { fitPanelLayout, resolveWorkspaceModeForViewport, WORKSPACE_DEFAULT_WIDT
  */
 export type RightPanelTab = "preview";
 /** Top-level main-area pages (new IA): chat plus the workbench feature pages. */
-export type AppPage = "chat" | "notebook" | "skills" | "learner" | "jobs";
+export type AppPage = "chat" | "notebook" | "skills" | "jobs";
 export type WorkspaceMode = "collapsed" | "quarter" | "half" | "full";
 export type SettingsTab = "general" | "lab" | "models" | "memory" | "integrations" | "channels" | "about";
 
@@ -16,7 +16,7 @@ interface AppStoreEvents {
 	change: void;
 }
 
-const VALID_PAGES: AppPage[] = ["chat", "notebook", "skills", "learner", "jobs"];
+const VALID_PAGES: AppPage[] = ["chat", "notebook", "skills", "jobs"];
 
 /**
  * Legacy `?tab=` deep links that now resolve to full pages instead of right
@@ -28,7 +28,6 @@ const TAB_TO_PAGE: Record<string, AppPage> = {
 	wiki: "notebook",
 	graph: "notebook",
 	skills: "skills",
-	profile: "learner",
 	jobs: "jobs",
 };
 

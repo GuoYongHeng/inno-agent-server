@@ -29,8 +29,7 @@ See the [multi-user Durable guide](./docs/MULTI_USER_DURABLE.md) and [runtime co
 
 - 👥 **Multi-user Durable server**
   - Better Auth + PostgreSQL personal tenants, independent session concurrency, tenant-scoped credentials and storage, crash recovery, SSE replay, and optional static worker routing. [Architecture and limits](./docs/MULTI_USER_DURABLE.md).
-- 🧠 **Three-layer memory**
-  - **L1 learner profile** — goals, knowledge states, misconceptions, preferences; summarized into a context pack injected each turn.
+- 🧠 **Two-layer memory**
   - **L2 native wiki** — human-readable, agent-queryable pages with hybrid retrieval (lexical BM25 + knowledge graph), LLM-assisted summarization, and PDF/Office/image ingestion.
   - **L3 session recall** — session history indexed into SQLite (FTS5) with threshold-gated cross-conversation retrieval.
 - ⏰ **Proactive scheduler** — cron jobs created in natural language, runnable from the agent, the UI, or the daemon.
@@ -115,7 +114,7 @@ Each account configures its own provider/model in Settings. This is a restricted
     "feishu": { "enabled": false },
     "wechat": { "enabled": false, "mode": "ilink" }
   },
-  "memory": { "l1Enabled": true, "l2Enabled": true, "l3Enabled": true },
+  "memory": { "l2Enabled": true, "l3Enabled": true },
   "ui": { "theme": "light", "closeBehavior": "ask" }
 }
 ```
@@ -156,13 +155,13 @@ Application Layer    Better Auth · personal tenants · ownership · HTTP/SSE
 Agent Runtime        pi-durable session runtimes (one SQLite storage per session)
 (PI SDK, unmodified) Native tools: memory · OCR · documents · search · scheduler · channels
         ↓
-Layered Memory       L1 learner profile · L2 native wiki · L3 session recall
+Layered Memory       L2 native wiki · L3 session recall
                      Local data root, or verified tenant roots in multi-user mode
 ```
 
 - **Agent core** — isolated `pi-durable` runtimes; tools use the native `(params, api, context)` ABI. The PI SDK kernel is not modified. See [docs/DURABLE_RUNTIME.md](./docs/DURABLE_RUNTIME.md).
 - **Multi-user and recovery** — Better Auth + PostgreSQL verifies identity and ownership. Durable adds per-session SQLite, request-ID deduplication, application SSE journals, replay-safe question/approval recovery, and independent session concurrency. See [docs/MULTI_USER_DURABLE.md](./docs/MULTI_USER_DURABLE.md).
-- **Memory** — L1 (`src/memory/learner/`): evidence-driven profile + event log. L2 (`src/memory/l2/`): structured wiki with graph, ingestion, and hybrid retrieval; exposed via agent tools and `/api/wiki/*`. L3 (`src/memory/l3/`): a tenant-scoped SQLite FTS5 index over committed durable history.
+- **Memory** — L2 (`src/memory/l2/`): structured wiki with graph, ingestion, and hybrid retrieval; exposed via agent tools and `/api/wiki/*`. L3 (`src/memory/l3/`): a tenant-scoped SQLite FTS5 index over committed durable history.
 - **Scheduler** (`src/scheduler/`) — cron jobs persisted to `jobs.json` + `runs.jsonl`; every agent run executes in a durable session.
 - **Channels** (`src/channels/`) — `ChannelRegistry` with Feishu, WeChat (iLink / bridge), and QQ (bridge).
 - **HTTP server** (`src/server.ts`) — plain Node `http.createServer` with SSE chat streaming; route table in [`apps/inno-agent/README.md`](./apps/inno-agent/README.md).

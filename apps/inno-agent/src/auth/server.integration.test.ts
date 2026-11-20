@@ -313,17 +313,9 @@ beforeAll(async () => {
 			if (memoryPrompt) {
 				const request = JSON.parse(body) as { messages?: Array<{ role?: string }> };
 				const toolResults = request.messages?.filter((message) => message.role === "tool").length ?? 0;
-				if (toolResults < 6) {
+				if (toolResults < 3) {
 					const tenant = memoryPrompt[1];
 					const toolCalls = [{
-						id: `durable-memory-event-${tenant}`,
-						name: "record_learning_event",
-						arguments: {
-							event_type: "concept_explained",
-							context: { concept_ids: [`durable-concept-${tenant}`] },
-							payload: { topic: `durable-topic-${tenant}` },
-						},
-					}, {
 						id: `durable-memory-archive-${tenant}`,
 						name: "l2_archive",
 						arguments: {
@@ -331,14 +323,6 @@ beforeAll(async () => {
 							content: `durable-content-${tenant}`,
 							sourceType: "markdown",
 						},
-					}, {
-						id: `durable-profile-patch-${tenant}`,
-						name: "patch_learner_profile",
-						arguments: { profile_summary_append: `durable-patch-${tenant}` },
-					}, {
-						id: `durable-profile-update-${tenant}`,
-						name: "update_learner_profile",
-						arguments: { profile_summary: `durable-profile-${tenant}` },
 					}, {
 						id: `durable-ocr-call-${tenant}`,
 						name: "ocr_image",
@@ -777,23 +761,14 @@ describe("job and check-in tenant isolation", () => {
 	});
 });
 
-describe("L1 and L2 tenant storage", () => {
-	it("uses separate profile and wiki roots and hides legacy global memory", async () => {
+describe("L2 tenant storage", () => {
+	it("uses separate wiki roots and hides legacy global memory", async () => {
 		const [cookieA, cookieB] = await Promise.all([
 			registerUser("memory-a@example.com"),
 			registerUser("memory-b@example.com"),
 		]);
 		await mkdir(join(home, "data", "l2"), { recursive: true });
 		await writeFile(join(home, "data", "l2", "legacy.md"), "legacy global memory");
-
-		expect((await api(cookieA, "/api/learner/profile", {
-			method: "PATCH", body: JSON.stringify({ profile_summary: "tenant-a-profile" }),
-		})).status).toBe(200);
-		const profileB = await (await api(cookieB, "/api/learner/profile")).json() as { profile_summary?: string };
-		expect(profileB.profile_summary).not.toBe("tenant-a-profile");
-		expect((await api(cookieB, "/api/learner/profile/goals/goal_missing", {
-			method: "PATCH", body: JSON.stringify({ title: "missing" }),
-		})).status).toBe(404);
 
 		expect((await api(cookieA, "/api/wiki/page", {
 			method: "PUT", body: JSON.stringify({ path: "private.md", content: "tenant-a-wiki" }),
@@ -853,17 +828,17 @@ describe("settings and model credential isolation", () => {
 		expect(settingsB.providers.shared.apiKey).toBe("****cret");
 
 		expect((await api(cookieB, "/api/settings/memory", {
-			method: "PUT", body: JSON.stringify({ l1Enabled: false, l2Enabled: false }),
+			method: "PUT", body: JSON.stringify({ l2Enabled: false }),
 		})).status).toBe(200);
 		expect((await api(cookieB, "/api/settings/theme", {
 			method: "PUT", body: JSON.stringify({ theme: "ocean" }),
 		})).status).toBe(200);
 		const independentA = await (await api(cookieA, "/api/settings")).json() as {
-			memory: { l1Enabled: boolean; l2Enabled: boolean };
+			memory: { l2Enabled: boolean; l3Enabled: boolean };
 			ui: { theme: string };
 			providers: Record<string, { apiKey: string }>;
 		};
-		expect(independentA.memory).toMatchObject({ l1Enabled: true, l2Enabled: true });
+		expect(independentA.memory).toMatchObject({ l2Enabled: true, l3Enabled: true });
 		expect(independentA.ui.theme).toBe("light");
 		expect(independentA.providers.shared.apiKey).toBe("****cret");
 		expect(await readFile(join(home, "config", "config.json"), "utf-8")).toBe(globalConfigBefore);
@@ -1994,7 +1969,7 @@ describe("durable session HTTP boundary", () => {
 		expect(detail.messages.filter((message) => message.role === "user")).toHaveLength(1);
 	}, 60_000);
 
-	it("writes durable L1/L2/OCR state only to the authenticated tenant roots", async () => {
+	it("writes durable L2/OCR state only to the authenticated tenant roots", async () => {
 		const [cookieA, cookieB] = await Promise.all([
 			registerUser("durable-memory-a@example.com"),
 			registerUser("durable-memory-b@example.com"),
@@ -2054,29 +2029,14 @@ describe("durable session HTTP boundary", () => {
 		}
 		const rootA = join(home, "data", "tenants", tenantA);
 		const rootB = join(home, "data", "tenants", tenantB);
-		const [eventsA, eventsB, manifestA, manifestB, profileA, profileB] = await Promise.all([
-			readFile(join(rootA, "learner", "events.jsonl"), "utf-8"),
-			readFile(join(rootB, "learner", "events.jsonl"), "utf-8"),
+		const [manifestA, manifestB] = await Promise.all([
 			readFile(join(rootA, "l2", "manifest.jsonl"), "utf-8"),
 			readFile(join(rootB, "l2", "manifest.jsonl"), "utf-8"),
-			readFile(join(rootA, "learner", "profile.json"), "utf-8"),
-			readFile(join(rootB, "learner", "profile.json"), "utf-8"),
 		]);
-		expect(eventsA).toContain("durable-concept-a");
-		expect(eventsA).not.toContain("durable-concept-b");
-		expect(eventsB).toContain("durable-concept-b");
-		expect(eventsB).not.toContain("durable-concept-a");
 		expect(manifestA).toContain("durable-archive-a");
 		expect(manifestA).not.toContain("durable-archive-b");
 		expect(manifestB).toContain("durable-archive-b");
 		expect(manifestB).not.toContain("durable-archive-a");
-		expect(profileA).toContain("record_learning_event:");
-		expect(profileA).toContain("patch_learner_profile:");
-		expect(profileA).toContain("update_learner_profile:");
-		expect(profileA).toContain("durable-profile-a");
-		expect(profileA).not.toContain("durable-profile-b");
-		expect(profileB).toContain("durable-profile-b");
-		expect(profileB).not.toContain("durable-profile-a");
 		const readOcrCheckpoints = async (tenantRoot: string) => {
 			const directory = join(tenantRoot, "ocr");
 			const files = await readdir(directory);
@@ -2090,7 +2050,6 @@ describe("durable session HTTP boundary", () => {
 		expect(ocrB).not.toContain("durable-ocr-text-a");
 		expect(ocrRequests.find((request) => request.body.includes("durable-ocr-a"))?.authorization).toBe("bearer durable-ocr-secret-a");
 		expect(ocrRequests.find((request) => request.body.includes("durable-ocr-b"))?.authorization).toBe("bearer durable-ocr-secret-b");
-		expect(existsSync(join(home, "data", "learner", "events.jsonl"))).toBe(false);
 		expect(existsSync(join(home, "data", "ocr"))).toBe(false);
 	}, 60_000);
 

@@ -2,8 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadEvents, loadProfile } from "../memory/learner/profile-store.js";
-import { createDurableMemoryRegistrations, createDurableMemoryTools, buildDurableInstructions } from "./durable-memory.js";
+import { readManifest } from "../memory/l2/manifest-store.js";
+import { createDurableMemoryRegistrations, createDurableMemoryTools } from "./durable-memory.js";
 
 const roots: string[] = [];
 
@@ -16,10 +16,8 @@ function root(): string {
 function options(base: string, sessionId: string) {
 	return {
 		sessionId,
-		learnerDataDir: join(base, "learner"),
 		l2DataDir: join(base, "l2"),
 		workspaceDir: base,
-		l1Enabled: true,
 		l2Enabled: true,
 	};
 }
@@ -36,88 +34,32 @@ function executeTool(
 	);
 }
 
-async function recordGoal(base: string, sessionId: string) {
-	const tools = createDurableMemoryTools(options(base, sessionId));
-	const tool = tools.find((item) => item.name === "record_learning_event")!;
-	return executeTool(tool, "shared-tool-call", {
-		event_type: "goal_declared",
-		context: { goal_id: "goal-rust" },
-		payload: { goal_description: "学习 Rust", action: "active" },
-	});
-}
-
 afterEach(() => {
 	for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
 describe("durable memory tools", () => {
-	it("scopes idempotency by durable session and stable tool-call ID", async () => {
-		const base = root();
-		const first = await recordGoal(base, "durable-a");
-		const retry = await recordGoal(base, "durable-a");
-		const otherSession = await recordGoal(base, "durable-b");
-		const learnerDir = join(base, "learner");
-
-		expect(first.details.duplicate).toBe(false);
-		expect(retry.details.duplicate).toBe(true);
-		expect(otherSession.details.duplicate).toBe(false);
-		expect(loadEvents(learnerDir)).toHaveLength(2);
-		expect(loadProfile(learnerDir).applied_operation_ids).toEqual([
-			"record_learning_event:durable-a:shared-tool-call",
-			"record_learning_event:durable-b:shared-tool-call",
-		]);
-	});
-
-	it("exposes replay-safe event and direct profile mutation tools", () => {
+	it("exposes the L2 tools, all replay-safe, and the L3 recall tool only when L3 is wired", () => {
 		const base = root();
 		const tools = createDurableMemoryRegistrations(options(base, "durable-a"));
-		const names = tools.map((tool) => tool.name);
-		expect(names).toEqual(expect.arrayContaining([
-			"get_learner_context",
-			"record_learning_event",
-			"record_learning_evidence",
-			"assess_learning_prerequisites",
-			"review_learner_profile",
-			"patch_learner_profile",
-			"update_learner_profile",
-			"l2_archive",
-			"l2_query",
-			"l2_lint",
-		]));
+		expect(tools.map((tool) => tool.name).sort()).toEqual(["l2_archive", "l2_lint", "l2_query"]);
 		expect(tools.every((tool) => tool.replay === "safe")).toBe(true);
+		const withL3 = createDurableMemoryRegistrations({
+			...options(base, "durable-a"),
+			l3: { enabled: true, memory: { recall: async () => [] } },
+		});
+		expect(withL3.map((tool) => tool.name)).toContain("l3_recall");
 	});
 
-	it("applies direct profile patch and update once across stable-call retries", async () => {
+	it("archives the same content once however many times the call is replayed", async () => {
 		const base = root();
-		const tools = createDurableMemoryTools(options(base, "durable-a"));
-		const execute = (name: string, params: Record<string, unknown>) => {
-			const tool = tools.find((item) => item.name === name)!;
-			return executeTool(tool, "shared-profile-call", params);
-		};
-		const patch = {
-			concept_id: "rust.ownership",
-			mastery_delta: 0.1,
-			profile_summary_append: "需要更多练习",
-		};
-		const patched = await execute("patch_learner_profile", patch);
-		const patchRetry = await execute("patch_learner_profile", patch);
-		expect(patched.details.duplicate).toBe(false);
-		expect(patchRetry.details.duplicate).toBe(true);
-		expect(patchRetry.details.version).toBe(patched.details.version);
-		let profile = loadProfile(join(base, "learner"));
-		expect(profile.profile_summary).toBe("需要更多练习");
-		expect(profile.knowledge_states[0].mastery).toBeCloseTo(0.15);
-
-		const update = { profile_summary: "用户明确修正后的画像" };
-		await execute("update_learner_profile", update);
-		const updateRetry = await execute("update_learner_profile", update);
-		expect(updateRetry.details.duplicate).toBe(true);
-		profile = loadProfile(join(base, "learner"));
-		expect(profile.profile_summary).toBe("用户明确修正后的画像");
-		expect(profile.applied_operation_ids).toEqual([
-			"patch_learner_profile:durable-a:shared-profile-call",
-			"update_learner_profile:durable-a:shared-profile-call",
-		]);
+		const params = { title: "闭包", content: "闭包会保留词法环境。", sourceType: "markdown" };
+		const first = createDurableMemoryTools(options(base, "durable-a")).find((tool) => tool.name === "l2_archive")!;
+		await executeTool(first, "call-1", params);
+		// A replay after a crash re-runs the tool with the same call ID, possibly in a new process.
+		const replay = createDurableMemoryTools(options(base, "durable-a")).find((tool) => tool.name === "l2_archive")!;
+		await executeTool(replay, "call-1", params);
+		expect(readManifest(join(base, "l2"))).toHaveLength(1);
 	});
 
 	it("exposes tenant-scoped L3 recall with the durable session excluded", async () => {
@@ -140,17 +82,5 @@ describe("durable memory tools", () => {
 		expect(calls).toEqual([{ query: "机器学习", exclude: "durable-current" }]);
 		expect(result.output[0].text).toContain("之前的机器学习计划");
 		expect(result.details).toEqual({ results: 1 });
-	});
-
-	it("adds tenant-local learner context to durable instructions", async () => {
-		const base = root();
-		await recordGoal(base, "durable-a");
-		const memory = options(base, "durable-a");
-		const instructions = buildDurableInstructions("BASE", memory);
-
-		expect(instructions).toContain("BASE");
-		expect(instructions).toContain("学习者上下文");
-		expect(instructions).toContain("goal_declared");
-		expect(buildDurableInstructions("BASE", { ...memory, l1Enabled: false })).toBe("BASE");
 	});
 });

@@ -27,8 +27,7 @@
 
 - 👥 **多用户 Durable 服务**——Better Auth + PostgreSQL personal tenant、独立会话并发、租户级凭证与存储、崩溃恢复、SSE 回放和可选静态 worker 路由。
 
-- 🧠 **三层记忆**
-  - **L1 学习者画像**——目标、知识状态、误解、偏好;每轮汇总为上下文包注入系统提示词。
+- 🧠 **两层记忆**
   - **L2 原生 wiki**——人类可读、agent 可查询的页面,混合检索(词法 BM25 + 知识图谱),LLM 辅助摘要,支持 PDF/Office/图片摄入。
   - **L3 会话检索**——会话历史索引进 SQLite(FTS5),按相关性阈值门控的跨对话召回。
 - ⏰ **主动调度器**——自然语言创建 cron 任务,可从 agent、UI 或守护进程触发。
@@ -113,7 +112,7 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
     "feishu": { "enabled": false },
     "wechat": { "enabled": false, "mode": "ilink" }
   },
-  "memory": { "l1Enabled": true, "l2Enabled": true, "l3Enabled": true },
+  "memory": { "l2Enabled": true, "l3Enabled": true },
   "ui": { "theme": "light", "closeBehavior": "ask" }
 }
 ```
@@ -154,13 +153,13 @@ agent 没有 shell，也没有宿主机执行能力。文件工具（`read`、`w
 Agent 运行时      pi-durable session runtimes（每个会话一个 SQLite）
 (PI SDK,未修改)   原生工具：记忆 · OCR · 文档 · 搜索 · 调度 · 渠道
         ↓
-分层记忆          L1 学习者画像 · L2 原生 wiki · L3 会话检索
+分层记忆          L2 原生 wiki · L3 会话检索
                   local 使用本地数据目录；多用户使用经验证的 tenant 数据根
 ```
 
 - **Agent 核心**——独立的 `pi-durable` runtime；工具使用原生 `(params, api, context)` ABI。PI SDK 内核未修改。详见 [docs/DURABLE_RUNTIME.md](./docs/DURABLE_RUNTIME.md)。
 - **多用户与恢复**——Better Auth + PostgreSQL 验证身份和所有权。Durable 提供 per-session SQLite、request-ID 去重、应用 SSE journal、问题/审批恢复和独立会话并发。详见[多用户 Durable 指南](./docs/MULTI_USER_DURABLE.md)。
-- **记忆**——L1(`src/memory/learner/`):证据驱动的画像 + 事件日志。L2(`src/memory/l2/`):带图谱、文档摄入与混合检索的结构化 wiki,经 agent 工具和 `/api/wiki/*` 暴露。L3(`src/memory/l3/`):tenant-scoped SQLite FTS5 会话历史索引。
+- **记忆**——L2(`src/memory/l2/`):带图谱、文档摄入与混合检索的结构化 wiki,经 agent 工具和 `/api/wiki/*` 暴露。L3(`src/memory/l3/`):tenant-scoped SQLite FTS5 会话历史索引。
 - **调度器**(`src/scheduler/`)——cron 任务持久化到 `jobs.json` + `runs.jsonl`；每次 agent 运行都在 durable 会话中执行。
 - **渠道**(`src/channels/`)——`ChannelRegistry`,支持飞书、微信(iLink / bridge)、QQ(bridge)。
 - **HTTP 服务**(`src/server.ts`)——原生 Node `http.createServer`,SSE 流式对话;路由表见 [`apps/inno-agent/README.md`](./apps/inno-agent/README.md)。

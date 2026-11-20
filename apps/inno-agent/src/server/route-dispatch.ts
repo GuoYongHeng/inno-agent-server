@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 type RouteHandler = (req: IncomingMessage, res: ServerResponse, method: string, url: string) => Promise<boolean>;
 
 export type RouteHandlers = Record<
-	| "checkins" | "jobs" | "channels" | "skills" | "sessions" | "wiki" | "learner"
+	| "checkins" | "jobs" | "channels" | "skills" | "sessions" | "wiki"
 	| "workspaces" | "presets" | "settings" | "btw" | "chat",
 	RouteHandler
 >;
@@ -19,7 +19,6 @@ export function createRouteDispatcher(handlers: RouteHandlers) {
 		{ prefix: "/api/sessions", handler: handlers.sessions },
 		{ prefix: "/api/wiki", handler: handlers.wiki },
 		{ prefix: "/api/l2", handler: handlers.wiki },
-		{ prefix: "/api/learner", handler: handlers.learner },
 		{ prefix: "/api/workspace", handler: handlers.workspaces },
 		{ prefix: "/api/workspaces", handler: handlers.workspaces },
 		// Preserve the old chain's sessions -> workspaces order. Sessions must

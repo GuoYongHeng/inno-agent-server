@@ -53,7 +53,6 @@
 		"tabs": {
 			"notebook": "Notebook",
 			"preview": "Preview",
-			"profile": "Profile",
 			"skills": "Skills",
 			"jobs": "Jobs"
 		},
@@ -134,7 +133,6 @@
 		"workbench": "Workbench",
 		"notebook": "Notebook",
 		"skills": "Skill Store",
-		"learner": "Learner Profile",
 		"jobs": "Jobs",
 		"workspaces": "Workspaces",
 		"theme": "Theme",
@@ -270,90 +268,6 @@
 		"streamingWaiting": "Waiting for output…",
 		"streamingClose": "Close generation preview"
 	},
-	"profile": {
-		"title": "Learner Profile",
-		"subtitle": "Built from conversations and learning events; editable.",
-		"refresh": "Refresh",
-		"empty": "No profile data yet.",
-		"version": "version {{version}} · {{updated}}",
-		"sections": {
-			"summary": "Summary",
-			"goals": "Goals",
-			"knowledge": "Knowledge",
-			"misconceptions": "Misconceptions",
-			"preferences": "Preferences"
-		},
-		"summary": {
-			"placeholder": "Agent's high-level summary of the learner…",
-			"activeGoals": "Active goals",
-			"concepts": "Concepts tracked",
-			"dueReviews": "Due for review",
-			"openMisconceptions": "Open misconceptions"
-		},
-		"goals": {
-			"addNew": "+ New goal",
-			"newTitle": "New learning goal",
-			"newGoalDefault": "New goal",
-			"addFailed": "Failed to add: {{message}}",
-			"namePlaceholder": "e.g. Master Rust ownership",
-			"empty": "No goals yet.",
-			"title": "Title",
-			"type": "Type",
-			"priority": "Priority",
-			"status": "Status",
-			"successCriteria": "Success criteria",
-			"successCriteriaPlaceholder": "One per line…",
-			"typeOptions": {
-				"skill": "Skill",
-				"concept": "Concept",
-				"project": "Project",
-				"exam": "Exam",
-				"habit": "Habit"
-			},
-			"statusOptions": {
-				"active": "Active",
-				"paused": "Paused",
-				"completed": "Completed",
-				"archived": "Archived"
-			}
-		},
-		"knowledge": {
-			"empty": "No concepts tracked yet.",
-			"concept": "Concept",
-			"domain": "Domain",
-			"mastery": "Mastery",
-			"due": "Review due",
-			"diagnosis": "Diagnosis",
-			"diagnosisPlaceholder": "Notes about current understanding…",
-			"nextActions": "Next actions",
-			"nextActionsPlaceholder": "One per line…",
-			"masteryState": {
-				"mastered": "Mastered",
-				"consolidating": "Consolidating",
-				"needsReview": "Needs review"
-			}
-		},
-		"misconceptions": {
-			"empty": "No misconceptions tracked.",
-			"description": "Description",
-			"severity": "Severity",
-			"status": "Status",
-			"repair": "Repair strategy",
-			"statusOptions": {
-				"active": "active",
-				"repairing": "repairing",
-				"resolved": "resolved",
-				"stale": "stale"
-			}
-		},
-		"preferences": {
-			"explanationStyle": "Explanation style",
-			"practiceStyle": "Practice style",
-			"feedbackTone": "Feedback tone",
-			"avoid": "Avoid",
-			"addPlaceholder": "Press Enter to add…"
-		}
-	},
 	"jobs": {
 		"title": "Scheduled Jobs",
 		"subtitle": "Recurring automations and reminders",
@@ -448,7 +362,6 @@
 			"daily_review": "Daily review",
 			"weekly_summary": "Weekly summary",
 			"graphify_update": "Graph update",
-			"learner_profile_reflection": "Profile reflection",
 			"spaced_review": "Spaced review",
 			"check_in_reminder": "Check-in reminder",
 			"push_reminder": "Push reminder",
@@ -546,11 +459,6 @@
 		"providers": "Providers",
 		"newProvider": "New provider",
 		"memorySection": "Memory layers",
-		"l1": {
-			"title": "Learner profile (L1)",
-			"onDesc": "On: injects the learner profile each turn and lets tools update it for personalized teaching.",
-			"offDesc": "Off: the learner profile is neither read into the prompt nor updated by tools."
-		},
 		"l2": {
 			"title": "Knowledge base (L2)",
 			"onDesc": "On: lets the agent archive material to and query the Wiki knowledge base.",
@@ -834,7 +742,6 @@
 			"newChatDesc": "Start a new chat",
 			"modelDesc": "Switch model",
 			"empty": "No commands matching \"/{{query}}\"",
-			"profileDesc": "Open learner profile",
 			"jobsDesc": "View scheduled jobs",
 			"skillsDesc": "Manage skills",
 			"settingsDesc": "Open settings"

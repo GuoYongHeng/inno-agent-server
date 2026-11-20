@@ -21,8 +21,6 @@
 
 ━━ 每轮对话动态注入（before_agent_start 钩子）━━━━━━━━━━━━━━━
 
-  L1 上下文包（学习目标 / 掌握度 / 误解 / 偏好）
-    ↓
   工作区上下文              ← 跟着工作区走，每轮重新读取
     ├── agent.md            workspace 根目录，直接写，无需上传
     └── .skills/            workspace 工具栏 ✦ 按钮上传的 skill 包
@@ -139,7 +137,6 @@ ubiquitous;adj. 无处不在的 | Smartphones have become ubiquitous in daily li
 ### 记忆联动
 
 - 来源文章调用 `l2_archive` 归档，标题格式 `[雅思阅读] 文章主题`
-- 调用 `record_learning_event` 记录 `concept_explained` 事件，`mastery_delta` 设为 0.01
 ````
 
 ### 4.2 上传到 workspace

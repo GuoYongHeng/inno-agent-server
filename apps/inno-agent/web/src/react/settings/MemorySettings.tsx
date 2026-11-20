@@ -5,9 +5,9 @@ import type { InnoSettings } from "../../types/settings.js";
 import { Switch } from "../ui/Switch.js";
 import { SettingsSection, SettingsCard, SettingsRow } from "./primitives.js";
 
-/* ---------- Memory layer toggles (L1/L2/L3) ---------- */
+/* ---------- Memory layer toggles (L2/L3) ---------- */
 
-type MemoryLayer = "l1Enabled" | "l2Enabled" | "l3Enabled";
+type MemoryLayer = "l2Enabled" | "l3Enabled";
 
 function MemoryToggleRow({
 	enabled,
@@ -34,7 +34,6 @@ function MemoryToggleRow({
 function MemoryLayersCard({ settings }: { settings: InnoSettings }) {
 	const { t } = useTranslation();
 	const initial = {
-		l1Enabled: settings.memory?.l1Enabled !== false,
 		l2Enabled: settings.memory?.l2Enabled !== false,
 		l3Enabled: settings.memory?.l3Enabled !== false,
 	};
@@ -43,11 +42,10 @@ function MemoryLayersCard({ settings }: { settings: InnoSettings }) {
 
 	useEffect(() => {
 		setState({
-			l1Enabled: settings.memory?.l1Enabled !== false,
 			l2Enabled: settings.memory?.l2Enabled !== false,
 			l3Enabled: settings.memory?.l3Enabled !== false,
 		});
-	}, [settings.memory?.l1Enabled, settings.memory?.l2Enabled, settings.memory?.l3Enabled]);
+	}, [settings.memory?.l2Enabled, settings.memory?.l3Enabled]);
 
 	async function handleToggle(key: MemoryLayer, next: boolean) {
 		setState((s) => ({ ...s, [key]: next }));
@@ -61,8 +59,7 @@ function MemoryLayersCard({ settings }: { settings: InnoSettings }) {
 		}
 	}
 
-	const layers: { key: MemoryLayer; ns: "l1" | "l2" | "memory" }[] = [
-		{ key: "l1Enabled", ns: "l1" },
+	const layers: { key: MemoryLayer; ns: "l2" | "memory" }[] = [
 		{ key: "l2Enabled", ns: "l2" },
 		{ key: "l3Enabled", ns: "memory" },
 	];

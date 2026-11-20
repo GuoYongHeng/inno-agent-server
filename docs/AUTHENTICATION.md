@@ -62,7 +62,6 @@ Authenticated state uses tenant-local roots such as:
 <dataDir>/tenants/<verifiedTenantId>/
 ├── config/
 ├── durable/
-├── learner/
 ├── l2/
 ├── l3/
 ├── ocr/
@@ -71,11 +70,11 @@ Authenticated state uses tenant-local roots such as:
 └── sessions/
 ```
 
-Provider/default-model settings, memory flags, OCR credentials, channels, workspaces, L1/L2/L3 state, scheduler state, and Durable catalogs do not fall back to legacy global tenant data. Process-global read-only skill and preset catalogs are shared deliberately; authenticated shared-skill mutation is disabled, while owned workspace-private skills remain available.
+Provider/default-model settings, memory flags, OCR credentials, channels, workspaces, L2/L3 state, scheduler state, and Durable catalogs do not fall back to legacy global tenant data. Process-global read-only skill and preset catalogs are shared deliberately; authenticated shared-skill mutation is disabled, while owned workspace-private skills remain available.
 
 ## Files from before the multi-user runtime
 
-Existing global files (data, sessions, learner state, jobs) are never assigned to the first user who signs in, and the former `tenants:legacy` backfill command has been removed together with the legacy runtime. Global state stays hidden in authenticated mode; each tenant starts empty with its own temporary workspace. Old JSONL sessions are not converted into Durable sessions.
+Existing global files (data, sessions, jobs) are never assigned to the first user who signs in, and the former `tenants:legacy` backfill command has been removed together with the legacy runtime. Global state stays hidden in authenticated mode; each tenant starts empty with its own temporary workspace. Old JSONL sessions are not converted into Durable sessions.
 
 ## Authenticated capability restrictions
 

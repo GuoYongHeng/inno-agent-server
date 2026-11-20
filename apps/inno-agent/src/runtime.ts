@@ -8,7 +8,6 @@ export interface RuntimePaths {
 	configDir: string;
 	configPath: string;
 	dataDir: string;
-	learnerDataDir: string;
 	sessionDir: string;
 	jobsDir: string;
 	l2DataDir: string;
@@ -122,7 +121,6 @@ export function resolveRuntimePaths(options: RuntimeCliOptions = {}): RuntimePat
 		configDir,
 		configPath,
 		dataDir,
-		learnerDataDir: join(dataDir, "learner"),
 		sessionDir: join(dataDir, "sessions"),
 		jobsDir: join(dataDir, "jobs"),
 		l2DataDir: join(dataDir, "l2"),

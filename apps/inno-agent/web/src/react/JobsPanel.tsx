@@ -24,7 +24,6 @@ const TASK_TYPE_IDS: TaskType[] = [
 	"daily_review",
 	"weekly_summary",
 	"graphify_update",
-	"learner_profile_reflection",
 	"spaced_review",
 	"check_in_reminder",
 	"push_reminder",

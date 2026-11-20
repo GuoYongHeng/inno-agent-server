@@ -1,6 +1,6 @@
 # 代码质量整改计划（2026-08）
 
-> **注**：本文提到的 `terminal/`、`routes/practice.ts`、Practice Lab 和 legacy 会话相关条目对应的代码已随旧运行时移除，仅作历史记录；覆盖率清单中仍有效的是 channels / scheduler / L1 / L3 部分。
+> **注**：本文提到的 `terminal/`、`routes/practice.ts`、Practice Lab 和 legacy 会话相关条目对应的代码已随旧运行时移除，仅作历史记录；覆盖率清单中仍有效的是 channels / scheduler / L3 部分（L1 学习者画像层已整体移除，相关条目作废）。
 
 > 来源：2026-08-09 全仓库质量审核。审核结论经逐项核实（server.ts 实际 5,295 行、17 个测试文件中 9 个集中于 memory/l2、CI 只 build 不跑测试、xlsx 走 CDN tarball、axios 直接依赖零 import、jiti 出现在 4 个文件、scheduler 三处时区硬编码）。
 >

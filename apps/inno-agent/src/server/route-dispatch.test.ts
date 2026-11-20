@@ -18,7 +18,6 @@ function makeHandlers() {
 		skills: vi.fn<RouteHandlers["skills"]>().mockResolvedValue(false),
 		sessions: vi.fn<RouteHandlers["sessions"]>().mockResolvedValue(false),
 		wiki: vi.fn<RouteHandlers["wiki"]>().mockResolvedValue(false),
-		learner: vi.fn<RouteHandlers["learner"]>().mockResolvedValue(false),
 		workspaces: vi.fn<RouteHandlers["workspaces"]>().mockResolvedValue(false),
 		presets: vi.fn<RouteHandlers["presets"]>().mockResolvedValue(false),
 		settings: vi.fn<RouteHandlers["settings"]>().mockResolvedValue(false),

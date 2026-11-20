@@ -41,7 +41,6 @@ import {
 	createConfiguredDurableModels,
 	type DurableChatTurn,
 } from "./durable-models.js";
-import { buildDurableInstructions } from "./durable-memory.js";
 import { durableEntriesToMessages } from "./durable-projection.js";
 import { DurablePermissionStore, type PendingDurablePermission } from "./durable-permissions.js";
 import { DurableQuestionStore } from "./durable-questions.js";
@@ -839,10 +838,8 @@ export class DurableSessionService {
 							: scopedL3;
 						const memory = {
 							sessionId: id,
-							learnerDataDir: join(tenantDataRoot, "learner"),
 							l2DataDir: join(tenantDataRoot, "l2"),
 							workspaceDir,
-							l1Enabled: config.memory?.l1Enabled !== false,
 							l2Enabled: config.memory?.l2Enabled !== false,
 							l3: { memory: l3Memory, enabled: config.memory?.l3Enabled !== false },
 						};
@@ -877,7 +874,7 @@ export class DurableSessionService {
 							...selection,
 							...(record.conversationId ? { conversationId: record.conversationId } : {}),
 							instructions: [
-								buildDurableInstructions(INNO_SYSTEM_PROMPT, memory),
+								INNO_SYSTEM_PROMPT,
 								sandbox?.promptSection,
 								sandbox
 									? sandbox.rebasePaths(buildGlobalSkillsSection(this.options.skillsDir) ?? "")

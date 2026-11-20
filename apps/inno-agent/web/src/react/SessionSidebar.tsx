@@ -26,7 +26,6 @@ import {
 	SquarePen,
 	BookOpen,
 	Puzzle,
-	UserRound,
 	CalendarClock,
 	Settings as SettingsIcon,
 	Sun,
@@ -1137,12 +1136,6 @@ export function SessionSidebar({ collapsed }: SessionSidebarProps) {
 					label={t("nav.skills")}
 					active={page === "skills"}
 					onClick={() => navigateTo("skills")}
-				/>
-				<NavItem
-					icon={<UserRound size={16} />}
-					label={t("nav.learner")}
-					active={page === "learner"}
-					onClick={() => navigateTo("learner")}
 				/>
 				<NavItem
 					icon={<CalendarClock size={16} />}

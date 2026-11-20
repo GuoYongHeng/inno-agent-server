@@ -6,7 +6,6 @@ import { Spinner } from "./ui/Spinner.js";
 
 const Notebook = lazy(() => import("./Notebook.js").then((mod) => ({ default: mod.Notebook })));
 const JobsPanel = lazy(() => import("./JobsPanel.js").then((mod) => ({ default: mod.JobsPanel })));
-const LearnerProfilePanel = lazy(() => import("./LearnerProfilePanel.js").then((mod) => ({ default: mod.LearnerProfilePanel })));
 const SkillsPanel = lazy(() => import("./SkillsPanel.js").then((mod) => ({ default: mod.SkillsPanel })));
 
 export type FeaturePageId = Exclude<AppPage, "chat">;
@@ -14,7 +13,6 @@ export type FeaturePageId = Exclude<AppPage, "chat">;
 const PAGE_TITLE_KEYS: Record<FeaturePageId, string> = {
 	notebook: "notebook.title",
 	skills: "skills.title",
-	learner: "profile.title",
 	jobs: "jobs.title",
 };
 
@@ -35,8 +33,6 @@ function PageContent({ page }: { page: FeaturePageId }) {
 			return <Notebook />;
 		case "skills":
 			return <SkillsPanel dndManager={dndManager} />;
-		case "learner":
-			return <LearnerProfilePanel />;
 		case "jobs":
 			return <JobsPanel />;
 	}

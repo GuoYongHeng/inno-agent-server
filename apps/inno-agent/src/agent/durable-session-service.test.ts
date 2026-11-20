@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { normalizeConfig } from "../config.js";
 import { runInTenantContext, runWithoutTenantContext, getCurrentTenant } from "../tenants/current.js";
 import { saveTenantConfig } from "../tenants/config.js";
-import { loadEvents } from "../memory/learner/profile-store.js";
+import { readManifest } from "../memory/l2/manifest-store.js";
 import { closeL3Memory, ScopedL3Memory } from "../memory/l3/l3-tools.js";
 import { ChannelRegistry } from "../channels/channel.js";
 import { setRequestTenant } from "../tenants/http.js";
@@ -116,11 +116,11 @@ describe("DurableSessionService", () => {
 					faux = fauxProvider();
 					const tenantConcept = options.storagePath.includes("tenant-a") ? "concept-a" : "concept-b";
 					faux.setResponses([
-						fauxAssistantMessage(fauxToolCall("record_learning_event", {
-							event_type: "concept_explained",
-							context: { concept_ids: [tenantConcept] },
-							payload: { topic: tenantConcept },
-						}, { id: `event-${tenantConcept}` }), { stopReason: "toolUse" }),
+						fauxAssistantMessage(fauxToolCall("l2_archive", {
+							title: tenantConcept,
+							content: `notes of ${tenantConcept}`,
+							sourceType: "markdown",
+						}, { id: `archive-${tenantConcept}` }), { stopReason: "toolUse" }),
 						fauxAssistantMessage(fauxToolCall("send_file_to_channel", {
 							filePath: "shared.txt",
 							channel: "feishu",
@@ -168,12 +168,10 @@ describe("DurableSessionService", () => {
 		expect((await inTenant(b, () => service.list(boundB.req))).map((item) => item.id)).toEqual([boundB.summary.id]);
 		expect(readFileSync(join(base, "tenants", "tenant-a", "durable", "sessions.json"), "utf-8")).toContain(boundA.summary.id);
 		expect(readFileSync(join(base, "tenants", "tenant-b", "durable", "sessions.json"), "utf-8")).not.toContain(boundA.summary.id);
-		const eventsA = loadEvents(join(base, "tenants", "tenant-a", "learner"));
-		const eventsB = loadEvents(join(base, "tenants", "tenant-b", "learner"));
-		expect(eventsA).toHaveLength(1);
-		expect(eventsB).toHaveLength(1);
-		expect(eventsA[0]!.context.concept_ids).toEqual(["concept-a"]);
-		expect(eventsB[0]!.context.concept_ids).toEqual(["concept-b"]);
+		const archivesA = readManifest(join(base, "tenants", "tenant-a", "l2"));
+		const archivesB = readManifest(join(base, "tenants", "tenant-b", "l2"));
+		expect(archivesA.map((entry) => entry.title)).toEqual(["concept-a"]);
+		expect(archivesB.map((entry) => entry.title)).toEqual(["concept-b"]);
 		expect(channelSends).toEqual(expect.arrayContaining([
 			{ tenantId: "tenant-a", chatId: "chat-tenant-a" },
 			{ tenantId: "tenant-b", chatId: "chat-tenant-b" },

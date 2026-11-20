@@ -54,7 +54,6 @@ export async function saveChannelsSettings(payload: ChannelsSettingsPayload): Pr
 }
 
 export interface MemorySettingsPatch {
-	l1Enabled?: boolean;
 	l2Enabled?: boolean;
 	l3Enabled?: boolean;
 }

@@ -1211,7 +1211,6 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 		// so "new chat" would be a no-op.
 		if (!isWelcome) actions.push({ action: "new-chat", name: "new", description: t("chat.slashPalette.newChatDesc") });
 		actions.push({ action: "model", name: "model", description: t("chat.slashPalette.modelDesc") });
-		actions.push({ action: "profile", name: "profile", description: t("chat.slashPalette.profileDesc") });
 		actions.push({ action: "jobs", name: "jobs", description: t("chat.slashPalette.jobsDesc") });
 		actions.push({ action: "skills", name: "skills", description: t("chat.slashPalette.skillsDesc") });
 		actions.push({ action: "settings", name: "settings", description: t("chat.slashPalette.settingsDesc") });
@@ -1245,9 +1244,6 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 					break;
 				// Feature panels became full pages in the new IA — navigate instead
 				// of opening a right-panel tab.
-				case "profile":
-					appStore.setPage("learner");
-					break;
 				case "jobs":
 					appStore.setPage("jobs");
 					break;

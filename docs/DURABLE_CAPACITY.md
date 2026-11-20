@@ -87,7 +87,7 @@ not statistically stable production SLOs.
 ## What this does not size
 
 This harness currently excludes HTTP/SSE, Better Auth and PostgreSQL advisory
-locks, tenant catalog/configuration, L1/L2/L3 work, OCR, channels, attachments,
+locks, tenant catalog/configuration, L2/L3 work, OCR, channels, attachments,
 real provider streaming, network variance, and production CPU limits. It opens
 minimal runtimes without Inno's tool groups. Therefore this baseline alone must
 not be used to promise a Pod count, a savings percentage, or a per-user memory

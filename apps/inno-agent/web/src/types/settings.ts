@@ -126,7 +126,7 @@ export interface InnoSettings {
 		baseUrl: string;
 		token: string; // masked
 	};
-	memory?: { l1Enabled: boolean; l2Enabled: boolean; l3Enabled: boolean };
+	memory?: { l2Enabled: boolean; l3Enabled: boolean };
 	smartInput?: SmartInputSettings;
 	ui?: { theme: string; closeBehavior: WindowCloseBehavior; mathSingleDollar: boolean };
 }

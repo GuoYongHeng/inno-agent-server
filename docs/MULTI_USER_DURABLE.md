@@ -13,7 +13,7 @@
 - 保留 CLI、Desktop 和 local server 的 legacy 行为；
 - 使用 `pi-durable` 为 Web 多用户服务提供独立会话并发、持久执行和崩溃恢复；
 - 使用 Better Auth + PostgreSQL 提供账号、personal tenant 和资源所有权；
-- 让模型配置、L1/L2/L3、OCR、频道、工作区和后台任务按 tenant 隔离；
+- 让模型配置、L2/L3、OCR、频道、工作区和后台任务按 tenant 隔离；
 - 为后续静态 sharded-worker 部署保留单 owner 存储边界。
 
 ## 2. 两种运行时
@@ -86,7 +86,6 @@ execute(params, api, context)
 
 当前支持：
 
-- L1 learner context、event/evidence、profile patch/update，带 session/tool-call operation markers；
 - Durable L2 确定性 archive/query/lint，不在恢复路径嵌套模型摘要；
 - tenant-owned legacy + committed durable history 的显式和自动 L3 recall；
 - OCR job-ID checkpoint、轮询恢复和最终结果缓存；
@@ -102,7 +101,6 @@ execute(params, api, context)
 <dataDir>/tenants/<verifiedTenantId>/
 ├── config/config.json
 ├── durable/                 # catalog、session SQLite、question/permission records
-├── learner/                 # L1 profile + events
 ├── l2/                      # wiki、manifest、index
 ├── l3/                      # tenant-owned history index
 ├── ocr/                     # OCR checkpoints
@@ -127,7 +125,7 @@ INNO_DURABLE_SHARD_URLS='{"worker-a":"http://worker-a:3000","worker-b":"http://w
 - `clientRequestId` 映射到 conversation-scoped durable request ID；已完成重试重新取得原 submission，不新增 user turn 或模型调用。
 - 进程重启后重新打开 storage 并 `resume()`；应用 SSE journal 恢复已接纳 turn，并支持 `after=<eventId>` 连续回放。
 - question/permission 的决定先持久化，再唤醒原 run；不会用 synthetic user message 恢复。
-- L1 event/profile、OCR checkpoint 和 channel outbox 分别处理各自的 crash window。
+- L2 archive（内容哈希去重）、OCR checkpoint 和 channel outbox 分别处理各自的 crash window。
 - SQLite 使用 WAL + `synchronous=NORMAL`；宿主机/电源故障仍可能丢失最新提交。
 - 模型调用、远端 OCR 首次提交、外部频道发送以及部分文件 mutation 仍存在 **at-least-once** 窗口，不能宣称计费或外部副作用 exactly-once。
 - scheduler occurrence lease 只防止同一 slot 并发执行，不是 storage lock，也不是分布式事务。
@@ -165,11 +163,11 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
   1. Better Auth 匿名 401 与 Durable probe；
   2. 跨 tenant detail/status/chat 404、legacy 409；
   3. 两用户 provider 请求真实重叠、credentials 隔离、request-ID 去重；
-  4. 原生 L1/L2/L3/OCR/channel 工具及 tenant-local 文件；
+  4. 原生 L2/L3/OCR/channel 工具及 tenant-local 文件；
   5. BTW bring-back 去重且无模型调用；
   6. workspace write 审批、stale/cross-tenant 拒绝与文件落盘；
   7. SIGKILL/restart 后 running turn 恢复、连续 SSE event ID、单 user turn；
-  8. 独立 local legacy 会话经反向适配器执行 L1 工具。
+  8. （已随旧运行时和 L1 移除）
 
 真实服务验收使用本地 fake provider/OCR，没有调用付费模型。channel 只验证了受控的未配置响应，没有把该结果当作真实 IM 文件投递成功。
 

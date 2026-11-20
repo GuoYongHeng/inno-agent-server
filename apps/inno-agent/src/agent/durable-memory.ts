@@ -1,17 +1,11 @@
 import type { ToolRegistration } from "@earendil-works/pi-durable";
-import { createLearnerTools } from "../memory/learner/learner-tools.js";
-import { buildContextPack, formatContextPackForPrompt } from "../memory/learner/context-pack.js";
-import { isProfileEmpty, loadProfile, loadRecentEvents } from "../memory/learner/profile-store.js";
 import { createL2Tools } from "../memory/l2/l2-tools.js";
 import { createL3Tools, type ScopedL3Memory } from "../memory/l3/l3-tools.js";
-import { ONBOARDING_GUIDE } from "./system-prompt.js";
 
 export interface DurableMemoryToolOptions {
 	sessionId: string;
-	learnerDataDir: string;
 	l2DataDir: string;
 	workspaceDir: string;
-	l1Enabled: boolean;
 	l2Enabled: boolean;
 	l3?: {
 		memory: Pick<ScopedL3Memory, "recall">;
@@ -19,42 +13,9 @@ export interface DurableMemoryToolOptions {
 	};
 }
 
-const DURABLE_L1_TOOLS = new Set([
-	"get_learner_context",
-	"record_learning_event",
-	"record_learning_evidence",
-	"assess_learning_prerequisites",
-	"review_learner_profile",
-	"patch_learner_profile",
-	"update_learner_profile",
-]);
-
-export function buildDurableInstructions(
-	baseInstructions: string,
-	options: Pick<DurableMemoryToolOptions, "learnerDataDir" | "l1Enabled">,
-): string {
-	if (!options.l1Enabled) return baseInstructions;
-	const profile = loadProfile(options.learnerDataDir);
-	const sections = [baseInstructions];
-	if (isProfileEmpty(profile)) sections.push(ONBOARDING_GUIDE);
-	const context = buildContextPack(profile, loadRecentEvents(options.learnerDataDir, 8));
-	sections.push(formatContextPackForPrompt(context));
-	return sections.join("\n\n");
-}
-
-/** Memory surface for opt-in durable sessions. Event/evidence writes use the
- * stable durable tool-call identity; L2 archive resumes by content hash and
- * manifest without nested model calls. Direct profile patch/update mutations
- * use the same per-session/tool-call operation markers and atomic profile write. */
+/** Memory surface for durable sessions: L2 archive resumes by content hash and
+ * manifest without nested model calls; L3 recall is read-only. */
 export function createDurableMemoryTools(options: DurableMemoryToolOptions): ToolRegistration[] {
-	const learnerTools = createLearnerTools(
-		options.learnerDataDir,
-		"default",
-		() => options.l1Enabled,
-		options.l2DataDir,
-		() => options.l2Enabled,
-		(toolCallId) => `${options.sessionId}:${toolCallId}`,
-	).filter((tool) => DURABLE_L1_TOOLS.has(tool.name));
 	const l2Tools = createL2Tools(
 		options.l2DataDir,
 		() => options.l2Enabled,
@@ -66,11 +27,11 @@ export function createDurableMemoryTools(options: DurableMemoryToolOptions): Too
 	const l3Tools = options.l3
 		? createL3Tools(options.l3.memory, () => options.sessionId, () => options.l3!.enabled)
 		: [];
-	return [...learnerTools, ...l2Tools, ...l3Tools];
+	return [...l2Tools, ...l3Tools];
 }
 
-/** Return native registrations; replay-safe tools reuse their stable durable
- * call IDs and persisted operation markers after reopen. */
+/** Return native registrations. Every memory tool is idempotent or read-only, so
+ * all are replay-safe: archive resumes by content hash and manifest. */
 export function createDurableMemoryRegistrations(
 	options: DurableMemoryToolOptions,
 ): ToolRegistration[] {

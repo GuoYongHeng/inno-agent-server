@@ -91,7 +91,7 @@ export interface DurableSessionRuntimeOptions {
 	workspaceDir?: string;
 	/** Workspace-contained read/write/edit tools. Shell and other mutations stay disabled. */
 	workspaceTools?: boolean;
-	/** Tenant-local, replay-safe L1/L2 tools. */
+	/** Tenant-local, replay-safe L2/L3 memory tools. */
 	memory?: DurableMemoryToolOptions;
 	/** Remote OCR recovery checkpoints; submission remains at-least-once. */
 	ocr?: DurableOcrToolOptions;
@@ -288,7 +288,7 @@ export class DurableSessionRuntime {
 				// `harness.root()` applies `agent` only when it creates the root, and a fork keeps its
 				// parent's agent as of the fork point. Re-apply the current model, instructions,
 				// workspace and tools to the conversation this session continues in, so a session that
-				// already exists sees newly registered tools, refreshed skills and L1 context.
+				// already exists sees newly registered tools, refreshed skills and instructions.
 				await rootConversation.configure(agentConfig, BACKGROUND_CONTEXT);
 				const inspection = await harness.inspect(BACKGROUND_CONTEXT);
 				if (inspection.tasks.length === 0 && inspection.submissions.length === 0) {

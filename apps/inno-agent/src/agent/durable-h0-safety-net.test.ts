@@ -211,11 +211,7 @@ describe("replay-safe tool audit", () => {
 	 * and add to it only with a stated reason.
 	 *
 	 * Memory group (agent/durable-memory.ts):
-	 * - get_learner_context, assess_learning_prerequisites, review_learner_profile,
-	 *   l2_query, l2_lint, l3_recall: read-only.
-	 * - record_learning_event, record_learning_evidence, patch_learner_profile,
-	 *   update_learner_profile: persisted operation marker keyed session+toolCallId
-	 *   (durable-memory.test.ts "once across stable-call retries").
+	 * - l2_query, l2_lint, l3_recall: read-only.
 	 * - l2_archive: content-hash dedupe plus resumable manifest records
 	 *   (l2-tools.test.ts "deduplicates repeated content", "resumes an incomplete
 	 *   manifest record"); deterministic, no nested model call.
@@ -228,23 +224,14 @@ describe("replay-safe tool audit", () => {
 		const base = root();
 		const tools = createDurableMemoryRegistrations({
 			sessionId: "durable-audit",
-			learnerDataDir: join(base, "learner"),
 			l2DataDir: join(base, "l2"),
 			workspaceDir: base,
-			l1Enabled: true,
 			l2Enabled: true,
 		});
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
-			"assess_learning_prerequisites",
-			"get_learner_context",
 			"l2_archive",
 			"l2_lint",
 			"l2_query",
-			"patch_learner_profile",
-			"record_learning_event",
-			"record_learning_evidence",
-			"review_learner_profile",
-			"update_learner_profile",
 		]);
 		expect(tools.every((tool) => tool.replay === "safe")).toBe(true);
 	});

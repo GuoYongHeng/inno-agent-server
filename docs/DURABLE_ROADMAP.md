@@ -226,6 +226,8 @@ S4 期间发现并修复的回归：
 
 同一进程内的目录操作是同步读改写，没有 `await` 穿插，40 个交错的 create/rename 与两个服务实例交替写都没有丢更新，所以"单进程"这个前提在代码里成立；失效的只有跨进程路径（K2）。
 
+> L1 已移除（见下文"L1 移除"），下面的复核结论里涉及 L1 工具的部分仅作历史记录。
+
 **`replay: "safe"` 复核**：只读工具（`get_learner_context`、`assess_learning_prerequisites`、`review_learner_profile`、`l2_query`、`l2_lint`、`l3_recall`）无副作用；`record_learning_event`、`record_learning_evidence`、`patch_learner_profile`、`update_learner_profile` 用 session+toolCallId 的持久操作标记；`l2_archive` 靠内容哈希去重与可续写的 manifest 记录；提问与写入审批靠按稳定调用 ID 持久化的决定；`ocr_image` 与 `send_file_to_channel` 有 job-ID 检查点与外发队列，提交/外发窗口仍是至少一次。没有发现需要降级的工具。记忆工具集合已用测试钉住，新增 safe 工具必须在测试注释里写明依据。
 
 **容量基线**（`sessions.json`，每租户一份；单次同步读改写，会阻塞事件循环）：
@@ -339,12 +341,30 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - 宿主侧删除不传到沙箱；符号链接、超大文件、被忽略的目录不同步。
 - 每次 `bash` 都经 E2B 往返，长输出不做截断以外的处理（pi-durable 的 bash 工具自己做输出窗口）。
 
+### L1 移除（H3 之前）
+
+**决定**：产品不再需要 L1 学习者画像，整层删除，目的之一是缩小 H3 的范围：L1 是 H3 里状态语义最复杂的一块（带版本的画像 JSON 读改写、事件追加日志、靠 `applied_operation_ids` 去重的操作标记、事件重放重建）。记忆现在只有两层：L2 Wiki 与 L3 会话召回。
+
+**删掉的东西**
+- 后端：`memory/learner/` 整个目录（画像存储与更新、证据与状态引擎、上下文包、前置知识解析与教学入口门控、`rebuild-profile`），7 个 L1 工具（`get_learner_context`、`record_learning_event`、`record_learning_evidence`、`assess_learning_prerequisites`、`review_learner_profile`、`patch_learner_profile`、`update_learner_profile`），`/api/learner/*` 路由，每轮注入的"学习者上下文"和新手引导，`memory.l1Enabled` 配置与设置接口字段，`runtime.ts` 里的 `learner/` 数据目录，`tenants/paths.ts` 的 `learner` 域，定时任务类型 `learner_profile_reflection`。
+- 提示词：改为"两层记忆"，去掉 L1 工作原则、教学入口门控和依赖 L1 状态的教学策略指南。
+- 前端：学习者画像页面与面板、侧边栏入口、`/profile` 斜杠命令、记忆设置里的 L1 开关、相关翻译、store 与 API 模块。`?page=learner` 与 `?tab=profile` 的旧链接落回聊天页。
+- 文档：`docs/learner-state-engine-design.md`，以及 CLAUDE.md、README、持久运行时、多用户、认证等文档里的 L1 描述。
+
+**连带影响**
+- `assess_learning_prerequisites` 一并删除（它依赖 L1 的掌握度）；L2 里的前置关系数据本身没动，只是目前没有工具消费它。
+- 崩溃重放的验证改用真实的 `l2_archive`：`durable-runtime.test.ts` 里"SIGKILL 后重放被打断的工具"原先用 L1 事件工具，现在用被杀在"写完记录、提交结果之前"的 `l2_archive`，验证重放后 manifest 仍只有 1 条。`replay: "safe"` 的记忆工具集合从 10 个降到 3 个（`l2_archive`、`l2_query`、`l2_lint`，加条件注册的 `l3_recall`）。
+- **磁盘上已有的 L1 数据不再被读取**，也不会被删除或迁移：本地模式的 `<data>/learner/`、多用户模式每个租户的 `tenants/<id>/learner/` 保持原样，可自行清理。旧 `config.json` 里的 `memory.l1Enabled` 会被忽略，下次保存配置时丢弃。已有的 `learner_profile_reflection` 定时任务仍会按其提示词作为普通任务运行，只是不再出现在创建选项里。
+- 展示用静态数据（`apps/showcase`）里仍有 L1 的演示内容，那是导出的历史案例，没有改。
+
+**效果**：H3 从四批变成三批（恢复类记录、L2 wiki、L3 召回），L1 的画像 JSON 与事件日志不再需要迁移。
+
 ### H3 记忆、OCR、发件箱、恢复记录迁出本地文件（约 4–6 周）
 
 按风险从低到高分批，每批独立开关：
 
 1. **恢复类记录**（question、permission、流日志、OCR 检查点、渠道发件箱）→ PG 表。幂等键变成唯一约束，如 `UNIQUE (session_id, tool_call_id)`，取代文件里的操作标记，最能提升 `replay: safe` 的可信度。
-2. **L1 画像与事件** → PG（`tenant_id` 作用域，事件追加表加画像 JSONB 加版本号）。
+2. ~~L1 画像与事件 → PG~~：**已取消**——L1 学习者画像层已整体移除，见上面"L1 移除"。
 3. **L2 wiki**：元数据/manifest 进 PG，大文件正文进对象存储；`wiki-graph` 与搜索索引由派生任务重建。
 4. **L3 召回**：当前是每租户 `node:sqlite` 加 FTS5；迁 PG（`tsvector`/`pg_trgm`），或保留 SQLite 作为可重建缓存、以 PG 为准。先评估召回质量差异（待验证）。
 
