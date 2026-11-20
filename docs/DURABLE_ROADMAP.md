@@ -361,12 +361,18 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 ### H3 记忆、OCR、发件箱、恢复记录迁出本地文件（约 4–6 周）
 
+**已定决策**
+- 目标是任意 worker 都能接管会话，所以 H3 与 H4 都必须完成：H3 迁出租户级状态，H4 迁出每会话 SQLite。
+- 数据库统一换成 ParadeDB 镜像（`paradedb/paradedb:*-pg17`，带 pgvector、`pg_search`、`pg_trgm`）。中文全文检索用 `pg_search` 的 BM25（`chinese_lindera` 分词）。本地与 CI 的临时 PG 也用该镜像。
+- 对象存储：生产用阿里云 OSS，本地与测试用 MinIO，两者都走 S3 兼容接口，通过一层 `ObjectStore` 抽象隔离（桶、前缀按租户分隔）。
+
 按风险从低到高分批，每批独立开关：
 
-1. **恢复类记录**（question、permission、流日志、OCR 检查点、渠道发件箱）→ PG 表。幂等键变成唯一约束，如 `UNIQUE (session_id, tool_call_id)`，取代文件里的操作标记，最能提升 `replay: safe` 的可信度。
+0. ✅**基础设施（已完成）**：换 ParadeDB 镜像；引入带编号的迁移文件与 `schema_migrations` 表，取代 `tenants/schema.ts` 里零散的 `IF NOT EXISTS`；加 `ObjectStore` 抽象（OSS/MinIO 实现与内存测试替身）。
+1. **恢复类记录**（question、permission、流日志、OCR 检查点、渠道发件箱）→ PG 表。幂等键变成唯一约束，如 `UNIQUE (session_id, tool_call_id)`，取代文件里的操作标记，最能提升 `replay: safe` 的可信度。发件箱用 `FOR UPDATE SKIP LOCKED` 认领并回收过期认领，重试用尽进死信表；30 天保留改为按 `completed_at` 删除。
 2. ~~L1 画像与事件 → PG~~：**已取消**——L1 学习者画像层已整体移除，见上面"L1 移除"。
-3. **L2 wiki**：元数据/manifest 进 PG，大文件正文进对象存储；`wiki-graph` 与搜索索引由派生任务重建。
-4. **L3 召回**：当前是每租户 `node:sqlite` 加 FTS5；迁 PG（`tsvector`/`pg_trgm`），或保留 SQLite 作为可重建缓存、以 PG 为准。先评估召回质量差异（待验证）。
+3. **L3 召回**：每租户 `node:sqlite` 加 FTS5 → PG 表（`tenant_id` + `session_id` 过滤），检索用 `pg_search` BM25。不建向量索引：按租户过滤后的精确扫描比近似索引稳。
+4. **L2 wiki**：manifest 与页面元数据、正文进 PG（链接与引用用 JSONB，`version` 乐观锁，软删除用部分唯一索引，检索用 BM25 索引取代 `l2-index-store`）；`raw/` 下的原始文件文本类小文件进 PG，PDF、Word、图片进对象存储（库中只存对象键与 `sha256`）；`wiki-graph` 继续按需在内存构建。
 
 **退出标准**：worker 重启或迁移不丢任何租户状态；任一租户目录整体删除后，能从 PG 加对象存储重建全部非缓存状态。
 

@@ -1,6 +1,8 @@
 import type { Pool, PoolClient } from "pg";
+import { runMigrations, type Migration } from "../db/migrations.js";
 
-export const TENANT_SCHEMA_SQL = `
+/** Migration 1: the schema as it existed before numbered migrations (idempotent, so existing databases adopt it). */
+const BASELINE_SQL = `
 CREATE TABLE IF NOT EXISTS tenants (
 	id text PRIMARY KEY,
 	kind text NOT NULL DEFAULT 'personal' CHECK (kind = 'personal'),
@@ -84,8 +86,26 @@ CREATE INDEX IF NOT EXISTS job_run_claims_tenant_job_idx
 	ON job_run_claims (tenant_id, job_id);
 `;
 
+/**
+ * Search extensions the memory layers rely on (BM25 via pg_search, trigram, pgvector).
+ * Requires a ParadeDB image; pg_search needs vector to exist first.
+ */
+const EXTENSIONS_SQL = `
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS pg_search;
+`;
+
+export const TENANT_MIGRATIONS: readonly Migration[] = [
+	{ version: 1, name: "baseline", sql: BASELINE_SQL },
+	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
+];
+
+/** Every migration's SQL in order, for `auth:migrate --print`. */
+export const TENANT_SCHEMA_SQL = TENANT_MIGRATIONS.map((migration) => `-- ${migration.version} ${migration.name}\n${migration.sql}`).join("\n");
+
 export async function migrateTenantDatabase(pool: Pool): Promise<void> {
-	await pool.query(TENANT_SCHEMA_SQL);
+	await runMigrations(pool, TENANT_MIGRATIONS);
 }
 
 export async function withTenantTransaction<T>(

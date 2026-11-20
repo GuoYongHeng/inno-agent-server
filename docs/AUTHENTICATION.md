@@ -98,4 +98,4 @@ See [DURABLE_RUNTIME.md](./DURABLE_RUNTIME.md) for the storage/recovery contract
 
 ## Tests
 
-`npm test` remains PostgreSQL-free. `npm run test:integration` requires a real PostgreSQL installation (`initdb` and `postgres`) and starts an isolated temporary instance. In CI or an existing development environment, set `INNO_TEST_DATABASE_URL` to an administrative connection URL; the suite creates and drops its own temporary database. Missing or unusable PostgreSQL fails the suite explicitly rather than skipping it.
+`npm test` remains PostgreSQL-free. `npm run test:integration` requires a ParadeDB PostgreSQL 17 (the schema needs `pg_search`; plain PostgreSQL is not enough). Without configuration it starts a disposable `paradedb/paradedb` container through docker; in CI or an existing development environment, set `INNO_TEST_DATABASE_URL` to an administrative connection URL and the suite creates and drops its own temporary database. Schema changes are numbered migrations (`schema_migrations`), applied by `auth:migrate`. Missing or unusable PostgreSQL fails the suite explicitly rather than skipping it.

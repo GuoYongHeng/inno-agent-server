@@ -1,0 +1,60 @@
+import { MemoryObjectStore, type ObjectStore } from "./object-store.js";
+import { S3ObjectStore, type S3ObjectStoreConfig } from "./s3-object-store.js";
+
+export * from "./object-store.js";
+export { S3ObjectStore, type S3ObjectStoreConfig } from "./s3-object-store.js";
+
+/**
+ * Platform-level object storage. Read from the server's own config and
+ * environment, never from a tenant's config.
+ */
+export interface InnoObjectStorageConfig {
+	/** "memory" keeps objects in process (tests, single-process trials); "s3" targets OSS, MinIO or S3. */
+	provider: "memory" | "s3";
+	bucket?: string;
+	endpoint?: string;
+	region: string;
+	accessKeyId?: string;
+	secretAccessKey?: string;
+	forcePathStyle: boolean;
+}
+
+export type RawObjectStorageConfig = Partial<InnoObjectStorageConfig>;
+
+export function normalizeObjectStorageConfig(raw: RawObjectStorageConfig | undefined, env: NodeJS.ProcessEnv = process.env): InnoObjectStorageConfig {
+	const text = (value: unknown, fallback?: string) => (typeof value === "string" && value.trim() ? value.trim() : fallback?.trim() || undefined);
+	const endpoint = text(raw?.endpoint, env.INNO_OBJECT_STORAGE_ENDPOINT);
+	const bucket = text(raw?.bucket, env.INNO_OBJECT_STORAGE_BUCKET);
+	const accessKeyId = text(raw?.accessKeyId, env.INNO_OBJECT_STORAGE_ACCESS_KEY_ID);
+	const secretAccessKey = text(raw?.secretAccessKey, env.INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY);
+	const provider = raw?.provider ?? (text(env.INNO_OBJECT_STORAGE_PROVIDER) === "s3" || (bucket && accessKeyId) ? "s3" : "memory");
+	const pathStyleEnv = env.INNO_OBJECT_STORAGE_FORCE_PATH_STYLE;
+	return {
+		provider: provider === "s3" ? "s3" : "memory",
+		...(bucket ? { bucket } : {}),
+		...(endpoint ? { endpoint } : {}),
+		region: text(raw?.region, env.INNO_OBJECT_STORAGE_REGION) ?? "us-east-1",
+		...(accessKeyId ? { accessKeyId } : {}),
+		...(secretAccessKey ? { secretAccessKey } : {}),
+		// A custom endpoint that is not OSS (MinIO and friends) needs path-style addressing.
+		forcePathStyle: typeof raw?.forcePathStyle === "boolean"
+			? raw.forcePathStyle
+			: pathStyleEnv !== undefined ? pathStyleEnv === "true" : Boolean(endpoint && !/aliyuncs\.com/i.test(endpoint)),
+	};
+}
+
+export function createObjectStore(config: InnoObjectStorageConfig): ObjectStore {
+	if (config.provider === "memory") return new MemoryObjectStore();
+	if (!config.bucket || !config.accessKeyId || !config.secretAccessKey) {
+		throw new Error("Object storage needs bucket, accessKeyId and secretAccessKey (INNO_OBJECT_STORAGE_BUCKET / _ACCESS_KEY_ID / _SECRET_ACCESS_KEY)");
+	}
+	const s3: S3ObjectStoreConfig = {
+		bucket: config.bucket,
+		...(config.endpoint ? { endpoint: config.endpoint } : {}),
+		region: config.region,
+		accessKeyId: config.accessKeyId,
+		secretAccessKey: config.secretAccessKey,
+		forcePathStyle: config.forcePathStyle,
+	};
+	return new S3ObjectStore(s3);
+}

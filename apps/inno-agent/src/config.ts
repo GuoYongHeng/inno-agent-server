@@ -1,3 +1,4 @@
+import type { RawObjectStorageConfig } from "./object-store/index.js";
 import { DEFAULT_SANDBOX_LIMITS, type SandboxLimits } from "./sandbox/sandbox-quota.js";
 import { chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -238,6 +239,8 @@ export interface InnoConfig {
 		apiKey: string;
 	};
 	sandbox?: Omit<Partial<InnoSandboxConfig>, "limits"> & { limits?: Partial<SandboxLimits> };
+	/** Platform-level blob storage (Alibaba Cloud OSS, MinIO or S3); never read from a tenant config. */
+	objectStorage?: RawObjectStorageConfig;
 }
 
 /**
@@ -546,6 +549,7 @@ export function normalizeConfig(
 		ocrApi: config.ocrApi,
 		tavily: config.tavily,
 		...(config.sandbox ? { sandbox: config.sandbox } : {}),
+		...(config.objectStorage ? { objectStorage: config.objectStorage } : {}),
 	} as InnoConfig;
 }
 
