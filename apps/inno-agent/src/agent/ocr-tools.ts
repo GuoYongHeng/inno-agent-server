@@ -15,13 +15,13 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, isAbsolute, relative, resolve } from "node:path";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import type { ConfigHolder } from "./config-holder.js";
 import { defineInnoTool } from "./inno-tool.js";
 import { logger } from "../logger.js";
-import { writeJson } from "../storage/file-store.js";
+import type { RecoveryRecordStore } from "./recovery-store.js";
 import { checkWorkspaceMutationPath } from "./workspace-path-guard.js";
 
 export interface OcrToolOptions {
@@ -30,7 +30,8 @@ export interface OcrToolOptions {
 	workspaceDir?: string;
 	/** Persist submit/result checkpoints for replay-safe durable tool calls. */
 	durable?: {
-		checkpointDir: string;
+		records: RecoveryRecordStore;
+		sessionId: string;
 		getOperationId: (toolCallId: string) => string;
 	};
 }
@@ -72,21 +73,29 @@ interface OcrCheckpoint {
 	completion?: OcrCompletion;
 }
 
-function checkpointPath(checkpointDir: string, operationId: string): string {
-	return join(checkpointDir, `${createHash("sha256").update(operationId).digest("hex")}.json`);
+function checkpointKey(operationId: string): string {
+	return createHash("sha256").update(operationId).digest("hex");
 }
 
-function loadCheckpoint(filePath: string, operationId: string, inputPath: string): OcrCheckpoint | undefined {
-	if (!existsSync(filePath)) return undefined;
-	const checkpoint = JSON.parse(readFileSync(filePath, "utf-8")) as OcrCheckpoint;
+async function loadCheckpoint(
+	records: RecoveryRecordStore,
+	sessionId: string,
+	operationId: string,
+	inputPath: string,
+): Promise<OcrCheckpoint | undefined> {
+	const checkpoint = await records.get<OcrCheckpoint>(sessionId, checkpointKey(operationId));
+	if (!checkpoint) return undefined;
 	if (checkpoint.operationId !== operationId || checkpoint.filePath !== inputPath) {
 		throw new Error("OCR checkpoint does not match the durable tool call");
 	}
 	return checkpoint;
 }
 
-function saveCheckpoint(checkpointDir: string, checkpoint: OcrCheckpoint): void {
-	writeJson(checkpointPath(checkpointDir, checkpoint.operationId), checkpoint);
+async function saveCheckpoint(
+	durable: { records: RecoveryRecordStore; sessionId: string },
+	checkpoint: OcrCheckpoint,
+): Promise<void> {
+	await durable.records.put(durable.sessionId, checkpointKey(checkpoint.operationId), checkpoint);
 }
 
 function completedResult(completion: OcrCompletion) {
@@ -286,11 +295,7 @@ export function createOcrTools(configHolder: ConfigHolder, options: OcrToolOptio
 			let checkpoint: OcrCheckpoint | undefined;
 			if (durable && operationId) {
 				try {
-					checkpoint = loadCheckpoint(
-						checkpointPath(durable.checkpointDir, operationId),
-						operationId,
-						filePath,
-					);
+					checkpoint = await loadCheckpoint(durable.records, durable.sessionId, operationId, filePath);
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					logger.warn({ err, filePath }, "ocr_image: checkpoint recovery failed");
@@ -326,7 +331,7 @@ export function createOcrTools(configHolder: ConfigHolder, options: OcrToolOptio
 					try {
 						if (durable && operationId) {
 							checkpoint = { operationId, filePath };
-							saveCheckpoint(durable.checkpointDir, checkpoint);
+							await saveCheckpoint(durable, checkpoint);
 						}
 						jobId = await submitJob(
 							cfg,
@@ -337,7 +342,7 @@ export function createOcrTools(configHolder: ConfigHolder, options: OcrToolOptio
 						);
 						if (durable && operationId) {
 							checkpoint = { operationId, filePath, jobId };
-							saveCheckpoint(durable.checkpointDir, checkpoint);
+							await saveCheckpoint(durable, checkpoint);
 						}
 					} catch (err) {
 						logger.warn({ err, filePath }, "ocr_image: submit failed");
@@ -389,7 +394,7 @@ export function createOcrTools(configHolder: ConfigHolder, options: OcrToolOptio
 					details: { jobId, pages: 0 },
 				};
 				if (durable && operationId) {
-					saveCheckpoint(durable.checkpointDir, { operationId, filePath, jobId, completion });
+					await saveCheckpoint(durable, { operationId, filePath, jobId, completion });
 				}
 				return completedResult(completion);
 			} catch (err) {

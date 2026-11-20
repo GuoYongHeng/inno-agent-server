@@ -5,7 +5,7 @@ import { sessionToMarkdown } from "./session-markdown.js";
 import { DurableBranchError } from "../agent/durable-runtime.js";
 import { DurableModelNotFoundError, DurableRuntimeDisabledError, DurableSessionBusyError, type DurableSessionService, type DurableSessionSummary, type PreparedDurableAttachments, type PreparedDurableImages } from "../agent/durable-session-service.js";
 import { DurableSseProjector } from "../agent/durable-projection.js";
-import type { DurableStreamStore } from "../agent/durable-stream-store.js";
+import type { StreamJournal } from "../agent/durable-stream-store.js";
 import type { QuestionBridgeResult } from "../agent/question-types.js";
 import type { PermissionDecision } from "../agent/permission-types.js";
 import {
@@ -36,7 +36,7 @@ function errorStatus(error: unknown): number {
 
 interface DurableStreamContext {
 	state: SessionStreamState;
-	store: DurableStreamStore;
+	store: StreamJournal;
 }
 
 const durableProjections = new Map<string, Promise<void>>();
@@ -59,14 +59,14 @@ function finishDurableTurn(
 }
 
 /** Restore before any registry lookup that follows a process restart. */
-export function restoreDurableStream(
+export async function restoreDurableStream(
 	req: HttpReq,
 	service: DurableSessionService,
 	sessionId: string,
 	turnId?: string,
-): DurableStreamContext | undefined {
+): Promise<DurableStreamContext | undefined> {
 	const store = service.streamStore(req);
-	const restored = turnId ? store.load(sessionId, turnId) : store.latest(sessionId);
+	const restored = turnId ? await store.load(sessionId, turnId) : await store.latest(sessionId);
 	if (!restored) return undefined;
 	try {
 		const state = streamRegistry.restoreTurn(restored.snapshot, restored.history, restored.cancelRequested);
@@ -168,7 +168,7 @@ export async function handleDurableSessionResourceRoutes(
 		return true;
 	}
 	if (matchRoute("POST", method, url, "/api/sessions/:id/branch-before-message")) {
-		restoreDurableStream(req, ctx.service, id);
+		await restoreDurableStream(req, ctx.service, id);
 		if (streamRegistry.getActiveForSession(id)) {
 			json(res, 409, { error: "Cannot edit a message while the session is generating" });
 			return true;
@@ -193,7 +193,7 @@ export async function handleDurableSessionResourceRoutes(
 		return true;
 	}
 	if (matchRoute("DELETE", method, url, "/api/sessions/:id")) {
-		restoreDurableStream(req, ctx.service, id);
+		await restoreDurableStream(req, ctx.service, id);
 		if (streamRegistry.getActiveForSession(id)) {
 			json(res, 409, { error: "Cannot delete a session with an active chat turn" });
 			return true;
@@ -263,14 +263,14 @@ async function streamDurableTurn(
 		workspaceMonitor = null;
 	};
 	try {
-		const journal = store.load(state.sessionId, state.turnId);
+		const journal = await store.load(state.sessionId, state.turnId);
 		if (!journal) throw new Error("Durable stream journal not found");
 		lease = await service.lease(req, state.sessionId);
-		lease.runtime.bindQuestionTurn({
+		await lease.runtime.bindQuestionTurn({
 			turnId: state.turnId,
 			emit: (event) => publishDurableEvent(context, event),
 		});
-		lease.runtime.bindPermissionTurn({
+		await lease.runtime.bindPermissionTurn({
 			turnId: state.turnId,
 			emit: (event) => publishDurableEvent(context, event),
 		});
@@ -328,7 +328,7 @@ async function streamDurableTurn(
 		if (submissionId === undefined) {
 			const submission = await lease.runtime.submit(journal.input, state.clientRequestId);
 			submissionId = submission.id;
-			store.markAdmitted(state.sessionId, state.turnId, submissionId);
+			await store.markAdmitted(state.sessionId, state.turnId, submissionId);
 		}
 		await service.noteSubmission(req, state.sessionId, state.inputSnapshot.prompt);
 		// Cancellation can race durable admission. Re-apply the abort after the
@@ -429,10 +429,10 @@ export async function handleDurableChatRoutes(
 			json(res, 400, { error: "Missing or invalid sessionId, turnId, questionId or result" });
 			return true;
 		}
-		const status = ctx.service.respondQuestion(req, sessionId, { turnId, questionId, result });
+		const status = await ctx.service.respondQuestion(req, sessionId, { turnId, questionId, result });
 		let resumed = false;
 		if (status === "accepted") {
-			const restored = restoreDurableStream(req, ctx.service, sessionId, turnId);
+			const restored = await restoreDurableStream(req, ctx.service, sessionId, turnId);
 			const live = restored?.state ?? streamRegistry.getByTurn(turnId);
 			if (live?.sessionId === sessionId && (live.status === "queued" || live.status === "running")) {
 				// The original or recovered projection holds the runtime lease until
@@ -470,12 +470,12 @@ export async function handleDurableChatRoutes(
 			json(res, 400, { error: "Missing sessionId, turnId, requestId or a valid decision" });
 			return true;
 		}
-		const status = ctx.service.respondPermission(req, sessionId, {
+		const status = await ctx.service.respondPermission(req, sessionId, {
 			turnId, requestId, decision: validDecision, ...(reason ? { reason } : {}),
 		});
 		let resumed = false;
 		if (status === "accepted") {
-			const restored = restoreDurableStream(req, ctx.service, sessionId, turnId);
+			const restored = await restoreDurableStream(req, ctx.service, sessionId, turnId);
 			const live = restored?.state ?? streamRegistry.getByTurn(turnId);
 			if (live?.sessionId === sessionId && (live.status === "queued" || live.status === "running")) {
 				if (restored) void ensureDurableStreamProjection(req, ctx.service, restored);
@@ -503,16 +503,16 @@ export async function handleDurableChatRoutes(
 		const prompt = typeof body.prompt === "string" ? body.prompt : "";
 		const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
 		if (!prompt || !sessionId) { json(res, 400, { error: "Missing prompt or sessionId" }); return true; }
-		restoreDurableStream(req, ctx.service, sessionId);
+		await restoreDurableStream(req, ctx.service, sessionId);
 		if (streamRegistry.getActiveForSession(sessionId)) {
 			json(res, 409, { error: "Session already has an active chat turn" });
 			return true;
 		}
-		if (ctx.service.pendingQuestion(req, sessionId)) {
+		if (await ctx.service.pendingQuestion(req, sessionId)) {
 			json(res, 409, { error: "This session has a pending question; answer it through the streaming UI" });
 			return true;
 		}
-		if (ctx.service.pendingPermission(req, sessionId)) {
+		if (await ctx.service.pendingPermission(req, sessionId)) {
 			json(res, 409, { error: "This session has a pending permission request; answer it through the streaming UI" });
 			return true;
 		}
@@ -525,8 +525,8 @@ export async function handleDurableChatRoutes(
 		let lease: Awaited<ReturnType<DurableSessionService["lease"]>> | undefined;
 		try {
 			lease = await ctx.service.lease(req, sessionId);
-			lease.runtime.bindQuestionTurn({ turnId: requestId, noUi: true });
-			lease.runtime.bindPermissionTurn({ turnId: requestId, noUi: true });
+			await lease.runtime.bindQuestionTurn({ turnId: requestId, noUi: true });
+			await lease.runtime.bindPermissionTurn({ turnId: requestId, noUi: true });
 			ctx.service.recordTurnMetadata(req, sessionId, attachments, images, prompt, requestId);
 			const submission = await lease.runtime.submit(durableUserInput(prompt, attachments, images, recallContext), requestId);
 			await ctx.service.noteSubmission(req, sessionId, prompt);
@@ -554,7 +554,7 @@ export async function handleDurableChatRoutes(
 		json(res, 400, { error: "Missing prompt, sessionId or clientRequestId" });
 		return true;
 	}
-	restoreDurableStream(req, ctx.service, sessionId);
+	await restoreDurableStream(req, ctx.service, sessionId);
 	if (streamRegistry.getActiveForSession(sessionId)) {
 		json(res, 409, { error: "Session already has an active chat turn" });
 		return true;
@@ -593,7 +593,7 @@ export async function handleDurableChatRoutes(
 	try {
 		// Persist the exact model input before admission. If the process dies
 		// before the submission ID append, the same requestId reacquires it.
-		store.create(state, input);
+		await store.create(state, input);
 	} catch (error) {
 		streamRegistry.discardTurn(state);
 		json(res, 500, { error: error instanceof Error ? error.message : String(error) });

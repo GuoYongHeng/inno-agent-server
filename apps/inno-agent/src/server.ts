@@ -1022,6 +1022,7 @@ const durableSessions = new DurableSessionService({
 	tenantStore: auth.tenantStore,
 	getSandboxManager,
 	...(auth.tenantStore ? {
+		recoveryPool: auth.tenantStore.database,
 		pgCatalog: new PgSessionCatalog(auth.tenantStore.database, (req) => join(resolveRequestTenantDataRoot(req, dataDir), "durable", "sessions.json")),
 	} : {}),
 });
@@ -1069,8 +1070,10 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		durableExecutor: executeDurableJob,
 		disconnectJobRun: (sessionId, turnId) => {
 			if (activeDurableJobTurns.get(sessionId) === turnId) {
-				durableSessions.cancelPermissionTurn(req, sessionId, turnId);
-				durableSessions.cancelQuestionTurn(req, sessionId, turnId);
+				void Promise.all([
+					durableSessions.cancelPermissionTurn(req, sessionId, turnId),
+					durableSessions.cancelQuestionTurn(req, sessionId, turnId),
+				]).catch((error) => logger.warn({ err: error, sessionId, turnId }, "cancelling a disconnected job run's pending prompts failed"));
 			}
 		},
 		recordJobRunSession,

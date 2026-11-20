@@ -45,6 +45,24 @@ export interface RestoredDurableStream {
 	terminal: boolean;
 }
 
+/**
+ * Journal of one chat turn's SSE events and submission intent. `append` is
+ * fire-and-forget and keeps order (an observability failure must not fail a
+ * healthy model run); the other writes are awaited. `flush` waits for appends.
+ */
+export interface StreamJournal {
+	create(state: SessionStreamState, input: UserInput): Promise<void>;
+	append(envelope: StreamEventEnvelope): void;
+	flush(): Promise<void>;
+	markAdmitted(sessionId: string, turnId: string, submissionId: SubmissionId): Promise<void>;
+	markCancelled(sessionId: string, turnId: string): Promise<void>;
+	load(sessionId: string, turnId: string): Promise<RestoredDurableStream | undefined>;
+	latest(sessionId: string): Promise<RestoredDurableStream | undefined>;
+	deleteSession(sessionId: string): Promise<void>;
+}
+
+export { TERMINAL_RETENTION_MS };
+
 function validIds(sessionId: string, turnId?: string): boolean {
 	return DURABLE_ID_PATTERN.test(sessionId) && (!turnId || TURN_ID_PATTERN.test(turnId));
 }
@@ -178,4 +196,18 @@ export class DurableStreamStore {
 			terminal,
 		};
 	}
+}
+
+/** The JSONL-file journal as a {@link StreamJournal}. File writes are synchronous, so there is nothing to flush. */
+export class FileStreamJournal implements StreamJournal {
+	constructor(private readonly store: DurableStreamStore) {}
+
+	async create(state: SessionStreamState, input: UserInput): Promise<void> { this.store.create(state, input); }
+	append(envelope: StreamEventEnvelope): void { this.store.append(envelope); }
+	async flush(): Promise<void> {}
+	async markAdmitted(sessionId: string, turnId: string, submissionId: SubmissionId): Promise<void> { this.store.markAdmitted(sessionId, turnId, submissionId); }
+	async markCancelled(sessionId: string, turnId: string): Promise<void> { this.store.markCancelled(sessionId, turnId); }
+	async load(sessionId: string, turnId: string): Promise<RestoredDurableStream | undefined> { return this.store.load(sessionId, turnId); }
+	async latest(sessionId: string): Promise<RestoredDurableStream | undefined> { return this.store.latest(sessionId); }
+	async deleteSession(sessionId: string): Promise<void> { this.store.deleteSession(sessionId); }
 }

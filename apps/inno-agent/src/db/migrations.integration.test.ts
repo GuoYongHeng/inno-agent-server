@@ -1,9 +1,13 @@
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Pool } from "pg";
 import { startTemporaryPostgres, type TemporaryPostgres } from "./test-postgres.js";
 import { runMigrations, type Migration } from "./migrations.js";
-import { migrateTenantDatabase } from "../tenants/schema.js";
+import { migrateTenantDatabase, TENANT_MIGRATIONS } from "../tenants/schema.js";
 
+// Unique per run: extra databases live on the same server and must not collide with an earlier run.
+const raceDb = `inno_race_${randomUUID().replaceAll("-", "")}`;
+const tenantDb = `inno_tenant_${randomUUID().replaceAll("-", "")}`;
 let database: TemporaryPostgres;
 let pool: Pool;
 
@@ -13,6 +17,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+	for (const name of [raceDb, tenantDb]) await pool?.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
 	await pool?.end();
 	await database?.close();
 });
@@ -52,10 +57,10 @@ describe("runMigrations", () => {
 			const raceSteps: Migration[] = [{ version: 1, name: "race", sql: "SELECT pg_sleep(0.3); CREATE TABLE race.once (id int)" }];
 			// A separate database so the shared schema_migrations above does not interfere.
 			const admin = new Pool({ connectionString: database.databaseUrl });
-			await admin.query("CREATE DATABASE race_db");
+			await admin.query(`CREATE DATABASE ${raceDb}`);
 			await admin.end();
 			const url = new URL(database.databaseUrl);
-			url.pathname = "/race_db";
+			url.pathname = `/${raceDb}`;
 			const a = new Pool({ connectionString: url.toString() });
 			const b = new Pool({ connectionString: url.toString() });
 			try {
@@ -74,10 +79,10 @@ describe("runMigrations", () => {
 describe("tenant schema on ParadeDB", () => {
 	it("creates the search extensions the memory layers need and adopts an existing baseline", async () => {
 		const admin = new Pool({ connectionString: database.databaseUrl });
-		await admin.query("CREATE DATABASE tenant_db");
+		await admin.query(`CREATE DATABASE ${tenantDb}`);
 		await admin.end();
 		const url = new URL(database.databaseUrl);
-		url.pathname = "/tenant_db";
+		url.pathname = `/${tenantDb}`;
 		const tenantPool = new Pool({ connectionString: url.toString() });
 		try {
 			await tenantPool.query('CREATE TABLE "user" (id text PRIMARY KEY)');
@@ -86,7 +91,7 @@ describe("tenant schema on ParadeDB", () => {
 			const extensions = await tenantPool.query("SELECT extname FROM pg_extension WHERE extname IN ('vector','pg_trgm','pg_search')");
 			expect(extensions.rows.map((row) => row.extname).sort()).toEqual(["pg_search", "pg_trgm", "vector"]);
 			const versions = await tenantPool.query("SELECT version FROM schema_migrations ORDER BY version");
-			expect(versions.rows.map((row) => row.version)).toEqual([1, 2]);
+			expect(versions.rows.map((row) => row.version)).toEqual(TENANT_MIGRATIONS.map((migration) => migration.version));
 		} finally {
 			await tenantPool.end();
 		}

@@ -9,19 +9,21 @@ if (!storagePath || !permissionDir || !workspaceDir) {
 }
 
 const store = new DurablePermissionStore("durable-crash-permission", permissionDir);
-store.bindTurn({
+await store.bindTurn({
 	turnId: "crash-permission-turn",
 	emit: (event) => {
 		if (event.type !== "permission_request") return;
-		const status = store.respond({
-			turnId: "crash-permission-turn",
-			requestId: String(event.requestId),
-			decision: "allow_once",
-		});
-		console.log(`permission-decision-persisted:${status}:${String(event.requestId)}`);
-		// The approval is durable, but neither the write nor its tool result has
-		// committed yet. Recovery must resume this exact call without a new card.
-		process.kill(process.pid, "SIGKILL");
+		void (async () => {
+			const status = await store.respond({
+				turnId: "crash-permission-turn",
+				requestId: String(event.requestId),
+				decision: "allow_once",
+			});
+			console.log(`permission-decision-persisted:${status}:${String(event.requestId)}`);
+			// The approval is durable, but neither the write nor its tool result has
+			// committed yet. Recovery must resume this exact call without a new card.
+			process.kill(process.pid, "SIGKILL");
+		})();
 	},
 });
 

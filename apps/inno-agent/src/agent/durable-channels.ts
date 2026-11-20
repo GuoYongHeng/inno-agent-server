@@ -1,10 +1,13 @@
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import type { ChannelRegistry } from "../channels/channel.js";
+import { FileChannelOutbox, type ChannelOutbox } from "../channels/channel-outbox.js";
 import { createChannelTools } from "../channels/channel-tools.js";
 
 export interface DurableChannelToolOptions {
 	sessionId: string;
-	outboxDir: string;
+	/** Where send intents live. Defaults to JSON files under `outboxDir`. */
+	outbox?: ChannelOutbox;
+	outboxDir?: string;
 	workspaceDir: string;
 	channelRegistry: ChannelRegistry;
 }
@@ -18,8 +21,14 @@ export function createDurableChannelRegistrations(options: DurableChannelToolOpt
 		workspaceDir: options.workspaceDir,
 		allowWorkspaceFallback: true,
 		durable: {
-			outboxDir: options.outboxDir,
+			outbox: resolveChannelOutbox(options),
 			getOperationId: (toolCallId) => `send_file_to_channel:${options.sessionId}:${toolCallId}`,
 		},
 	});
+}
+
+export function resolveChannelOutbox(options: { outbox?: ChannelOutbox; outboxDir?: string }): ChannelOutbox {
+	if (options.outbox) return options.outbox;
+	if (!options.outboxDir) throw new Error("Channel sends need an outbox store or an outbox directory");
+	return new FileChannelOutbox(options.outboxDir);
 }

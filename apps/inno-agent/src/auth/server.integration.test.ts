@@ -2037,13 +2037,20 @@ describe("durable session HTTP boundary", () => {
 		expect(manifestA).not.toContain("durable-archive-b");
 		expect(manifestB).toContain("durable-archive-b");
 		expect(manifestB).not.toContain("durable-archive-a");
-		const readOcrCheckpoints = async (tenantRoot: string) => {
-			const directory = join(tenantRoot, "ocr");
-			const files = await readdir(directory);
-			expect(files).toHaveLength(1);
-			return (await Promise.all(files.map((file) => readFile(join(directory, file), "utf-8")))).join("\n");
+		// OCR checkpoints are PostgreSQL rows scoped to the tenant, not files in its data root.
+		const readOcrCheckpoints = async (tenantId: string) => {
+			const pool = new Pool({ connectionString: postgres.databaseUrl });
+			try {
+				const rows = await pool.query<{ value: unknown }>("SELECT value FROM recovery_records WHERE tenant_id = $1 AND kind = 'ocr'", [tenantId]);
+				expect(rows.rows).toHaveLength(1);
+				return rows.rows.map((row) => JSON.stringify(row.value)).join("\n");
+			} finally {
+				await pool.end();
+			}
 		};
-		const [ocrA, ocrB] = await Promise.all([readOcrCheckpoints(rootA), readOcrCheckpoints(rootB)]);
+		expect(existsSync(join(rootA, "ocr"))).toBe(false);
+		expect(existsSync(join(rootB, "ocr"))).toBe(false);
+		const [ocrA, ocrB] = await Promise.all([readOcrCheckpoints(tenantA), readOcrCheckpoints(tenantB)]);
 		expect(ocrA).toContain("durable-ocr-text-a");
 		expect(ocrA).not.toContain("durable-ocr-text-b");
 		expect(ocrB).toContain("durable-ocr-text-b");

@@ -5,13 +5,7 @@ import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { defineInnoTool } from "../agent/inno-tool.js";
 import { ChannelRegistry, FileSendNotSupportedError } from "./channel.js";
-import {
-	channelOutboxPayloadPath,
-	completeChannelOutbox,
-	loadChannelOutbox,
-	prepareChannelOutbox,
-	type ChannelOutboxRecord,
-} from "./channel-outbox.js";
+import type { ChannelOutbox, ChannelOutboxRecord, OutboxPayload } from "./channel-outbox.js";
 import type { ChannelName } from "./types.js";
 import type { WorkspaceRegistry } from "../workspace/workspace-registry.js";
 import { logger } from "../logger.js";
@@ -33,7 +27,7 @@ export interface ChannelToolsDeps {
 	/** Durable sends persist a payload snapshot and completion marker. External
 	 * delivery remains at-least-once across the send/completion crash window. */
 	durable?: {
-		outboxDir: string;
+		outbox: ChannelOutbox;
 		getOperationId: (toolCallId: string) => string;
 	};
 }
@@ -114,7 +108,7 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 			let outbox: ChannelOutboxRecord | undefined;
 			if (durable && operationId) {
 				try {
-					outbox = loadChannelOutbox(durable.outboxDir, operationId);
+					outbox = await durable.outbox.load(operationId);
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					return {
@@ -193,14 +187,17 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 			}
 
 			let resolved: string;
+			// A snapshot materialised from the outbox is a temporary file in some backends.
+			let snapshot: OutboxPayload | undefined;
 			if (outbox && durable && operationId) {
-				resolved = channelOutboxPayloadPath(durable.outboxDir, operationId);
-				if (!existsSync(resolved) || !statSync(resolved).isFile()) {
+				snapshot = await durable.outbox.payload(outbox);
+				if (!snapshot) {
 					return {
 						content: [{ type: "text" as const, text: "渠道 outbox 的文件快照丢失，已停止恢复发送。" }],
 						details: { error: "outbox_payload_missing", filePath: outbox.filePath } as Record<string, unknown>,
 					};
 				}
+				resolved = snapshot.path;
 			} else {
 				// Resolve and validate the file path within the workspace.
 				const workspaceDir = resolveWorkspaceDir(deps);
@@ -239,7 +236,8 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 						fileName: params.fileName,
 					};
 					try {
-						resolved = prepareChannelOutbox(durable.outboxDir, outbox, workspaceFile);
+						snapshot = await durable.outbox.prepare(outbox, workspaceFile);
+						resolved = snapshot.path;
 					} catch (err) {
 						const msg = err instanceof Error ? err.message : String(err);
 						return {
@@ -272,6 +270,8 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 					}],
 					details: { error: "send_failed", channel: channelName, message: msg } as Record<string, unknown>,
 				};
+			} finally {
+				snapshot?.cleanup();
 			}
 
 			const completion = {
@@ -280,7 +280,7 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 			};
 			if (durable && outbox) {
 				try {
-					completeChannelOutbox(durable.outboxDir, outbox, completion);
+					await durable.outbox.complete(outbox, completion);
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					return {

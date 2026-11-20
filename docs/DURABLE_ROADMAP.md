@@ -369,10 +369,17 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 按风险从低到高分批，每批独立开关：
 
 0. ✅**基础设施（已完成）**：换 ParadeDB 镜像；引入带编号的迁移文件与 `schema_migrations` 表，取代 `tenants/schema.ts` 里零散的 `IF NOT EXISTS`；加 `ObjectStore` 抽象（OSS/MinIO 实现与内存测试替身）。
-1. **恢复类记录**（question、permission、流日志、OCR 检查点、渠道发件箱）→ PG 表。幂等键变成唯一约束，如 `UNIQUE (session_id, tool_call_id)`，取代文件里的操作标记，最能提升 `replay: safe` 的可信度。发件箱用 `FOR UPDATE SKIP LOCKED` 认领并回收过期认领，重试用尽进死信表；30 天保留改为按 `completed_at` 删除。
+1. ✅**恢复类记录（已完成）**（question、permission、流日志、OCR 检查点、渠道发件箱）→ PG 表。幂等键变成唯一约束，如 `UNIQUE (session_id, tool_call_id)`，取代文件里的操作标记，最能提升 `replay: safe` 的可信度。发件箱用 `FOR UPDATE SKIP LOCKED` 认领并回收过期认领，重试用尽进死信表；30 天保留改为按 `completed_at` 删除。
 2. ~~L1 画像与事件 → PG~~：**已取消**——L1 学习者画像层已整体移除，见上面"L1 移除"。
 3. **L3 召回**：每租户 `node:sqlite` 加 FTS5 → PG 表（`tenant_id` + `session_id` 过滤），检索用 `pg_search` BM25。不建向量索引：按租户过滤后的精确扫描比近似索引稳。
 4. **L2 wiki**：manifest 与页面元数据、正文进 PG（链接与引用用 JSONB，`version` 乐观锁，软删除用部分唯一索引，检索用 BM25 索引取代 `l2-index-store`）；`raw/` 下的原始文件文本类小文件进 PG，PDF、Word、图片进对象存储（库中只存对象键与 `sha256`）；`wiki-graph` 继续按需在内存构建。
+
+**第 1 批实现说明**：
+- 抽象为异步的 `RecoveryRecordStore`（`agent/recovery-store.ts`）：本地模式仍是 JSON 文件（目录布局不变），认证模式是 `recovery_records` 表，主键 `(tenant_id, session_id, kind, record_key)`，`record_key` 即工具调用 operation ID 的 SHA-256，所以幂等键就是主键。question、permission、OCR 检查点走它；渠道发件箱用 `recovery_records`（kind `outbox`）加 `recovery_blobs`（快照字节，与记录同事务写入，上限 100 MB）；SSE 流日志用 `stream_turns`/`stream_events`（批量写入保序，结束后 5 分钟可重放）。
+- 旧文件在认证租户首次访问某会话时一次性导入（只导入该租户拥有的会话；per-session 目录改名为 `.migrated`，共享目录里的 OCR/发件箱文件逐个删除）。**旧的 SSE 流日志文件不导入**：它只覆盖结束后 5 分钟或进行中的回合，升级窗口内的进行中回合需要用户重发。
+- 同步文件代码天然的原子性没有了：`DurableQuestionStore`/`DurablePermissionStore` 内部用 `SerialQueue` 串行化，避免同一进程里 `present` 用旧快照覆盖已答复的记录。
+- 集成测试发现并修复两个 PG 特有的问题：`jsonb` 不保留键顺序（原来按 `JSON.stringify` 比较重放时的参数会误报"参数变了"，现用 `canonicalJson`）；`jsonb` 不能存 U+0000（审批键里的 `\0` 分隔符不再入库，命令预览里的 NUL 替换为 U+FFFD）。
+- 已知限制：两个进程同时答复同一张卡片，数据库不做仲裁（"读—改—写"非原子），依赖 H4 的单 owner 路由；OCR/发件箱仍是至少一次语义。
 
 **退出标准**：worker 重启或迁移不丢任何租户状态；任一租户目录整体删除后，能从 PG 加对象存储重建全部非缓存状态。
 

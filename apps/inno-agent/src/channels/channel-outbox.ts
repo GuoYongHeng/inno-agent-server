@@ -119,3 +119,63 @@ export function deleteChannelOutboxForSession(outboxDir: string, sessionId: stri
 	}
 	return removed;
 }
+
+/** A payload snapshot as a local file the channel can upload. Call `cleanup` once the send finished. */
+export interface OutboxPayload {
+	path: string;
+	cleanup(): void;
+}
+
+/** Operation IDs are `send_file_to_channel:<sessionId>:<callId>`; the session is part of the identity. */
+export function outboxSessionId(operationId: string): string {
+	const [, sessionId] = operationId.split(":");
+	if (!sessionId) throw new Error("Channel outbox operation ID has no session");
+	return sessionId;
+}
+
+/**
+ * Persistent send intent for `send_file_to_channel`: the target, a snapshot of
+ * the file, and a completion marker. Files in local mode, PostgreSQL rows when
+ * authenticated (see `pg-channel-outbox.ts`).
+ */
+export interface ChannelOutbox {
+	load(operationId: string): Promise<ChannelOutboxRecord | undefined>;
+	/** Snapshot the payload, then commit the intent. Returns the snapshot as a local file. */
+	prepare(record: ChannelOutboxRecord, sourceFilePath: string): Promise<OutboxPayload>;
+	/** The stored snapshot as a local file, or undefined when it is gone. */
+	payload(record: ChannelOutboxRecord): Promise<OutboxPayload | undefined>;
+	complete(record: ChannelOutboxRecord, completion: ChannelOutboxCompletion): Promise<void>;
+	/** Delete this session's expired completions; only valid once the session has no live work. */
+	pruneCompletedForIdleSession(sessionId: string, completedBefore: number): Promise<number>;
+	deleteSession(sessionId: string): Promise<number>;
+}
+
+export class FileChannelOutbox implements ChannelOutbox {
+	constructor(readonly outboxDir: string) {}
+
+	async load(operationId: string): Promise<ChannelOutboxRecord | undefined> {
+		return loadChannelOutbox(this.outboxDir, operationId);
+	}
+
+	async prepare(record: ChannelOutboxRecord, sourceFilePath: string): Promise<OutboxPayload> {
+		return { path: prepareChannelOutbox(this.outboxDir, record, sourceFilePath), cleanup() {} };
+	}
+
+	async payload(record: ChannelOutboxRecord): Promise<OutboxPayload | undefined> {
+		const path = channelOutboxPayloadPath(this.outboxDir, record.operationId);
+		if (!existsSync(path) || !statSync(path).isFile()) return undefined;
+		return { path, cleanup() {} };
+	}
+
+	async complete(record: ChannelOutboxRecord, completion: ChannelOutboxCompletion): Promise<void> {
+		completeChannelOutbox(this.outboxDir, record, completion);
+	}
+
+	async pruneCompletedForIdleSession(sessionId: string, completedBefore: number): Promise<number> {
+		return pruneCompletedChannelOutboxForIdleSession(this.outboxDir, sessionId, completedBefore);
+	}
+
+	async deleteSession(sessionId: string): Promise<number> {
+		return deleteChannelOutboxForSession(this.outboxDir, sessionId);
+	}
+}

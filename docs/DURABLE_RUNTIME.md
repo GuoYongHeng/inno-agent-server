@@ -276,7 +276,7 @@ at-least-once across crashes; the fallback does not claim exactly-once billing.
 
 Durable questions use the stable operation ID
 `ask_user_question:<sessionId>:<toolCallId>`. Records live under the
-tenant-local `durable/questions/<sessionId>/` directory, use mode `0600`, and
+tenant-local `durable/questions/<sessionId>/` directory (local mode; authenticated mode keeps them in the `recovery_records` PostgreSQL table), use mode `0600`, and
 bind the question ID to a hash of that operation ID. An accepted answer is
 persisted before its waiter is released or `question_resolved` is emitted.
 Replay-safe tool re-entry returns a completed answer from disk without showing

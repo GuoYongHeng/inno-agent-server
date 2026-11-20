@@ -23,10 +23,10 @@ export async function runDurableJobPrompt(
 	prompt: string,
 	options: DurableJobPromptOptions,
 ): Promise<string> {
-	if ((options.noUi || !options.onEvent) && service.pendingQuestion(req, sessionId)) {
+	if ((options.noUi || !options.onEvent) && await service.pendingQuestion(req, sessionId)) {
 		throw new Error("This session has a pending question; answer it through the streaming UI");
 	}
-	if ((options.noUi || !options.onEvent) && service.pendingPermission(req, sessionId)) {
+	if ((options.noUi || !options.onEvent) && await service.pendingPermission(req, sessionId)) {
 		throw new Error("This session has a pending permission request; answer it through the streaming UI");
 	}
 	const images = await service.prepareImages(req, sessionId, options.images, options.requestId);
@@ -36,12 +36,12 @@ export async function runDurableJobPrompt(
 	try {
 		lease = await service.lease(req, sessionId);
 		const noUi = options.noUi || !options.onEvent;
-		lease.runtime.bindQuestionTurn({
+		await lease.runtime.bindQuestionTurn({
 			turnId: options.turnId,
 			...(options.onEvent ? { emit: options.onEvent } : {}),
 			...(noUi ? { noUi: true } : {}),
 		});
-		lease.runtime.bindPermissionTurn({
+		await lease.runtime.bindPermissionTurn({
 			turnId: options.turnId,
 			...(options.onEvent ? { emit: options.onEvent } : {}),
 			...(noUi ? { noUi: true } : {}),

@@ -96,9 +96,79 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS pg_search;
 `;
 
+/**
+ * Per-session recovery records (pending/answered questions and approvals). The
+ * record key is the SHA-256 of the tool call's operation ID, so the primary key
+ * is the idempotency key: one tool call can only ever own one row.
+ */
+const RECOVERY_RECORDS_SQL = `
+CREATE TABLE IF NOT EXISTS recovery_records (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	session_id text NOT NULL,
+	kind text NOT NULL,
+	record_key text NOT NULL,
+	value jsonb NOT NULL,
+	created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, session_id, kind, record_key)
+);
+`;
+
+/** Payload snapshots for the channel outbox, written in the same transaction as their record. */
+const RECOVERY_BLOBS_SQL = `
+CREATE TABLE IF NOT EXISTS recovery_blobs (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	session_id text NOT NULL,
+	kind text NOT NULL,
+	record_key text NOT NULL,
+	payload bytea NOT NULL,
+	created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, session_id, kind, record_key)
+);
+`;
+
+/**
+ * Journal of each chat turn's SSE events and original submission intent, so a
+ * reconnecting client (or a different worker) can replay a turn exactly. A turn
+ * is replayable for a short time after it finishes (`finished_at`).
+ */
+const STREAM_JOURNAL_SQL = `
+CREATE TABLE IF NOT EXISTS stream_turns (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	session_id text NOT NULL,
+	turn_id text NOT NULL,
+	header jsonb NOT NULL,
+	input jsonb NOT NULL,
+	submission_id bigint,
+	cancel_requested boolean NOT NULL DEFAULT false,
+	created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	finished_at timestamptz,
+	PRIMARY KEY (tenant_id, session_id, turn_id)
+);
+
+CREATE INDEX IF NOT EXISTS stream_turns_session_created_idx
+	ON stream_turns (tenant_id, session_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS stream_events (
+	id bigserial PRIMARY KEY,
+	tenant_id text NOT NULL,
+	session_id text NOT NULL,
+	turn_id text NOT NULL,
+	envelope jsonb NOT NULL,
+	FOREIGN KEY (tenant_id, session_id, turn_id)
+		REFERENCES stream_turns (tenant_id, session_id, turn_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS stream_events_turn_idx
+	ON stream_events (tenant_id, session_id, turn_id, id);
+`;
+
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
+	{ version: 3, name: "recovery_records", sql: RECOVERY_RECORDS_SQL },
+	{ version: 4, name: "recovery_blobs", sql: RECOVERY_BLOBS_SQL },
+	{ version: 5, name: "stream_journal", sql: STREAM_JOURNAL_SQL },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

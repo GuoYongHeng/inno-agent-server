@@ -98,7 +98,7 @@ export async function handleChatRoutes(
 	const chatAbortMatch = matchRoute("POST", method, url, "/api/chat/:sessionId/:turnId/abort");
 	if (chatAbortMatch) {
 		if (!await ownsSession(chatAbortMatch.sessionId) || !await durableSessions.get(req, chatAbortMatch.sessionId)) return denySession();
-		const restored = restoreDurableStream(req, durableSessions, chatAbortMatch.sessionId, chatAbortMatch.turnId);
+		const restored = await restoreDurableStream(req, durableSessions, chatAbortMatch.sessionId, chatAbortMatch.turnId);
 		const state = restored?.state ?? streamRegistry.getByTurn(chatAbortMatch.turnId);
 		if (!state || state.sessionId !== chatAbortMatch.sessionId) {
 			json(res, 404, { error: "Chat turn not found" });
@@ -110,7 +110,7 @@ export async function handleChatRoutes(
 		}
 		streamRegistry.requestCancel(state);
 		try {
-			restored?.store.markCancelled(state.sessionId, state.turnId);
+			await restored?.store.markCancelled(state.sessionId, state.turnId);
 			await durableSessions.abort(req, state.sessionId, state.turnId);
 			if (restored) void ensureDurableStreamProjection(req, durableSessions, restored);
 		} catch (error) {
@@ -126,7 +126,7 @@ export async function handleChatRoutes(
 	if (chatStatusMatch) {
 		streamRegistry.cleanupExpiredTurns();
 		if (await durableSessions.get(req, chatStatusMatch.sessionId)) {
-			restoreDurableStream(req, durableSessions, chatStatusMatch.sessionId);
+			await restoreDurableStream(req, durableSessions, chatStatusMatch.sessionId);
 		}
 		const state = streamRegistry.getLatest(chatStatusMatch.sessionId);
 		json(res, 200, state
@@ -146,7 +146,7 @@ export async function handleChatRoutes(
 			return true;
 		}
 		const restored = await durableSessions.get(req, sessionId)
-			? restoreDurableStream(req, durableSessions, sessionId, turnId)
+			? await restoreDurableStream(req, durableSessions, sessionId, turnId)
 			: undefined;
 		const state = restored?.state ?? streamRegistry.getByTurn(turnId);
 		if (!state || state.sessionId !== sessionId) {

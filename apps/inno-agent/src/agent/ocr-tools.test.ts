@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConfigHolder } from "./config-holder.js";
+import { FileRecoveryStore } from "./recovery-store.js";
 import { createOcrTools } from "./ocr-tools.js";
 
 function config(): ConfigHolder {
@@ -58,7 +59,8 @@ describe("ocr_image workspace boundary", () => {
 			restrictToWorkspace: true,
 			workspaceDir: workspace,
 			durable: {
-				checkpointDir: join(tempRoot, "ocr"),
+				records: new FileRecoveryStore(() => join(tempRoot, "ocr")),
+				sessionId: "durable-session",
 				getOperationId: (callId) => `ocr_image:durable-session:${callId}`,
 			},
 		})[0];

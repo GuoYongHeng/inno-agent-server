@@ -9,11 +9,13 @@ import {
 } from "./session-catalog.js";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
+import type { Pool } from "pg";
 import type { IncomingMessage } from "node:http";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { join } from "node:path";
 import type { InnoConfig } from "../config.js";
-import { deleteChannelOutboxForSession } from "../channels/channel-outbox.js";
+import { FileChannelOutbox, type ChannelOutbox } from "../channels/channel-outbox.js";
+import { PgChannelOutbox } from "../channels/pg-channel-outbox.js";
 import type { ChannelRegistry } from "../channels/channel.js";
 import { resolveCurrentTenantConfig } from "../tenants/config.js";
 import { runInTenantContext, runWithoutTenantContext } from "../tenants/current.js";
@@ -44,7 +46,9 @@ import {
 import { durableEntriesToMessages } from "./durable-projection.js";
 import { DurablePermissionStore, type PendingDurablePermission } from "./durable-permissions.js";
 import { DurableQuestionStore } from "./durable-questions.js";
-import { DurableStreamStore } from "./durable-stream-store.js";
+import { DurableStreamStore, FileStreamJournal, type StreamJournal } from "./durable-stream-store.js";
+import { PgStreamJournal } from "./pg-stream-journal.js";
+import { FileRecoveryStore, PgRecoveryStore, type RecoveryKind, type RecoveryRecordStore } from "./recovery-store.js";
 import { DurableSessionRuntime } from "./durable-runtime.js";
 import type { PersistedQuestion, QuestionBridgeResult, QuestionResponseStatus } from "./question-types.js";
 import type { PermissionDecision, PermissionResponseStatus } from "./permission-types.js";
@@ -116,6 +120,8 @@ export interface DurableSessionServiceOptions {
 	tenantStore?: TenantStore | null;
 	/** PostgreSQL catalog for authenticated tenants; without it every scope uses `sessions.json`. */
 	pgCatalog?: SessionCatalog;
+	/** PostgreSQL pool for authenticated tenants' recovery records; without it every scope keeps JSON files. */
+	recoveryPool?: Pool;
 	/** When set, every session runs its shell and file tools in a remote sandbox. */
 	getSandboxManager?: () => SandboxManager | undefined;
 	openRuntime?: typeof DurableSessionRuntime.open;
@@ -213,6 +219,7 @@ export class DurableSessionService {
 	private readonly openings = new Map<string, Promise<OpenedRuntime>>();
 	private readonly questionStores = new Map<string, DurableQuestionStore>();
 	private readonly permissionStores = new Map<string, DurablePermissionStore>();
+	private readonly streamJournals = new Map<string, StreamJournal>();
 	private readonly topicGenerations = new Map<string, Promise<DurableSessionSummary>>();
 	private readonly openRuntime: typeof DurableSessionRuntime.open;
 	private closing = false;
@@ -247,11 +254,38 @@ export class DurableSessionService {
 		return join(this.root(req), "permissions", id);
 	}
 
+	private recoveryStore(req: IncomingMessage, kind: RecoveryKind): RecoveryRecordStore {
+		const dir = (id: string) => kind === "question" ? this.questionDir(req, id) : this.permissionDir(req, id);
+		const tenant = getRequestTenant(req);
+		return tenant && this.options.recoveryPool
+			? new PgRecoveryStore(this.options.recoveryPool, tenant.tenantId, kind, { dir })
+			: new FileRecoveryStore(dir);
+	}
+
+	/** OCR checkpoints. Files are tenant-wide in one directory; rows are per session. */
+	private ocrStore(req: IncomingMessage, tenantDataRoot: string): RecoveryRecordStore {
+		const dir = join(tenantDataRoot, "ocr");
+		// A checkpoint's operation ID is `ocr_image:<sessionId>:<callId>`.
+		const belongsTo = (value: unknown, sessionId: string) =>
+			(value as { operationId?: unknown })?.operationId?.toString().startsWith(`ocr_image:${sessionId}:`) === true;
+		const tenant = getRequestTenant(req);
+		if (!(tenant && this.options.recoveryPool)) return new FileRecoveryStore(() => dir, belongsTo);
+		return new PgRecoveryStore(this.options.recoveryPool, tenant.tenantId, "ocr", { dir: () => dir, flat: true, belongsTo });
+	}
+
+	private channelOutbox(req: IncomingMessage, tenantDataRoot: string): ChannelOutbox {
+		const dir = join(tenantDataRoot, "channels", "outbox");
+		const tenant = getRequestTenant(req);
+		return tenant && this.options.recoveryPool
+			? new PgChannelOutbox(this.options.recoveryPool, tenant.tenantId, dir)
+			: new FileChannelOutbox(dir);
+	}
+
 	private permissionStore(req: IncomingMessage, id: string): DurablePermissionStore {
 		const key = this.runtimeKey(req, id);
 		let store = this.permissionStores.get(key);
 		if (!store) {
-			store = new DurablePermissionStore(id, this.permissionDir(req, id));
+			store = new DurablePermissionStore(id, this.recoveryStore(req, "permission"));
 			this.permissionStores.set(key, store);
 		}
 		return store;
@@ -261,21 +295,30 @@ export class DurableSessionService {
 		const key = this.runtimeKey(req, id);
 		let store = this.questionStores.get(key);
 		if (!store) {
-			store = new DurableQuestionStore(id, this.questionDir(req, id));
+			store = new DurableQuestionStore(id, this.recoveryStore(req, "question"));
 			this.questionStores.set(key, store);
 		}
 		return store;
 	}
 
-	streamStore(req: IncomingMessage): DurableStreamStore {
-		return new DurableStreamStore(join(this.root(req), "streams"));
+	streamStore(req: IncomingMessage): StreamJournal {
+		const tenant = getRequestTenant(req);
+		const key = `${tenant?.tenantId ?? "local"}`;
+		if (!(tenant && this.options.recoveryPool)) return new FileStreamJournal(new DurableStreamStore(join(this.root(req), "streams")));
+		// One journal per tenant so buffered appends keep their order across requests.
+		let journal = this.streamJournals.get(key);
+		if (!journal) {
+			journal = new PgStreamJournal(this.options.recoveryPool, tenant.tenantId);
+			this.streamJournals.set(key, journal);
+		}
+		return journal;
 	}
 
-	pendingQuestion(req: IncomingMessage, id: string): PersistedQuestion | undefined {
+	pendingQuestion(req: IncomingMessage, id: string): Promise<PersistedQuestion | undefined> {
 		return this.questionStore(req, id).pendingQuestion();
 	}
 
-	pendingPermission(req: IncomingMessage, id: string): PendingDurablePermission | undefined {
+	pendingPermission(req: IncomingMessage, id: string): Promise<PendingDurablePermission | undefined> {
 		return this.permissionStore(req, id).pendingPermission();
 	}
 
@@ -284,11 +327,11 @@ export class DurableSessionService {
 		requestId: string;
 		decision: PermissionDecision;
 		reason?: string;
-	}): PermissionResponseStatus {
+	}): Promise<PermissionResponseStatus> {
 		return this.permissionStore(req, id).respond(input);
 	}
 
-	cancelPermissionTurn(req: IncomingMessage, id: string, turnId: string): number {
+	cancelPermissionTurn(req: IncomingMessage, id: string, turnId: string): Promise<number> {
 		return this.permissionStore(req, id).cancelTurn(turnId);
 	}
 
@@ -296,11 +339,11 @@ export class DurableSessionService {
 		turnId: string;
 		questionId: string;
 		result: QuestionBridgeResult;
-	}): QuestionResponseStatus {
+	}): Promise<QuestionResponseStatus> {
 		return this.questionStore(req, id).respond(input);
 	}
 
-	cancelQuestionTurn(req: IncomingMessage, id: string, turnId: string): number {
+	cancelQuestionTurn(req: IncomingMessage, id: string, turnId: string): Promise<number> {
 		return this.questionStore(req, id).cancelTurn(turnId);
 	}
 
@@ -328,8 +371,8 @@ export class DurableSessionService {
 		try {
 			// Resolve the application-owned card while this turn still owns the
 			// runtime, then persist pi-durable's abort marks before releasing it.
-			this.permissionStore(req, id).cancelTurn(turnId);
-			this.questionStore(req, id).cancelTurn(turnId);
+			await this.permissionStore(req, id).cancelTurn(turnId);
+			await this.questionStore(req, id).cancelTurn(turnId);
 			await lease.runtime.abort();
 		} finally {
 			await lease.release();
@@ -437,15 +480,15 @@ export class DurableSessionService {
 		entryId: string,
 	): Promise<{ sessionId: string; replacedEntryId: string; branchMarkerId: string; sessionRevision: string }> {
 		if (!await this.get(req, id)) throw new Error("Durable session not found");
-		const pendingQuestion = this.questionStore(req, id).pendingQuestion();
-		const pendingPermission = this.permissionStore(req, id).pendingPermission();
+		const pendingQuestion = await this.questionStore(req, id).pendingQuestion();
+		const pendingPermission = await this.permissionStore(req, id).pendingPermission();
 		const lease = await this.lease(req, id);
 		let branched: { conversationId: string; replacedEntryId: string };
 		try {
 			// Validate and fork first: a rejected edit must not cancel anything.
 			branched = await lease.runtime.branchBeforeUserMessage(entryId);
-			if (pendingQuestion) this.questionStore(req, id).cancelTurn(pendingQuestion.turnId);
-			if (pendingPermission) this.permissionStore(req, id).cancelTurn(pendingPermission.turnId);
+			if (pendingQuestion) await this.questionStore(req, id).cancelTurn(pendingQuestion.turnId);
+			if (pendingPermission) await this.permissionStore(req, id).cancelTurn(pendingPermission.turnId);
 			await this.update(req, id, { conversationId: branched.conversationId, updatedAt: new Date().toISOString() });
 		} finally {
 			await lease.release();
@@ -766,8 +809,8 @@ export class DurableSessionService {
 			const next = await this.update(req, id, { messageCount: messages.length, updatedAt });
 			const lastEntryId = snapshot.entries.at(-1)?.id ?? 0;
 			await this.indexL3Snapshot(req, id, messages, lastEntryId);
-			const pendingQuestion = this.pendingQuestion(req, id);
-			const pendingPermission = this.pendingPermission(req, id);
+			const pendingQuestion = await this.pendingQuestion(req, id);
+			const pendingPermission = await this.pendingPermission(req, id);
 			return {
 				summary: toSummary(next),
 				messages,
@@ -845,14 +888,14 @@ export class DurableSessionService {
 						};
 						const ocr = {
 							sessionId: id,
-							checkpointDir: join(tenantDataRoot, "ocr"),
+							records: this.ocrStore(req, tenantDataRoot),
 							workspaceDir,
 							ocrApi: config.ocrApi,
 						};
 						const baseChannelRegistry = this.options.getChannelRegistry?.();
 						const channels = baseChannelRegistry ? {
 							sessionId: id,
-							outboxDir: join(tenantDataRoot, "channels", "outbox"),
+							outbox: this.channelOutbox(req, tenantDataRoot),
 							workspaceDir,
 							channelRegistry: bindChannelRegistry(req, baseChannelRegistry, this.options.tenantStore),
 						} : undefined;
@@ -982,10 +1025,13 @@ export class DurableSessionService {
 		clearSessionAttachments(dataRoot, id);
 		clearWorkspaceActivity(dataRoot, id);
 		await rm(join(this.root(req), "storage", id), { recursive: true, force: true });
+		await this.recoveryStore(req, "question").deleteSession(id);
+		await this.recoveryStore(req, "permission").deleteSession(id);
 		await rm(this.questionDir(req, id), { recursive: true, force: true });
 		await rm(this.permissionDir(req, id), { recursive: true, force: true });
-		this.streamStore(req).deleteSession(id);
-		deleteChannelOutboxForSession(join(dataRoot, "channels", "outbox"), id);
+		await this.streamStore(req).deleteSession(id);
+		await this.channelOutbox(req, dataRoot).deleteSession(id);
+		await this.ocrStore(req, dataRoot).deleteSession(id);
 	}
 
 	async close(): Promise<void> {
@@ -997,6 +1043,8 @@ export class DurableSessionService {
 		this.openings.clear();
 		this.questionStores.clear();
 		this.permissionStores.clear();
+		await Promise.all([...this.streamJournals.values()].map((journal) => journal.flush().catch(() => undefined)));
+		this.streamJournals.clear();
 		this.topicGenerations.clear();
 		await Promise.all(entries.map((entry) => this.closeRuntimeEntry(entry).catch(() => undefined)));
 	}

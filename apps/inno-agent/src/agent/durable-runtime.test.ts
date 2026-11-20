@@ -381,7 +381,7 @@ describe("DurableSessionRuntime", () => {
 		const sessionId = "durable-retention";
 		const questionDir = join(root, "questions");
 		const questions = new DurableQuestionStore(sessionId, questionDir);
-		questions.bindTurn({ turnId: "old-http", noUi: true });
+		await questions.bindTurn({ turnId: "old-http", noUi: true });
 		await questions.ask("old-question", { questions: [] }, new AbortController().signal);
 		const questionPath = join(questionDir, readdirSync(questionDir)[0]!);
 		const outboxDir = join(root, "outbox");
@@ -610,7 +610,7 @@ describe("DurableSessionRuntime", () => {
 		provider.faux.setResponses([fauxAssistantMessage("permission approval recovered")]);
 		const store = new DurablePermissionStore("durable-crash-permission", permissionDir);
 		const events: Array<Record<string, unknown>> = [];
-		store.bindTurn({ turnId: "recovered-turn", emit: (event) => events.push(event) });
+		await store.bindTurn({ turnId: "recovered-turn", emit: (event) => events.push(event) });
 		const runtime = await open({
 			storagePath,
 			workspaceDir: workspace,
@@ -622,7 +622,7 @@ describe("DurableSessionRuntime", () => {
 
 		expect(recovered).toMatchObject({ status: "done", text: "permission approval recovered" });
 		expect(events).toEqual([]);
-		expect(store.pendingPermission()).toBeUndefined();
+		expect((await store.pendingPermission())).toBeUndefined();
 		expect(readFileSync(join(workspace, "recovered.txt"), "utf-8")).toBe("written after recovered approval");
 		const messages = durableEntriesToMessages((await runtime.snapshot()).entries);
 		expect(messages.filter((message) => message.role === "user")).toHaveLength(1);
@@ -652,7 +652,7 @@ describe("DurableSessionRuntime", () => {
 		provider.faux.setResponses([fauxAssistantMessage("question answer recovered")]);
 		const store = new DurableQuestionStore("durable-crash-question", questionDir);
 		const events: Array<Record<string, unknown>> = [];
-		store.bindTurn({ turnId: "recovered-turn", emit: (event) => events.push(event) });
+		await store.bindTurn({ turnId: "recovered-turn", emit: (event) => events.push(event) });
 		const runtime = await open({
 			storagePath,
 			workspaceDir: workspace,
@@ -663,7 +663,7 @@ describe("DurableSessionRuntime", () => {
 
 		expect(recovered).toMatchObject({ status: "done", text: "question answer recovered" });
 		expect(events).toEqual([]);
-		expect(store.pendingQuestion()).toBeUndefined();
+		expect((await store.pendingQuestion())).toBeUndefined();
 		const messages = durableEntriesToMessages((await runtime.snapshot()).entries);
 		const tool = messages.flatMap((message) => message.tools ?? []).find((call) => call.toolCallId === "crash-question-call");
 		expect(JSON.stringify(tool?.result)).toContain("继续学习吗？");

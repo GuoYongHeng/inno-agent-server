@@ -26,11 +26,10 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { SandboxExecutionEnv } from "../sandbox/sandbox-env.js";
 import type { SandboxRuntimeBinding } from "../sandbox/sandbox-session.js";
-import { pruneCompletedChannelOutboxForIdleSession } from "../channels/channel-outbox.js";
 import { logger } from "../logger.js";
 import { WorkspaceFileEnv } from "./durable-env.js";
 import { withNativeImageFallback } from "./native-image-fallback.js";
-import { createDurableChannelRegistrations, type DurableChannelToolOptions } from "./durable-channels.js";
+import { createDurableChannelRegistrations, resolveChannelOutbox, type DurableChannelToolOptions } from "./durable-channels.js";
 import { createDurableMemoryRegistrations, type DurableMemoryToolOptions } from "./durable-memory.js";
 import { createDurableOcrRegistrations, type DurableOcrToolOptions } from "./durable-ocr.js";
 import {
@@ -296,10 +295,10 @@ export class DurableSessionRuntime {
 					const completedBefore = Date.now() - retentionMs;
 					try {
 						if (options.channels) {
-							pruneCompletedChannelOutboxForIdleSession(options.channels.outboxDir, options.channels.sessionId, completedBefore);
+							await resolveChannelOutbox(options.channels).pruneCompletedForIdleSession(options.channels.sessionId, completedBefore);
 						}
-						options.permissions?.pruneCompletedForIdleSession(completedBefore);
-						options.questions?.store.pruneCompletedForIdleSession(completedBefore);
+						await options.permissions?.pruneCompletedForIdleSession(completedBefore);
+						await options.questions?.store.pruneCompletedForIdleSession(completedBefore);
 					} catch (error) {
 						// Cleanup must never prevent an otherwise recoverable session opening.
 						logger.warn({ err: error, storagePath }, "durable recovery-record retention failed (non-fatal)");
@@ -403,16 +402,16 @@ export class DurableSessionRuntime {
 		return { id, status: "done", answer, text: textFromAssistant(answer) };
 	}
 
-	bindPermissionTurn(binding: DurablePermissionBinding): void {
-		this.permissions?.bindTurn(binding);
+	async bindPermissionTurn(binding: DurablePermissionBinding): Promise<void> {
+		await this.permissions?.bindTurn(binding);
 	}
 
 	unbindPermissionTurn(turnId?: string): void {
 		this.permissions?.unbindTurn(turnId);
 	}
 
-	bindQuestionTurn(binding: DurableQuestionBinding): void {
-		this.questions?.bindTurn(binding);
+	async bindQuestionTurn(binding: DurableQuestionBinding): Promise<void> {
+		await this.questions?.bindTurn(binding);
 	}
 
 	unbindQuestionTurn(turnId?: string): void {

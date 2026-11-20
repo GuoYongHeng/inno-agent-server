@@ -6,6 +6,7 @@ import type { WorkspaceRegistry } from "../workspace/workspace-registry.js";
 import { ChannelRegistry } from "./channel.js";
 import {
 	channelOutboxPayloadPath,
+	FileChannelOutbox,
 	completeChannelOutbox,
 	deleteChannelOutboxForSession,
 	loadChannelOutbox,
@@ -106,7 +107,7 @@ describe("tenant-safe channel file tools", () => {
 			channelRegistry: registry,
 			workspaceDir: workspace,
 			durable: {
-				outboxDir: join(workspace, "outbox"),
+				outbox: new FileChannelOutbox(join(workspace, "outbox")),
 				getOperationId: (callId) => `send_file_to_channel:durable-session:${callId}`,
 			},
 		})[0];

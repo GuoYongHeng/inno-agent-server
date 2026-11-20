@@ -9,21 +9,23 @@ if (!storagePath || !questionDir || !workspaceDir) {
 }
 
 const store = new DurableQuestionStore("durable-crash-question", questionDir);
-store.bindTurn({
+await store.bindTurn({
 	turnId: "crash-question-turn",
 	emit: (event) => {
 		if (event.type !== "question") return;
-		const status = store.respond({
-			turnId: "crash-question-turn",
-			questionId: String(event.questionId),
-			result: {
-				answers: [{ questionIndex: 0, question: "继续学习吗？", kind: "option", answer: "继续" }],
-				cancelled: false,
-			},
-		});
-		console.log(`question-answer-persisted:${status}:${String(event.questionId)}`);
-		// The answer is durable, but the tool result has not committed yet.
-		process.kill(process.pid, "SIGKILL");
+		void (async () => {
+			const status = await store.respond({
+				turnId: "crash-question-turn",
+				questionId: String(event.questionId),
+				result: {
+					answers: [{ questionIndex: 0, question: "继续学习吗？", kind: "option", answer: "继续" }],
+					cancelled: false,
+				},
+			});
+			console.log(`question-answer-persisted:${status}:${String(event.questionId)}`);
+			// The answer is durable, but the tool result has not committed yet.
+			process.kill(process.pid, "SIGKILL");
+		})();
 	},
 });
 
