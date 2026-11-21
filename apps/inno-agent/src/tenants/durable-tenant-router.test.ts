@@ -100,7 +100,7 @@ describe("durable tenant router", () => {
 	/** Source server that routes every request through forwardDurableTenantRequest
 	 * and reports local service when the router returns a request to serve. */
 	function sourceServer(localShardId: string, targets: Record<string, string>,
-		tenantId: string, resolveOwner?: (sessionId: string) => Promise<string | null>): Promise<string> {
+		tenantId: string, resolveOwner?: (sessionId: string) => Promise<string | { owner: string | null; affinity?: string | null } | null>): Promise<string> {
 		const tenant = { tenantId, userId: "verified-user", role: "owner" as const };
 		const source = createServer((req, res) => {
 			void forwardDurableTenantRequest(req, res, tenant, { localShardId, targets }, resolveOwner)
@@ -173,6 +173,25 @@ describe("durable tenant router", () => {
 		expect(response.status).toBe(200);
 		expect(response.headers.get("x-inno-durable-shard")).toBe("worker-b");
 		expect(received).toBe(body);
+	});
+
+	it("prefers the last-claiming worker for an idle session over the tenant hash", async () => {
+		let ownerHit = "";
+		const affinity = createServer((req, res) => {
+			ownerHit = req.url ?? "";
+			res.writeHead(200, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ served: "worker-b" }));
+		});
+		const affinityOrigin = await listen(affinity);
+		const targets = { "worker-a": "http://127.0.0.1:1", "worker-b": affinityOrigin };
+		const tenantId = tenantOn("worker-a", targets);
+		const source = await sourceServer("worker-a", targets, tenantId, async () => ({ owner: null, affinity: "worker-b" }));
+
+		const response = await fetch(`${source}/api/sessions/ses-1`, { method: "GET" });
+		expect(response.status).toBe(200);
+		expect(response.headers.get("x-inno-durable-shard")).toBe("worker-b");
+		expect(await response.json()).toEqual({ served: "worker-b" });
+		expect(ownerHit).toBe("/api/sessions/ses-1");
 	});
 
 	it("falls back to local service when the session target is unreachable", async () => {

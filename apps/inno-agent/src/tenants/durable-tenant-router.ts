@@ -171,7 +171,7 @@ export async function forwardDurableTenantRequest(
 	res: ServerResponse,
 	tenant: TenantContext,
 	config: DurableShardConfig,
-	resolveSessionOwner?: (sessionId: string) => Promise<string | null>,
+	resolveSessionOwner?: (sessionId: string) => Promise<string | { owner: string | null; affinity?: string | null } | null>,
 ): Promise<IncomingMessage | null> {
 	const path = (req.url ?? "/").split("?")[0];
 	let sessionId = sessionIdFromPath(path);
@@ -195,13 +195,17 @@ export async function forwardDurableTenantRequest(
 		req = replayBodyRequest(req, bufferedBody);
 		if (!sessionId) sessionId = sessionIdFromBody(bufferedBody);
 	}
-	const owner = sessionId && resolveSessionOwner ? await resolveSessionOwner(sessionId) : null;
-	// Session-scoped requests follow the live recorded owner, else the tenant
-	// hash; an unreachable target falls back to local service so the requester
-	// can claim the lease itself. Tenant-level requests keep the hash target
-	// and fail closed because other tenant state is not routed by lease.
-	const targetShard = owner && config.targets[owner]
-		? owner
+	const hint = sessionId && resolveSessionOwner ? await resolveSessionOwner(sessionId) : null;
+	// Session-scoped requests follow the live recorded owner, else the worker
+	// that last held the lease (its disk still carries the session's local
+	// files), else the tenant hash; an unreachable target falls back to local
+	// service so the requester can claim the lease itself. Tenant-level
+	// requests keep the hash target and fail closed because other tenant
+	// state is not routed by lease.
+	const resolved = typeof hint === "string" ? { owner: hint, affinity: null } : hint;
+	const preferred = (resolved?.owner ?? resolved?.affinity) ?? null;
+	const targetShard = preferred && config.targets[preferred]
+		? preferred
 		: selectDurableShard(tenant.tenantId, config);
 	if (targetShard === config.localShardId) return req;
 	if (req.headers[FORWARDED_HEADER]) {

@@ -321,7 +321,7 @@ export class TenantStore {
 		const objid = Number(BigInt.asIntN(32, lockKey));
 		const claimed = await this.pool.query<{ lease_epoch: string }>(
 			`UPDATE ds_metadata
-			 SET owner_worker = $2, lease_epoch = lease_epoch + 1,
+			 SET owner_worker = $2, last_worker = $2, lease_epoch = lease_epoch + 1,
 				 lease_expires_at = NOW() + ($3 * INTERVAL '1 millisecond')
 			 WHERE session_id = $1
 			   AND (owner_worker IS NULL OR owner_worker = $2
@@ -393,18 +393,33 @@ export class TenantStore {
 	 * ignored). Returns null for unowned or provably-dead-owner sessions.
 	 */
 	async durableSessionOwner(context: TenantContext, sessionId: string): Promise<string | null> {
+		return (await this.durableSessionRouteHint(context, sessionId)).owner;
+	}
+
+	/**
+	 * Routing hint for a session-scoped request: `owner` is the live recorded
+	 * storage owner (lease unexpired and the advisory lock still held), while
+	 * `affinity` is the worker that last claimed the session — set on every
+	 * claim and kept on release so idle sessions stay near their worker-local
+	 * files. Either may name a dead worker; the forward path handles that.
+	 */
+	async durableSessionRouteHint(context: TenantContext, sessionId: string): Promise<{ owner: string | null; affinity: string | null }> {
 		const lockKey = BigInt(durableStorageLockKey(context.tenantId, sessionId));
 		const classid = Number(BigInt.asIntN(32, lockKey >> 32n));
 		const objid = Number(BigInt.asIntN(32, lockKey));
-		const rows = await this.pool.query<{ owner_worker: string }>(
-			`SELECT owner_worker FROM ds_metadata
-			 WHERE session_id = $1 AND owner_worker IS NOT NULL
-			   AND lease_expires_at > NOW()
-			   AND EXISTS (SELECT 1 FROM pg_locks
-				 WHERE locktype = 'advisory' AND classid = $2 AND objid = $3 AND granted)`,
+		const rows = await this.pool.query<{ owner_worker: string | null; last_worker: string | null; live: boolean }>(
+			`SELECT owner_worker, last_worker,
+				 (lease_expires_at > NOW()
+				   AND EXISTS (SELECT 1 FROM pg_locks
+					 WHERE locktype = 'advisory' AND classid = $2 AND objid = $3 AND granted)) AS live
+			 FROM ds_metadata WHERE session_id = $1`,
 			[sessionId, classid, objid],
 		);
-		return rows.rows[0]?.owner_worker ?? null;
+		const row = rows.rows[0];
+		return {
+			owner: row?.live ? row.owner_worker : null,
+			affinity: row?.last_worker ?? null,
+		};
 	}
 
 	/**

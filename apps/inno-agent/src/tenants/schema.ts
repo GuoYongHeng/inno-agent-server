@@ -404,6 +404,16 @@ CREATE TABLE IF NOT EXISTS tenant_configs (
 );
 `;
 
+/**
+ * Worker affinity for idle sessions: `last_worker` records the worker that
+ * last claimed the storage lease and survives lease release. Workspaces and
+ * other session-local state still live on one worker's disk, so routing idle
+ * session requests back to that worker keeps the session next to its files.
+ */
+const SESSION_AFFINITY_SQL = `
+ALTER TABLE ds_metadata ADD COLUMN IF NOT EXISTS last_worker text;
+`;
+
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
@@ -414,6 +424,7 @@ export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 7, name: "l2_wiki", sql: L2_WIKI_SQL },
 	{ version: 8, name: "durable_storage", sql: DURABLE_STORAGE_SQL },
 	{ version: 9, name: "tenant_config", sql: TENANT_CONFIG_SQL },
+	{ version: 10, name: "session_affinity", sql: SESSION_AFFINITY_SQL },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

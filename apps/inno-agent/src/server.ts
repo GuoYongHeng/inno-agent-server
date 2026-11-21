@@ -1288,7 +1288,7 @@ const server = createServer(async (req, response) => {
 				const tenant = await auth.tenantStore.ensurePersonalTenant(session.principal.userId);
 				if (durableShardConfig) {
 					const routedReq = await forwardDurableTenantRequest(req, res, tenant, durableShardConfig,
-						(sessionId) => auth.tenantStore!.durableSessionOwner(tenant, sessionId));
+						(sessionId) => auth.tenantStore!.durableSessionRouteHint(tenant, sessionId));
 					if (!routedReq) return;
 					req = routedReq;
 				}

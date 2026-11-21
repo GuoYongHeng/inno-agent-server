@@ -355,6 +355,13 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 	} finally {
 		await leaseRows.end();
 	}
+	// Affinity: the idle session (no live owner) keeps routing to the worker
+	// that last claimed its lease — the worker holding its local files.
+	await startWorker(owner);
+	const affinity = await api(owner, cookie, `/api/chat/status/${session.id}`);
+	expect(affinity.status).toBe(200);
+	expect(affinity.headers.get("x-inno-durable-shard")).toBe(nonOwnerId);
+	await affinity.text();
 }, 60_000);
 
 it("takes over from a SIGSTOP zombie owner once its lease expires", async () => {
@@ -498,6 +505,8 @@ it("takes over from a SIGSTOP zombie owner once its lease expires", async () => 
 	});
 	const revivedText = await revived.text();
 	expect(revived.status, revivedText).toBe(200);
-	expect(revived.headers.get("x-inno-durable-shard")).toBe(ownerId);
+	// The takeover worker recorded last_worker on its claim, so session
+	// affinity keeps the request local instead of hashing it back.
+	expect(revived.headers.get("x-inno-durable-shard")).toBeNull();
 	expect(revivedText).toContain('"type":"done"');
 }, 90_000);
