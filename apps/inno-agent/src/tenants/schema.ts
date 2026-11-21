@@ -414,6 +414,37 @@ const SESSION_AFFINITY_SQL = `
 ALTER TABLE ds_metadata ADD COLUMN IF NOT EXISTS last_worker text;
 `;
 
+const WORKSPACE_REPLICA_SQL = `
+CREATE TABLE IF NOT EXISTS tenant_workspaces (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	workspace_id text NOT NULL,
+	rel_path text NOT NULL,
+	name text NOT NULL,
+	is_temp boolean NOT NULL DEFAULT false,
+	created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, workspace_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_workspaces (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	session_id text NOT NULL REFERENCES durable_sessions (id) ON DELETE CASCADE,
+	workspace_id text NOT NULL,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS workspace_files (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	workspace_id text NOT NULL,
+	rel_path text NOT NULL,
+	size bigint NOT NULL,
+	mtime_ms double precision NOT NULL,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, workspace_id, rel_path)
+);
+`;
+
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
@@ -425,6 +456,7 @@ export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 8, name: "durable_storage", sql: DURABLE_STORAGE_SQL },
 	{ version: 9, name: "tenant_config", sql: TENANT_CONFIG_SQL },
 	{ version: 10, name: "session_affinity", sql: SESSION_AFFINITY_SQL },
+	{ version: 11, name: "workspace_replica", sql: WORKSPACE_REPLICA_SQL },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

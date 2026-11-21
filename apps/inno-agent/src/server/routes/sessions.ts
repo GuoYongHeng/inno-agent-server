@@ -12,6 +12,7 @@ import { TEMP_WORKSPACE_ID, type WorkspaceRegistry } from "../../workspace/works
 import type { TenantStore } from "../../tenants/store.js";
 import { claimRequestResource, getRequestTenant, ownsRequestResource, releaseRequestResource } from "../../tenants/http.js";
 import { resolveRequestWorkspace } from "../../tenants/workspaces.js";
+import type { WorkspaceReplica } from "../../workspace/workspace-replica.js";
 import { HttpError, decodeRouteParam, json, readBody } from "../http-helpers.js";
 import { handleDurableSessionResourceRoutes, type DurableHttpContext } from "../durable-routes.js";
 
@@ -20,6 +21,7 @@ export interface SessionsRouteContext {
 	workspaceRegistry: WorkspaceRegistry;
 	paths: RuntimePaths;
 	tenantStore?: TenantStore | null;
+	workspaceReplica?: WorkspaceReplica | null;
 	durableSessions: DurableHttpContext["service"];
 	getContentSource: () => RemoteContentSource;
 	getCachedPresetAvailability?: (presetId: string) => boolean | null;
@@ -37,6 +39,7 @@ export async function handleSessionsRoutes(
 	ctx: SessionsRouteContext,
 ): Promise<boolean> {
 	const { workspaceRegistry, paths, getContentSource, getCachedPresetAvailability, tenantStore, durableSessions } = ctx;
+	const workspaceReplica = ctx.workspaceReplica ?? null;
 
 	// Every session subresource is protected before any metadata access.
 	const sessionResourceMatch = /^\/api\/sessions\/([^/]+)(?:\/|$)/.exec(url.split("?", 1)[0]);
@@ -136,7 +139,7 @@ export async function handleSessionsRoutes(
 					name: typeof newWorkspaceSpec.name === "string" ? newWorkspaceSpec.name : undefined,
 					isTemp: false,
 				})
-				: await resolveRequestWorkspace(req, workspaceRegistry, tenantStore, explicitWorkspaceId || TEMP_WORKSPACE_ID);
+				: await resolveRequestWorkspace(req, workspaceRegistry, tenantStore, explicitWorkspaceId || TEMP_WORKSPACE_ID, workspaceReplica);
 		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
 		if ((presetId && !existingPresetWorkspace) || (newWorkspaceSpec && !newWorkspaceSpec.isTemp)) {
 			await claimRequestResource(req, tenantStore, "workspace", workspace.id);
@@ -147,6 +150,12 @@ export async function handleSessionsRoutes(
 			const summary = await durableSessions.create(req, { workspaceId: workspace.id });
 			createdId = summary.id;
 			if (!workspaceRegistry.bindSession(summary.id, workspace.id)) throw new Error("Workspace not found");
+			if (workspaceReplica && tenant) {
+				await workspaceReplica.replicateWorkspace(tenant, workspace);
+				await workspaceReplica.setSessionBinding(tenant, summary.id, workspace.id);
+				const wsDir = workspaceRegistry.resolveWorkspaceDir(workspace.id);
+				if (wsDir) await workspaceReplica.push(tenant, workspace.id, wsDir);
+			}
 			await claimRequestResource(req, tenantStore, "session", summary.id);
 			claimed = true;
 			json(res, 201, { id: summary.id, active: true, workspaceId: workspace.id, runtime: "durable" });

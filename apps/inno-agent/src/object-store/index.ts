@@ -1,7 +1,9 @@
+import { FsObjectStore } from "./fs-object-store.js";
 import { MemoryObjectStore, type ObjectStore } from "./object-store.js";
 import { S3ObjectStore, type S3ObjectStoreConfig } from "./s3-object-store.js";
 
 export * from "./object-store.js";
+export { FsObjectStore } from "./fs-object-store.js";
 export { S3ObjectStore, type S3ObjectStoreConfig } from "./s3-object-store.js";
 
 /**
@@ -9,8 +11,9 @@ export { S3ObjectStore, type S3ObjectStoreConfig } from "./s3-object-store.js";
  * environment, never from a tenant's config.
  */
 export interface InnoObjectStorageConfig {
-	/** "memory" keeps objects in process (tests, single-process trials); "s3" targets OSS, MinIO or S3. */
-	provider: "memory" | "s3";
+	/** "memory" keeps objects in process; "fs" mirrors keys under `fsRoot` (single-host or tests); "s3" targets OSS, MinIO or S3. */
+	provider: "memory" | "fs" | "s3";
+	fsRoot?: string;
 	bucket?: string;
 	endpoint?: string;
 	region: string;
@@ -27,10 +30,15 @@ export function normalizeObjectStorageConfig(raw: RawObjectStorageConfig | undef
 	const bucket = text(raw?.bucket, env.INNO_OBJECT_STORAGE_BUCKET);
 	const accessKeyId = text(raw?.accessKeyId, env.INNO_OBJECT_STORAGE_ACCESS_KEY_ID);
 	const secretAccessKey = text(raw?.secretAccessKey, env.INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY);
-	const provider = raw?.provider ?? (text(env.INNO_OBJECT_STORAGE_PROVIDER) === "s3" || (bucket && accessKeyId) ? "s3" : "memory");
+	const rawProvider = raw?.provider ?? text(env.INNO_OBJECT_STORAGE_PROVIDER);
+	const provider = rawProvider === "s3" || rawProvider === "fs" || rawProvider === "memory"
+		? rawProvider
+		: (bucket && accessKeyId) ? "s3" : "memory";
+	const fsRoot = text(raw?.fsRoot, env.INNO_OBJECT_STORAGE_DIR);
 	const pathStyleEnv = env.INNO_OBJECT_STORAGE_FORCE_PATH_STYLE;
 	return {
-		provider: provider === "s3" ? "s3" : "memory",
+		provider,
+		...(fsRoot ? { fsRoot } : {}),
 		...(bucket ? { bucket } : {}),
 		...(endpoint ? { endpoint } : {}),
 		region: text(raw?.region, env.INNO_OBJECT_STORAGE_REGION) ?? "us-east-1",
@@ -45,6 +53,10 @@ export function normalizeObjectStorageConfig(raw: RawObjectStorageConfig | undef
 
 export function createObjectStore(config: InnoObjectStorageConfig): ObjectStore {
 	if (config.provider === "memory") return new MemoryObjectStore();
+	if (config.provider === "fs") {
+		if (!config.fsRoot) throw new Error("Filesystem object storage needs INNO_OBJECT_STORAGE_DIR");
+		return new FsObjectStore(config.fsRoot);
+	}
 	if (!config.bucket || !config.accessKeyId || !config.secretAccessKey) {
 		throw new Error("Object storage needs bucket, accessKeyId and secretAccessKey (INNO_OBJECT_STORAGE_BUCKET / _ACCESS_KEY_ID / _SECRET_ACCESS_KEY)");
 	}

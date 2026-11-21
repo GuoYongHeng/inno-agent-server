@@ -69,7 +69,8 @@ import {
 import { logger } from "./logger.js";
 import { applyRuntimeEnvironment, parseRuntimeArgs, resolveRuntimePaths } from "./runtime.js";
 import { createGracefulShutdownHandler, installProcessFallbacks } from "./utils/process-fallback.js";
-import { DEFAULT_WORKSPACE_ID, WorkspaceRegistry, type WorkspaceMeta } from "./workspace/workspace-registry.js";
+import { DEFAULT_WORKSPACE_ID, TEMP_WORKSPACE_ID, WorkspaceRegistry, type WorkspaceMeta } from "./workspace/workspace-registry.js";
+import { WorkspaceReplica } from "./workspace/workspace-replica.js";
 import type { RemoteContentSource } from "./content-source/index.js";
 import { ContentHubCatalog } from "./content-source/catalog-service.js";
 import { readAuthRuntimeConfig, readListenConfig } from "./auth/config.js";
@@ -126,6 +127,12 @@ const skillsDir = paths.skillsDir;
 // (H3): wiki pages, logs and raw text go to l2_* tables; binary originals go
 // to the configured ObjectStore. Local mode keeps the file backend.
 let sharedObjectStore: ObjectStore | null = null;
+const getSharedObjectStore = (): ObjectStore => {
+	if (!sharedObjectStore) {
+		sharedObjectStore = createObjectStore(normalizeObjectStorageConfig(config?.objectStorage));
+	}
+	return sharedObjectStore;
+};
 if (auth.tenantStore) {
 	const l2Pool = auth.tenantStore.database;
 	const tenantL2Root = resolve(dataDir, "tenants");
@@ -134,12 +141,17 @@ if (auth.tenantStore) {
 		if (parts.length !== 2 || parts[1] !== "l2") return null;
 		const tenantId = parts[0];
 		if (!tenantId || tenantId.startsWith(".")) return null;
-		if (!sharedObjectStore) {
-			sharedObjectStore = createObjectStore(normalizeObjectStorageConfig(config?.objectStorage));
-		}
-		return new PgL2Backend(l2Pool, tenantId, sharedObjectStore, resolvedDir);
+		return new PgL2Backend(l2Pool, tenantId, getSharedObjectStore(), resolvedDir);
 	});
 }
+
+// Workspace replication (H4): registry rows, session bindings and workspace
+// file bytes mirror into PostgreSQL + object storage so a takeover worker can
+// reconstruct a session's workspace. `memory` object storage is per-process
+// and cannot carry state across workers — replication still runs (it keeps
+// rows consistent for tests) but real deployments need "s3" or "fs". Created
+// lazily next to the workspace registry it materializes into.
+let workspaceReplica: WorkspaceReplica | null = null;
 
 const contentHubCatalog = new ContentHubCatalog({
 	dataDir,
@@ -197,6 +209,9 @@ async function ensureBootstrapped(): Promise<void> {
 
 		workspaceRegistry = new WorkspaceRegistry(paths.workspaceDir, dataDir);
 		workspaceRegistry.ensureBootstrapped();
+		if (auth.tenantStore) {
+			workspaceReplica = new WorkspaceReplica(getSharedObjectStore(), auth.tenantStore, workspaceRegistry, join(dataDir, "workspaces", "replica"));
+		}
 		try {
 			const sessionFiles = existsSync(paths.sessionDir)
 				? readdirSync(paths.sessionDir).filter((f) => f.endsWith(".jsonl"))
@@ -249,6 +264,10 @@ async function ensureBootstrapped(): Promise<void> {
 					const ws = workspaceRegistry.ensureChannelWorkspace(channel, tenant.tenantId);
 					await store.claimResource(tenant, "workspace", ws.id);
 					workspaceRegistry.bindSession(sessionId, ws.id);
+					if (workspaceReplica) {
+						await workspaceReplica.replicateWorkspace(tenant, ws);
+						await workspaceReplica.setSessionBinding(tenant, sessionId, ws.id);
+					}
 					return;
 				}
 				try {
@@ -270,6 +289,10 @@ async function ensureBootstrapped(): Promise<void> {
 				if (tenant) await store!.claimResource(tenant, "workspace", workspace.id);
 				const summary = await durableSessions.create(req, { workspaceId: workspace.id });
 				if (!workspaceRegistry.bindSession(summary.id, workspace.id)) throw new Error("Channel workspace not found");
+				if (tenant && workspaceReplica) {
+					await workspaceReplica.replicateWorkspace(tenant, workspace);
+					await workspaceReplica.setSessionBinding(tenant, summary.id, workspace.id);
+				}
 				return summary.id;
 			},
 			resolveSessionTarget: async (sessionId) => await durableSessions.get(backgroundTenantRequest(), sessionId) ? sessionId : null,
@@ -393,10 +416,15 @@ async function ensureBootstrapped(): Promise<void> {
 					try {
 						if (tenant) await store!.claimResource(tenant, "session", summary.id);
 						if (!workspaceRegistry.bindSession(summary.id, ws.id)) throw new Error("Workspace not found");
+						if (tenant && workspaceReplica) {
+							await workspaceReplica.replicateWorkspace(tenant, ws);
+							await workspaceReplica.setSessionBinding(tenant, summary.id, ws.id);
+						}
 						return { id: summary.id, runtime: "durable" };
 					} catch (error) {
 						await durableSessions.delete(req, summary.id).catch(() => undefined);
 						workspaceRegistry.unbindSession(summary.id);
+						if (tenant && workspaceReplica) await workspaceReplica.clearSessionBinding(tenant, summary.id).catch(() => undefined);
 						if (tenant) await store!.releaseResource(tenant, "session", summary.id).catch(() => undefined);
 						throw error;
 					}
@@ -1049,6 +1077,14 @@ const durableSessions = new DurableSessionService({
 		recoveryPool: auth.tenantStore.database,
 		pgCatalog: new PgSessionCatalog(auth.tenantStore.database, (req) => join(resolveRequestTenantDataRoot(req, dataDir), "durable", "sessions.json")),
 	} : {}),
+	workspaceReplica: {
+		materializeSession: (tenant, sessionId, catalogWorkspaceId) =>
+			workspaceReplica
+				? workspaceReplica.materializeSessionWorkspace(tenant, sessionId, catalogWorkspaceId)
+				: Promise.resolve(catalogWorkspaceId || TEMP_WORKSPACE_ID),
+		pull: async (tenant, workspaceId, dir) => { await workspaceReplica?.pull(tenant, workspaceId, dir); },
+		push: async (tenant, workspaceId, dir) => { await workspaceReplica?.push(tenant, workspaceId, dir); },
+	},
 });
 
 const activeDurableJobTurns = new Map<string, string>();
@@ -1167,6 +1203,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	// --- Sessions API (extracted to server/routes/sessions.ts) ---
 	sessions: (req, res, method, url) => handleSessionsRoutes(req, res, method, url, {
 		workspaceRegistry, paths, getContentSource, tenantStore: auth.tenantStore, durableSessions,
+		workspaceReplica,
 		getCachedPresetAvailability: (presetId) => contentHubCatalog.getCachedPresetAvailability(presetId),
 	}),
 
@@ -1178,6 +1215,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	workspaces: (req, res, method, url) => handleWorkspacesRoutes(req, res, method, url, {
 		workspaceRegistry, dataDir, paths, tenantStore: auth.tenantStore,
 		installSkillZip, installSkillMarkdown, scheduleSkillsReload, importWorkspaceZip, durableSessions,
+		workspaceReplica,
 	}),
 
 	// --- Presets API (extracted to server/routes/presets.ts) ---

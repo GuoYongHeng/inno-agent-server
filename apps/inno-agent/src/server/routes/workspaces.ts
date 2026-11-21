@@ -25,6 +25,7 @@ import { TEMP_WORKSPACE_ID, type WorkspaceMeta, type WorkspaceRegistry } from ".
 import type { TenantStore } from "../../tenants/store.js";
 import { claimRequestResource, getRequestTenant, ownsRequestResource, releaseRequestResource } from "../../tenants/http.js";
 import { resolveRequestWorkspace } from "../../tenants/workspaces.js";
+import type { WorkspaceReplica } from "../../workspace/workspace-replica.js";
 import {
 	canonicalTreeRoot,
 	contentDispositionAttachment,
@@ -61,6 +62,7 @@ export interface WorkspacesRouteContext {
 	importWorkspaceZip: (fileName: string, data: Buffer, name?: string) => WorkspaceMeta;
 	scheduleSkillsReload: () => void;
 	durableSessions: DurableHttpContext["service"];
+	workspaceReplica?: WorkspaceReplica | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +320,15 @@ export async function handleWorkspacesRoutes(
 	} = ctx;
 
 	const resolveWorkspace = (workspaceId?: string | null) =>
-		resolveRequestWorkspace(req, workspaceRegistry, tenantStore, workspaceId);
+		resolveRequestWorkspace(req, workspaceRegistry, tenantStore, workspaceId, ctx.workspaceReplica);
+	const replica = ctx.workspaceReplica ?? null;
+	const requestTenant = getRequestTenant(req);
+	/** Upload a workspace's file mirror after a route mutation (authenticated mode). */
+	const pushReplica = async (workspaceId: string) => {
+		if (!replica || !requestTenant) return;
+		const dir = workspaceRegistry.resolveWorkspaceDir(workspaceId);
+		if (dir) await replica.push(requestTenant, workspaceId, dir);
+	};
 	const ownsWorkspace = (workspaceId: string) =>
 		ownsRequestResource(req, tenantStore, "workspace", workspaceId);
 	const ownsSession = (sessionId: string) =>
@@ -382,7 +392,10 @@ export async function handleWorkspacesRoutes(
 	const resolveSessionWorkspace = async (sessionId: string): Promise<WorkspaceMeta | null> => {
 		const currentId = workspaceRegistry.getSessionWorkspaceId(sessionId);
 		const workspace = await resolveWorkspace(currentId);
-		if (workspace && workspace.id !== currentId) workspaceRegistry.bindSession(sessionId, workspace.id);
+		if (workspace && workspace.id !== currentId) {
+			workspaceRegistry.bindSession(sessionId, workspace.id);
+			if (replica && requestTenant) await replica.setSessionBinding(requestTenant, sessionId, workspace.id);
+		}
 		return workspace;
 	};
 
@@ -599,6 +612,7 @@ export async function handleWorkspacesRoutes(
 		}
 		writeFileSync(fullPath, content, "utf-8");
 		const stat = statSync(fullPath);
+				await pushReplica(wsId);
 		json(res, 200, { path: filePath, saved: true, size: stat.size, updatedAt: stat.mtime.toISOString() });
 		return true;
 	}
@@ -624,6 +638,7 @@ export async function handleWorkspacesRoutes(
 			writeFileSync(fullPath, "");
 		}
 		const stat = statSync(fullPath);
+				await pushReplica(wsId);
 		json(res, 201, {
 			name: basename(fullPath),
 			path: workspaceRelativePath(root, fullPath),
@@ -654,6 +669,7 @@ export async function handleWorkspacesRoutes(
 		ensureDir(dirname(fullNew));
 		renameSync(fullOld, fullNew);
 		const stat = statSync(fullNew);
+				await pushReplica(wsId);
 		json(res, 200, {
 			name: basename(fullNew),
 			path: workspaceRelativePath(root, fullNew),
@@ -676,6 +692,7 @@ export async function handleWorkspacesRoutes(
 		if (!fullPath) { json(res, 400, { error: "Invalid path" }); return true; }
 		if (!existsSync(fullPath)) { json(res, 404, { error: "Not found" }); return true; }
 		rmSync(fullPath, { recursive: true, force: true });
+				await pushReplica(wsId);
 		json(res, 200, { deleted: true, path: itemPath });
 		return true;
 	}
@@ -700,6 +717,7 @@ export async function handleWorkspacesRoutes(
 		ensureDir(fullTargetDir);
 		renameSync(fullSource, newFullPath);
 		const stat = statSync(newFullPath);
+				await pushReplica(wsId);
 		json(res, 200, {
 			name: basename(newFullPath),
 			path: workspaceRelativePath(root, newFullPath),
@@ -765,6 +783,7 @@ export async function handleWorkspacesRoutes(
 			});
 		}
 		if (installedSkill) scheduleSkillsReload();
+				await pushReplica(wsId);
 		json(res, 201, { uploaded });
 		return true;
 	}
@@ -793,6 +812,7 @@ export async function handleWorkspacesRoutes(
 				? installSkillZip(fileName, data, skillsRoot)
 				: installSkillMarkdown(fileName, data, skillsRoot);
 			scheduleSkillsReload();
+			await pushReplica(wsId);
 			json(res, 201, workspaceSkillNode(root, skill.name));
 		} catch (err) {
 			logger.error({ err }, "failed to install workspace skill package");
@@ -818,6 +838,11 @@ export async function handleWorkspacesRoutes(
 				.map((file) => basename(file, ".jsonl"))
 				.filter((id) => !ownedSessionIds || ownedSessionIds.has(id))
 			: [];
+		if (replica && tenant && ownedWorkspaceIds) {
+			for (const ownedId of ownedWorkspaceIds) {
+				if (!workspaceRegistry.getWorkspace(ownedId)) await replica.materializeWorkspace(tenant, ownedId);
+			}
+		}
 		const workspaces = workspaceRegistry.listWorkspaces(allSessionIds)
 			.filter((workspace) => !ownedWorkspaceIds || ownedWorkspaceIds.has(workspace.id))
 			.map((workspace) => ({
@@ -840,6 +865,7 @@ export async function handleWorkspacesRoutes(
 				: workspaceRegistry.createWorkspace({ name, isTemp: false });
 			if (!ws) { json(res, 404, { error: "Workspace not found" }); return true; }
 			if (!isTemp) await claimRequestResource(req, tenantStore, "workspace", ws.id);
+			if (replica && requestTenant) await replica.replicateWorkspace(requestTenant, ws);
 			json(res, 201, ws);
 		} catch (err) {
 			logger.error({ err }, "failed to create workspace");
@@ -863,6 +889,10 @@ export async function handleWorkspacesRoutes(
 		try {
 			const ws = importWorkspaceZip(fileName, Buffer.from(dataBase64, "base64"), name);
 			await claimRequestResource(req, tenantStore, "workspace", ws.id);
+			if (replica && requestTenant) {
+				await replica.replicateWorkspace(requestTenant, ws);
+				await pushReplica(ws.id);
+			}
 			json(res, 201, ws);
 		} catch (err) {
 			logger.error({ err }, "failed to import workspace archive");
@@ -878,6 +908,7 @@ export async function handleWorkspacesRoutes(
 		if (!name.trim()) { json(res, 400, { error: "Missing name" }); return true; }
 		const updated = workspaceRegistry.renameWorkspace(decodeURIComponent(workspacePatchMatch.id), name);
 		if (!updated) { json(res, 404, { error: "Workspace not found" }); return true; }
+		if (replica && requestTenant) await replica.replicateWorkspace(requestTenant, updated);
 		json(res, 200, updated);
 		return true;
 	}
@@ -898,6 +929,7 @@ export async function handleWorkspacesRoutes(
 		const ok = workspaceRegistry.deleteWorkspace(id, { removeFiles });
 		if (!ok) { json(res, 404, { error: "Workspace not found" }); return true; }
 		await releaseRequestResource(req, tenantStore, "workspace", id);
+		if (replica && requestTenant) await replica.deleteWorkspace(requestTenant, id);
 		json(res, 200, { id, deleted: true, removedFiles: removeFiles });
 		return true;
 	}
@@ -1003,6 +1035,11 @@ export async function handleWorkspacesRoutes(
 			return true;
 		}
 		const files = transferWorkspaceFiles({ preview, sourceRoot, targetRoot, fileActions });
+		if (replica && requestTenant) {
+			await replica.setSessionBinding(requestTenant, sessionId, targetWorkspaceId);
+			await pushReplica(preview.sourceWorkspace.id);
+			await pushReplica(targetWorkspaceId);
+		}
 		json(res, 200, {
 			switched: true,
 			sessionId,
@@ -1043,6 +1080,7 @@ export async function handleWorkspacesRoutes(
 		}
 		const ok = workspaceRegistry.bindSession(sessionId, workspaceId);
 		if (!ok) { json(res, 404, { error: "Workspace not found" }); return true; }
+		if (replica && requestTenant) await replica.setSessionBinding(requestTenant, sessionId, workspaceId);
 		json(res, 200, { sessionId, workspaceId });
 		return true;
 	}

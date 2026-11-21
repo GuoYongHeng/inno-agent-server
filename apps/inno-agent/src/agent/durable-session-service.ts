@@ -21,7 +21,7 @@ import { resolveCurrentTenantConfig } from "../tenants/config.js";
 import { runInTenantContext, runWithoutTenantContext } from "../tenants/current.js";
 import { getRequestTenant } from "../tenants/http.js";
 import { resolveRequestTenantDataRoot } from "../tenants/paths.js";
-import { DURABLE_STORAGE_LEASE_MS, durableWorkerId, type DurableStorageLock, type TenantStore } from "../tenants/store.js";
+import { DURABLE_STORAGE_LEASE_MS, durableWorkerId, type DurableStorageLock, type TenantContext, type TenantStore } from "../tenants/store.js";
 import { TOPIC_UPGRADE_MESSAGE_THRESHOLD, type SessionMessageSummary, type SessionSummary } from "../server/session-model.js";
 import {
 	buildAttachmentContext,
@@ -106,6 +106,7 @@ interface RuntimeEntry {
 	runtime: DurableSessionRuntime;
 	storageLock?: DurableStorageLock;
 	storageLease?: StorageLease;
+	replica?: { tenant: TenantContext; workspaceId: string; dir: string };
 	references: number;
 	closePromise?: Promise<void>;
 }
@@ -114,6 +115,7 @@ interface OpenedRuntime {
 	runtime: DurableSessionRuntime;
 	storageLock?: DurableStorageLock;
 	storageLease?: StorageLease;
+	replica?: { tenant: TenantContext; workspaceId: string; dir: string };
 }
 
 export interface DurableSessionServiceOptions {
@@ -138,6 +140,18 @@ export interface DurableSessionServiceOptions {
 	openRuntime?: typeof DurableSessionRuntime.open;
 	completeTopic?: typeof completeConfiguredDurablePrompt;
 	completeChat?: typeof completeConfiguredDurableChat;
+	/**
+	 * Tenant workspace replication (authenticated mode): `materializeSession`
+	 * adopts replicated registry/binding rows into the local registry before a
+	 * runtime opens, `pull` downloads missing replica files, and `push` uploads
+	 * the workspace mirror when the runtime entry closes — while the session's
+	 * storage lease still names this worker the single writer.
+	 */
+	workspaceReplica?: {
+		materializeSession: (tenant: TenantContext, sessionId: string, catalogWorkspaceId: string | null) => Promise<string>;
+		pull: (tenant: TenantContext, workspaceId: string, dir: string) => Promise<void>;
+		push: (tenant: TenantContext, workspaceId: string, dir: string) => Promise<void>;
+	};
 }
 
 /** Re-enter the verified tenant for tools that read tenant-scoped stores, since
@@ -839,6 +853,13 @@ export class DurableSessionService {
 			entry.closePromise = (async () => {
 				try {
 					await entry.runtime.close();
+					// Upload the workspace mirror while this worker still owns the
+					// storage lease — the lease makes it the single writer, so the
+					// push can't race a successor's pull.
+					if (entry.replica && this.options.workspaceReplica) {
+						await this.options.workspaceReplica.push(entry.replica.tenant, entry.replica.workspaceId, entry.replica.dir)
+							.catch((error) => logger.warn({ err: error, sessionId: entry.storageLease?.sessionId, workspaceId: entry.replica!.workspaceId }, "failed to push workspace replica"));
+					}
 				} finally {
 					if (entry.storageLease) {
 						if (entry.storageLease.heartbeat) clearInterval(entry.storageLease.heartbeat);
@@ -884,6 +905,7 @@ export class DurableSessionService {
 					const tenant = getRequestTenant(req);
 					let storageLock: DurableStorageLock | undefined;
 					let storageLease: StorageLease | undefined;
+					let replicaDir: { tenant: TenantContext; workspaceId: string; dir: string } | undefined;
 					if (tenant) {
 						if (!this.options.tenantStore) throw new Error("Authenticated durable storage requires a tenant store");
 						const lockStarted = performance.now();
@@ -923,8 +945,16 @@ export class DurableSessionService {
 							provider: record.provider,
 							modelId: record.modelId,
 						});
-						const workspaceDir = this.options.resolveWorkspaceDir(id, record.workspaceId);
+						let workspaceId = record.workspaceId;
+						if (tenant && this.options.workspaceReplica) {
+							workspaceId = await this.options.workspaceReplica.materializeSession(tenant, id, record.workspaceId);
+						}
+						const workspaceDir = this.options.resolveWorkspaceDir(id, workspaceId);
 						if (!workspaceDir) throw new Error(`Durable session workspace not found: ${record.workspaceId}`);
+						if (tenant && this.options.workspaceReplica) {
+							replicaDir = { tenant, workspaceId, dir: workspaceDir };
+							await this.options.workspaceReplica.pull(tenant, workspaceId, workspaceDir);
+						}
 						const tenantDataRoot = resolveRequestTenantDataRoot(req, this.options.dataDir);
 						const scopedL3 = new ScopedL3Memory(this.options.dataDir, this.options.recoveryPool);
 						const l3Memory = tenant
@@ -1012,6 +1042,7 @@ export class DurableSessionService {
 							runtime,
 							...(storageLock ? { storageLock } : {}),
 							...(storageLease ? { storageLease } : {}),
+							...(replicaDir ? { replica: replicaDir } : {}),
 						};
 					} catch (error) {
 						if (storageLease) {
@@ -1037,6 +1068,7 @@ export class DurableSessionService {
 					runtime: opened.runtime,
 					...(opened.storageLock ? { storageLock: opened.storageLock } : {}),
 					...(opened.storageLease ? { storageLease: opened.storageLease } : {}),
+					...(opened.replica ? { replica: opened.replica } : {}),
 					references: 0,
 				};
 				this.runtimes.set(key, entry);

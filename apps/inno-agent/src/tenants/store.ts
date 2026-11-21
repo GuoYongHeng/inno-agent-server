@@ -422,6 +422,117 @@ export class TenantStore {
 		};
 	}
 
+	/** Replicated workspace registry rows (durable source of truth across workers). */
+	async upsertWorkspaceRow(context: TenantContext, ws: { workspaceId: string; relPath: string; name: string; isTemp: boolean }): Promise<void> {
+		await this.pool.query(
+			`INSERT INTO tenant_workspaces (tenant_id, workspace_id, rel_path, name, is_temp, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, NOW())
+			 ON CONFLICT (tenant_id, workspace_id)
+			 DO UPDATE SET rel_path = EXCLUDED.rel_path, name = EXCLUDED.name,
+				is_temp = EXCLUDED.is_temp, updated_at = NOW()`,
+			[context.tenantId, ws.workspaceId, ws.relPath, ws.name, ws.isTemp],
+		);
+	}
+
+	async getWorkspaceRow(context: TenantContext, workspaceId: string): Promise<{ workspaceId: string; relPath: string; name: string; isTemp: boolean; createdAt: string; updatedAt: string } | null> {
+		const rows = await this.pool.query(
+			`SELECT workspace_id, rel_path, name, is_temp,
+				 created_at::text AS created_at, updated_at::text AS updated_at
+			 FROM tenant_workspaces WHERE tenant_id = $1 AND workspace_id = $2`,
+			[context.tenantId, workspaceId],
+		);
+		const row = rows.rows[0];
+		return row ? {
+			workspaceId: row.workspace_id, relPath: row.rel_path, name: row.name,
+			isTemp: row.is_temp, createdAt: row.created_at, updatedAt: row.updated_at,
+		} : null;
+	}
+
+	async deleteWorkspaceRow(context: TenantContext, workspaceId: string): Promise<void> {
+		await this.pool.query(
+			"DELETE FROM tenant_workspaces WHERE tenant_id = $1 AND workspace_id = $2",
+			[context.tenantId, workspaceId],
+		);
+		await this.pool.query(
+			"DELETE FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2",
+			[context.tenantId, workspaceId],
+		);
+		await this.pool.query(
+			"DELETE FROM session_workspaces WHERE tenant_id = $1 AND workspace_id = $2",
+			[context.tenantId, workspaceId],
+		);
+	}
+
+	/** Replicated session→workspace bindings (the local session map is a cache). */
+	async setSessionWorkspace(context: TenantContext, sessionId: string, workspaceId: string): Promise<void> {
+		await this.pool.query(
+			`INSERT INTO session_workspaces (tenant_id, session_id, workspace_id, updated_at)
+			 VALUES ($1, $2, $3, NOW())
+			 ON CONFLICT (tenant_id, session_id)
+			 DO UPDATE SET workspace_id = EXCLUDED.workspace_id, updated_at = NOW()`,
+			[context.tenantId, sessionId, workspaceId],
+		);
+	}
+
+	async getSessionWorkspace(context: TenantContext, sessionId: string): Promise<string | null> {
+		const rows = await this.pool.query<{ workspace_id: string }>(
+			"SELECT workspace_id FROM session_workspaces WHERE tenant_id = $1 AND session_id = $2",
+			[context.tenantId, sessionId],
+		);
+		return rows.rows[0]?.workspace_id ?? null;
+	}
+
+	async deleteSessionWorkspace(context: TenantContext, sessionId: string): Promise<void> {
+		await this.pool.query(
+			"DELETE FROM session_workspaces WHERE tenant_id = $1 AND session_id = $2",
+			[context.tenantId, sessionId],
+		);
+	}
+
+	/** The remote file listing for one workspace replica. */
+	async listWorkspaceFiles(context: TenantContext, workspaceId: string): Promise<Array<{ relPath: string; size: number; mtimeMs: number }>> {
+		const rows = await this.pool.query<{ rel_path: string; size: string; mtime_ms: string }>(
+			"SELECT rel_path, size, mtime_ms FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2",
+			[context.tenantId, workspaceId],
+		);
+		return rows.rows.map((row) => ({ relPath: row.rel_path, size: Number(row.size), mtimeMs: Number(row.mtime_ms) }));
+	}
+
+	/**
+	 * Apply one push diff: upsert present files and delete vanished ones in a
+	 * single transaction so the remote listing never observes a half-applied sync.
+	 */
+	async syncWorkspaceFiles(
+		context: TenantContext,
+		workspaceId: string,
+		upserts: Array<{ relPath: string; size: number; mtimeMs: number }>,
+		deletes: string[],
+	): Promise<void> {
+		const client = await this.pool.connect();
+		try {
+			await withTenantTransaction(client, async () => {
+				if (upserts.length > 0) {
+					await client.query(
+						`INSERT INTO workspace_files (tenant_id, workspace_id, rel_path, size, mtime_ms, updated_at)
+						 SELECT $1, $2, rel_path, size, mtime_ms, NOW()
+						 FROM unnest($3::text[], $4::bigint[], $5::double precision[]) AS t(rel_path, size, mtime_ms)
+						 ON CONFLICT (tenant_id, workspace_id, rel_path)
+						 DO UPDATE SET size = EXCLUDED.size, mtime_ms = EXCLUDED.mtime_ms, updated_at = NOW()`,
+						[context.tenantId, workspaceId, upserts.map((f) => f.relPath), upserts.map((f) => f.size), upserts.map((f) => f.mtimeMs)],
+					);
+				}
+				if (deletes.length > 0) {
+					await client.query(
+						"DELETE FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2 AND rel_path = ANY($3::text[])",
+						[context.tenantId, workspaceId, deletes],
+					);
+				}
+			});
+		} finally {
+			client.release();
+		}
+	}
+
 	/**
 	 * Atomically claim one scheduled occurrence. A crashed owner's lease can be
 	 * taken over only after expiry; successful/failed executions release it and

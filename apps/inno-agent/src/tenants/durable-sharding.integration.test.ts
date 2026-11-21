@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer, type AddressInfo } from "node:net";
@@ -26,6 +26,7 @@ interface Worker {
 }
 
 let postgres: TemporaryPostgres;
+let objectStoreDir = "";
 let provider: HttpServer;
 let sidecar: HttpServer;
 let providerOrigin = "";
@@ -67,6 +68,8 @@ async function startWorker(worker: Worker): Promise<void> {
 			INNO_DURABLE_SHARD_URLS: JSON.stringify(shardConfig.targets),
 			INNO_DURABLE_STORAGE_LEASE_MS: "2000",
 			INNO_DURABLE_FORWARD_TIMEOUT_MS: "3000",
+			INNO_OBJECT_STORAGE_PROVIDER: "fs",
+			INNO_OBJECT_STORAGE_DIR: objectStoreDir,
 			DATABASE_URL: postgres.databaseUrl,
 			BETTER_AUTH_SECRET: SECRET,
 			BETTER_AUTH_URL: publicOrigin,
@@ -147,6 +150,7 @@ beforeAll(async () => {
 		localShardId: "worker-a",
 		targets: { "worker-a": workers["worker-a"].origin, "worker-b": workers["worker-b"].origin },
 	};
+	objectStoreDir = await mkdtemp(join(tmpdir(), "inno-objects-"));
 	for (const worker of Object.values(workers)) {
 		worker.home = await mkdtemp(join(tmpdir(), `inno-${worker.id}-`));
 		await mkdir(join(worker.home, "config"), { recursive: true });
@@ -176,6 +180,7 @@ afterAll(async () => {
 		}
 		if (worker.home) await rm(worker.home, { recursive: true, force: true });
 	}));
+	if (objectStoreDir) await rm(objectStoreDir, { recursive: true, force: true });
 	if (provider) {
 		provider.closeAllConnections();
 		await new Promise<void>((resolveClose) => provider.close(() => resolveClose()));
@@ -510,3 +515,103 @@ it("takes over from a SIGSTOP zombie owner once its lease expires", async () => 
 	expect(revived.headers.get("x-inno-durable-shard")).toBeNull();
 	expect(revivedText).toContain('"type":"done"');
 }, 90_000);
+
+it("restores a session's workspace files on the takeover worker", async () => {
+	const email = "durable-workspace@example.com";
+	const registered = await fetch(`${publicOrigin}/api/auth/sign-up/email`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Origin: publicOrigin },
+		body: JSON.stringify({ name: "Durable workspace", email, password: "durable-workspace-password-123" }),
+	});
+	expect(registered.status).toBe(200);
+	const cookie = registered.headers.get("set-cookie")?.split(";", 1)[0]!;
+	expect((await api(workers["worker-b"], cookie, "/api/sessions")).status).toBe(200);
+	const tenantPool = new Pool({ connectionString: postgres.databaseUrl });
+	let tenantId: string;
+	try {
+		const result = await tenantPool.query<{ id: string }>(
+			'SELECT tenant.id FROM tenants tenant JOIN "user" account ON account.id = tenant.owner_user_id WHERE account.email = $1',
+			[email],
+		);
+		tenantId = result.rows[0].id;
+	} finally {
+		await tenantPool.end();
+	}
+	const ownerId = selectDurableShard(tenantId, shardConfig) as WorkerId;
+	const nonOwnerId: WorkerId = ownerId === "worker-a" ? "worker-b" : "worker-a";
+	const owner = workers[ownerId];
+	const nonOwner = workers[nonOwnerId];
+
+	const configured = await api(nonOwner, cookie, "/api/settings/providers", {
+		method: "PUT",
+		body: JSON.stringify({
+			providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-shard-secret",
+			api: "openai-completions", makeDefault: true,
+			models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
+		}),
+	});
+	expect(configured.status).toBe(200);
+	const created = await api(nonOwner, cookie, "/api/sessions", {
+		method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
+	});
+	expect(created.status).toBe(201);
+	const session = await created.json() as { id: string; workspaceId: string };
+
+	// A workspace upload lands on the hash owner and is mirrored into the
+	// tenant's object-store replica (objects + workspace_files listing rows).
+	const upload = await api(nonOwner, cookie, "/api/workspace/upload", {
+		method: "POST",
+		body: JSON.stringify({
+			workspaceId: session.workspaceId,
+			files: [{ path: "notes/research.txt", dataBase64: Buffer.from("workspace replica content").toString("base64") }],
+		}),
+	});
+	expect(upload.status).toBe(201);
+	const listingPool = new Pool({ connectionString: postgres.databaseUrl });
+	try {
+		const rows = await listingPool.query<{ n: string }>(
+			"SELECT COUNT(*)::text AS n FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2",
+			[tenantId, session.workspaceId],
+		);
+		expect(Number(rows.rows[0]?.n)).toBe(1);
+	} finally {
+		await listingPool.end();
+	}
+	// The file only exists on the owner's disk.
+	expect(existsSync(join(nonOwner.home, "workspace", ".tmp", `tmp-${tenantId}`, "notes", "research.txt"))).toBe(false);
+
+	// Permanently kill the owner; the survivor takes the lease and must
+	// reconstruct the workspace (registry row + files) before running.
+	owner.child!.kill("SIGKILL");
+	await new Promise<void>((resolveExit) => owner.child!.once("exit", () => resolveExit()));
+	const locksPool = new Pool({ connectionString: postgres.databaseUrl });
+	try {
+		const lockKey = BigInt(durableStorageLockKey(tenantId, session.id));
+		const classid = Number(BigInt.asIntN(32, lockKey >> 32n));
+		const objid = Number(BigInt.asIntN(32, lockKey));
+		const lockDeadline = Date.now() + 10_000;
+		while (true) {
+			const held = await locksPool.query(
+				"SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = $1 AND objid = $2 AND granted",
+				[classid, objid],
+			);
+			if (held.rowCount === 0) break;
+			if (Date.now() > lockDeadline) throw new Error("dead owner's advisory lock was not released");
+			await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+		}
+	} finally {
+		await locksPool.end();
+	}
+	const takenOver = await api(nonOwner, cookie, "/api/chat/stream", {
+		method: "POST",
+		body: JSON.stringify({ sessionId: session.id, prompt: "workspace takeover prompt", clientRequestId: "workspace-takeover" }),
+	});
+	expect(takenOver.status).toBe(200);
+	const takeoverText = await takenOver.text();
+	expect(takeoverText).toContain('"type":"done"');
+
+	// Opening the session materialized the replicated workspace and its files.
+	const restored = join(nonOwner.home, "workspace", ".tmp", `tmp-${tenantId}`, "notes", "research.txt");
+	expect(existsSync(restored)).toBe(true);
+	expect(readFileSync(restored, "utf8")).toBe("workspace replica content");
+}, 60_000);

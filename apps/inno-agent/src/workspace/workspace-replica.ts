@@ -1,0 +1,238 @@
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, sep } from "node:path";
+import { logger } from "../logger.js";
+import { tenantObjectKey } from "../object-store/object-store.js";
+import type { ObjectStore } from "../object-store/object-store.js";
+import { readJson, writeJson } from "../storage/file-store.js";
+import type { TenantContext, TenantStore } from "../tenants/store.js";
+import { incCounter } from "../utils/metrics.js";
+import { isWithin } from "../utils/path-safety.js";
+import { TEMP_WORKSPACE_ID, type WorkspaceMeta, type WorkspaceRegistry } from "./workspace-registry.js";
+
+/**
+ * Replicates tenant workspaces into durable storage so any worker can
+ * reconstruct them after a takeover:
+ * - registry rows (`workspaces/registry.json`) → `tenant_workspaces` (PG)
+ * - session→workspace bindings (`sessions/workspaces.json`) → `session_workspaces` (PG)
+ * - workspace file bytes → `tenants/<t>/workspaces/<ws>/<path>` objects + the
+ *   `workspace_files` listing table (PG)
+ * The worker-local directory stays the working copy; the replica is the
+ * durable mirror. Sync granularity is file-level last-writer-wins — two workers
+ * actively writing the same shared workspace can overwrite each other's copy,
+ * which is documented in the roadmap.
+ */
+
+const IGNORED_DIRS = new Set([".git", "node_modules", "__pycache__", ".venv", ".cache"]);
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_FILES = 5_000;
+const MAX_DEPTH = 24;
+
+interface ReplicaStamp {
+	size: number;
+	mtimeMs: number;
+}
+
+interface ReplicaState {
+	files: Record<string, ReplicaStamp>;
+}
+
+export interface ReplicaReport {
+	uploaded: number;
+	downloaded: number;
+	deleted: number;
+	skipped: number;
+}
+
+function ignored(rel: string): boolean {
+	return rel.split("/").some((part) => IGNORED_DIRS.has(part));
+}
+
+function b64(value: string): string {
+	return Buffer.from(value, "utf8").toString("base64url");
+}
+
+export class WorkspaceReplica {
+	constructor(
+		private readonly objects: ObjectStore,
+		private readonly store: TenantStore,
+		private readonly registry: WorkspaceRegistry,
+		private readonly stateDir: string,
+	) {}
+
+	private objectKey(context: TenantContext, workspaceId: string, rel: string): string {
+		return tenantObjectKey(context.tenantId, "workspaces", b64(workspaceId), b64(rel));
+	}
+
+	private statePath(context: TenantContext, workspaceId: string): string {
+		return join(this.stateDir, `${b64(context.tenantId)}--${b64(workspaceId)}.json`);
+	}
+
+	private loadState(context: TenantContext, workspaceId: string): ReplicaState {
+		const state = readJson<ReplicaState>(this.statePath(context, workspaceId), { files: {} });
+		return state.files && typeof state.files === "object" ? state : { files: {} };
+	}
+
+	private saveState(context: TenantContext, workspaceId: string, state: ReplicaState): void {
+		writeJson(this.statePath(context, workspaceId), state);
+	}
+
+	// ---- Registry + binding replication -------------------------------------
+
+	async replicateWorkspace(context: TenantContext, ws: WorkspaceMeta): Promise<void> {
+		await this.store.upsertWorkspaceRow(context, {
+			workspaceId: ws.id, relPath: ws.relPath, name: ws.name, isTemp: ws.isTemp,
+		});
+	}
+
+	async deleteWorkspace(context: TenantContext, workspaceId: string): Promise<void> {
+		await this.store.deleteWorkspaceRow(context, workspaceId);
+		await this.objects.deletePrefix(tenantObjectKey(context.tenantId, "workspaces", b64(workspaceId)) + "/");
+		rmSync(this.statePath(context, workspaceId), { force: true });
+	}
+
+	async setSessionBinding(context: TenantContext, sessionId: string, workspaceId: string): Promise<void> {
+		await this.store.setSessionWorkspace(context, sessionId, workspaceId);
+	}
+
+	async clearSessionBinding(context: TenantContext, sessionId: string): Promise<void> {
+		await this.store.deleteSessionWorkspace(context, sessionId);
+	}
+
+	/**
+	 * Ensure the local registry knows `workspaceId`, adopting the replicated
+	 * row when the workspace was created on another worker. Returns the local
+	 * meta or null when the workspace is unknown everywhere.
+	 */
+	async materializeWorkspace(context: TenantContext, workspaceId: string): Promise<WorkspaceMeta | null> {
+		const local = this.registry.getWorkspace(workspaceId);
+		if (local) return local;
+		const row = await this.store.getWorkspaceRow(context, workspaceId);
+		if (!row) return null;
+		const meta = this.registry.adoptWorkspace({
+			id: row.workspaceId, name: row.name, relPath: row.relPath,
+			createdAt: row.createdAt, updatedAt: row.updatedAt, isTemp: row.isTemp,
+		});
+		const dir = join(this.registry.workspaceRoot, meta.relPath);
+		mkdirSync(dir, { recursive: true });
+		// A freshly adopted workspace is empty locally — pull its replica before
+		// callers write, so remote files aren't "missing" from the next push.
+		await this.pull(context, workspaceId, dir);
+		return meta;
+	}
+
+	/**
+	 * Resolve the workspace a session opens on this worker: an existing local
+	 * binding wins, then the replicated binding, then the catalog workspace,
+	 * then the shared tmp fallback. Adopted bindings are written into the local
+	 * session map so `getSessionWorkspaceId` resolves correctly afterwards.
+	 */
+	async materializeSessionWorkspace(context: TenantContext, sessionId: string, catalogWorkspaceId?: string | null): Promise<string> {
+		if (this.registry.isSessionBound(sessionId)) {
+			const id = this.registry.getSessionWorkspaceId(sessionId);
+			await this.materializeWorkspace(context, id);
+			return id;
+		}
+		const candidates = [await this.store.getSessionWorkspace(context, sessionId), catalogWorkspaceId ?? null];
+		for (const id of candidates) {
+			if (!id || id === TEMP_WORKSPACE_ID) continue;
+			if (await this.materializeWorkspace(context, id)) {
+				this.registry.bindSession(sessionId, id);
+				return id;
+			}
+		}
+		return TEMP_WORKSPACE_ID;
+	}
+
+	// ---- File sync -----------------------------------------------------------
+
+	private hostFiles(dir: string): Map<string, ReplicaStamp> {
+		const out = new Map<string, ReplicaStamp>();
+		const walk = (current: string, depth: number) => {
+			if (depth > MAX_DEPTH || out.size >= MAX_FILES) return;
+			let entries;
+			try { entries = readdirSync(current, { withFileTypes: true }); } catch { return; }
+			for (const entry of entries) {
+				if (IGNORED_DIRS.has(entry.name)) continue;
+				const full = join(current, entry.name);
+				if (entry.isDirectory()) walk(full, depth + 1);
+				else if (entry.isFile()) {
+					const stats = statSync(full);
+					if (stats.size > MAX_FILE_BYTES) { incCounter("inno_workspace_replica_skipped_total"); continue; }
+					out.set(relative(dir, full).split(sep).join("/"), { size: stats.size, mtimeMs: stats.mtimeMs });
+					if (out.size >= MAX_FILES) return;
+				}
+			}
+		};
+		walk(dir, 0);
+		return out;
+	}
+
+	/** Local workspace → objects + listing rows. Local deletions propagate. */
+	async push(context: TenantContext, workspaceId: string, dir: string): Promise<ReplicaReport> {
+		const report: ReplicaReport = { uploaded: 0, downloaded: 0, deleted: 0, skipped: 0 };
+		const state = this.loadState(context, workspaceId);
+		const upserts: Array<{ relPath: string; size: number; mtimeMs: number }> = [];
+		const deletes: string[] = [];
+		if (!existsSync(dir)) { this.saveState(context, workspaceId, state); return report; }
+		for (const [rel, stamp] of this.hostFiles(dir)) {
+			const known = state.files[rel];
+			if (known && known.size === stamp.size && known.mtimeMs === stamp.mtimeMs) continue;
+			await this.objects.put(this.objectKey(context, workspaceId, rel), new Uint8Array(readFileSync(join(dir, ...rel.split("/")))));
+			state.files[rel] = stamp;
+			upserts.push({ relPath: rel, ...stamp });
+			report.uploaded++;
+		}
+		for (const rel of Object.keys(state.files)) {
+			const target = join(dir, ...rel.split("/"));
+			let gone = false;
+			try { gone = !lstatSync(target).isFile(); } catch { gone = true; }
+			if (!gone) continue;
+			await this.objects.delete(this.objectKey(context, workspaceId, rel));
+			delete state.files[rel];
+			deletes.push(rel);
+			report.deleted++;
+		}
+		await this.store.syncWorkspaceFiles(context, workspaceId, upserts, deletes);
+		this.saveState(context, workspaceId, state);
+		incCounter("inno_workspace_replica_uploaded_total", report.uploaded);
+		return report;
+	}
+
+	/**
+	 * Remote replica → local workspace: downloads rows whose local file is
+	 * missing or has drifted, and never deletes files the replica doesn't know
+	 * (local extras are kept). Returns early when the workspace has no replica.
+	 */
+	async pull(context: TenantContext, workspaceId: string, dir: string): Promise<ReplicaReport> {
+		const report: ReplicaReport = { uploaded: 0, downloaded: 0, deleted: 0, skipped: 0 };
+		const rows = await this.store.listWorkspaceFiles(context, workspaceId);
+		if (rows.length === 0) return report;
+		const state = this.loadState(context, workspaceId);
+		mkdirSync(dir, { recursive: true });
+		for (const row of rows) {
+			if (ignored(row.relPath)) { report.skipped++; continue; }
+			const target = join(dir, ...row.relPath.split("/"));
+			if (!isWithin(dir, target)) { report.skipped++; continue; }
+			let local: ReplicaStamp | null = null;
+			try {
+				const stats = lstatSync(target);
+				if (stats.isFile()) local = { size: stats.size, mtimeMs: stats.mtimeMs };
+			} catch { /* missing */ }
+			if (local && local.size === row.size && local.mtimeMs === row.mtimeMs) {
+				state.files[row.relPath] = row;
+				continue;
+			}
+			const body = await this.objects.get(this.objectKey(context, workspaceId, row.relPath));
+			if (!body) { report.skipped++; logger.warn({ workspaceId, rel: row.relPath }, "workspace replica object missing"); continue; }
+			mkdirSync(dirname(target), { recursive: true });
+			writeFileSync(target, body);
+			const mtimeSec = row.mtimeMs / 1000;
+			try { utimesSync(target, mtimeSec, mtimeSec); } catch { /* mtime best-effort */ }
+			state.files[row.relPath] = { size: row.size, mtimeMs: row.mtimeMs };
+			report.downloaded++;
+		}
+		this.saveState(context, workspaceId, state);
+		incCounter("inno_workspace_replica_downloaded_total", report.downloaded);
+		return report;
+	}
+}

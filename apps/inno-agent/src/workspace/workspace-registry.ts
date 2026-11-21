@@ -326,6 +326,23 @@ export class WorkspaceRegistry {
 		this.saveRegistry(reg);
 	}
 
+	get workspaceRoot(): string {
+		return this.workspaceDir;
+	}
+
+	/**
+	 * Insert a workspace exactly as described (used when materializing a
+	 * replicated row from durable storage). No-op when the id already exists.
+	 */
+	adoptWorkspace(meta: WorkspaceMeta): WorkspaceMeta {
+		const reg = this.loadRegistry();
+		const existing = reg.workspaces.find((w) => w.id === meta.id);
+		if (existing) return existing;
+		reg.workspaces.push({ ...meta });
+		this.saveRegistry(reg);
+		return meta;
+	}
+
 	renameWorkspace(id: string, name: string): WorkspaceMeta | null {
 		const reg = this.loadRegistry();
 		const ws = reg.workspaces.find((w) => w.id === id);
