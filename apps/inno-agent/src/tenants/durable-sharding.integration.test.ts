@@ -226,7 +226,17 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 	const text = await streamed.text();
 	expect(text).toContain("shard response");
 	expect(text).toContain('"type":"done"');
-	expect(existsSync(tenantStorage(owner))).toBe(true);
+	// Durable state lives in the tenant's PostgreSQL storage, not a per-worker file.
+	const storageRows = new Pool({ connectionString: postgres.databaseUrl });
+	try {
+		const entries = await storageRows.query<{ n: string }>(
+			"SELECT COUNT(*)::text AS n FROM ds_entries WHERE session_id = $1",
+			[session.id],
+		);
+		expect(Number(entries.rows[0]!.n)).toBeGreaterThan(0);
+	} finally {
+		await storageRows.end();
+	}
 	const detail = await api(nonOwner, cookie, `/api/sessions/${session.id}`);
 	expect(detail.status).toBe(200);
 	expect(await detail.json()).toMatchObject({ id: session.id, runtime: "durable" });

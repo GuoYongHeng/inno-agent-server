@@ -391,6 +391,15 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 ### H4 PG 版 `Storage` 与租约路由（约 3–6 周，依赖 H1–H3）
 
+**状态（H4 第 1 批已完成）**：`PgDurableStorage`（`agent/pg-durable-storage.ts`）是 pi-durable `Storage` 接口的 PostgreSQL 移植，`agent/pg-durable-storage.integration.test.ts` 用官方 `createStorageConformance` 一致性套件全量验证（25 例）并加租约/fencing/旧 sqlite 导入测试。
+
+- 表结构（迁移 v8，`ds_*`）：`ds_metadata`（每会话一行：`next_id`/`next_seq` 计数器 + `owner_worker`/`lease_epoch`/`lease_expires_at` 租约）与 `ds_record_ids`/`ds_conversations`/`ds_entries`/`ds_tasks`/`ds_submissions`/`ds_documents`/`ds_document_revisions` 逐表镜像 sqlite schema，全部按 `session_id` 隔离并 `REFERENCES durable_sessions(id) ON DELETE CASCADE`；`record`/`content` 列用 text 存 JSON，与 sqlite 逐字节一致。
+- `commit()` 在事务首句做 fencing：`UPDATE ds_metadata SET next_seq = next_seq + 1, next_id = GREATEST(...) WHERE session_id AND lease_epoch = <epoch> RETURNING next_seq - 1`——epoch 不匹配即抛 `DurableStorageFencedError`，按"错误即致命"契约使旧 Session 失败。`mintId()` 走同一行的原子自增，跨 reopen 单调。
+- 租约认领（`TenantStore.claimDurableStorage`）：条件 UPDATE 在"无主/同 worker/租约过期/advisory 锁无其他持有者"任一时成功并递增 epoch。advisory lock 仍保留为活跃 worker 间的快速互斥与 `onLost` 通知；SIGKILL 后锁随连接释放→立即接管，SIGSTOP 僵尸进程要等租约 TTL（45s）过期→心跳续约（TTL/3）失败即关闭 runtime。`openStorage` 选项接进 `DurableSessionRuntime.open`，认证模式开 PG storage，本地模式仍是 sqlite。
+- 旧 `session.sqlite` 首次打开时一次性导入（逐表 `INSERT ... ON CONFLICT DO NOTHING`，计数器取 GREATEST），成功后改名 `session.sqlite.migrated`。
+
+**已知限制**：路由仍是租户级静态哈希分片（`durable-tenant-router.ts`），按会话 owner 的动态路由未做——静态路由下接管只发生在请求恰好落到新 worker 时（如同 shard 滚动重启）；"偷来"的 owner 若在 advisory 锁释放与下次续约重拿锁之间被第三个 worker 撞上，epoch fencing 仍会保证单写者，但旧 owner 的会话会被判失败关闭。
+
 **已确认（pi-durable 1.4.0）**：`Storage` 是公开接口，`Harness.open(storage, ...)` 接受任意实现；包内已有 memory、jsonl、indexeddb、sqlite（node / cloudflare）后端，并随包提供 `registerStorageConformance` 和 `storage-benchmark`。因此实现 PostgreSQL 后端的 `Storage`，不必在网络卷上跑 SQLite。
 
 实现要点（来自接口注释，须逐条满足）：

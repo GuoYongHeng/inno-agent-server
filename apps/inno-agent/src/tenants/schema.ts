@@ -272,6 +272,124 @@ CREATE INDEX IF NOT EXISTS l2_pages_bm25 ON l2_pages
 	);
 `;
 
+/**
+ * Per-session pi-durable storage (H4). `ds_metadata` keeps one row per
+ * session: the `next_id`/`next_seq` counters from the SQLite
+ * `durable_metadata` table plus the lease (`owner_worker`, `lease_epoch`,
+ * `lease_expires_at`) used for cross-worker ownership and commit fencing.
+ * The remaining tables mirror the pi-durable SQLite schema verbatim, scoped
+ * by `session_id`; `record`/`content` are JSON text exactly like the SQLite
+ * columns. All rows cascade with the `durable_sessions` row.
+ */
+const DURABLE_STORAGE_SQL = `
+CREATE TABLE IF NOT EXISTS ds_metadata (
+	session_id text PRIMARY KEY REFERENCES durable_sessions (id) ON DELETE CASCADE,
+	next_id numeric NOT NULL DEFAULT 2,
+	next_seq bigint NOT NULL DEFAULT 1,
+	owner_worker text,
+	lease_epoch bigint NOT NULL DEFAULT 0,
+	lease_expires_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS ds_record_ids (
+	session_id text NOT NULL REFERENCES durable_sessions (id) ON DELETE CASCADE,
+	id bigint NOT NULL,
+	record_type text NOT NULL CHECK (record_type IN ('conversation', 'entry', 'task', 'submission', 'document')),
+	PRIMARY KEY (session_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS ds_conversations (
+	session_id text NOT NULL REFERENCES durable_sessions (id) ON DELETE CASCADE,
+	id bigint NOT NULL,
+	owner_conversation_id bigint,
+	owner_task_id bigint,
+	record text NOT NULL,
+	PRIMARY KEY (session_id, id)
+);
+CREATE INDEX IF NOT EXISTS ds_conversations_owner_conversation_idx
+	ON ds_conversations (session_id, owner_conversation_id, id);
+CREATE INDEX IF NOT EXISTS ds_conversations_owner_task_idx
+	ON ds_conversations (session_id, owner_task_id, id);
+
+CREATE TABLE IF NOT EXISTS ds_entries (
+	session_id text NOT NULL REFERENCES durable_sessions (id) ON DELETE CASCADE,
+	id bigint NOT NULL,
+	conversation_id bigint NOT NULL,
+	head bigint,
+	commit_seq bigint NOT NULL,
+	record text NOT NULL,
+	PRIMARY KEY (session_id, id)
+);
+CREATE INDEX IF NOT EXISTS ds_entries_conversation_idx
+	ON ds_entries (session_id, conversation_id, id DESC);
+CREATE INDEX IF NOT EXISTS ds_entry_heads_conversation_idx
+	ON ds_entries (session_id, conversation_id, id DESC) WHERE head IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ds_tasks (
+	session_id text NOT NULL REFERENCES durable_sessions (id) ON DELETE CASCADE,
+	id bigint NOT NULL,
+	conversation_id bigint NOT NULL,
+	kind text NOT NULL,
+	status text NOT NULL CHECK (status IN ('pending', 'running', 'waiting', 'sleeping', 'completing', 'terminal')),
+	abort_requested boolean NOT NULL,
+	background boolean NOT NULL,
+	record text NOT NULL,
+	PRIMARY KEY (session_id, id)
+);
+CREATE INDEX IF NOT EXISTS ds_tasks_status_idx ON ds_tasks (session_id, status, id);
+CREATE INDEX IF NOT EXISTS ds_tasks_conversation_idx ON ds_tasks (session_id, conversation_id, id);
+CREATE INDEX IF NOT EXISTS ds_tasks_kind_idx ON ds_tasks (session_id, kind, id);
+CREATE INDEX IF NOT EXISTS ds_tasks_abort_requested_idx ON ds_tasks (session_id, abort_requested, id);
+CREATE INDEX IF NOT EXISTS ds_tasks_background_idx ON ds_tasks (session_id, background, id);
+
+CREATE TABLE IF NOT EXISTS ds_submissions (
+	session_id text NOT NULL REFERENCES durable_sessions (id) ON DELETE CASCADE,
+	id bigint NOT NULL,
+	conversation_id bigint NOT NULL,
+	request_id text,
+	status text NOT NULL CHECK (status IN ('queued', 'placed', 'done', 'unanswered')),
+	record text NOT NULL,
+	PRIMARY KEY (session_id, id)
+);
+CREATE INDEX IF NOT EXISTS ds_submissions_request_idx
+	ON ds_submissions (session_id, conversation_id, request_id);
+CREATE INDEX IF NOT EXISTS ds_submissions_conversation_idx
+	ON ds_submissions (session_id, conversation_id, id);
+CREATE INDEX IF NOT EXISTS ds_submissions_status_idx ON ds_submissions (session_id, status, id);
+
+CREATE TABLE IF NOT EXISTS ds_documents (
+	session_id text NOT NULL REFERENCES durable_sessions (id) ON DELETE CASCADE,
+	id bigint NOT NULL,
+	kind text NOT NULL,
+	family smallint NOT NULL CHECK (family IN (0, 1)),
+	key_value text NOT NULL,
+	scope_kind text NOT NULL CHECK (scope_kind IN ('session', 'conversation', 'task')),
+	owner_id bigint NOT NULL,
+	created_at bigint NOT NULL,
+	retired_at bigint,
+	record text NOT NULL,
+	PRIMARY KEY (session_id, id)
+);
+CREATE INDEX IF NOT EXISTS ds_documents_address_idx
+	ON ds_documents (session_id, kind, scope_kind, owner_id, family, key_value, created_at DESC, retired_at);
+CREATE INDEX IF NOT EXISTS ds_documents_scope_idx
+	ON ds_documents (session_id, scope_kind, owner_id, id);
+CREATE INDEX IF NOT EXISTS ds_documents_scope_kind_idx
+	ON ds_documents (session_id, scope_kind, owner_id, kind, id);
+
+CREATE TABLE IF NOT EXISTS ds_document_revisions (
+	session_id text NOT NULL REFERENCES durable_sessions (id) ON DELETE CASCADE,
+	document_id bigint NOT NULL,
+	seq bigint NOT NULL,
+	kind text NOT NULL CHECK (kind IN ('base', 'delta')),
+	version bigint NOT NULL,
+	content text NOT NULL,
+	PRIMARY KEY (session_id, document_id, seq)
+);
+CREATE INDEX IF NOT EXISTS ds_document_revisions_kind_idx
+	ON ds_document_revisions (session_id, document_id, kind, seq DESC);
+`;
+
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
@@ -280,6 +398,7 @@ export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 5, name: "stream_journal", sql: STREAM_JOURNAL_SQL },
 	{ version: 6, name: "l3_index", sql: L3_INDEX_SQL },
 	{ version: 7, name: "l2_wiki", sql: L2_WIKI_SQL },
+	{ version: 8, name: "durable_storage", sql: DURABLE_STORAGE_SQL },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

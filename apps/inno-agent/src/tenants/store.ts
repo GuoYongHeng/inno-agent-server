@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import type { Pool, PoolClient } from "pg";
 import { logger } from "../logger.js";
 import { withTenantTransaction } from "./schema.js";
@@ -40,6 +41,8 @@ export interface JobRunClaim {
 
 export interface DurableStorageLock {
 	readonly lost: boolean;
+	/** Backend pid of the dedicated connection holding the advisory lock. */
+	readonly backendPid: number;
 	onLost(listener: () => void): void;
 	release(): Promise<void>;
 }
@@ -64,6 +67,10 @@ class PostgresDurableStorageLock implements DurableStorageLock {
 	}
 
 	get lost(): boolean { return this.invalidated; }
+
+	get backendPid(): number {
+		return (this.client as unknown as { processID?: number }).processID ?? 0;
+	}
 
 	onLost(listener: () => void): void {
 		if (this.invalidated) listener();
@@ -93,6 +100,17 @@ function durableStorageLockKey(tenantId: string, sessionId: string): string {
 }
 
 const JOB_RUN_LEASE_MS = 5 * 60_000;
+
+/** How long a durable storage lease stays valid without a heartbeat. */
+export const DURABLE_STORAGE_LEASE_MS = 45_000;
+
+/** Identity recorded as `ds_metadata.owner_worker`. The configured shard id
+ * is preferred so leases line up with routing; otherwise host+pid. */
+export function durableWorkerId(env: NodeJS.ProcessEnv = process.env): string {
+	const shard = env.INNO_DURABLE_SHARD_ID?.trim();
+	if (shard) return shard;
+	return `${hostname()}:${process.pid}`;
+}
 
 /** A leased occurrence claim. Renewal and release are owner-token fenced. */
 class PostgresJobRunClaim implements JobRunClaim {
@@ -260,6 +278,85 @@ export class TenantStore {
 			client.release(error instanceof Error ? error : undefined);
 			throw error;
 		}
+	}
+
+	/**
+	 * Claim durable session storage ownership for `workerId`. The conditional
+	 * update wins only when no other worker holds an unexpired lease (or the
+	 * claimant is already the owner), and each successful claim bumps the
+	 * fencing epoch that `PgDurableStorage` commits are checked against.
+	 * Returns the new epoch, or null while another worker's lease is live.
+	 */
+	async claimDurableStorage(
+		context: TenantContext,
+		sessionId: string,
+		workerId: string,
+		leaseMs = DURABLE_STORAGE_LEASE_MS,
+		advisoryBackendPid: number | null = null,
+	): Promise<number | null> {
+		const owned = await this.pool.query(
+			`SELECT 1 FROM resource_ownership ownership
+			 JOIN tenant_memberships membership ON membership.tenant_id = ownership.tenant_id
+			 WHERE ownership.tenant_id = $1 AND ownership.resource_type = 'session'
+			   AND ownership.resource_id = $2 AND membership.user_id = $3`,
+			[context.tenantId, sessionId, context.userId],
+		);
+		if (owned.rowCount !== 1) throw new ResourceOwnershipError("session", sessionId);
+		// Sessions created before the storage migration have no metadata row yet.
+		await this.pool.query(
+			`INSERT INTO ds_metadata (session_id)
+			 SELECT id FROM durable_sessions WHERE id = $1
+			 ON CONFLICT DO NOTHING`,
+			[sessionId],
+		);
+		// A recorded owner is provably dead once no other backend still holds its
+		// advisory lock (process death releases it): a claimant that already owns
+		// the lock passes its backend pid so its own lock does not count; a
+		// claimant holding nothing requires the lock to be free entirely or the
+		// recorded lease to be expired, which fences a merely paused owner.
+		const lockKey = BigInt(durableStorageLockKey(context.tenantId, sessionId));
+		const classid = Number(BigInt.asIntN(32, lockKey >> 32n));
+		const objid = Number(BigInt.asIntN(32, lockKey));
+		const claimed = await this.pool.query<{ lease_epoch: string }>(
+			`UPDATE ds_metadata
+			 SET owner_worker = $2, lease_epoch = lease_epoch + 1,
+				 lease_expires_at = NOW() + ($3 * INTERVAL '1 millisecond')
+			 WHERE session_id = $1
+			   AND (owner_worker IS NULL OR owner_worker = $2
+					OR lease_expires_at IS NULL OR lease_expires_at < NOW()
+					OR NOT EXISTS (SELECT 1 FROM pg_locks
+						WHERE locktype = 'advisory' AND classid = $4 AND objid = $5 AND granted
+						  AND pid IS DISTINCT FROM $6))
+			 RETURNING lease_epoch`,
+			[sessionId, workerId, leaseMs, classid, objid, advisoryBackendPid],
+		);
+		const epoch = claimed.rows[0]?.lease_epoch;
+		return epoch === undefined ? null : Number(epoch);
+	}
+
+	/** Renew a held storage lease; false once the epoch was taken over. */
+	async renewDurableStorage(
+		sessionId: string,
+		workerId: string,
+		epoch: number,
+		leaseMs = DURABLE_STORAGE_LEASE_MS,
+	): Promise<boolean> {
+		const result = await this.pool.query(
+			`UPDATE ds_metadata
+			 SET lease_expires_at = NOW() + ($4 * INTERVAL '1 millisecond')
+			 WHERE session_id = $1 AND owner_worker = $2 AND lease_epoch = $3`,
+			[sessionId, workerId, epoch, leaseMs],
+		);
+		return result.rowCount === 1;
+	}
+
+	/** Release a held storage lease so another worker can claim immediately. */
+	async releaseDurableStorage(sessionId: string, epoch: number): Promise<void> {
+		await this.pool.query(
+			`UPDATE ds_metadata SET owner_worker = NULL, lease_expires_at = NULL
+			 WHERE session_id = $1 AND lease_epoch = $2`,
+			[sessionId, epoch],
+		);
 	}
 
 	/**

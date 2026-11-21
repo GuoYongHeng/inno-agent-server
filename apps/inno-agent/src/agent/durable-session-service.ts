@@ -21,7 +21,7 @@ import { resolveCurrentTenantConfig } from "../tenants/config.js";
 import { runInTenantContext, runWithoutTenantContext } from "../tenants/current.js";
 import { getRequestTenant } from "../tenants/http.js";
 import { resolveRequestTenantDataRoot } from "../tenants/paths.js";
-import type { DurableStorageLock, TenantStore } from "../tenants/store.js";
+import { DURABLE_STORAGE_LEASE_MS, durableWorkerId, type DurableStorageLock, type TenantStore } from "../tenants/store.js";
 import { TOPIC_UPGRADE_MESSAGE_THRESHOLD, type SessionMessageSummary, type SessionSummary } from "../server/session-model.js";
 import {
 	buildAttachmentContext,
@@ -50,6 +50,7 @@ import { DurableStreamStore, FileStreamJournal, type StreamJournal } from "./dur
 import { PgStreamJournal } from "./pg-stream-journal.js";
 import { FileRecoveryStore, PgRecoveryStore, type RecoveryKind, type RecoveryRecordStore } from "./recovery-store.js";
 import { DurableSessionRuntime } from "./durable-runtime.js";
+import { PgDurableStorage } from "./pg-durable-storage.js";
 import type { PersistedQuestion, QuestionBridgeResult, QuestionResponseStatus } from "./question-types.js";
 import type { PermissionDecision, PermissionResponseStatus } from "./permission-types.js";
 import { INNO_SYSTEM_PROMPT } from "./system-prompt.js";
@@ -93,9 +94,18 @@ export interface PreparedDurableImages {
 	workspaceRoot: string;
 }
 
+/** PostgreSQL storage ownership: fencing epoch plus the renewing heartbeat. */
+interface StorageLease {
+	sessionId: string;
+	workerId: string;
+	epoch: number;
+	heartbeat?: NodeJS.Timeout;
+}
+
 interface RuntimeEntry {
 	runtime: DurableSessionRuntime;
 	storageLock?: DurableStorageLock;
+	storageLease?: StorageLease;
 	references: number;
 	closePromise?: Promise<void>;
 }
@@ -103,6 +113,7 @@ interface RuntimeEntry {
 interface OpenedRuntime {
 	runtime: DurableSessionRuntime;
 	storageLock?: DurableStorageLock;
+	storageLease?: StorageLease;
 }
 
 export interface DurableSessionServiceOptions {
@@ -829,6 +840,11 @@ export class DurableSessionService {
 				try {
 					await entry.runtime.close();
 				} finally {
+					if (entry.storageLease) {
+						if (entry.storageLease.heartbeat) clearInterval(entry.storageLease.heartbeat);
+						await this.options.tenantStore?.releaseDurableStorage(entry.storageLease.sessionId, entry.storageLease.epoch)
+							.catch((error) => logger.warn({ err: error, sessionId: entry.storageLease!.sessionId }, "failed to release durable storage lease"));
+					}
 					await entry.storageLock?.release();
 				}
 			})();
@@ -849,16 +865,39 @@ export class DurableSessionService {
 				opening = (async () => {
 					const tenant = getRequestTenant(req);
 					let storageLock: DurableStorageLock | undefined;
+					let storageLease: StorageLease | undefined;
 					if (tenant) {
 						if (!this.options.tenantStore) throw new Error("Authenticated durable storage requires a tenant store");
 						const lockStarted = performance.now();
+						const workerId = durableWorkerId();
 						storageLock = await this.options.tenantStore.acquireDurableStorageLock(tenant, id) ?? undefined;
-						observeMs("inno_advisory_lock_acquire_ms", performance.now() - lockStarted);
-						if (!storageLock) {
-							incCounter("inno_advisory_lock_busy_total");
-							throw new DurableSessionBusyError("Durable session is owned by another worker");
+						if (storageLock) {
+							incCounter("inno_advisory_lock_acquired_total");
+							// Holding the advisory lock means the previous owner is
+							// gone; the claim only races with an already-stolen lease.
+							const epoch = await this.options.tenantStore.claimDurableStorage(
+								tenant, id, workerId, DURABLE_STORAGE_LEASE_MS, storageLock.backendPid);
+							if (epoch === null) {
+								await storageLock.release().catch(() => undefined);
+								incCounter("inno_advisory_lock_busy_total");
+								throw new DurableSessionBusyError("Durable session is leased to another worker");
+							}
+							storageLease = { sessionId: id, workerId, epoch };
+						} else {
+							// The previous owner may be dead (SIGKILL) or paused (SIGSTOP):
+							// its advisory lock lingers but an expired lease can be taken
+							// over. Fenced commits reject a zombie that wakes up later.
+							const epoch = await this.options.tenantStore.claimDurableStorage(tenant, id, workerId);
+							if (epoch === null) {
+								observeMs("inno_advisory_lock_acquire_ms", performance.now() - lockStarted);
+								incCounter("inno_advisory_lock_busy_total");
+								throw new DurableSessionBusyError("Durable session is owned by another worker");
+							}
+							storageLease = { sessionId: id, workerId, epoch };
+							storageLock = await this.options.tenantStore.acquireDurableStorageLock(tenant, id) ?? undefined;
+							if (storageLock) incCounter("inno_advisory_lock_acquired_total");
 						}
-						incCounter("inno_advisory_lock_acquired_total");
+						observeMs("inno_advisory_lock_acquire_ms", performance.now() - lockStarted);
 					}
 					try {
 						const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
@@ -912,8 +951,15 @@ export class DurableSessionService {
 								persistSandboxId: async (sandboxId) => { await this.update(req, id, { sandboxId }); },
 							})
 							: undefined;
+						const legacyStoragePath = this.storagePath(req, id);
 						const runtime = await this.openRuntime({
-							storagePath: this.storagePath(req, id),
+							storagePath: legacyStoragePath,
+							...(storageLease && this.options.recoveryPool ? {
+								openStorage: () => PgDurableStorage.open(this.options.recoveryPool!, id, {
+									leaseEpoch: storageLease!.epoch,
+									legacySqlitePath: legacyStoragePath,
+								}),
+							} : {}),
 							...selection,
 							...(record.conversationId ? { conversationId: record.conversationId } : {}),
 							instructions: [
@@ -944,8 +990,16 @@ export class DurableSessionService {
 							await sandbox?.release().catch(() => undefined);
 							throw error;
 						});
-						return { runtime, ...(storageLock ? { storageLock } : {}) };
+						return {
+							runtime,
+							...(storageLock ? { storageLock } : {}),
+							...(storageLease ? { storageLease } : {}),
+						};
 					} catch (error) {
+						if (storageLease) {
+							await this.options.tenantStore?.releaseDurableStorage(storageLease.sessionId, storageLease.epoch)
+								.catch((releaseError) => logger.error({ err: releaseError, sessionId: id }, "failed to release durable storage lease after open failure"));
+						}
 						await storageLock?.release().catch((releaseError) => {
 							logger.error({ err: releaseError, sessionId: id }, "failed to release durable storage lock after open failure");
 						});
@@ -964,10 +1018,28 @@ export class DurableSessionService {
 				entry = this.runtimes.get(key) ?? {
 					runtime: opened.runtime,
 					...(opened.storageLock ? { storageLock: opened.storageLock } : {}),
+					...(opened.storageLease ? { storageLease: opened.storageLease } : {}),
 					references: 0,
 				};
 				this.runtimes.set(key, entry);
 				const openedEntry = entry;
+				if (openedEntry.storageLease && !openedEntry.storageLease.heartbeat) {
+					const lease = openedEntry.storageLease;
+					lease.heartbeat = setInterval(() => {
+						void this.options.tenantStore?.renewDurableStorage(lease.sessionId, lease.workerId, lease.epoch)
+							.then((renewed) => {
+								if (renewed) return;
+								incCounter("inno_durable_lease_lost_total");
+								if (this.runtimes.get(key) !== openedEntry) return;
+								this.runtimes.delete(key);
+								void this.closeRuntimeEntry(openedEntry).catch((error) => {
+									logger.error({ err: error, sessionId: lease.sessionId }, "failed to close runtime after durable storage lease loss");
+								});
+							})
+							.catch((error) => logger.error({ err: error, sessionId: lease.sessionId }, "durable storage lease renewal failed"));
+					}, Math.max(1_000, Math.floor(DURABLE_STORAGE_LEASE_MS / 3)));
+					lease.heartbeat.unref();
+				}
 				opened.storageLock?.onLost(() => {
 					incCounter("inno_advisory_lock_lost_total");
 					if (this.runtimes.get(key) !== openedEntry) return;

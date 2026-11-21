@@ -18,6 +18,7 @@ import {
 	type Registry,
 	type SettledSubmissionRecord,
 	type SnapshotEvent,
+	type Storage,
 	type SubmissionId,
 	type ToolRegistration,
 	type UserInput,
@@ -83,7 +84,13 @@ export interface DurableContextInfo {
 }
 
 export interface DurableSessionRuntimeOptions {
+	/** Session identity and, in local mode, the SQLite storage file. When
+	 * `openStorage` is set the path only identifies the session for the
+	 * process-local owner guard and legacy import; no file is created. */
 	storagePath: string;
+	/** Storage factory replacing the default SQLite file at `storagePath`
+	 * (authenticated mode opens PostgreSQL storage bound to the held lease). */
+	openStorage?: () => Promise<Storage>;
 	models: Models;
 	model: ModelRef;
 	instructions?: string;
@@ -239,9 +246,12 @@ export class DurableSessionRuntime {
 
 	static async open(options: DurableSessionRuntimeOptions): Promise<DurableSessionRuntime> {
 		const requestedPath = resolve(options.storagePath);
-		await mkdir(dirname(requestedPath), { recursive: true });
-		const storagePath = await realpath(requestedPath).catch(async () =>
-			join(await realpath(dirname(requestedPath)), basename(requestedPath)));
+		let storagePath = requestedPath;
+		if (!options.openStorage) {
+			await mkdir(dirname(requestedPath), { recursive: true });
+			storagePath = await realpath(requestedPath).catch(async () =>
+				join(await realpath(dirname(requestedPath)), basename(requestedPath)));
+		}
 		if (openStoragePaths.has(storagePath)) throw new DurableStorageOwnerError(storagePath);
 		openStoragePaths.add(storagePath);
 		try {
@@ -258,7 +268,7 @@ export class DurableSessionRuntime {
 				options.sandbox,
 			);
 			const harness = await Harness.open(
-				await openNodeSqliteStorage(storagePath),
+				options.openStorage ? await options.openStorage() : await openNodeSqliteStorage(storagePath),
 				{
 					models: withNativeImageFallback(options.models),
 					registry,

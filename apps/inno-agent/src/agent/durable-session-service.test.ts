@@ -27,6 +27,9 @@ const tenantStore = {
 		onLost: () => {},
 		release: async () => {},
 	}),
+	claimDurableStorage: async () => 1,
+	renewDurableStorage: async () => true,
+	releaseDurableStorage: async () => {},
 } as unknown as TenantStore;
 
 function root(): string {
@@ -488,6 +491,7 @@ describe("DurableSessionService", () => {
 				let listener: (() => void) | undefined;
 				const lock: DurableStorageLock = {
 					lost: false,
+					backendPid: 0,
 					onLost: (callback) => { listener = callback; },
 					release: async () => { releases += 1; },
 				};
@@ -497,6 +501,9 @@ describe("DurableSessionService", () => {
 				});
 				return lock;
 			},
+			claimDurableStorage: async () => 1,
+			renewDurableStorage: async () => true,
+			releaseDurableStorage: async () => {},
 		} as unknown as TenantStore;
 		const service = new DurableSessionService({
 			dataDir: base,
