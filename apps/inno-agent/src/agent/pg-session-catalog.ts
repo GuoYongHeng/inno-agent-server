@@ -4,16 +4,20 @@ import type { Pool } from "pg";
 import { logger } from "../logger.js";
 import { getRequestTenant } from "../tenants/http.js";
 import { ResourceOwnershipError, type TenantContext } from "../tenants/store.js";
-import { timedAsync } from "../utils/metrics.js";
+import { setGauge, timedAsync } from "../utils/metrics.js";
 import {
 	SessionNotFoundError,
+	decodeSessionListCursor,
+	encodeSessionListCursor,
 	isSessionRecord,
 	type DurableSessionPatch,
 	type DurableSessionRecord,
 	type SessionCatalog,
+	type SessionCatalogListOptions,
+	type SessionCatalogPage,
 } from "./session-catalog.js";
 
-interface SessionRow {
+export interface SessionRow {
 	id: string;
 	workspace_id: string;
 	name: string;
@@ -31,7 +35,7 @@ interface SessionRow {
 	updated_at: Date;
 }
 
-const COLUMNS = "id, workspace_id, name, provider, model_id, origin, archived, message_count, preview, topic_generated, topic_upgraded, conversation_id, sandbox_id, created_at, updated_at";
+export const COLUMNS = "id, workspace_id, name, provider, model_id, origin, archived, message_count, preview, topic_generated, topic_upgraded, conversation_id, sandbox_id, created_at, updated_at";
 
 /** Patch field -> column. `id` is never patchable and `version` is bumped by every update. */
 const PATCH_COLUMNS: Record<keyof DurableSessionPatch, string> = {
@@ -51,7 +55,7 @@ const PATCH_COLUMNS: Record<keyof DurableSessionPatch, string> = {
 	sandboxId: "sandbox_id",
 };
 
-function toRecord(row: SessionRow): DurableSessionRecord {
+export function toRecord(row: SessionRow): DurableSessionRecord {
 	return {
 		id: row.id,
 		workspaceId: row.workspace_id,
@@ -161,22 +165,44 @@ export class PgSessionCatalog implements SessionCatalog {
 
 	async get(req: IncomingMessage, id: string): Promise<DurableSessionRecord | undefined> {
 		const tenant = await this.ready(req);
-		const result = await timedAsync("inno_catalog_pg_get", () => this.pool.query<SessionRow>(
+		const result = await timedAsync("inno_durable_sessions_get_ms", () => this.pool.query<SessionRow>(
 			`SELECT ${COLUMNS} FROM durable_sessions WHERE id = $1 AND tenant_id = $2`, [id, tenant.tenantId]));
 		return result.rows[0] ? toRecord(result.rows[0]) : undefined;
 	}
 
 	async list(req: IncomingMessage): Promise<DurableSessionRecord[]> {
 		const tenant = await this.ready(req);
-		const result = await this.pool.query<SessionRow>(
-			`SELECT ${COLUMNS} FROM durable_sessions WHERE tenant_id = $1 ORDER BY updated_at DESC`, [tenant.tenantId]);
+		const result = await timedAsync("inno_durable_sessions_list_ms", () => this.pool.query<SessionRow>(
+			`SELECT ${COLUMNS} FROM durable_sessions WHERE tenant_id = $1 ORDER BY updated_at DESC`, [tenant.tenantId]));
+		setGauge("inno_durable_sessions", result.rowCount ?? result.rows.length);
 		return result.rows.map(toRecord);
+	}
+
+	async listPage(req: IncomingMessage, options?: SessionCatalogListOptions): Promise<SessionCatalogPage> {
+		const tenant = await this.ready(req);
+		const limit = options?.limit && options.limit > 0 ? options.limit : 500;
+		const values: unknown[] = [tenant.tenantId];
+		let where = "tenant_id = $1";
+		if (options?.cursor) {
+			const cursor = decodeSessionListCursor(options.cursor);
+			if (!cursor) throw new Error("Invalid session list cursor");
+			values.push(cursor.updatedAt, cursor.id);
+			where += " AND (updated_at, id) < ($2::timestamptz, $3)";
+		}
+		values.push(limit + 1);
+		const result = await timedAsync("inno_durable_sessions_list_ms", () => this.pool.query<SessionRow>(
+			`SELECT ${COLUMNS} FROM durable_sessions WHERE ${where}
+			 ORDER BY updated_at DESC, id DESC LIMIT $${values.length}`, values));
+		const records = result.rows.slice(0, limit).map(toRecord);
+		const more = result.rows.length > limit;
+		return { records, nextCursor: more && records.length > 0 ? encodeSessionListCursor(records[records.length - 1]!) : null };
 	}
 
 	async insert(req: IncomingMessage, record: DurableSessionRecord): Promise<void> {
 		const tenant = await this.ready(req);
 		const client = await this.pool.connect();
 		try {
+			await timedAsync("inno_durable_sessions_insert_ms", async () => {
 			await client.query("BEGIN");
 			const member = await client.query(
 				"SELECT 1 FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2", [tenant.tenantId, tenant.userId]);
@@ -202,6 +228,7 @@ export class PgSessionCatalog implements SessionCatalog {
 				],
 			);
 			await client.query("COMMIT");
+			});
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);
 			throw error;
@@ -221,7 +248,7 @@ export class PgSessionCatalog implements SessionCatalog {
 			sets.push(`${column} = $${values.length}${column.endsWith("_at") ? "::timestamptz" : ""}`);
 		}
 		sets.push("version = version + 1");
-		const result = await timedAsync("inno_catalog_pg_update", () => this.pool.query<SessionRow>(
+		const result = await timedAsync("inno_durable_sessions_update_ms", () => this.pool.query<SessionRow>(
 			`UPDATE durable_sessions SET ${sets.join(", ")} WHERE id = $1 AND tenant_id = $2 RETURNING ${COLUMNS}`, values));
 		if (!result.rows[0]) throw new SessionNotFoundError();
 		return toRecord(result.rows[0]);
@@ -231,12 +258,14 @@ export class PgSessionCatalog implements SessionCatalog {
 		const tenant = await this.ready(req);
 		const client = await this.pool.connect();
 		try {
-			await client.query("BEGIN");
-			await client.query("DELETE FROM durable_sessions WHERE id = $1 AND tenant_id = $2", [id, tenant.tenantId]);
-			await client.query(
-				"DELETE FROM resource_ownership WHERE tenant_id = $1 AND resource_type = 'session' AND resource_id = $2",
-				[tenant.tenantId, id]);
-			await client.query("COMMIT");
+			await timedAsync("inno_durable_sessions_remove_ms", async () => {
+				await client.query("BEGIN");
+				await client.query("DELETE FROM durable_sessions WHERE id = $1 AND tenant_id = $2", [id, tenant.tenantId]);
+				await client.query(
+					"DELETE FROM resource_ownership WHERE tenant_id = $1 AND resource_type = 'session' AND resource_id = $2",
+					[tenant.tenantId, id]);
+				await client.query("COMMIT");
+			});
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);
 			throw error;

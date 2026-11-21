@@ -31,7 +31,8 @@
 		"showcase:build": "npm run build --workspace inno-agent-showcase",
 		"electron:build:mac:signed": "bash scripts/build-mac-signed.sh",
 		"electron:package:mac:signed": "node scripts/check-mac-signing.cjs && electron-builder --config build/electron-builder.mac-signed.cjs --mac dmg --arm64 --publish never && bash scripts/verify-mac-release.sh",
-		"test:mac-signing": "node --test scripts/check-mac-signing.test.cjs"
+		"test:mac-signing": "node --test scripts/check-mac-signing.test.cjs",
+		"durable:export-catalog": "npm --workspace inno-agent run durable:export-catalog --"
 	},
 	"engines": {
 		"node": ">=22.19.0"

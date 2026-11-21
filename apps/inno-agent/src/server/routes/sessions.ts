@@ -62,6 +62,27 @@ export async function handleSessionsRoutes(
 		const tenant = getRequestTenant(req);
 		if (!tenantStore && tenant) throw new Error("Tenant store is required for an authenticated request");
 		const ownedSessionIds = tenant ? await tenantStore!.listResourceIds(tenant, "session") : null;
+		// `limit`/`cursor` opt into cursor pagination; without them the legacy
+		// full-array response is kept for existing clients.
+		const query = new URL(url, "http://localhost").searchParams;
+		const rawLimit = query.get("limit");
+		const cursor = query.get("cursor")?.trim() || undefined;
+		if (rawLimit !== null || cursor) {
+			const parsed = rawLimit === null ? NaN : Number.parseInt(rawLimit, 10);
+			if (rawLimit !== null && (!Number.isInteger(parsed) || parsed < 1 || parsed > 500)) {
+				json(res, 400, { error: "limit must be an integer between 1 and 500" });
+				return true;
+			}
+			const page = await durableSessions.listPage(req, {
+				...(Number.isInteger(parsed) ? { limit: parsed } : {}),
+				...(cursor ? { cursor } : {}),
+			});
+			json(res, 200, {
+				sessions: page.sessions.filter((summary) => !ownedSessionIds || ownedSessionIds.has(summary.id)),
+				nextCursor: page.nextCursor,
+			});
+			return true;
+		}
 		const sessions = (await durableSessions.list(req))
 			.filter((summary) => !ownedSessionIds || ownedSessionIds.has(summary.id))
 			.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));

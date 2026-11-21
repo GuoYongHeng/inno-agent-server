@@ -6,6 +6,7 @@ import {
 	type DurableSessionPatch,
 	type DurableSessionRecord,
 	type SessionCatalog,
+	type SessionCatalogListOptions,
 } from "./session-catalog.js";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
@@ -416,6 +417,11 @@ export class DurableSessionService {
 	async list(req: IncomingMessage): Promise<DurableSessionSummary[]> {
 		return (await this.catalogFor(req).list(req)).map(toSummary)
 			.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+	}
+
+	async listPage(req: IncomingMessage, options?: SessionCatalogListOptions): Promise<{ sessions: DurableSessionSummary[]; nextCursor: string | null }> {
+		const page = await this.catalogFor(req).listPage(req, options);
+		return { sessions: page.records.map(toSummary), nextCursor: page.nextCursor };
 	}
 
 	async create(req: IncomingMessage, input: { workspaceId: string; origin?: "web" | "scheduler" }): Promise<DurableSessionSummary> {

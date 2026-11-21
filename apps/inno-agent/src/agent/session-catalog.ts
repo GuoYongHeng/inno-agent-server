@@ -48,11 +48,41 @@ export interface SessionCatalog {
 	get(req: IncomingMessage, id: string): Promise<DurableSessionRecord | undefined>;
 	/** All records of the caller's scope, newest `updatedAt` first. */
 	list(req: IncomingMessage): Promise<DurableSessionRecord[]>;
+	/**
+	 * One page of records, newest `updatedAt` first. `cursor` is the opaque
+	 * token returned by the previous call; omit both options for the full list.
+	 */
+	listPage(req: IncomingMessage, options?: SessionCatalogListOptions): Promise<SessionCatalogPage>;
 	insert(req: IncomingMessage, record: DurableSessionRecord): Promise<void>;
 	/** Merge `patch` into the record; throws {@link SessionNotFoundError}. */
 	update(req: IncomingMessage, id: string, patch: DurableSessionPatch): Promise<DurableSessionRecord>;
 	/** Remove the record; absent records are not an error. */
 	remove(req: IncomingMessage, id: string): Promise<void>;
+}
+
+export interface SessionCatalogListOptions {
+	limit?: number;
+	cursor?: string;
+}
+
+export interface SessionCatalogPage {
+	records: DurableSessionRecord[];
+	/** Pass back to fetch the next page; null when the listing is exhausted. */
+	nextCursor: string | null;
+}
+
+/** Opaque list cursor: the (updatedAt, id) tuple a page ended on. */
+export function encodeSessionListCursor(record: DurableSessionRecord): string {
+	return Buffer.from(JSON.stringify({ u: record.updatedAt, i: record.id }), "utf8").toString("base64url");
+}
+
+export function decodeSessionListCursor(cursor: string): { updatedAt: string; id: string } | null {
+	try {
+		const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as { u?: unknown; i?: unknown };
+		return typeof parsed.u === "string" && typeof parsed.i === "string" ? { updatedAt: parsed.u, id: parsed.i } : null;
+	} catch {
+		return null;
+	}
 }
 
 export function isSessionRecord(value: unknown): value is DurableSessionRecord {
@@ -95,6 +125,25 @@ export class FileSessionCatalog implements SessionCatalog {
 
 	async list(req: IncomingMessage): Promise<DurableSessionRecord[]> {
 		return this.read(req).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+	}
+
+	async listPage(req: IncomingMessage, options?: SessionCatalogListOptions): Promise<SessionCatalogPage> {
+		const sorted = (await this.list(req))
+			.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || (a.id < b.id ? 1 : -1));
+		let start = 0;
+		if (options?.cursor) {
+			const cursor = decodeSessionListCursor(options.cursor);
+			if (cursor) {
+				const index = sorted.findIndex((record) =>
+					record.updatedAt < cursor.updatedAt
+					|| (record.updatedAt === cursor.updatedAt && record.id < cursor.id));
+				start = index < 0 ? sorted.length : index;
+			}
+		}
+		const limit = options?.limit && options.limit > 0 ? options.limit : sorted.length;
+		const records = sorted.slice(start, start + limit);
+		const more = start + records.length < sorted.length;
+		return { records, nextCursor: more && records.length > 0 ? encodeSessionListCursor(records[records.length - 1]!) : null };
 	}
 
 	async insert(req: IncomingMessage, record: DurableSessionRecord): Promise<void> {

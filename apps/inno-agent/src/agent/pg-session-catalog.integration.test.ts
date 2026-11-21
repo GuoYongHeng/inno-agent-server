@@ -155,3 +155,33 @@ describe("PgSessionCatalog", () => {
 		expect(existsSync(legacyPath(reqB))).toBe(true);
 	});
 });
+
+	it("paginates by cursor without skipping or duplicating rows", async () => {
+		const same = "2030-01-01T00:00:00.000Z";
+		const ids = [uuid(3001), uuid(3002), uuid(3003), uuid(3004)];
+		for (const id of ids) await catalog.insert(reqA, record(id, { updatedAt: same }));
+
+		// The four equal timestamps land at the head ordered by id DESC.
+		const page1 = await catalog.listPage(reqA, { limit: 2 });
+		expect(page1.records.map((r) => r.id)).toEqual([uuid(3004), uuid(3003)]);
+		expect(page1.nextCursor).toBeTruthy();
+		const page2 = await catalog.listPage(reqA, { limit: 2, cursor: page1.nextCursor! });
+		expect(page2.records.map((r) => r.id)).toEqual([uuid(3002), uuid(3001)]);
+
+		// A full cursor walk covers every tenant row exactly once.
+		const seen = new Set<string>();
+		let cursor: string | undefined;
+		for (let pageNo = 0; pageNo < 20; pageNo++) {
+			const page = await catalog.listPage(reqA, { limit: 25, ...(cursor ? { cursor } : {}) });
+			for (const rec of page.records) {
+				expect(seen.has(rec.id)).toBe(false);
+				seen.add(rec.id);
+			}
+			cursor = page.nextCursor ?? undefined;
+			if (!cursor) break;
+		}
+		expect(ids.every((id) => seen.has(id))).toBe(true);
+		expect(cursor).toBeUndefined();
+
+		await expect(catalog.listPage(reqA, { cursor: "not-a-cursor" })).rejects.toThrow("Invalid session list cursor");
+	});
