@@ -371,7 +371,10 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 0. ✅**基础设施（已完成）**：换 ParadeDB 镜像；引入带编号的迁移文件与 `schema_migrations` 表，取代 `tenants/schema.ts` 里零散的 `IF NOT EXISTS`；加 `ObjectStore` 抽象（OSS/MinIO 实现与内存测试替身）。
 1. ✅**恢复类记录（已完成）**（question、permission、流日志、OCR 检查点、渠道发件箱）→ PG 表。幂等键变成唯一约束，如 `UNIQUE (session_id, tool_call_id)`，取代文件里的操作标记，最能提升 `replay: safe` 的可信度。发件箱用 `FOR UPDATE SKIP LOCKED` 认领并回收过期认领，重试用尽进死信表；30 天保留改为按 `completed_at` 删除。
 2. ~~L1 画像与事件 → PG~~：**已取消**——L1 学习者画像层已整体移除，见上面"L1 移除"。
-3. **L3 召回**：每租户 `node:sqlite` 加 FTS5 → PG 表（`tenant_id` + `session_id` 过滤），检索用 `pg_search` BM25。不建向量索引：按租户过滤后的精确扫描比近似索引稳。
+3. ✅**L3 召回（已完成）**：每租户 `node:sqlite` 加 FTS5 → PG 表（`tenant_id` + `session_id` 过滤），检索用 `pg_search` BM25。不建向量索引：按租户过滤后的精确扫描比近似索引稳。
+   - 实现：`L3Backend` 异步接口（`SqliteL3Backend` 本地、`PgL3Backend` 认证模式），表 `l3_chunks`（BM25 索引，`rowid` 为 key field）与 `l3_index_state`。沿用 SQLite 那套 `segmentForFts` CJK 二元分词，把分词结果存进 `tokens` 列并用 whitespace 分词器建索引，查询用 `tokens ||| '…'`（match disjunction）加 `paradedb.score`，因此两个后端的分词、召回与阈值筛选完全一致，不依赖 `chinese_lindera` 的分词质量。重建索引时旧块、新块和状态在同一事务里替换。
+   - 索引是派生数据：不导入旧的 `l3/memory.db`，会话在下一次快照时按提交 revision 惰性重建；删除会话时同步清理其块（失败仅留下已被所有权过滤隐藏的块）。
+   - 已知限制：召回质量按"词元覆盖率"阈值把关，BM25 只负责取候选；没有跨租户的全局统计，每个租户的 BM25 统计量来自整张表（语料大时 IDF 偏向全局），排序影响有限，阈值不受影响。
 4. **L2 wiki**：manifest 与页面元数据、正文进 PG（链接与引用用 JSONB，`version` 乐观锁，软删除用部分唯一索引，检索用 BM25 索引取代 `l2-index-store`）；`raw/` 下的原始文件文本类小文件进 PG，PDF、Word、图片进对象存储（库中只存对象键与 `sha256`）；`wiki-graph` 继续按需在内存构建。
 
 **第 1 批实现说明**：

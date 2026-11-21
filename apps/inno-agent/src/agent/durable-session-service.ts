@@ -739,7 +739,7 @@ export class DurableSessionService {
 		try {
 			const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
 			if (config.memory?.l3Enabled === false || !prompt.trim()) return "";
-			const scoped = new ScopedL3Memory(this.options.dataDir);
+			const scoped = new ScopedL3Memory(this.options.dataDir, this.options.recoveryPool);
 			const tenant = getRequestTenant(req);
 			if (tenant && !this.options.tenantStore) throw new Error("Authenticated durable L3 recall requires a tenant store");
 			const recall = () => scoped.recall(prompt, id);
@@ -760,7 +760,7 @@ export class DurableSessionService {
 		revision: number,
 	): Promise<void> {
 		// Indexing continues while recall is disabled so re-enabling L3 has no gap.
-		const scoped = new ScopedL3Memory(this.options.dataDir);
+		const scoped = new ScopedL3Memory(this.options.dataDir, this.options.recoveryPool);
 		const tenant = getRequestTenant(req);
 		try {
 			if (tenant) {
@@ -869,7 +869,7 @@ export class DurableSessionService {
 						const workspaceDir = this.options.resolveWorkspaceDir(id, record.workspaceId);
 						if (!workspaceDir) throw new Error(`Durable session workspace not found: ${record.workspaceId}`);
 						const tenantDataRoot = resolveRequestTenantDataRoot(req, this.options.dataDir);
-						const scopedL3 = new ScopedL3Memory(this.options.dataDir);
+						const scopedL3 = new ScopedL3Memory(this.options.dataDir, this.options.recoveryPool);
 						const l3Memory = tenant
 							? {
 								recall: (query: string, excludeSessionId?: string) => runInTenantContext(
@@ -1032,6 +1032,19 @@ export class DurableSessionService {
 		await this.streamStore(req).deleteSession(id);
 		await this.channelOutbox(req, dataRoot).deleteSession(id);
 		await this.ocrStore(req, dataRoot).deleteSession(id);
+		await this.deleteL3Session(req, id);
+	}
+
+	/** The L3 index is derived data; a failed cleanup only leaves chunks that recall already hides (the session is no longer owned). */
+	private async deleteL3Session(req: IncomingMessage, id: string): Promise<void> {
+		const scoped = new ScopedL3Memory(this.options.dataDir, this.options.recoveryPool);
+		const tenant = getRequestTenant(req);
+		try {
+			if (tenant && this.options.tenantStore) await runInTenantContext(tenant, this.options.tenantStore, () => scoped.deleteSession(id));
+			else if (!tenant) await runWithoutTenantContext(() => scoped.deleteSession(id));
+		} catch (error) {
+			logger.warn({ err: error, sessionId: id }, "failed to remove deleted session from the L3 index");
+		}
 	}
 
 	async close(): Promise<void> {

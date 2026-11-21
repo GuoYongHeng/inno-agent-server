@@ -10,7 +10,8 @@
  * Chunk ids are stable (`${sessionId}:${ordinal}`) and upserts are idempotent.
  */
 
-import type { L3Chunk, L3Store } from "./sqlite-store.js";
+import type { L3Backend } from "./l3-backend.js";
+import type { L3Chunk } from "./sqlite-store.js";
 
 /** Minimum characters for a chunk to be worth indexing. */
 const MIN_CHUNK_CHARS = 8;
@@ -69,33 +70,31 @@ function buildChunks(sessionId: string, messages: ExtractedMessage[]): L3Chunk[]
 	return chunks;
 }
 
-function replaceSessionChunks(
-	store: L3Store,
+async function replaceSessionChunks(
+	backend: L3Backend,
 	sessionId: string,
 	messages: ExtractedMessage[],
 	revisionOffset: number,
 	revision: number,
-): number {
+): Promise<number> {
 	const chunks = buildChunks(sessionId, messages);
-	// Re-index cleanly: drop old chunks for this session, then insert current.
-	store.deleteSession(sessionId);
-	if (chunks.length > 0) store.upsertChunks(chunks);
-	store.setIndexState(sessionId, revisionOffset, revision, chunks.length);
+	// Re-index cleanly and atomically: the old chunks, the new ones and the state move together.
+	await backend.replaceSession(sessionId, chunks, { lastOffset: revisionOffset, revision });
 	return chunks.length;
 }
 
 /** Index an already projected durable history. The committed entry revision is
  * the incremental gate; user-visible projection has already removed hidden
  * attachment/OCR context, thinking, and tool payloads. */
-export function indexSessionMessages(
-	store: L3Store,
+export async function indexSessionMessages(
+	backend: L3Backend,
 	sessionId: string,
 	messages: L3IndexMessage[],
 	revision: number,
-): number {
-	const previous = store.getIndexState(sessionId);
+): Promise<number> {
+	const previous = await backend.getIndexState(sessionId);
 	if (previous?.lastMtimeMs === revision && previous.lastOffset === messages.length) return 0;
-	return replaceSessionChunks(store, sessionId, messages.map((message) => ({
+	return replaceSessionChunks(backend, sessionId, messages.map((message) => ({
 		role: message.role,
 		text: message.content,
 		ts: message.timestamp,

@@ -163,12 +163,56 @@ CREATE INDEX IF NOT EXISTS stream_events_turn_idx
 	ON stream_events (tenant_id, session_id, turn_id, id);
 `;
 
+/**
+ * L3 cross-conversation recall index. `tokens` holds the segmented text (CJK
+ * bigrams, lowercase words) and is searched with BM25 through pg_search; the
+ * whitespace tokenizer keeps index and query tokens identical to the SQLite
+ * index. `rowid` is the bm25 key field; (tenant_id, id) is the logical key.
+ */
+const L3_INDEX_SQL = `
+CREATE TABLE IF NOT EXISTS l3_chunks (
+	rowid bigserial PRIMARY KEY,
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	id text NOT NULL,
+	session_id text NOT NULL,
+	role text NOT NULL CHECK (role IN ('user', 'assistant')),
+	text text NOT NULL,
+	tokens text NOT NULL,
+	ts bigint NOT NULL,
+	UNIQUE (tenant_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS l3_chunks_session_idx ON l3_chunks (tenant_id, session_id);
+
+CREATE INDEX IF NOT EXISTS l3_chunks_bm25 ON l3_chunks
+	USING bm25 (rowid, tenant_id, session_id, tokens)
+	WITH (
+		key_field = 'rowid',
+		text_fields = '{
+			"tokens": {"tokenizer": {"type": "whitespace"}},
+			"tenant_id": {"tokenizer": {"type": "raw"}},
+			"session_id": {"tokenizer": {"type": "raw"}}
+		}'
+	);
+
+CREATE TABLE IF NOT EXISTS l3_index_state (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	session_id text NOT NULL,
+	last_offset integer NOT NULL,
+	revision bigint NOT NULL,
+	chunk_count integer NOT NULL,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, session_id)
+);
+`;
+
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
 	{ version: 3, name: "recovery_records", sql: RECOVERY_RECORDS_SQL },
 	{ version: 4, name: "recovery_blobs", sql: RECOVERY_BLOBS_SQL },
 	{ version: 5, name: "stream_journal", sql: STREAM_JOURNAL_SQL },
+	{ version: 6, name: "l3_index", sql: L3_INDEX_SQL },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

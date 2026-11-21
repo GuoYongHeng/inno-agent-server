@@ -10,7 +10,8 @@
  * reserved behind the same interface for when an embedding provider is added.
  */
 
-import { segmentForFts, type L3SearchHit, type L3Store } from "./sqlite-store.js";
+import type { L3Backend } from "./l3-backend.js";
+import { segmentForFts, type L3SearchHit } from "./sqlite-store.js";
 import { logger } from "../../logger.js";
 
 export interface RecallOptions {
@@ -74,7 +75,7 @@ function coverage(queryTokens: string[], chunkText: string): number {
  * store is unavailable, the query is too short, or nothing clears the
  * threshold — callers can then inject nothing.
  */
-export function recall(store: L3Store | null, query: string, opts: RecallOptions = {}): RecallResult[] {
+export async function recall(store: L3Backend | null, query: string, opts: RecallOptions = {}): Promise<RecallResult[]> {
 	if (!store) return [];
 	const q = (query ?? "").trim();
 	if (!q || !isQuerySearchable(q)) return [];
@@ -86,7 +87,7 @@ export function recall(store: L3Store | null, query: string, opts: RecallOptions
 	const limit = opts.limit ?? DEFAULT_LIMIT;
 
 	// Over-fetch candidates by bm25, then gate by absolute token coverage.
-	const raw: L3SearchHit[] = store.searchLexical(q, Math.max(limit * 4, 16));
+	const raw: L3SearchHit[] = await store.searchLexical(q, Math.max(limit * 4, 16));
 
 	const scored = raw
 		.map((hit) => ({ hit, score: coverage(queryTokens, hit.text) }))
