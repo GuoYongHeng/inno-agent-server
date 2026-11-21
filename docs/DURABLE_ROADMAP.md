@@ -429,6 +429,15 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 **退出标准**：一致性套件全绿；跨 worker 接管与 fencing 测试通过；PG Storage 的单会话 turn 延迟与 sqlite 基线的差距在可接受范围内（阈值由 H0 基线给出）。
 
+**H4 之后剩余工作**（最初目标"任意 worker 接管会话"已达成并验证；以下为记录在案的开放项）：
+
+- channel/job 内部调用方（`runDurableChannelPrompt`、调度器、渠道 prompt 等）仍锚定租户哈希 worker，会话 owner 漂移后这些内部 prompt 会被 fencing 拒绝。修复方向：内部调用方也走 `durableSessionOwner` 路由或请求入口。
+- 空闲会话无 owner（runtime 引用归零即放租约），owner-follow 只覆盖活跃 turn 期间。若要覆盖空闲会话需在会话目录里持久化"最后活跃 worker"之类的亲和记录。
+- H1 未做项：目录分页、回滚导出命令、`durable_sessions` 专用指标（见 H1 结果段）。
+- 缺"旧会话重开后能看到新工具"的验证测试（S 系遗留：`harness.root(...)` 的 `agent.tools` 在已有根对话时是否重新应用未验证）。
+- E2B 云沙箱仅 mock 验证；真实账号验收需 `E2B_API_KEY`（`e2b-live.integration.test.ts`），上线前必跑并实测暂停/恢复/冷启动/国内延迟。
+- benchmark 现状：单条读/写 ~0.2–2.7ms PG 固有开销可接受；`commit 100 entries` 批量化后仍 ~74–140ms（Docker PG 往返主导），若真实部署往返更低可复跑基线；进一步压缩需减少 fencing UPDATE/unnest INSERT 的往返（如 PREPARE 或单语句复合写）。
+
 ## 8. 测试策略
 
 - 先跑基线并保存各测试文件通过情况；删除 legacy 时同时删除只测 legacy 的测试，并在 PR 里列出被删测试及原因，避免静默降低覆盖。
