@@ -94,15 +94,16 @@ class PostgresDurableStorageLock implements DurableStorageLock {
 	}
 }
 
-function durableStorageLockKey(tenantId: string, sessionId: string): string {
+export function durableStorageLockKey(tenantId: string, sessionId: string): string {
 	const digest = createHash("sha256").update(`durable\0${tenantId}\0${sessionId}`).digest();
 	return BigInt.asIntN(64, digest.readBigUInt64BE(0)).toString();
 }
 
 const JOB_RUN_LEASE_MS = 5 * 60_000;
 
-/** How long a durable storage lease stays valid without a heartbeat. */
-export const DURABLE_STORAGE_LEASE_MS = 45_000;
+/** How long a durable storage lease stays valid without a heartbeat.
+ * `INNO_DURABLE_STORAGE_LEASE_MS` shortens it in tests (zombie-owner takeover). */
+export const DURABLE_STORAGE_LEASE_MS = Math.max(1_000, Number(process.env.INNO_DURABLE_STORAGE_LEASE_MS) || 45_000);
 
 /** Identity recorded as `ds_metadata.owner_worker`. The configured shard id
  * is preferred so leases line up with routing; otherwise host+pid. */
@@ -282,10 +283,11 @@ export class TenantStore {
 
 	/**
 	 * Claim durable session storage ownership for `workerId`. The conditional
-	 * update wins only when no other worker holds an unexpired lease (or the
-	 * claimant is already the owner), and each successful claim bumps the
-	 * fencing epoch that `PgDurableStorage` commits are checked against.
-	 * Returns the new epoch, or null while another worker's lease is live.
+	 * update wins when the recorded lease is unowned/expired, already owned by
+	 * the claimant, or its owner is provably dead (no other backend holds the
+	 * session advisory lock); each successful claim bumps the fencing epoch
+	 * that `PgDurableStorage` commits are checked against. Returns the new
+	 * epoch, or null while another worker's live lease is still defensible.
 	 */
 	async claimDurableStorage(
 		context: TenantContext,

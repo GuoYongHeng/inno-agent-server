@@ -405,6 +405,8 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 **已知限制**：channel/job 内部调用方（`runDurableChannelPrompt` 等）仍按租户哈希在固定 worker 上执行，会话 owner 漂到别的 worker 后这些内部 prompt 会被 fencing 拒绝（正确性由 fencing 保证，可用性边缘已记录）；"偷来"的 owner 若在 advisory 锁释放与下次续约重拿锁之间被第三个 worker 撞上，epoch fencing 仍保证单写者，但旧 owner 的会话会被判失败关闭。
 
+**状态（H4 收尾已完成）**：`pg-durable-storage-benchmark.integration.test.ts` 用 pi-durable 官方 `storage-benchmark` 对比 SQLite 与 PG 后端（同一数据集经 `Storage` 契约播种，多样本取 median/mean）。首轮暴露 PG `commit()` 每条 write 3+ 次串行往返（100 条 entry ≈ 300 次查询、median 201ms）；批量化后（`checkGlobalIds` 单条 `ANY()` 查询、`ds_record_ids` 认领与四种表写入各一条 `unnest` 多行 INSERT、文档存在性/版本探测 `ANY()` 化）降至 median 74ms，混合 commit 168→8.4ms，conformance 套件 25 例语义不变。单条读/写仍有 ~0.2–2.7ms 的容器内网络+SQL 固有开销（sqlite 0.01–0.9ms），属预期量级。`durable-sharding.integration.test.ts` 增加 SIGSTOP 僵尸 owner 用例：慢 turn in-flight 时冻结 owner → TCP 不报错故转发带响应头超时 → 租约过期后本地认领 → events 重连驱动 `waitForSubmission` 完成被接管 turn（epoch≥2）→ SIGCONT 后僵尸写被 fencing（无重复 entry）且 worker 可复活重投路由。
+
 **已确认（pi-durable 1.4.0）**：`Storage` 是公开接口，`Harness.open(storage, ...)` 接受任意实现；包内已有 memory、jsonl、indexeddb、sqlite（node / cloudflare）后端，并随包提供 `registerStorageConformance` 和 `storage-benchmark`。因此实现 PostgreSQL 后端的 `Storage`，不必在网络卷上跑 SQLite。
 
 实现要点（来自接口注释，须逐条满足）：

@@ -95,15 +95,23 @@ describe("PgDurableStorage conformance", () => {
 describe("PgDurableStorage lease and fencing", () => {
 	it("claims, renews and releases a storage lease", async () => {
 		const sessionId = await createSession();
-		const epoch = await store.claimDurableStorage(tenant, sessionId, "worker-1", 10_000);
-		expect(epoch).not.toBeNull();
-		// A competing worker cannot claim while the lease is live.
-		expect(await store.claimDurableStorage(tenant, sessionId, "worker-2", 10_000)).toBeNull();
-		expect(await store.renewDurableStorage(sessionId, "worker-1", epoch!, 10_000)).toBe(true);
-		// A stale epoch cannot renew.
-		expect(await store.renewDurableStorage(sessionId, "worker-1", epoch! + 99, 10_000)).toBe(false);
-		await store.releaseDurableStorage(sessionId, epoch!);
-		expect(await store.claimDurableStorage(tenant, sessionId, "worker-2", 10_000)).not.toBeNull();
+		// A live owner holds the advisory lock alongside the lease; without it
+		// the recorded owner is treated as provably dead and claimable.
+		const lock = await store.acquireDurableStorageLock(tenant, sessionId);
+		expect(lock).not.toBeNull();
+		try {
+			const epoch = await store.claimDurableStorage(tenant, sessionId, "worker-1", 10_000, lock!.backendPid);
+			expect(epoch).not.toBeNull();
+			// A competing worker cannot claim while the lease is live.
+			expect(await store.claimDurableStorage(tenant, sessionId, "worker-2", 10_000)).toBeNull();
+			expect(await store.renewDurableStorage(sessionId, "worker-1", epoch!, 10_000)).toBe(true);
+			// A stale epoch cannot renew.
+			expect(await store.renewDurableStorage(sessionId, "worker-1", epoch! + 99, 10_000)).toBe(false);
+			await store.releaseDurableStorage(sessionId, epoch!);
+			expect(await store.claimDurableStorage(tenant, sessionId, "worker-2", 10_000)).not.toBeNull();
+		} finally {
+			await lock!.release();
+		}
 	});
 
 	it("fences commits and mints once the lease epoch was taken over", async () => {

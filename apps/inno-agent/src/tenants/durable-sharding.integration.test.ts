@@ -12,6 +12,7 @@ import { readAuthRuntimeConfig } from "../auth/config.js";
 import { migrateAuthDatabase } from "../auth/migration.js";
 import { startTemporaryPostgres, type TemporaryPostgres } from "../db/test-postgres.js";
 import { selectDurableShard, type DurableShardConfig } from "./durable-tenant-router.js";
+import { durableStorageLockKey } from "./store.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
 const SECRET = "durable-shard-integration-secret-at-least-32-characters";
@@ -64,6 +65,8 @@ async function startWorker(worker: Worker): Promise<void> {
 			INNO_DURABLE_ENABLED: "true",
 			INNO_DURABLE_SHARD_ID: worker.id,
 			INNO_DURABLE_SHARD_URLS: JSON.stringify(shardConfig.targets),
+			INNO_DURABLE_STORAGE_LEASE_MS: "2000",
+			INNO_DURABLE_FORWARD_TIMEOUT_MS: "3000",
 			DATABASE_URL: postgres.databaseUrl,
 			BETTER_AUTH_SECRET: SECRET,
 			BETTER_AUTH_URL: publicOrigin,
@@ -93,7 +96,7 @@ async function api(worker: Worker, cookie: string, path: string, init: RequestIn
 			...init.headers,
 		},
 	});
-	if (response.status >= 500) {
+	if (response.status >= 400) {
 		console.error(`[api ${worker.id} ${init.method ?? "GET"} ${path}] ${response.status}: ${await response.clone().text()}`);
 		console.error(`--- ${worker.id} output tail ---\n${worker.output.slice(-3000)}`);
 	}
@@ -106,16 +109,22 @@ beforeAll(async () => {
 		let body = "";
 		req.on("data", (chunk) => { body += chunk; });
 		req.on("end", () => {
-			res.writeHead(200, { "Content-Type": "text/event-stream" });
-			res.end([
-				`data: ${JSON.stringify({ id: "shard-stub", object: "chat.completion.chunk", created: 0, model: "tenant-model", choices: [{ index: 0, delta: { role: "assistant", content: "shard response" }, finish_reason: null }] })}`,
-				"",
-				`data: ${JSON.stringify({ id: "shard-stub", object: "chat.completion.chunk", created: 0, model: "tenant-model", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}`,
-				"",
-				"data: [DONE]",
-				"",
-				"",
-			].join("\n"));
+			// "shard-slow" prompts keep the model call in flight so the owning
+			// worker still holds the storage lease while the test freezes it.
+			const respond = () => {
+				res.writeHead(200, { "Content-Type": "text/event-stream" });
+				res.end([
+					`data: ${JSON.stringify({ id: "shard-stub", object: "chat.completion.chunk", created: 0, model: "tenant-model", choices: [{ index: 0, delta: { role: "assistant", content: "shard response" }, finish_reason: null }] })}`,
+					"",
+					`data: ${JSON.stringify({ id: "shard-stub", object: "chat.completion.chunk", created: 0, model: "tenant-model", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}`,
+					"",
+					"data: [DONE]",
+					"",
+					"",
+				].join("\n"));
+			};
+			if (body.includes("shard-slow")) setTimeout(respond, 4_000);
+			else respond();
 		});
 	});
 	await new Promise<void>((resolveListen) => provider.listen(0, "127.0.0.1", resolveListen));
@@ -154,12 +163,14 @@ beforeAll(async () => {
 		BETTER_AUTH_URL: publicOrigin,
 	}));
 	await Promise.all(Object.values(workers).map(startWorker));
-}, 120_000);
+}, 180_000);
 
 afterAll(async () => {
 	await Promise.all(Object.values(workers).map(async (worker) => {
 		// A signal-killed child keeps exitCode === null; signalCode is the liveness signal.
 		if (worker.child && worker.child.exitCode === null && worker.child.signalCode === null) {
+			// SIGCONT first: SIGTERM pends on a stopped process and would hang the wait.
+			worker.child.kill("SIGCONT");
 			worker.child.kill("SIGTERM");
 			await new Promise<void>((resolveExit) => worker.child!.once("exit", () => resolveExit()));
 		}
@@ -304,6 +315,27 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 	}
 	owner.child!.kill("SIGKILL");
 	await new Promise<void>((resolveExit) => owner.child!.once("exit", () => resolveExit()));
+	// PostgreSQL reaps the dead backend asynchronously; the advisory lock can
+	// linger in pg_locks for a moment, during which a claim still sees a live
+	// owner. Wait for it to disappear so the takeover is deterministic.
+	const locksPool = new Pool({ connectionString: postgres.databaseUrl });
+	try {
+		const lockKey = BigInt(durableStorageLockKey(tenantId, session.id));
+		const classid = Number(BigInt.asIntN(32, lockKey >> 32n));
+		const objid = Number(BigInt.asIntN(32, lockKey));
+		const lockDeadline = Date.now() + 10_000;
+		while (true) {
+			const held = await locksPool.query(
+				"SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = $1 AND objid = $2 AND granted",
+				[classid, objid],
+			);
+			if (held.rowCount === 0) break;
+			if (Date.now() > lockDeadline) throw new Error("dead owner's advisory lock was not released");
+			await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+		}
+	} finally {
+		await locksPool.end();
+	}
 	const takenOver = await api(nonOwner, cookie, "/api/chat/stream", {
 		method: "POST",
 		body: JSON.stringify({ sessionId: session.id, prompt: "takeover prompt", clientRequestId: "durable-shard-takeover" }),
@@ -324,3 +356,148 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 		await leaseRows.end();
 	}
 }, 60_000);
+
+it("takes over from a SIGSTOP zombie owner once its lease expires", async () => {
+	// The previous test killed the hash owner (either worker); restart the dead one.
+	await Promise.all(Object.values(workers).map(async (worker) => {
+		if (worker.child && (worker.child.exitCode !== null || worker.child.signalCode !== null)) {
+			await startWorker(worker);
+		}
+	}));
+	const email = "durable-zombie@example.com";
+	const registered = await fetch(`${publicOrigin}/api/auth/sign-up/email`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Origin: publicOrigin },
+		body: JSON.stringify({ name: "Durable zombie", email, password: "durable-zombie-password-123" }),
+	});
+	expect(registered.status).toBe(200);
+	const cookie = registered.headers.get("set-cookie")?.split(";", 1)[0]!;
+	expect((await api(workers["worker-b"], cookie, "/api/sessions")).status).toBe(200);
+	const tenantPool = new Pool({ connectionString: postgres.databaseUrl });
+	let tenantId: string;
+	try {
+		const result = await tenantPool.query<{ id: string }>(
+			'SELECT tenant.id FROM tenants tenant JOIN "user" account ON account.id = tenant.owner_user_id WHERE account.email = $1',
+			[email],
+		);
+		tenantId = result.rows[0].id;
+	} finally {
+		await tenantPool.end();
+	}
+	const ownerId = selectDurableShard(tenantId, shardConfig) as WorkerId;
+	const nonOwnerId: WorkerId = ownerId === "worker-a" ? "worker-b" : "worker-a";
+	const owner = workers[ownerId];
+	const nonOwner = workers[nonOwnerId];
+	const configured = await api(owner, cookie, "/api/settings/providers", {
+		method: "PUT",
+		body: JSON.stringify({
+			providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-shard-secret",
+			api: "openai-completions", makeDefault: true,
+			models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
+		}),
+	});
+	expect(configured.status, await configured.text()).toBe(200);
+	const created = await api(nonOwner, cookie, "/api/sessions", {
+		method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
+	});
+	const createdBody = await created.text();
+	expect(created.status, createdBody).toBe(201);
+	const session = JSON.parse(createdBody) as { id: string };
+
+	// Keep the owner's lease live with an in-flight slow model turn, then freeze
+	// it: the advisory lock survives SIGSTOP, so takeover must wait out the lease.
+	const slowStream = api(nonOwner, cookie, "/api/chat/stream", {
+		method: "POST",
+		body: JSON.stringify({ sessionId: session.id, prompt: "shard-slow prompt", clientRequestId: "zombie-slow" }),
+	});
+	await new Promise((resolveWait) => setTimeout(resolveWait, 800));
+	owner.child!.kill("SIGSTOP");
+	let entryCount = "0";
+	try {
+		await new Promise((resolveWait) => setTimeout(resolveWait, 3_500));
+
+		// The forward to the frozen owner stalls (its kernel still completes the
+		// handshake), hits the headers timeout, and falls back to local service.
+		// The successor restores the still-running turn's durable journal, so a
+		// second prompt is refused instead of forking the conversation.
+		const refused = await api(nonOwner, cookie, "/api/chat/stream", {
+			method: "POST",
+			body: JSON.stringify({ sessionId: session.id, prompt: "zombie takeover", clientRequestId: "zombie-takeover" }),
+		});
+		expect(refused.status, await refused.text()).toBe(409);
+		expect(refused.headers.get("x-inno-durable-shard")).toBeNull();
+
+		// Reconnecting the turn's event stream drives the takeover: the
+		// successor claims the expired lease (SIGSTOP keeps the advisory lock,
+		// so only the lease TTL gives way) and finishes the reacquired
+		// submission locally. The durable turn id is server-generated, so it is
+		// read back through the status endpoint first.
+		const status = await api(nonOwner, cookie, `/api/chat/status/${session.id}`);
+		const statusText = await status.text();
+		expect(status.status, statusText).toBe(200);
+		const statusBody = JSON.parse(statusText) as { found: boolean; stream?: { turnId?: string } };
+		const turnId = statusBody.stream?.turnId;
+		expect(turnId).toBeTruthy();
+		const reattached = await api(nonOwner, cookie,
+			`/api/chat/events/${session.id}?turnId=${turnId}&after=0`);
+		const reattachedText = await reattached.text();
+		expect(reattached.status, reattachedText).toBe(200);
+		expect(reattached.headers.get("x-inno-durable-shard")).toBeNull();
+		expect(reattachedText).toContain("shard response");
+		expect(reattachedText).toContain('"type":"done"');
+		// The claim bumped the fencing epoch; owner_worker is already cleared
+		// again because the finished turn released its runtime reference.
+		const entriesPool = new Pool({ connectionString: postgres.databaseUrl });
+		try {
+			const lease = await entriesPool.query<{ lease_epoch: string, n: string }>(
+				`SELECT metadata.lease_epoch::text AS lease_epoch,
+						(SELECT COUNT(*) FROM ds_entries WHERE session_id = $1)::text AS n
+				 FROM ds_metadata metadata WHERE session_id = $1`,
+				[session.id],
+			);
+			expect(Number(lease.rows[0]?.lease_epoch)).toBeGreaterThanOrEqual(2);
+			entryCount = lease.rows[0]!.n;
+		} finally {
+			await entriesPool.end();
+		}
+	} finally {
+		// Always unfreeze: a stopped child ignores SIGTERM and would hang teardown.
+		owner.child!.kill("SIGCONT");
+	}
+	// The zombie's buffered model reply is fenced on its stale epoch, so it can
+	// no longer write; the next heartbeat loses the epoch race and closes its
+	// runtime. Wait a heartbeat window, then prove nothing was duplicated.
+	const settled = await slowStream.then(
+		(response) => ({ status: response.status, body: "" }),
+		() => ({ status: 0, body: "" }),
+	);
+	expect([200, 0]).toContain(settled.status);
+	await new Promise((resolveWait) => setTimeout(resolveWait, 3_000));
+	const verifyPool = new Pool({ connectionString: postgres.databaseUrl });
+	try {
+		const after = await verifyPool.query<{ n: string, lease_epoch: string }>(
+			`SELECT (SELECT COUNT(*) FROM ds_entries WHERE session_id = $1)::text AS n,
+					metadata.lease_epoch::text AS lease_epoch
+			 FROM ds_metadata metadata WHERE session_id = $1`,
+			[session.id],
+		);
+		expect(after.rows[0]?.n).toBe(entryCount);
+		expect(Number(after.rows[0]?.lease_epoch)).toBeGreaterThanOrEqual(2);
+	} finally {
+		await verifyPool.end();
+	}
+
+	// The revived worker must stay up — a fenced zombie degrades its session
+	// runtime, not the whole process — and a fresh prompt is served normally.
+	expect(owner.child!.exitCode).toBeNull();
+	expect(owner.child!.signalCode).toBeNull();
+	expect((await fetch(`${owner.origin}/health`)).ok).toBe(true);
+	const revived = await api(nonOwner, cookie, "/api/chat/stream", {
+		method: "POST",
+		body: JSON.stringify({ sessionId: session.id, prompt: "post-resume prompt", clientRequestId: "zombie-post-resume" }),
+	});
+	const revivedText = await revived.text();
+	expect(revived.status, revivedText).toBe(200);
+	expect(revived.headers.get("x-inno-durable-shard")).toBe(ownerId);
+	expect(revivedText).toContain('"type":"done"');
+}, 90_000);

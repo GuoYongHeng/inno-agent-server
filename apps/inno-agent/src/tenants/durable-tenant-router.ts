@@ -13,6 +13,15 @@ export interface DurableShardConfig {
 
 const FORWARDED_HEADER = "x-inno-durable-forwarded";
 
+/** How long a forwarded request waits for response headers before failing.
+ * A frozen (SIGSTOP) owner still completes the TCP handshake at kernel level,
+ * so a dead-looking target can only be detected by its silence. Session
+ * requests then fall back to local takeover; tenant requests get a 502. */
+const FORWARD_HEADERS_TIMEOUT_MS = Math.max(
+	500,
+	Number(process.env.INNO_DURABLE_FORWARD_TIMEOUT_MS) || 10_000,
+);
+
 function enabled(value: string | undefined): boolean {
 	return /^(1|true)$/i.test(value?.trim() ?? "");
 }
@@ -206,6 +215,8 @@ export async function forwardDurableTenantRequest(
 	const outcome = await new Promise<"forwarded" | "unavailable">((resolveForward) => {
 		let responded = false;
 		const upstream = transportRequest(target, { method: req.method, headers }, (upstreamResponse) => {
+			// Headers arrived: stop the connect timeout, the response may stream for a while.
+			upstream.setTimeout(0);
 			responded = true;
 			res.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
 			upstreamResponse.pipe(res);
@@ -227,6 +238,9 @@ export async function forwardDurableTenantRequest(
 		});
 		res.once("close", () => {
 			if (!res.writableFinished) upstream.destroy();
+		});
+		upstream.setTimeout(FORWARD_HEADERS_TIMEOUT_MS, () => {
+			upstream.destroy(new Error(`durable shard forward timed out after ${FORWARD_HEADERS_TIMEOUT_MS}ms`));
 		});
 		if (bufferedBody) upstream.end(bufferedBody);
 		else req.pipe(upstream);

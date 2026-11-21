@@ -254,9 +254,7 @@ export class PgDurableStorage implements Storage {
 			const committedSeq = Number(meta.rows[0]!.committed_seq) as Seq;
 			await this.checkGlobalIds(client, writes);
 			await this.checkDocumentActions(client, documentActions);
-			for (const write of writes) {
-				await this.applyTableWrite(client, write, committedSeq as unknown as number);
-			}
+			await this.applyTableWrites(client, writes, committedSeq as unknown as number);
 			await this.applyDocumentActions(client, documentActions, committedSeq as unknown as number);
 			await client.query("COMMIT");
 			return committedSeq;
@@ -696,19 +694,30 @@ export class PgDurableStorage implements Storage {
 			const document = write.type === "document.create" || write.type === "document.copy";
 			const table = document ? "document" : write.type;
 			const id = (document ? write.record.id : write.value.id) as unknown as number;
-			const existing = (await executor.query(
-				"SELECT record_type FROM ds_record_ids WHERE session_id = $1 AND id = $2",
-				[this.sessionId, id],
-			)).rows[0]?.record_type as string | undefined;
 			const earlier = claimed.get(id);
 			if (table === "conversation" || table === "entry" || table === "document") {
-				if (existing !== undefined) throw new Error(`ID ${id} already belongs to ${existing}`);
 				if (earlier !== undefined) throw new Error(`ID ${id} is written more than once`);
 			} else {
-				if (existing !== undefined && existing !== table) throw new Error(`ID ${id} already belongs to ${existing}`);
 				if (earlier !== undefined && earlier !== table) throw new Error(`ID ${id} is written as two record types`);
 			}
 			claimed.set(id, table);
+		}
+		if (claimed.size === 0) return;
+		// One round trip for every claimed id instead of a lookup per write.
+		const existing = new Map<number, string>();
+		for (const row of (await executor.query(
+			"SELECT id, record_type FROM ds_record_ids WHERE session_id = $1 AND id = ANY($2::bigint[])",
+			[this.sessionId, [...claimed.keys()]],
+		)).rows) {
+			existing.set(Number(row.id), row.record_type as string);
+		}
+		for (const [id, table] of claimed) {
+			const found = existing.get(id);
+			if (table === "conversation" || table === "entry" || table === "document") {
+				if (found !== undefined) throw new Error(`ID ${id} already belongs to ${found}`);
+			} else if (found !== undefined && found !== table) {
+				throw new Error(`ID ${id} already belongs to ${found}`);
+			}
 		}
 	}
 
@@ -760,27 +769,36 @@ export class PgDurableStorage implements Storage {
 	}
 
 	private async checkDocumentActions(executor: Executor, actions: Map<number, DocumentAction>): Promise<void> {
+		if (actions.size === 0) return;
 		const liveCounts = new Map<string, number>();
+		const records = new Map<number, DocumentRecord>();
+		for (const row of (await executor.query(
+			"SELECT id, record FROM ds_documents WHERE session_id = $1 AND id = ANY($2::bigint[])",
+			[this.sessionId, [...actions.keys()]],
+		)).rows) {
+			records.set(Number(row.id), parseJson<DocumentRecord>(row.record as string));
+		}
+		const latestVersions = new Map<number, number>();
+		for (const row of (await executor.query(
+			`SELECT DISTINCT ON (document_id) document_id, version FROM ds_document_revisions
+			 WHERE session_id = $1 AND document_id = ANY($2::bigint[])
+			 ORDER BY document_id, seq DESC`,
+			[this.sessionId, [...actions.keys()]],
+		)).rows) {
+			latestVersions.set(Number(row.document_id), Number(row.version));
+		}
 		for (const [id, action] of actions) {
 			if (action.copy !== undefined && actions.has(action.copy.id as unknown as number)) {
 				throw new Error(`Document copy ${id} source is changed in the copy batch`);
 			}
-			const row = (await executor.query(
-				"SELECT record FROM ds_documents WHERE session_id = $1 AND id = $2",
-				[this.sessionId, id],
-			)).rows[0];
-			const existing = row === undefined ? undefined : parseJson<DocumentRecord>(row.record as string);
+			const existing = records.get(id);
 			if (action.create === undefined && existing === undefined) throw new Error(`Unknown document: ${id}`);
 			if (action.create !== undefined && existing !== undefined) throw new Error(`Document ${id} already exists`);
 			if (existing?.retiredAt !== undefined) throw new Error(`Document ${id} is retired`);
 			if (action.content?.kind === "delta") {
-				const previous = (await executor.query(
-					`SELECT version FROM ds_document_revisions
-					 WHERE session_id = $1 AND document_id = $2 ORDER BY seq DESC LIMIT 1`,
-					[this.sessionId, id],
-				)).rows[0];
+				const previous = latestVersions.get(id);
 				if (previous === undefined) throw new Error(`Document ${id} delta has no base`);
-				if (Number(previous.version) !== action.content.version) {
+				if (previous !== action.content.version) {
 					throw new Error(`Document ${id} version transition requires a base`);
 				}
 			}
@@ -810,59 +828,108 @@ export class PgDurableStorage implements Storage {
 		return id === undefined ? undefined : Number(id);
 	}
 
-	private async applyTableWrite(executor: Executor, write: StorageWrite, seq: number): Promise<void> {
-		switch (write.type) {
-			case "conversation":
-				await this.claimId(executor, write.value.id as unknown as number, "conversation");
-				await executor.query(
-					`INSERT INTO ds_conversations (session_id, id, owner_conversation_id, owner_task_id, record)
-					 VALUES ($1, $2, $3, $4, $5)`,
-					[this.sessionId, write.value.id, write.value.owner?.conversationId ?? null, write.value.owner?.taskId ?? null, encodeJson(write.value)],
-				);
-				break;
-			case "entry":
-				await this.claimId(executor, write.value.id as unknown as number, "entry");
-				await executor.query(
-					`INSERT INTO ds_entries (session_id, id, conversation_id, head, commit_seq, record)
-					 VALUES ($1, $2, $3, $4, $5, $6)`,
-					[this.sessionId, write.value.id, write.value.conversationId, write.value.head ?? null, seq, encodeJson(write.value)],
-				);
-				break;
-			case "task":
-				await this.claimId(executor, write.value.id as unknown as number, "task");
-				await executor.query(
-					`INSERT INTO ds_tasks (session_id, id, conversation_id, kind, status, abort_requested, background, record)
-					 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-					 ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
-					 kind = excluded.kind, status = excluded.status, abort_requested = excluded.abort_requested,
-					 background = excluded.background, record = excluded.record`,
-					[
-						this.sessionId, write.value.id, write.value.conversationId,
-						encodeIndexedString(write.value.kind), write.value.state.status,
-						write.value.abortRequested ? true : false, write.value.background ? true : false,
-						encodeJson(write.value),
-					],
-				);
-				break;
-			case "submission":
-				await this.claimId(executor, write.value.id as unknown as number, "submission");
-				await executor.query(
-					`INSERT INTO ds_submissions (session_id, id, conversation_id, request_id, status, record)
-					 VALUES ($1, $2, $3, $4, $5, $6)
-					 ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
-					 request_id = excluded.request_id, status = excluded.status, record = excluded.record`,
-					[
-						this.sessionId, write.value.id, write.value.conversationId,
-						write.value.requestId === undefined ? null : encodeIndexedString(write.value.requestId),
-						write.value.status, encodeJson(write.value),
-					],
-				);
-				break;
-			case "document.create":
-			case "document.copy":
-			case "document.change":
-			case "document.retire":
-				break;
+	/** Apply all non-document writes with one insert per record type, not per row. */
+	private async applyTableWrites(executor: Executor, writes: readonly StorageWrite[], seq: number): Promise<void> {
+		const claims: Array<[number, string]> = [];
+		const conversations: ConversationRecord[] = [];
+		const entries: EntryRecord[] = [];
+		const tasks: Array<Extract<StorageWrite, { type: "task" }>["value"]> = [];
+		const submissions: SubmissionRecord[] = [];
+		for (const write of writes) {
+			switch (write.type) {
+				case "conversation":
+					conversations.push(write.value);
+					claims.push([write.value.id as unknown as number, "conversation"]);
+					break;
+				case "entry":
+					entries.push(write.value);
+					claims.push([write.value.id as unknown as number, "entry"]);
+					break;
+				case "task":
+					tasks.push(write.value);
+					claims.push([write.value.id as unknown as number, "task"]);
+					break;
+				case "submission":
+					submissions.push(write.value);
+					claims.push([write.value.id as unknown as number, "submission"]);
+					break;
+			}
+		}
+		if (claims.length > 0) {
+			await executor.query(
+				`INSERT INTO ds_record_ids (session_id, id, record_type)
+				 SELECT $1, id, record_type FROM unnest($2::bigint[], $3::text[]) AS ids(id, record_type)
+				 ON CONFLICT DO NOTHING`,
+				[this.sessionId, claims.map(([id]) => id), claims.map(([, table]) => table)],
+			);
+		}
+		if (conversations.length > 0) {
+			await executor.query(
+				`INSERT INTO ds_conversations (session_id, id, owner_conversation_id, owner_task_id, record)
+				 SELECT $1, id, owner_conversation_id, owner_task_id, record
+				 FROM unnest($2::bigint[], $3::bigint[], $4::bigint[], $5::text[]) AS rows(id, owner_conversation_id, owner_task_id, record)`,
+				[
+					this.sessionId,
+					conversations.map((value) => value.id as unknown as number),
+					conversations.map((value) => value.owner?.conversationId ?? null),
+					conversations.map((value) => value.owner?.taskId ?? null),
+					conversations.map((value) => encodeJson(value)),
+				],
+			);
+		}
+		if (entries.length > 0) {
+			await executor.query(
+				`INSERT INTO ds_entries (session_id, id, conversation_id, head, commit_seq, record)
+				 SELECT $1, id, conversation_id, head, $5, record
+				 FROM unnest($2::bigint[], $3::bigint[], $4::bigint[], $6::text[]) AS rows(id, conversation_id, head, record)`,
+				[
+					this.sessionId,
+					entries.map((value) => value.id as unknown as number),
+					entries.map((value) => value.conversationId as unknown as number),
+					entries.map((value) => value.head === undefined ? null : value.head as unknown as number),
+					seq,
+					entries.map((value) => encodeJson(value)),
+				],
+			);
+		}
+		if (tasks.length > 0) {
+			await executor.query(
+				`INSERT INTO ds_tasks (session_id, id, conversation_id, kind, status, abort_requested, background, record)
+				 SELECT $1, id, conversation_id, kind, status, abort_requested, background, record
+				 FROM unnest($2::bigint[], $3::bigint[], $4::text[], $5::text[], $6::boolean[], $7::boolean[], $8::text[])
+					 AS rows(id, conversation_id, kind, status, abort_requested, background, record)
+				 ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
+				 kind = excluded.kind, status = excluded.status, abort_requested = excluded.abort_requested,
+				 background = excluded.background, record = excluded.record`,
+				[
+					this.sessionId,
+					tasks.map((value) => value.id as unknown as number),
+					tasks.map((value) => value.conversationId as unknown as number),
+					tasks.map((value) => encodeIndexedString(value.kind)),
+					tasks.map((value) => value.state.status),
+					tasks.map((value) => value.abortRequested ? true : false),
+					tasks.map((value) => value.background ? true : false),
+					tasks.map((value) => encodeJson(value)),
+				],
+			);
+		}
+		if (submissions.length > 0) {
+			await executor.query(
+				`INSERT INTO ds_submissions (session_id, id, conversation_id, request_id, status, record)
+				 SELECT $1, id, conversation_id, request_id, status, record
+				 FROM unnest($2::bigint[], $3::bigint[], $4::text[], $5::text[], $6::text[])
+					 AS rows(id, conversation_id, request_id, status, record)
+				 ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
+				 request_id = excluded.request_id, status = excluded.status, record = excluded.record`,
+				[
+					this.sessionId,
+					submissions.map((value) => value.id as unknown as number),
+					submissions.map((value) => value.conversationId as unknown as number),
+					submissions.map((value) => value.requestId === undefined ? null : encodeIndexedString(value.requestId)),
+					submissions.map((value) => value.status),
+					submissions.map((value) => encodeJson(value)),
+				],
+			);
 		}
 	}
 
