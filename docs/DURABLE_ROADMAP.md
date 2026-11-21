@@ -398,7 +398,12 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - 租约认领（`TenantStore.claimDurableStorage`）：条件 UPDATE 在"无主/同 worker/租约过期/advisory 锁无其他持有者"任一时成功并递增 epoch。advisory lock 仍保留为活跃 worker 间的快速互斥与 `onLost` 通知；SIGKILL 后锁随连接释放→立即接管，SIGSTOP 僵尸进程要等租约 TTL（45s）过期→心跳续约（TTL/3）失败即关闭 runtime。`openStorage` 选项接进 `DurableSessionRuntime.open`，认证模式开 PG storage，本地模式仍是 sqlite。
 - 旧 `session.sqlite` 首次打开时一次性导入（逐表 `INSERT ... ON CONFLICT DO NOTHING`，计数器取 GREATEST），成功后改名 `session.sqlite.migrated`。
 
-**已知限制**：路由仍是租户级静态哈希分片（`durable-tenant-router.ts`），按会话 owner 的动态路由未做——静态路由下接管只发生在请求恰好落到新 worker 时（如同 shard 滚动重启）；"偷来"的 owner 若在 advisory 锁释放与下次续约重拿锁之间被第三个 worker 撞上，epoch fencing 仍会保证单写者，但旧 owner 的会话会被判失败关闭。
+**状态（H4 第 2 批已完成）**：会话级请求按 `ds_metadata` 的活 owner 动态路由（`durable-tenant-router.ts`）：URL（`/api/sessions/:id*`、`/api/chat/status|events/:id`、`/api/chat/:id/:turn/abort`、`/api/btw/state/:id`）或 JSON body（`/api/chat*`、`/api/btw/ask|bring-back`）里的 sessionId → `TenantStore.durableSessionOwner`（租约未过期且 advisory 锁仍被持有才算活 owner）→ 命中配置内 worker 即转发，否则回退租户哈希；会话请求的转发目标不可达时降级为本地服务并认领租约（跨 worker 接管链路），租户级请求仍哈希转发、目标死了回 502。body 在路由层缓冲并以 replay 流还原，32MB 上限同 `readBody`。
+
+- 租户 `config.json` 复制进 PG（迁移 v9 `tenant_configs`，权威副本）：settings/channels 写路径经 `persistTenantConfig` 双写文件+PG；每个认证请求在租户挂接后 `syncTenantConfigFromStore` 按 `updated_at` 标记把 PG 内容物化成本地文件，文件仍是同步读路径——非 owner worker 接管后才有 provider/channel 配置可跑会话。
+- `owner_worker` 只在 runtime 活跃期间记录（最后一个引用释放即清租约），所以 owner-follow 只作用于活跃 turn 期间的并发请求（abort/status/question-response 等）；空闲会话无主，走哈希。
+
+**已知限制**：channel/job 内部调用方（`runDurableChannelPrompt` 等）仍按租户哈希在固定 worker 上执行，会话 owner 漂到别的 worker 后这些内部 prompt 会被 fencing 拒绝（正确性由 fencing 保证，可用性边缘已记录）；"偷来"的 owner 若在 advisory 锁释放与下次续约重拿锁之间被第三个 worker 撞上，epoch fencing 仍保证单写者，但旧 owner 的会话会被判失败关闭。
 
 **已确认（pi-durable 1.4.0）**：`Storage` 是公开接口，`Harness.open(storage, ...)` 接受任意实现；包内已有 memory、jsonl、indexeddb、sqlite（node / cloudflare）后端，并随包提供 `registerStorageConformance` 和 `storage-benchmark`。因此实现 PostgreSQL 后端的 `Storage`，不必在网络卷上跑 SQLite。
 

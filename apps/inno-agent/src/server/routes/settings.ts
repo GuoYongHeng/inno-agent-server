@@ -19,9 +19,10 @@ import { logger } from "../../logger.js";
 import type { RuntimePaths } from "../../runtime.js";
 import { applyProviderProxyBypass } from "../../utils/proxy-bypass.js";
 import { getRequestTenant } from "../../tenants/http.js";
+import { getCurrentTenantStore } from "../../tenants/current.js";
 import {
 	loadTenantConfig,
-	saveTenantConfig,
+	persistTenantConfig,
 } from "../../tenants/config.js";
 import { json, readBody } from "../http-helpers.js";
 
@@ -199,9 +200,10 @@ export async function handleSettingsRoutes(
 	// Per-request view of local or tenant config. Tenant files start empty and
 	// never inherit deployment-owner credentials from the legacy global file.
 	let config = tenant ? loadTenantConfig(paths.dataDir, tenant.tenantId) : ctx.getConfig();
-	const save = (next: InnoConfig): void => {
+	const tenantStore = getCurrentTenantStore();
+	const save = async (next: InnoConfig): Promise<void> => {
 		config = tenant
-			? saveTenantConfig(paths.dataDir, tenant.tenantId, next)
+			? await persistTenantConfig(tenantStore, paths.dataDir, tenant.tenantId, next)
 			: saveConfig(paths.configPath, next);
 		if (!tenant) ctx.setConfig(config);
 	};
@@ -234,7 +236,7 @@ export async function handleSettingsRoutes(
 			return true;
 		}
 
-		save(setDefaultModel(config, provider, model));
+		await save(setDefaultModel(config, provider, model));
 		json(res, 200, { defaultProvider: provider, defaultModel: model });
 		return true;
 	}
@@ -246,7 +248,7 @@ export async function handleSettingsRoutes(
 			json(res, 400, { error: "bypassProxy is process-global and unavailable for tenant providers" });
 			return true;
 		}
-		save(upsertProvider(config, payload.providerId, payload.provider, {
+		await save(upsertProvider(config, payload.providerId, payload.provider, {
 			makeDefault: payload.makeDefault,
 			preserveApiKey: payload.preserveApiKey,
 			preserveHeaders: payload.preserveHeaders,
@@ -254,7 +256,7 @@ export async function handleSettingsRoutes(
 		if (!tenantScoped) applyProviderProxyBypass(config);
 		await refreshProviders();
 		if (payload.makeDefault) {
-			save(setDefaultModel(config, config.defaultProvider, config.defaultModel));
+			await save(setDefaultModel(config, config.defaultProvider, config.defaultModel));
 		}
 		json(res, 200, safeSettings());
 		return true;
@@ -293,7 +295,7 @@ export async function handleSettingsRoutes(
 			return true;
 		}
 		try {
-			save(deleteModel(config, providerId, modelId));
+			await save(deleteModel(config, providerId, modelId));
 			await refreshProviders();
 		} catch (err) {
 			logger.error({ err, providerId, modelId }, "failed to delete model");
@@ -311,7 +313,7 @@ export async function handleSettingsRoutes(
 			return true;
 		}
 		try {
-			save(deleteProvider(config, providerId));
+			await save(deleteProvider(config, providerId));
 			await refreshProviders();
 		} catch (err) {
 			logger.error({ err }, "failed to update channel settings");
@@ -370,7 +372,7 @@ export async function handleSettingsRoutes(
 			}
 			if (tenant && ctx.syncChannelOwnership) await ctx.syncChannelOwnership(previous, config);
 			try {
-				save(config);
+				await save(config);
 			} catch (error) {
 				if (tenant && ctx.syncChannelOwnership) {
 					try { await ctx.syncChannelOwnership(config, previous); }
@@ -419,7 +421,7 @@ export async function handleSettingsRoutes(
 			l2Enabled: typeof body.l2Enabled === "boolean" ? body.l2Enabled : current.l2Enabled,
 			l3Enabled: typeof body.l3Enabled === "boolean" ? body.l3Enabled : current.l3Enabled,
 		};
-		save(config);
+		await save(config);
 		sync();
 		json(res, 200, safeSettings());
 		return true;
@@ -429,7 +431,7 @@ export async function handleSettingsRoutes(
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const next = normalizeSmartInputConfig(body as Partial<InnoSmartInputConfig>);
 		config.smartInput = next;
-		save(config);
+		await save(config);
 		sync();
 		json(res, 200, safeSettings());
 		return true;
@@ -446,7 +448,7 @@ export async function handleSettingsRoutes(
 		// A masked value (e.g. "****abcd") means "keep the existing token".
 		const token = incoming.startsWith("****") ? (config.github?.token ?? "") : incoming;
 		config.github = token ? { token } : undefined;
-		save(config);
+		await save(config);
 		sync();
 		// Rebuild the content source so the new auth (and higher limit) applies.
 		ctx.invalidateContentSource();
@@ -475,7 +477,7 @@ export async function handleSettingsRoutes(
 				baseUrl: baseUrl || undefined,
 			};
 		}
-		save(config);
+		await save(config);
 		sync();
 		json(res, 200, safeSettings());
 		return true;
@@ -535,7 +537,7 @@ export async function handleSettingsRoutes(
 			return bad("Enabling the sandbox needs an API key (here or in the E2B_API_KEY environment variable)");
 		}
 		config.sandbox = next;
-		save(config);
+		await save(config);
 		ctx.invalidateSandbox?.();
 		json(res, 200, safeSettings());
 		return true;
@@ -556,7 +558,7 @@ export async function handleSettingsRoutes(
 		} else {
 			config.tavily = { apiKey };
 		}
-		save(config);
+		await save(config);
 		sync();
 		json(res, 200, safeSettings());
 		return true;
@@ -582,7 +584,7 @@ export async function handleSettingsRoutes(
 			baseUrl: str("baseUrl", current.baseUrl),
 			token,
 		});
-		save(config);
+		await save(config);
 		sync();
 		// Rebuild the content source so the new hub takes effect immediately.
 		ctx.invalidateContentSource();
@@ -602,7 +604,7 @@ export async function handleSettingsRoutes(
 			return true;
 		}
 		config.ui = { ...normalizeUiConfig(config.ui), theme };
-		save(config);
+		await save(config);
 		json(res, 200, safeSettings());
 		return true;
 	}
@@ -619,7 +621,7 @@ export async function handleSettingsRoutes(
 			...normalizeUiConfig(config.ui),
 			closeBehavior,
 		};
-		save(config);
+		await save(config);
 		json(res, 200, safeSettings());
 		return true;
 	}
@@ -635,7 +637,7 @@ export async function handleSettingsRoutes(
 			...normalizeUiConfig(config.ui),
 			mathSingleDollar: body.mathSingleDollar,
 		};
-		save(config);
+		await save(config);
 		json(res, 200, safeSettings());
 		return true;
 	}

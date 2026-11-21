@@ -390,6 +390,20 @@ CREATE INDEX IF NOT EXISTS ds_document_revisions_kind_idx
 	ON ds_document_revisions (session_id, document_id, kind, seq DESC);
 `;
 
+/**
+ * Replicated tenant configuration. PostgreSQL is the authoritative copy so any
+ * worker can serve a tenant after takeover; each worker materialises it to its
+ * local `tenants/<id>/config/config.json` on request entry and every settings
+ * write updates both the file and this row.
+ */
+const TENANT_CONFIG_SQL = `
+CREATE TABLE IF NOT EXISTS tenant_configs (
+	tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+	config TEXT NOT NULL,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`;
+
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
@@ -399,6 +413,7 @@ export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 6, name: "l3_index", sql: L3_INDEX_SQL },
 	{ version: 7, name: "l2_wiki", sql: L2_WIKI_SQL },
 	{ version: 8, name: "durable_storage", sql: DURABLE_STORAGE_SQL },
+	{ version: 9, name: "tenant_config", sql: TENANT_CONFIG_SQL },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

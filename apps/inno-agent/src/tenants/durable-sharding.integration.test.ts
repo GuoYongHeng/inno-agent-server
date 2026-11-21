@@ -84,7 +84,7 @@ async function startWorker(worker: Worker): Promise<void> {
 }
 
 async function api(worker: Worker, cookie: string, path: string, init: RequestInit = {}): Promise<Response> {
-	return fetch(`${worker.origin}${path}`, {
+	const response = await fetch(`${worker.origin}${path}`, {
 		...init,
 		headers: {
 			Cookie: cookie,
@@ -93,6 +93,11 @@ async function api(worker: Worker, cookie: string, path: string, init: RequestIn
 			...init.headers,
 		},
 	});
+	if (response.status >= 500) {
+		console.error(`[api ${worker.id} ${init.method ?? "GET"} ${path}] ${response.status}: ${await response.clone().text()}`);
+		console.error(`--- ${worker.id} output tail ---\n${worker.output.slice(-3000)}`);
+	}
+	return response;
 }
 
 beforeAll(async () => {
@@ -149,11 +154,12 @@ beforeAll(async () => {
 		BETTER_AUTH_URL: publicOrigin,
 	}));
 	await Promise.all(Object.values(workers).map(startWorker));
-});
+}, 120_000);
 
 afterAll(async () => {
 	await Promise.all(Object.values(workers).map(async (worker) => {
-		if (worker.child?.exitCode === null) {
+		// A signal-killed child keeps exitCode === null; signalCode is the liveness signal.
+		if (worker.child && worker.child.exitCode === null && worker.child.signalCode === null) {
 			worker.child.kill("SIGTERM");
 			await new Promise<void>((resolveExit) => worker.child!.once("exit", () => resolveExit()));
 		}
@@ -168,7 +174,7 @@ afterAll(async () => {
 		await new Promise<void>((resolveClose) => sidecar.close(() => resolveClose()));
 	}
 	await postgres?.close();
-});
+}, 120_000);
 
 it("routes a verified tenant and its durable stream to one owning worker", async () => {
 	const email = "durable-shard@example.com";
@@ -206,7 +212,7 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 			models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
 		}),
 	});
-	expect(configured.status).toBe(200);
+	expect(configured.status, await configured.text()).toBe(200);
 	expect(configured.headers.get("x-inno-durable-shard")).toBe(ownerId);
 	const created = await api(nonOwner, cookie, "/api/sessions", {
 		method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
@@ -217,6 +223,9 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 	const tenantStorage = (worker: Worker) => join(worker.home, "data", "tenants", tenantId, "durable", "storage", session.id, "session.sqlite");
 	expect(existsSync(tenantStorage(nonOwner))).toBe(false);
 
+	// A session-scoped request without a recorded live owner still follows the
+	// tenant hash; the receiving worker claims the storage lease as it opens the
+	// session and becomes the recorded owner.
 	const streamed = await api(nonOwner, cookie, "/api/chat/stream", {
 		method: "POST",
 		body: JSON.stringify({ sessionId: session.id, prompt: "durable shard prompt", clientRequestId: "durable-shard-request" }),
@@ -237,9 +246,15 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 	} finally {
 		await storageRows.end();
 	}
+	// Session-scoped requests anywhere follow the live recorded owner, whether
+	// the session id arrives in the URL or the request body.
 	const detail = await api(nonOwner, cookie, `/api/sessions/${session.id}`);
 	expect(detail.status).toBe(200);
+	expect(detail.headers.get("x-inno-durable-shard")).toBe(ownerId);
 	expect(await detail.json()).toMatchObject({ id: session.id, runtime: "durable" });
+	const status = await api(owner, cookie, `/api/chat/status/${session.id}`);
+	expect(status.status).toBe(200);
+	await status.text();
 	expect(existsSync(tenantStorage(nonOwner))).toBe(false);
 
 	const bridgeToken = "durable-shard-bridge-token";
@@ -271,4 +286,41 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 	const runLog = (worker: Worker) => join(worker.home, "data", "tenants", tenantId, "channels", "runs.jsonl");
 	expect(existsSync(runLog(owner))).toBe(true);
 	expect(existsSync(runLog(nonOwner))).toBe(false);
+
+	// Takeover: kill the recorded owner mid-lease. The next session request is
+	// still hashed toward it, but the dead worker is unreachable so the request
+	// falls back to local service and claims the lease itself. The epoch only
+	// ever increments on a successful claim, so its growth proves the takeover.
+	const epochBefore = await new Pool({ connectionString: postgres.databaseUrl });
+	let epoch = "0";
+	try {
+		const row = await epochBefore.query<{ lease_epoch: string }>(
+			"SELECT lease_epoch::text AS lease_epoch FROM ds_metadata WHERE session_id = $1",
+			[session.id],
+		);
+		epoch = row.rows[0]?.lease_epoch ?? "0";
+	} finally {
+		await epochBefore.end();
+	}
+	owner.child!.kill("SIGKILL");
+	await new Promise<void>((resolveExit) => owner.child!.once("exit", () => resolveExit()));
+	const takenOver = await api(nonOwner, cookie, "/api/chat/stream", {
+		method: "POST",
+		body: JSON.stringify({ sessionId: session.id, prompt: "takeover prompt", clientRequestId: "durable-shard-takeover" }),
+	});
+	expect(takenOver.status).toBe(200);
+	expect(takenOver.headers.get("x-inno-durable-shard")).toBeNull();
+	const takeoverText = await takenOver.text();
+	expect(takeoverText).toContain("shard response");
+	expect(takeoverText).toContain('"type":"done"');
+	const leaseRows = new Pool({ connectionString: postgres.databaseUrl });
+	try {
+		const lease = await leaseRows.query<{ lease_epoch: string }>(
+			"SELECT lease_epoch::text AS lease_epoch FROM ds_metadata WHERE session_id = $1",
+			[session.id],
+		);
+		expect(Number(lease.rows[0]?.lease_epoch)).toBeGreaterThan(Number(epoch));
+	} finally {
+		await leaseRows.end();
+	}
 }, 60_000);

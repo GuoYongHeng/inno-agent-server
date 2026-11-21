@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { PassThrough } from "node:stream";
 import type { TenantContext } from "./store.js";
-import { json } from "../server/http-helpers.js";
+import { DEFAULT_MAX_BODY_BYTES, json } from "../server/http-helpers.js";
 import { logger } from "../logger.js";
 
 export interface DurableShardConfig {
@@ -67,40 +68,168 @@ export function selectDurableShard(tenantId: string, config: DurableShardConfig)
 	return shardIds[Number(digest.readUInt32BE(0) % shardIds.length)];
 }
 
-/** Forward after cookie authentication and personal-tenant provisioning, before
- * the request body or local agent runtime is touched. The target authenticates
- * the forwarded cookie again; no client-supplied tenant or shard is trusted. */
-export function forwardDurableTenantRequest(
+/** Resolve a session id carried in the request URL, mirroring the session-scoped
+ * route shapes in server/routes/{chat,btw,sessions,workspaces}.ts. */
+function sessionIdFromPath(path: string): string | null {
+	const patterns = [
+		/^\/api\/sessions\/([^/?#]+)/,
+		/^\/api\/chat\/status\/([^/?#]+)$/,
+		/^\/api\/chat\/events\/([^/?#]+)$/,
+		/^\/api\/chat\/([^/?#]+)\/[^/?#]+\/abort$/,
+		/^\/api\/btw\/state\/([^/?#]+)$/,
+	];
+	for (const pattern of patterns) {
+		const match = pattern.exec(path);
+		if (match?.[1]) return decodeURIComponent(match[1]);
+	}
+	return null;
+}
+
+/** Session-scoped JSON endpoints that carry `sessionId` in the request body. */
+const BODY_SESSION_ROUTES = new Set([
+	"POST /api/chat",
+	"POST /api/chat/stream",
+	"POST /api/chat/question-response",
+	"POST /api/chat/permission-response",
+	"POST /api/btw/ask",
+	"POST /api/btw/bring-back",
+]);
+
+function sessionIdFromBody(body: Buffer): string | null {
+	try {
+		const parsed = JSON.parse(body.toString("utf8")) as { sessionId?: unknown };
+		return typeof parsed?.sessionId === "string" && parsed.sessionId ? parsed.sessionId : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Rebuild a request-like stream around a buffered body so downstream handlers
+ * can still read it when the request is served locally. */
+function replayBodyRequest(req: IncomingMessage, body: Buffer): IncomingMessage {
+	const stream = new PassThrough();
+	const replay = stream as unknown as IncomingMessage;
+	replay.method = req.method;
+	replay.url = req.url;
+	replay.headers = req.headers;
+	replay.rawHeaders = req.rawHeaders;
+	replay.httpVersion = req.httpVersion;
+	replay.httpVersionMajor = req.httpVersionMajor;
+	replay.httpVersionMinor = req.httpVersionMinor;
+	replay.complete = true;
+	Object.defineProperty(replay, "socket", { value: req.socket });
+	Object.defineProperty(replay, "connection", { value: req.socket });
+	// Propagate client disconnect: handlers abort long-running work on 'close'.
+	req.socket?.once("close", () => replay.destroy());
+	stream.end(body);
+	return replay;
+}
+
+function bufferBody(req: IncomingMessage): Promise<Buffer> {
+	return new Promise((resolveBuffer, reject) => {
+		const chunks: Buffer[] = [];
+		let received = 0;
+		req.on("data", (chunk: Buffer) => {
+			received += chunk.length;
+			if (received > DEFAULT_MAX_BODY_BYTES) {
+				req.removeAllListeners("data");
+				req.pause();
+				reject(new Error("body too large"));
+				return;
+			}
+			chunks.push(chunk);
+		});
+		req.once("end", () => resolveBuffer(Buffer.concat(chunks)));
+		req.once("error", reject);
+	});
+}
+
+/**
+ * Route after cookie authentication and personal-tenant provisioning, before
+ * the local agent runtime is touched. Session-scoped requests follow the live
+ * recorded storage owner (`ds_metadata`) instead of the tenant hash, so a
+ * request landing on any worker reaches the worker holding the lease; requests
+ * without a live owner keep the tenant-hash target that will claim it.
+ * The target authenticates the forwarded cookie again; no client-supplied
+ * tenant or shard is trusted.
+ *
+ * Returns the request to serve locally — a replay wrapper when the body was
+ * buffered to extract a session id — or null when the response was handled
+ * here (forwarded upstream or answered with an error).
+ */
+export async function forwardDurableTenantRequest(
 	req: IncomingMessage,
 	res: ServerResponse,
 	tenant: TenantContext,
 	config: DurableShardConfig,
-): boolean {
-	const targetShard = selectDurableShard(tenant.tenantId, config);
-	if (targetShard === config.localShardId) return false;
+	resolveSessionOwner?: (sessionId: string) => Promise<string | null>,
+): Promise<IncomingMessage | null> {
+	const path = (req.url ?? "/").split("?")[0];
+	let sessionId = sessionIdFromPath(path);
+	let bufferedBody: Buffer | null = null;
+	const methodHasBody = req.method === "POST" || req.method === "PUT" || req.method === "PATCH";
+	// Buffer every session-scoped body: for body-carried ids it is how the
+	// session is identified, and for any session request it keeps the request
+	// replayable when the chosen target turns out to be unreachable.
+	if ((sessionId && methodHasBody) || BODY_SESSION_ROUTES.has(`${req.method} ${path}`)) {
+		const declared = Number.parseInt(req.headers["content-length"] ?? "", 10);
+		if (Number.isFinite(declared) && declared > DEFAULT_MAX_BODY_BYTES) {
+			json(res, 413, { error: `Request body too large (limit ${DEFAULT_MAX_BODY_BYTES} bytes)` });
+			return null;
+		}
+		try {
+			bufferedBody = await bufferBody(req);
+		} catch {
+			json(res, 413, { error: `Request body too large (limit ${DEFAULT_MAX_BODY_BYTES} bytes)` });
+			return null;
+		}
+		req = replayBodyRequest(req, bufferedBody);
+		if (!sessionId) sessionId = sessionIdFromBody(bufferedBody);
+	}
+	const owner = sessionId && resolveSessionOwner ? await resolveSessionOwner(sessionId) : null;
+	// Session-scoped requests follow the live recorded owner, else the tenant
+	// hash; an unreachable target falls back to local service so the requester
+	// can claim the lease itself. Tenant-level requests keep the hash target
+	// and fail closed because other tenant state is not routed by lease.
+	const targetShard = owner && config.targets[owner]
+		? owner
+		: selectDurableShard(tenant.tenantId, config);
+	if (targetShard === config.localShardId) return req;
 	if (req.headers[FORWARDED_HEADER]) {
 		json(res, 503, { error: "Durable shard forwarding loop detected", code: "durable_shard_loop" });
-		return true;
+		return null;
 	}
 	const target = new URL(req.url ?? "/", config.targets[targetShard]);
 	const transportRequest = target.protocol === "https:" ? httpsRequest : httpRequest;
 	const headers = { ...req.headers, host: target.host, [FORWARDED_HEADER]: "1" };
 	res.setHeader("x-inno-durable-shard", targetShard);
-	const upstream = transportRequest(target, { method: req.method, headers }, (upstreamResponse) => {
-		res.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
-		upstreamResponse.pipe(res);
+	const outcome = await new Promise<"forwarded" | "unavailable">((resolveForward) => {
+		let responded = false;
+		const upstream = transportRequest(target, { method: req.method, headers }, (upstreamResponse) => {
+			responded = true;
+			res.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+			upstreamResponse.pipe(res);
+			resolveForward("forwarded");
+		});
+		upstream.on("error", (error) => {
+			if (!responded && sessionId) {
+				res.removeHeader("x-inno-durable-shard");
+				resolveForward("unavailable");
+				return;
+			}
+			logger.error({ err: error, tenantId: tenant.tenantId, targetShard }, "durable tenant shard forwarding failed");
+			if (res.headersSent) {
+				res.end();
+			} else {
+				json(res, 502, { error: "Durable shard owner unavailable", code: "durable_shard_unavailable" });
+			}
+			resolveForward("forwarded");
+		});
+		res.once("close", () => {
+			if (!res.writableFinished) upstream.destroy();
+		});
+		if (bufferedBody) upstream.end(bufferedBody);
+		else req.pipe(upstream);
 	});
-	upstream.on("error", (error) => {
-		logger.error({ err: error, tenantId: tenant.tenantId, targetShard }, "durable tenant shard forwarding failed");
-		if (res.headersSent) {
-			res.end();
-		} else {
-			json(res, 502, { error: "Durable shard owner unavailable", code: "durable_shard_unavailable" });
-		}
-	});
-	res.once("close", () => {
-		if (!res.writableFinished) upstream.destroy();
-	});
-	req.pipe(upstream);
-	return true;
+	return outcome === "unavailable" ? req : null;
 }

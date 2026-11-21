@@ -360,6 +360,52 @@ export class TenantStore {
 	}
 
 	/**
+	 * Authoritative tenant config copy for cross-worker takeover. Workers
+	 * materialise it into their local `tenants/<id>/config/config.json` on
+	 * request entry; `updatedAt` is the sync marker.
+	 */
+	async loadTenantConfigRecord(tenantId: string): Promise<{ config: string; updatedAt: string } | null> {
+		const rows = await this.pool.query<{ config: string; updated_at: string }>(
+			"SELECT config, updated_at::text AS updated_at FROM tenant_configs WHERE tenant_id = $1",
+			[tenantId],
+		);
+		const row = rows.rows[0];
+		return row ? { config: row.config, updatedAt: row.updated_at } : null;
+	}
+
+	/** Upsert the authoritative tenant config; returns the new updated_at marker. */
+	async saveTenantConfigRecord(tenantId: string, configJson: string): Promise<string> {
+		const rows = await this.pool.query<{ updated_at: string }>(
+			`INSERT INTO tenant_configs (tenant_id, config) VALUES ($1, $2)
+			 ON CONFLICT (tenant_id) DO UPDATE SET config = $2, updated_at = NOW()
+			 RETURNING updated_at::text AS updated_at`,
+			[tenantId, configJson],
+		);
+		return rows.rows[0]!.updated_at;
+	}
+
+	/**
+	 * Live recorded storage owner for request routing: owner_worker only while
+	 * its lease is unexpired and some backend still holds the session's advisory
+	 * lock (process death releases it, so a dead owner's live-looking lease is
+	 * ignored). Returns null for unowned or provably-dead-owner sessions.
+	 */
+	async durableSessionOwner(context: TenantContext, sessionId: string): Promise<string | null> {
+		const lockKey = BigInt(durableStorageLockKey(context.tenantId, sessionId));
+		const classid = Number(BigInt.asIntN(32, lockKey >> 32n));
+		const objid = Number(BigInt.asIntN(32, lockKey));
+		const rows = await this.pool.query<{ owner_worker: string }>(
+			`SELECT owner_worker FROM ds_metadata
+			 WHERE session_id = $1 AND owner_worker IS NOT NULL
+			   AND lease_expires_at > NOW()
+			   AND EXISTS (SELECT 1 FROM pg_locks
+				 WHERE locktype = 'advisory' AND classid = $2 AND objid = $3 AND granted)`,
+			[sessionId, classid, objid],
+		);
+		return rows.rows[0]?.owner_worker ?? null;
+	}
+
+	/**
 	 * Atomically claim one scheduled occurrence. A crashed owner's lease can be
 	 * taken over only after expiry; successful/failed executions release it and
 	 * rely on the job/occurrence ledgers for their durable completion state.

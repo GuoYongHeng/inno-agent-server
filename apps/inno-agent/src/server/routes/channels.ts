@@ -10,7 +10,8 @@ import type { ChannelName } from "../../channels/types.js";
 import { WeChatChannel } from "../../channels/wechat/wechat-channel.js";
 import { saveConfig, type InnoConfig } from "../../config.js";
 import { logger } from "../../logger.js";
-import { loadTenantConfig, saveTenantConfig } from "../../tenants/config.js";
+import { loadTenantConfig, persistTenantConfig } from "../../tenants/config.js";
+import { getCurrentTenantStore } from "../../tenants/current.js";
 import { getRequestTenant } from "../../tenants/http.js";
 import { json, matchRoute, readBody } from "../http-helpers.js";
 
@@ -66,7 +67,7 @@ export async function handleChannelsRoutes(
 	const persistConfig = async (previous: InnoConfig, next: InnoConfig): Promise<void> => {
 		if (tenant && ctx.syncChannelOwnership) await ctx.syncChannelOwnership(previous, next);
 		try {
-			if (tenant) saveTenantConfig(ctx.dataDir, tenant.tenantId, next);
+			if (tenant) await persistTenantConfig(getCurrentTenantStore(), ctx.dataDir, tenant.tenantId, next);
 			else ctx.setConfig(saveConfig(ctx.configPath, next));
 		} catch (error) {
 			if (tenant && ctx.syncChannelOwnership) {

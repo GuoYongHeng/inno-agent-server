@@ -76,6 +76,7 @@ import { readAuthRuntimeConfig, readListenConfig } from "./auth/config.js";
 import { assertSignUpAllowed, isPublicApiRequest, isTrustedOrigin, requireSession } from "./auth/http.js";
 import { createAuthRuntime } from "./auth/runtime.js";
 import { createBackgroundRequest, setRequestTenant } from "./tenants/http.js";
+import { syncTenantConfigFromStore } from "./tenants/config.js";
 import { forwardDurableTenantRequest, readDurableShardConfig } from "./tenants/durable-tenant-router.js";
 import { resolveCurrentTenantDataRoot, resolveRequestTenantDataRoot } from "./tenants/paths.js";
 import { getCurrentTenant, getCurrentTenantStore, runWithoutTenantContext } from "./tenants/current.js";
@@ -1285,8 +1286,16 @@ const server = createServer(async (req, response) => {
 			if (auth.mode === "better-auth" && !session) return;
 			if (session && auth.tenantStore) {
 				const tenant = await auth.tenantStore.ensurePersonalTenant(session.principal.userId);
+				if (durableShardConfig) {
+					const routedReq = await forwardDurableTenantRequest(req, res, tenant, durableShardConfig,
+						(sessionId) => auth.tenantStore!.durableSessionOwner(tenant, sessionId));
+					if (!routedReq) return;
+					req = routedReq;
+				}
 				setRequestTenant(req, tenant, auth.tenantStore);
-				if (durableShardConfig && forwardDurableTenantRequest(req, res, tenant, durableShardConfig)) return;
+				// Materialise the authoritative tenant config so this worker can
+				// serve tenant-scoped reads after taking over from another worker.
+				await syncTenantConfigFromStore(auth.tenantStore, dataDir, tenant.tenantId);
 			}
 		}
 
@@ -1299,7 +1308,7 @@ const server = createServer(async (req, response) => {
 			const tenant = token
 				? await auth.tenantStore.findResourceOwner("channel", bridgeChannelResourceId(token))
 				: null;
-			if (tenant && forwardDurableTenantRequest(req, res, tenant, durableShardConfig)) return;
+			if (tenant && !(await forwardDurableTenantRequest(req, res, tenant, durableShardConfig))) return;
 		}
 
 		// --- Lazy bootstrap on first API request ---

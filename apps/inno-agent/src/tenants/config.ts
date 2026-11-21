@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
 	loadConfig,
 	normalizeConfig,
@@ -7,6 +8,7 @@ import {
 	type InnoConfig,
 } from "../config.js";
 import { getCurrentTenant } from "./current.js";
+import type { TenantStore } from "./store.js";
 
 const TENANT_CONFIG_OPTIONS = { allowEmptyProviders: true } as const;
 
@@ -45,4 +47,52 @@ export function saveTenantConfig(dataDir: string, tenantId: string, config: Inno
 export function resolveCurrentTenantConfig(dataDir: string, localConfig: InnoConfig): InnoConfig {
 	const tenant = getCurrentTenant();
 	return tenant ? loadTenantConfig(dataDir, tenant.tenantId) : localConfig;
+}
+
+function tenantConfigSyncPath(dataDir: string, tenantId: string): string {
+	return join(tenantConfigDir(dataDir, tenantId), "config.json.pg-sync");
+}
+
+/**
+ * Materialise the authoritative PostgreSQL tenant config into the local file
+ * when it is missing or the PG row moved past the recorded `updated_at` marker.
+ * The local file stays the synchronous read path for every config consumer;
+ * this runs once per authenticated request before routing/dispatch.
+ */
+export async function syncTenantConfigFromStore(
+	store: TenantStore,
+	dataDir: string,
+	tenantId: string,
+): Promise<void> {
+	const record = await store.loadTenantConfigRecord(tenantId);
+	if (!record) return;
+	const path = tenantConfigPath(dataDir, tenantId);
+	const marker = tenantConfigSyncPath(dataDir, tenantId);
+	if (existsSync(path) && existsSync(marker)
+		&& (await readFile(marker, "utf8")) === record.updatedAt) {
+		return;
+	}
+	// Marker written after the config: a torn sync is retried on the next request.
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(path, record.config);
+	await writeFile(marker, record.updatedAt);
+}
+
+/**
+ * Tenant settings write path: updates the local file and the authoritative PG
+ * row, then records the new sync marker. Pass the tenant store only inside a
+ * verified tenant scope (or null to keep file-only local behaviour).
+ */
+export async function persistTenantConfig(
+	store: TenantStore | null,
+	dataDir: string,
+	tenantId: string,
+	config: InnoConfig,
+): Promise<InnoConfig> {
+	const saved = saveTenantConfig(dataDir, tenantId, config);
+	if (store) {
+		const updatedAt = await store.saveTenantConfigRecord(tenantId, JSON.stringify(saved));
+		await writeFile(tenantConfigSyncPath(dataDir, tenantId), updatedAt);
+	}
+	return saved;
 }
