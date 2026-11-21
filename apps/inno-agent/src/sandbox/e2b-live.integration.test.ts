@@ -5,15 +5,24 @@ import { SandboxRunError } from "./sandbox-backend.js";
 import { SandboxExecutionEnv } from "./sandbox-env.js";
 
 /**
- * Runs against the real E2B cloud, so it needs an account and creates (and
- * destroys) sandboxes. Skipped unless E2B_API_KEY is set:
+ * Runs against a real E2B(-compatible) service, so it needs an account and
+ * creates (and destroys) sandboxes. Skipped unless E2B_API_KEY is set:
  *   E2B_API_KEY=... npm run test:integration -- e2b-live
+ * Self-hosted E2B-compatible services set E2B_DOMAIN (and optionally
+ * E2B_TEMPLATE for a non-default image):
+ *   E2B_API_KEY=... E2B_DOMAIN=sandbox.example.com npm run test:integration -- e2b-live
  */
 const apiKey = process.env.E2B_API_KEY?.trim();
 const live = apiKey ? describe : describe.skip;
 
 live("E2B cloud sandbox", () => {
-	const provider = new E2BSandboxProvider({ apiKey, timeoutMs: 5 * 60_000, defaultCommandTimeoutMs: 60_000 });
+	const provider = new E2BSandboxProvider({
+		apiKey,
+		...(process.env.E2B_DOMAIN?.trim() ? { domain: process.env.E2B_DOMAIN.trim() } : {}),
+		...(process.env.E2B_TEMPLATE?.trim() ? { template: process.env.E2B_TEMPLATE.trim() } : {}),
+		timeoutMs: 5 * 60_000,
+		defaultCommandTimeoutMs: 60_000,
+	});
 
 	it("creates, runs commands, reports exit codes and timeouts, pauses, resumes and destroys", async () => {
 		const sandbox = await provider.create({ metadata: { app: "inno-agent-live-test" } });

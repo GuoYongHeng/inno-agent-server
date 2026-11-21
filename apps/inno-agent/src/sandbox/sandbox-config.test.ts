@@ -17,6 +17,13 @@ describe("normalizeSandboxConfig", () => {
 		expect(normalizeSandboxConfig({ apiKey: " cfg-key ", enabled: false }, env)).toMatchObject({ enabled: false, apiKey: "cfg-key" });
 	});
 
+	it("reads the self-hosted domain and template from the environment, with config winning", () => {
+		const env = { E2B_DOMAIN: " env-sandbox.example.com ", E2B_TEMPLATE: "env-tpl" } as NodeJS.ProcessEnv;
+		expect(normalizeSandboxConfig(undefined, env)).toMatchObject({ domain: "env-sandbox.example.com", template: "env-tpl" });
+		expect(normalizeSandboxConfig({ domain: "cfg.example.com", template: " cfg-tpl " }, env))
+			.toMatchObject({ domain: "cfg.example.com", template: "cfg-tpl" });
+	});
+
 	it("rejects nonsense numbers and only relaxes approval on an explicit 'never'", () => {
 		expect(normalizeSandboxConfig({ timeoutMinutes: -5, commandTimeoutSeconds: Number.NaN, requireApproval: "sometimes" as never }, {}))
 			.toMatchObject({ timeoutMinutes: 30, commandTimeoutSeconds: 600, requireApproval: "always" });
