@@ -1,7 +1,7 @@
-import { join, extname } from "node:path";
+import { extname } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { copyFileSync } from "node:fs";
-import { ensureDir, writeText } from "../../storage/file-store.js";
+import { readFileSync } from "node:fs";
+import { l2Store, type L2Target } from "./l2-backend.js";
 import type { RawSourceType } from "./types.js";
 
 /** Map source type to subdirectory under raw/. */
@@ -14,15 +14,18 @@ const TYPE_DIR_MAP: Record<RawSourceType, string> = {
 	image: "uploads",
 };
 
-function generateFilename(title: string, sourceType: RawSourceType): string {
-	const date = new Date().toISOString().slice(0, 10);
-	const slug = title
+function slugify(title: string): string {
+	return title
 		.toLowerCase()
 		.replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-")
 		.replace(/^-|-$/g, "")
 		.slice(0, 50);
+}
+
+function generateFilename(title: string, sourceType: RawSourceType): string {
+	const date = new Date().toISOString().slice(0, 10);
 	const ext = sourceType === "markdown" ? "md" : "txt";
-	return `${date}-${slug}-${randomUUID().slice(0, 6)}.${ext}`;
+	return `${date}-${slugify(title)}-${randomUUID().slice(0, 6)}.${ext}`;
 }
 
 function rawFrontmatter(content: string, sourceType: RawSourceType, sourceUrl?: string): string {
@@ -40,46 +43,37 @@ function rawFrontmatter(content: string, sourceType: RawSourceType, sourceUrl?: 
 }
 
 /**
- * Save raw content to data/l2/raw/<subdir>/<filename>.
- * Returns the relative path from l2DataDir.
+ * Save raw text content to raw/<subdir>/<filename>.
+ * Returns the relative path from the L2 root.
  */
-export function saveRaw(
-	l2DataDir: string,
+export async function saveRaw(
+	target: L2Target,
 	title: string,
 	content: string,
 	sourceType: RawSourceType,
 	sourceUrl?: string,
-): string {
-	const subdir = TYPE_DIR_MAP[sourceType];
-	const dir = join(l2DataDir, "raw", subdir);
-	ensureDir(dir);
+): Promise<string> {
 	const filename = generateFilename(title, sourceType);
-	writeText(join(dir, filename), rawFrontmatter(content, sourceType, sourceUrl) + content);
-	return join("raw", subdir, filename);
+	const rel = `raw/${TYPE_DIR_MAP[sourceType]}/${filename}`;
+	await l2Store(target).writeText(rel, rawFrontmatter(content, sourceType, sourceUrl) + content);
+	return rel;
 }
 
 /**
- * Copy an original binary file to data/l2/raw/<subdir>/<filename>.
- * Used for PDF/Word/Image files where we preserve the original.
- * Returns the relative path from l2DataDir.
+ * Save an original binary file (PDF/Word/Image) into raw storage.
+ * Local mode copies the file; tenant storage puts it in the object store.
+ * Returns the relative path from the L2 root.
  */
-export function saveRawFile(
-	l2DataDir: string,
+export async function saveRawFile(
+	target: L2Target,
 	title: string,
 	originalFilePath: string,
 	sourceType: RawSourceType,
-): string {
-	const subdir = TYPE_DIR_MAP[sourceType];
-	const dir = join(l2DataDir, "raw", subdir);
-	ensureDir(dir);
+): Promise<string> {
 	const date = new Date().toISOString().slice(0, 10);
-	const slug = title
-		.toLowerCase()
-		.replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-")
-		.replace(/^-|-$/g, "")
-		.slice(0, 50);
 	const ext = extname(originalFilePath);
-	const filename = `${date}-${slug}-${randomUUID().slice(0, 6)}${ext}`;
-	copyFileSync(originalFilePath, join(dir, filename));
-	return join("raw", subdir, filename);
+	const filename = `${date}-${slugify(title)}-${randomUUID().slice(0, 6)}${ext}`;
+	const rel = `raw/${TYPE_DIR_MAP[sourceType]}/${filename}`;
+	await l2Store(target).putBinary(rel, readFileSync(originalFilePath));
+	return rel;
 }

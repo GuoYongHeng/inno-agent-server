@@ -59,7 +59,7 @@ describe("durable memory tools", () => {
 		// A replay after a crash re-runs the tool with the same call ID, possibly in a new process.
 		const replay = createDurableMemoryTools(options(base, "durable-a")).find((tool) => tool.name === "l2_archive")!;
 		await executeTool(replay, "call-1", params);
-		expect(readManifest(join(base, "l2"))).toHaveLength(1);
+		expect((await readManifest(join(base, "l2")))).toHaveLength(1);
 	});
 
 	it("exposes tenant-scoped L3 recall with the durable session excluded", async () => {

@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
 import { loadConfig, normalizeSandboxConfig, type InnoConfig } from "./config.js";
 import { installFetchLogger } from "./utils/fetch-logger.js";
@@ -53,6 +53,9 @@ import { handleSkillsRoutes } from "./server/routes/skills.js";
 import { handleWorkspacesRoutes } from "./server/routes/workspaces.js";
 import { handleSessionsRoutes } from "./server/routes/sessions.js";
 import { handleWikiRoutes } from "./server/routes/wiki.js";
+import { setL2BackendResolver } from "./memory/l2/l2-backend.js";
+import { PgL2Backend } from "./memory/l2/pg-l2-backend.js";
+import { createObjectStore, normalizeObjectStorageConfig, type ObjectStore } from "./object-store/index.js";
 import { handlePresetsRoutes } from "./server/routes/presets.js";
 import { loadSkillsFromDir } from "./agent/skills.js";
 import { createSchedulerTools } from "./scheduler/scheduler-tools.js";
@@ -117,6 +120,26 @@ let config!: InnoConfig;
 const dataDir = paths.dataDir;
 const l2DataDir = paths.l2DataDir;
 const skillsDir = paths.skillsDir;
+
+// Authenticated tenants keep L2 wiki state in PostgreSQL + object storage
+// (H3): wiki pages, logs and raw text go to l2_* tables; binary originals go
+// to the configured ObjectStore. Local mode keeps the file backend.
+let sharedObjectStore: ObjectStore | null = null;
+if (auth.tenantStore) {
+	const l2Pool = auth.tenantStore.database;
+	const tenantL2Root = resolve(dataDir, "tenants");
+	setL2BackendResolver((resolvedDir) => {
+		const parts = relative(tenantL2Root, resolvedDir).split(sep);
+		if (parts.length !== 2 || parts[1] !== "l2") return null;
+		const tenantId = parts[0];
+		if (!tenantId || tenantId.startsWith(".")) return null;
+		if (!sharedObjectStore) {
+			sharedObjectStore = createObjectStore(normalizeObjectStorageConfig(config?.objectStorage));
+		}
+		return new PgL2Backend(l2Pool, tenantId, sharedObjectStore, resolvedDir);
+	});
+}
+
 const contentHubCatalog = new ContentHubCatalog({
 	dataDir,
 	paths,

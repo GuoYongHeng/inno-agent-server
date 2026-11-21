@@ -1,8 +1,8 @@
-import { basename, join } from "node:path";
+import { basename } from "node:path";
 import { wikiPathJoin } from "./wiki-paths.js";
 import { currentWikiDate } from "./wiki-date.js";
 import { parse as parseYaml, Document as YamlDocument } from "yaml";
-import { ensureDir, writeText, readText, appendText, fileExists } from "../../storage/file-store.js";
+import { l2Store, type L2Target } from "./l2-backend.js";
 import type {
 	WikiPageFrontmatter,
 	WikiPageType,
@@ -277,42 +277,41 @@ function initialLogContent(): string {
 	].join("\n");
 }
 
-export function ensureSchema(l2DataDir: string): void {
-	const schemaPath = join(l2DataDir, "wiki", "SCHEMA.md");
-	if (!fileExists(schemaPath)) {
-		writeText(schemaPath, defaultSchemaContent());
+export async function ensureSchema(target: L2Target): Promise<void> {
+	const store = l2Store(target);
+	if (!(await store.exists("wiki/SCHEMA.md"))) {
+		await store.writeText("wiki/SCHEMA.md", defaultSchemaContent());
 	}
 }
 
-function ensurePurpose(l2DataDir: string): void {
-	const purposePath = join(l2DataDir, "wiki", "PURPOSE.md");
-	if (!fileExists(purposePath)) writeText(purposePath, defaultPurposeContent());
+async function ensurePurpose(target: L2Target): Promise<void> {
+	const store = l2Store(target);
+	if (!(await store.exists("wiki/PURPOSE.md"))) await store.writeText("wiki/PURPOSE.md", defaultPurposeContent());
 }
 
-export function ensureNavigationFiles(l2DataDir: string): void {
-	const wikiDir = join(l2DataDir, "wiki");
-	ensureDir(wikiDir);
-	ensureSchema(l2DataDir);
-	ensurePurpose(l2DataDir);
-	const indexPath = join(wikiDir, "index.md");
-	if (!fileExists(indexPath)) writeText(indexPath, initialIndexContent());
-	const logPath = join(wikiDir, "log.md");
+export async function ensureNavigationFiles(target: L2Target): Promise<void> {
+	const store = l2Store(target);
+	await ensureSchema(store);
+	await ensurePurpose(store);
+	if (!(await store.exists("wiki/index.md"))) await store.writeText("wiki/index.md", initialIndexContent());
 	// Do not seed model-visible log content before the first ingest.
 	// Keep the storage file present, but let rich generation write the first entry.
-	if (!fileExists(logPath)) writeText(logPath, "");
+	if (!(await store.exists("wiki/log.md"))) await store.writeText("wiki/log.md", "");
 }
 
-export function readMaintenanceContext(l2DataDir: string): { schema: string; purpose: string; index: string; overview: string; recentLog: string } {
-	ensureNavigationFiles(l2DataDir);
-	const schema = readText(join(l2DataDir, "wiki", "SCHEMA.md"));
-	const purpose = readText(join(l2DataDir, "wiki", "PURPOSE.md"));
-	const storedIndex = readText(join(l2DataDir, "wiki", "index.md"));
+export async function readMaintenanceContext(target: L2Target): Promise<{ schema: string; purpose: string; index: string; overview: string; recentLog: string }> {
+	const store = l2Store(target);
+	await ensureNavigationFiles(store);
+	const schema = await store.readText("wiki/SCHEMA.md");
+	const purpose = await store.readText("wiki/PURPOSE.md");
+	const storedIndex = await store.readText("wiki/index.md");
 	// Keep an index file for Inno's storage/UI APIs, while giving the first
 	// ingest the same empty index context used before the first index write.
 	const index = storedIndex === initialIndexContent() ? "" : storedIndex;
-	const overviewPath = join(l2DataDir, "wiki", "analysis", "overview.md");
-	const overview = fileExists(overviewPath) ? readText(overviewPath) : "";
-	const log = readText(join(l2DataDir, "wiki", "log.md"));
+	const overview = (await store.exists("wiki/analysis/overview.md"))
+		? await store.readText("wiki/analysis/overview.md")
+		: "";
+	const log = await store.readText("wiki/log.md");
 	const recentLog = log.split("\n").slice(-80).join("\n");
 	return { schema, purpose, index, overview, recentLog };
 }
@@ -369,15 +368,13 @@ export function getSourcePagePath(entry: Pick<ManifestEntry, "title" | "id">, so
  * @param extractedPath - relative path to the full extracted file, for reference
  * Returns the relative path from l2DataDir.
  */
-export function createSourcePage(
-	l2DataDir: string,
+export async function createSourcePage(
+	target: L2Target,
 	entry: ManifestEntry,
 	summaryBody: string,
 	extractedPath?: string,
 	sourceIdentity?: string,
-): string {
-	const dir = join(l2DataDir, "wiki", "sources");
-	ensureDir(dir);
+): Promise<string> {
 	const filename = basename(getSourcePagePath(entry, sourceIdentity));
 	const fm: WikiPageFrontmatter = {
 		title: entry.title,
@@ -392,21 +389,21 @@ export function createSourcePage(
 	};
 	const ref = extractedPath ? `\n## 来源\n\n完整提取文本: \`${extractedPath}\`\n` : "";
 	const body = `\n# ${entry.title}\n\n${summaryBody}\n${ref}`;
-	writeText(join(dir, filename), serializeFrontmatter(fm) + body);
-	return wikiPathJoin("wiki", "sources", filename);
+	const wikiPath = wikiPathJoin("wiki", "sources", filename);
+	await l2Store(target).writeText(wikiPath, serializeFrontmatter(fm) + body);
+	return wikiPath;
 }
 
 // ============================================================================
 // Index maintenance
 // ============================================================================
 
-function readWikiPageIndexItem(
-	l2DataDir: string,
+async function readWikiPageIndexItem(
+	store: ReturnType<typeof l2Store>,
 	fallbackTitle: string,
 	wikiPath: string,
-): { type: WikiPageType; title: string; path: string } {
-	const fullPath = join(l2DataDir, wikiPath);
-	const content = fileExists(fullPath) ? readText(fullPath) : "";
+): Promise<{ type: WikiPageType; title: string; path: string }> {
+	const content = await store.readText(wikiPath);
 	const { frontmatter } = parseFrontmatter(content);
 	if (frontmatter) {
 		return { type: frontmatter.type, title: frontmatter.title || fallbackTitle, path: wikiPath };
@@ -423,10 +420,10 @@ function readWikiPageIndexItem(
 /**
  * Rebuild wiki/index.md from all manifest entries, grouped by page frontmatter type.
  */
-export function rebuildIndex(l2DataDir: string, entries: ManifestEntry[]): void {
-	ensureDir(join(l2DataDir, "wiki"));
-	ensureSchema(l2DataDir);
-	const allPages = listWikiPagesForIndex(l2DataDir, entries);
+export async function rebuildIndex(target: L2Target, entries: ManifestEntry[]): Promise<void> {
+	const store = l2Store(target);
+	await ensureSchema(store);
+	const allPages = await listWikiPagesForIndex(store, entries);
 	const byPath = new Map(allPages.map((item) => [item.path, item]));
 	const orderedPaths: string[] = [];
 	const seen = new Set<string>();
@@ -452,7 +449,7 @@ export function rebuildIndex(l2DataDir: string, entries: ManifestEntry[]): void 
 		lines.push(`- [[${target}]] — ${item.title}`);
 	}
 	lines.push("");
-	writeText(join(l2DataDir, "wiki", "index.md"), lines.join("\n"));
+	await store.writeText("wiki/index.md", lines.join("\n"));
 }
 
 function normalizeIndexTarget(target: string): string {
@@ -476,14 +473,14 @@ export function updateBoundedRecentIndexSection(index: string, additions: string
 }
 
 /** Update the deterministic wiki index after an ingest. */
-export function updateIndexAfterIngest(l2DataDir: string, writtenPaths: string[]): boolean {
+export async function updateIndexAfterIngest(target: L2Target, writtenPaths: string[]): Promise<boolean> {
 	const candidates = Array.from(new Set(writtenPaths.map((path) => path.replaceAll("\\", "/"))))
 		.filter((path) => path.startsWith("wiki/") && path.endsWith(".md")
 			&& !["wiki/index.md", "wiki/overview.md", "wiki/log.md"].includes(path));
 	if (candidates.length === 0) return false;
 
-	const indexPath = join(l2DataDir, "wiki", "index.md");
-	const index = fileExists(indexPath) ? readText(indexPath) : "# Wiki Index\n";
+	const store = l2Store(target);
+	const index = (await store.exists("wiki/index.md")) ? await store.readText("wiki/index.md") : "# Wiki Index\n";
 	const knownTargets = new Set(
 		Array.from(index.matchAll(/\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]/g))
 			.map((match) => normalizeIndexTarget(match[1])),
@@ -492,15 +489,14 @@ export function updateIndexAfterIngest(l2DataDir: string, writtenPaths: string[]
 	for (const path of candidates) {
 		const target = path.replace(/^wiki\//, "").replace(/\.md$/i, "");
 		if (knownTargets.has(normalizeIndexTarget(target))) continue;
-		const fullPath = join(l2DataDir, path);
-		const content = fileExists(fullPath) ? readText(fullPath) : "";
+		const content = await store.readText(path);
 		const parsed = parseFrontmatter(content);
 		const title = parsed.frontmatter?.title?.trim() || basename(path).replace(/\.md$/i, "");
 		additions.push(`- [[${target}]] — ${title}`);
 	}
 	if (additions.length === 0) return false;
 
-	writeText(indexPath, updateBoundedRecentIndexSection(index, additions));
+	await store.writeText("wiki/index.md", updateBoundedRecentIndexSection(index, additions));
 	return true;
 }
 
@@ -511,28 +507,26 @@ export function updateIndexAfterIngest(l2DataDir: string, writtenPaths: string[]
 /**
  * Append an entry to wiki/log.md.
  */
-export function appendLog(l2DataDir: string, action: string, title: string, details?: string): void {
-	const logPath = join(l2DataDir, "wiki", "log.md");
-	ensureDir(join(l2DataDir, "wiki"));
-	if (!fileExists(logPath) || !readText(logPath).trim()) {
-		writeText(logPath, initialLogContent());
+export async function appendLog(target: L2Target, action: string, title: string, details?: string): Promise<void> {
+	const store = l2Store(target);
+	if (!(await store.readText("wiki/log.md")).trim()) {
+		await store.writeText("wiki/log.md", initialLogContent());
 	}
 	const today = currentWikiDate();
 	let entry = `\n## [${today}] ${action} | ${title}\n`;
 	if (details) entry += `${details.trim()}\n`;
-	appendText(logPath, entry);
+	await store.appendText("wiki/log.md", entry);
 }
 
 /** Append the structural ingest entry used when rich generation omits wiki/log.md. */
-export function appendDeterministicIngestLog(l2DataDir: string, sourceIdentity: string): void {
-	const logPath = join(l2DataDir, "wiki", "log.md");
-	ensureDir(join(l2DataDir, "wiki"));
-	const existing = fileExists(logPath) ? readText(logPath) : "";
+export async function appendDeterministicIngestLog(target: L2Target, sourceIdentity: string): Promise<void> {
+	const store = l2Store(target);
+	const existing = await store.readText("wiki/log.md");
 	const entry = `## [${currentWikiDate()}] ingest | ${sourceIdentity}`;
 	const next = existing.trim()
 		? `${existing.trimEnd()}\n\n${entry}\n`
 		: `# Wiki Log\n\n${entry}\n`;
-	writeText(logPath, next);
+	await store.writeText("wiki/log.md", next);
 }
 
 // ============================================================================
@@ -540,27 +534,13 @@ export function appendDeterministicIngestLog(l2DataDir: string, sourceIdentity: 
 // ============================================================================
 
 /**
- * Ensure all L2 data directories exist.
+ * Ensure the L2 layout exists: directories for file storage (no-op for PG)
+ * and the seed navigation files.
  */
-export function ensureL2Directories(l2DataDir: string): void {
-	const dirs = [
-		"raw/uploads",
-		"raw/web",
-		"raw/conversations",
-		"raw/research",
-		"extracted",
-		"wiki/sources",
-		"wiki/entities",
-		"wiki/concepts",
-		"wiki/queries",
-		"wiki/comparisons",
-		"wiki/synthesis",
-		"wiki/analysis",
-	];
-	for (const dir of dirs) {
-		ensureDir(join(l2DataDir, dir));
-	}
-	ensureNavigationFiles(l2DataDir);
+export async function ensureL2Directories(target: L2Target): Promise<void> {
+	const store = l2Store(target);
+	await store.ensureDirs();
+	await ensureNavigationFiles(store);
 }
 
 function mergeUniqueTags(...tagGroups: string[][]): string[] {
@@ -577,10 +557,10 @@ function mergeUniqueTags(...tagGroups: string[][]): string[] {
 	return tags;
 }
 
-function listWikiPagesForIndex(
-	l2DataDir: string,
+async function listWikiPagesForIndex(
+	store: ReturnType<typeof l2Store>,
 	entries: ManifestEntry[],
-): { type: WikiPageType; title: string; path: string }[] {
+): Promise<{ type: WikiPageType; title: string; path: string }[]> {
 	const items: { type: WikiPageType; title: string; path: string }[] = [];
 	const fallbackTitleByPath = new Map<string, string>();
 	for (const entry of entries) {
@@ -588,9 +568,9 @@ function listWikiPagesForIndex(
 			fallbackTitleByPath.set(wikiPath, entry.title);
 		}
 	}
-	for (const wikiPath of listWikiPagePaths(l2DataDir)) {
+	for (const wikiPath of await listWikiPagePaths(store)) {
 		const file = basename(wikiPath);
-		items.push(readWikiPageIndexItem(l2DataDir, fallbackTitleByPath.get(wikiPath) ?? file.replace(/\.md$/, ""), wikiPath));
+		items.push(await readWikiPageIndexItem(store, fallbackTitleByPath.get(wikiPath) ?? file.replace(/\.md$/, ""), wikiPath));
 	}
 	return items;
 }

@@ -47,7 +47,7 @@ afterEach(() => {
 });
 
 describe("L2 wiki maintenance", () => {
-	it("uses portable logical paths for source pages", () => {
+	it("uses portable logical paths for source pages", async () => {
 		for (const pagePath of [
 			getSourcePagePath(entry()),
 			getSourcePagePath(entry(), "notes/algebra.md"),
@@ -56,7 +56,7 @@ describe("L2 wiki maintenance", () => {
 		}
 	});
 
-	it("round-trips frontmatter through the YAML parser", () => {
+	it("round-trips frontmatter through the YAML parser", async () => {
 		const frontmatter: WikiPageFrontmatter = {
 			title: "包含: 冒号与 # 符号",
 			created: "2026-07-30",
@@ -76,28 +76,28 @@ describe("L2 wiki maintenance", () => {
 		expect(parsed.body).toBe("正文");
 	});
 
-	it("creates navigation and schema files without user setup", () => {
+	it("creates navigation and schema files without user setup", async () => {
 		const root = makeTempDir();
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 
 		expect(readFileSync(join(root, "wiki", "SCHEMA.md"), "utf8")).toContain("# Wiki Schema");
 		const purpose = readFileSync(join(root, "wiki", "PURPOSE.md"), "utf8");
 		expect(purpose).toContain("## Scope\n\n**In scope:**\n-");
 		expect(purpose).not.toContain("What is in scope? What is explicitly out of scope?");
 		expect(readFileSync(join(root, "wiki", "index.md"), "utf8")).toBe("# Wiki Index\n");
-		expect(readMaintenanceContext(root).index).toBe("");
+		expect((await readMaintenanceContext(root)).index).toBe("");
 		expect(readFileSync(join(root, "wiki", "log.md"), "utf8")).toBe("");
-		appendLog(root, "ingest", "Fallback");
+		(await appendLog(root, "ingest", "Fallback"));
 		expect(readFileSync(join(root, "wiki", "log.md"), "utf8")).toContain("# L2 Wiki Log");
 	});
 
-	it("keeps source provenance in the page and rebuilt index", () => {
+	it("keeps source provenance in the page and rebuilt index", async () => {
 		const root = makeTempDir();
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 		const source = entry();
-		const pagePath = createSourcePage(root, source, "## 摘要\n\n核心结论。", source.extractedPath);
+		const pagePath = (await createSourcePage(root, source, "## 摘要\n\n核心结论。", source.extractedPath));
 		source.wikiPages = [pagePath];
-		rebuildIndex(root, [source]);
+		(await rebuildIndex(root, [source]));
 
 		const page = readFileSync(join(root, pagePath), "utf8");
 		const parsed = parseFrontmatter(page);
@@ -107,14 +107,14 @@ describe("L2 wiki maintenance", () => {
 		expect(readFileSync(join(root, "wiki", "index.md"), "utf8")).toContain(`[[${pagePath.replace(/^wiki\//, "").replace(/\.md$/, "")}]]`);
 	});
 
-	it("materializes the target first-ingest index shape", () => {
+	it("materializes the target first-ingest index shape", async () => {
 		const root = makeTempDir();
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 		const source = entry();
-		const pagePath = createSourcePage(root, source, "## 摘要\n\n核心结论。", source.extractedPath);
+		const pagePath = (await createSourcePage(root, source, "## 摘要\n\n核心结论。", source.extractedPath));
 
-		expect(readMaintenanceContext(root).index).toBe("");
-		expect(updateIndexAfterIngest(root, [pagePath])).toBe(true);
+		expect((await readMaintenanceContext(root)).index).toBe("");
+		expect((await updateIndexAfterIngest(root, [pagePath]))).toBe(true);
 		expect(readFileSync(join(root, "wiki", "index.md"), "utf8")).toBe([
 			"# Wiki Index",
 			"",
@@ -124,32 +124,32 @@ describe("L2 wiki maintenance", () => {
 		].join("\n"));
 	});
 
-	it("updates the ingest index incrementally and preserves existing sections", () => {
+	it("updates the ingest index incrementally and preserves existing sections", async () => {
 		const root = makeTempDir();
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 		const source = entry();
-		const pagePath = createSourcePage(root, source, "## 摘要\n\n核心结论。", source.extractedPath);
+		const pagePath = (await createSourcePage(root, source, "## 摘要\n\n核心结论。", source.extractedPath));
 		const indexPath = join(root, "wiki", "index.md");
 		const existing = `${readFileSync(indexPath, "utf8").trimEnd()}\n\n## Custom\n- Keep me\n`;
 		writeFileSync(indexPath, existing, "utf8");
 
-		expect(updateIndexAfterIngest(root, [pagePath])).toBe(true);
+		expect((await updateIndexAfterIngest(root, [pagePath]))).toBe(true);
 		const updated = readFileSync(indexPath, "utf8");
 		expect(updated).toContain("## Custom\n- Keep me");
 		expect(updated).toContain(`[[${pagePath.replace(/^wiki\//, "").replace(/\.md$/, "")}]]`);
-		expect(updateIndexAfterIngest(root, [pagePath])).toBe(false);
+		expect((await updateIndexAfterIngest(root, [pagePath]))).toBe(false);
 	});
 
-	it("preserves schema-defined directories when rebuilding the index", () => {
+	it("preserves schema-defined directories when rebuilding the index", async () => {
 		const root = makeTempDir();
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 		mkdirSync(join(root, "wiki", "methods"), { recursive: true });
 		writeFileSync(join(root, "wiki", "methods", "custom.md"), `${serializeFrontmatter({
 			title: "Custom method", created: "2026-07-30", type: "method", tags: [], sources: [], source_ids: [],
 			updated: "2026-07-30", status: "draft", confidence: "medium",
 		})}\n# Custom method\n`, "utf8");
 
-		rebuildIndex(root, []);
+		(await rebuildIndex(root, []));
 		expect(readFileSync(join(root, "wiki", "index.md"), "utf8")).toContain("[[methods/custom]] — Custom method");
 	});
 });

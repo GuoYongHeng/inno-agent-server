@@ -2029,10 +2029,20 @@ describe("durable session HTTP boundary", () => {
 		}
 		const rootA = join(home, "data", "tenants", tenantA);
 		const rootB = join(home, "data", "tenants", tenantB);
-		const [manifestA, manifestB] = await Promise.all([
-			readFile(join(rootA, "l2", "manifest.jsonl"), "utf-8"),
-			readFile(join(rootB, "l2", "manifest.jsonl"), "utf-8"),
-		]);
+		// The L2 manifest lives in PostgreSQL scoped to the tenant, not files in its data root.
+		const readManifest = async (tenantId: string) => {
+			const pool = new Pool({ connectionString: postgres.databaseUrl });
+			try {
+				const rows = await pool.query<{ entry: unknown }>("SELECT entry FROM l2_manifest WHERE tenant_id = $1", [tenantId]);
+				expect(rows.rows.length).toBeGreaterThan(0);
+				return rows.rows.map((row) => JSON.stringify(row.entry)).join("\n");
+			} finally {
+				await pool.end();
+			}
+		};
+		expect(existsSync(join(rootA, "l2", "manifest.jsonl"))).toBe(false);
+		expect(existsSync(join(rootB, "l2", "manifest.jsonl"))).toBe(false);
+		const [manifestA, manifestB] = await Promise.all([readManifest(tenantA), readManifest(tenantB)]);
 		expect(manifestA).toContain("durable-archive-a");
 		expect(manifestA).not.toContain("durable-archive-b");
 		expect(manifestB).toContain("durable-archive-b");

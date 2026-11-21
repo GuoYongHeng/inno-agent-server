@@ -299,7 +299,7 @@ describe("DurableSessionRuntime", () => {
 		const submission = await runtime.submit("remember this", "memory-request");
 		expect(await waitForText(runtime, submission.id)).toBe("memory complete");
 		expect(provider.faux.state.callCount).toBe(2);
-		expect(readManifest(memory.l2DataDir)).toHaveLength(1);
+		expect((await readManifest(memory.l2DataDir))).toHaveLength(1);
 		await runtime.close();
 		openRuntimes.splice(openRuntimes.indexOf(runtime), 1);
 
@@ -308,7 +308,7 @@ describe("DurableSessionRuntime", () => {
 		expect(duplicate.id).toBe(submission.id);
 		expect(await waitForText(runtime, duplicate.id)).toBe("memory complete");
 		expect(provider.faux.state.callCount).toBe(2);
-		expect(readManifest(memory.l2DataDir)).toHaveLength(1);
+		expect((await readManifest(memory.l2DataDir))).toHaveLength(1);
 	});
 
 	it("enforces one in-process owner and leaves unrelated legacy JSONL untouched", async () => {
@@ -430,7 +430,7 @@ describe("DurableSessionRuntime", () => {
 		await once(child, "exit");
 		children.delete(child);
 		const l2DataDir = join(dataRoot, "l2");
-		expect(readManifest(l2DataDir)).toHaveLength(1);
+		expect((await readManifest(l2DataDir))).toHaveLength(1);
 
 		const provider = fauxRuntime();
 		provider.faux.setResponses([fauxAssistantMessage("memory recovered")]);
@@ -440,7 +440,7 @@ describe("DurableSessionRuntime", () => {
 		expect(recovered).toMatchObject({ status: "done", text: "memory recovered" });
 		expect(provider.faux.state.callCount).toBe(1);
 		// The archive ran again on recovery and must have found its own earlier records.
-		expect(readManifest(l2DataDir)).toHaveLength(1);
+		expect((await readManifest(l2DataDir))).toHaveLength(1);
 	}, 20_000);
 
 	it("resumes a submitted OCR job after SIGKILL without submitting it again", async () => {

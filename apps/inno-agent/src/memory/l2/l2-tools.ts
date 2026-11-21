@@ -24,7 +24,8 @@ import { queryWikiHybridDetailed } from "./wiki-query.js";
 import { summarizeContent } from "./summarizer.js";
 import { generateRichWikiPages } from "./wiki-generator.js";
 import { maintainLinkedWikiPages } from "./wiki-linker.js";
-import { fileExists, readText } from "../../storage/file-store.js";
+import { fileExists } from "../../storage/file-store.js";
+import { l2Store } from "./l2-backend.js";
 import { parseDocument, DocumentParseError } from "./document-parser.js";
 import { getL2Memory, type L2Memory } from "./l2-memory.js";
 import { formatL2LintReport, runL2Lint } from "./l2-lint.js";
@@ -138,8 +139,9 @@ export function createL2Tools(
 				const memory = resolveMemory(l2DataDir);
 				return enqueueArchive(l2DataDir, async () => {
 				throwIfAborted(signal);
-			ensureL2Directories(l2DataDir);
-			const maintenanceContext = readMaintenanceContext(l2DataDir);
+				const store = l2Store(l2DataDir);
+			await ensureL2Directories(store);
+			const maintenanceContext = await readMaintenanceContext(store);
 
 			const sourceType = params.sourceType as RawSourceType;
 			const isFileType = sourceType === "pdf" || sourceType === "word" || sourceType === "image";
@@ -199,16 +201,15 @@ export function createL2Tools(
 
 					// Force reprocesses a stable source record; it must not manufacture a
 					// second provenance identity for the same source page.
-					const existing = findManifestByHash(l2DataDir, contentHash)
-						?? (params.force ? findManifestBySourceIdentity(l2DataDir, promptSourceIdentity) : undefined);
+					const existing = (await findManifestByHash(store, contentHash))
+						?? (params.force ? await findManifestBySourceIdentity(store, promptSourceIdentity) : undefined);
 				const completedArtifactsExist = Boolean(
 					existing?.rawPath
-					&& fileExists(join(l2DataDir, existing.rawPath))
+					&& (await store.exists(existing.rawPath))
 					&& existing.extractedPath
-					&& fileExists(join(l2DataDir, existing.extractedPath))
+					&& (await store.exists(existing.extractedPath))
 					&& existing?.wikiPages.length
-					&& existing.wikiPages.every((pagePath) => fileExists(join(l2DataDir, pagePath))),
-				);
+				) && (await Promise.all(existing!.wikiPages.map((pagePath) => store.exists(pagePath)))).every(Boolean);
 				if (!params.force && existing?.status === "indexed" && completedArtifactsExist) {
 					reportProgress("内容已归档，正在返回结果", "completed");
 					return {
@@ -228,22 +229,22 @@ export function createL2Tools(
 				}
 
 					const retryingSameContent = existing?.contentHash === contentHash;
-					const existingRawPath = retryingSameContent && existing?.rawPath && fileExists(join(l2DataDir, existing.rawPath))
+					const existingRawPath = retryingSameContent && existing?.rawPath && (await store.exists(existing.rawPath))
 					? existing.rawPath
 					: undefined;
 				const rawPath = existingRawPath ?? (resolvedFilePath
-					? saveRawFile(l2DataDir, params.title, resolvedFilePath, sourceType)
-					: saveRaw(l2DataDir, params.title, content, sourceType, params.url));
+					? await saveRawFile(store, params.title, resolvedFilePath, sourceType)
+					: await saveRaw(store, params.title, content, sourceType, params.url));
 
 				const id = existing?.id ?? `l2src_${randomUUID().slice(0, 8)}`;
 				const tags = params.tags ?? [];
 
 				// Convert to extracted markdown
-					const existingExtractedPath = retryingSameContent && existing?.extractedPath && fileExists(join(l2DataDir, existing.extractedPath))
+					const existingExtractedPath = retryingSameContent && existing?.extractedPath && (await store.exists(existing.extractedPath))
 					? existing.extractedPath
 					: undefined;
 				const extractedPath = existingExtractedPath
-					?? convertToExtracted(l2DataDir, params.title, content, sourceType);
+					?? await convertToExtracted(store, params.title, content, sourceType);
 
 				// Persist the recoverable source record before model/page work begins.
 				const inferredOrigin = sourceType === "conversation" ? "conversation" : "user_upload";
@@ -254,7 +255,7 @@ export function createL2Tools(
 				sourceType,
 				rawPath,
 				extractedPath,
-					wikiPages: (existing?.wikiPages ?? []).filter((pagePath) => fileExists(join(l2DataDir, pagePath))),
+					wikiPages: (await Promise.all((existing?.wikiPages ?? []).map(async (pagePath) => (await store.exists(pagePath)) ? pagePath : null))).filter((pagePath): pagePath is string => Boolean(pagePath)),
 				tags,
 				contentHash,
 				status: "extracted",
@@ -268,7 +269,7 @@ export function createL2Tools(
 					createdAt: existing?.createdAt ?? new Date().toISOString(),
 					updatedAt: new Date().toISOString(),
 					};
-				upsertManifest(l2DataDir, entry);
+				await upsertManifest(store, entry);
 
 				let wikiPagePath = "";
 				let ingestWarnings: string[] = [];
@@ -280,7 +281,7 @@ export function createL2Tools(
 				try {
 						throwIfAborted(signal);
 					// Create wiki source page (with LLM summary)
-					const extractedContent = readText(join(l2DataDir, extractedPath));
+					const extractedContent = await store.readText(extractedPath);
 						const wikiContext = [
 							maintenanceContext.schema && `## Schema\n${maintenanceContext.schema}`,
 							maintenanceContext.index && `## Existing index\n${maintenanceContext.index}`,
@@ -340,7 +341,7 @@ export function createL2Tools(
 					}
 					reportProgress("正在保存 Wiki 页面", "writing");
 					if (!rich) {
-						createSourcePage(l2DataDir, entry, summaryBody, extractedPath, promptSourceIdentity);
+						await createSourcePage(store, entry, summaryBody, extractedPath, promptSourceIdentity);
 					}
 					linkMaintenance = rich
 						? {
@@ -352,7 +353,7 @@ export function createL2Tools(
 							sourcePageBody: summaryBody,
 						}
 						: await maintainLinkedWikiPages(
-							l2DataDir,
+							store,
 							entry,
 							wikiPagePath,
 							summaryBody,
@@ -360,7 +361,7 @@ export function createL2Tools(
 							modelRegistry!,
 						);
 					if (!rich && linkMaintenance.sourcePageBody !== summaryBody) {
-						createSourcePage(l2DataDir, entry, linkMaintenance.sourcePageBody, extractedPath, promptSourceIdentity);
+						await createSourcePage(store, entry, linkMaintenance.sourcePageBody, extractedPath, promptSourceIdentity);
 					}
 						throwIfAborted(signal);
 						entry.wikiPages = uniquePaths([
@@ -373,8 +374,8 @@ export function createL2Tools(
 					// otherwise-complete generated pages.
 					if (!rich) {
 						try {
-							appendLog(
-								l2DataDir,
+							await appendLog(
+								store,
 								"ingest",
 								params.title,
 								[
@@ -393,13 +394,13 @@ export function createL2Tools(
 				}
 				reportProgress("正在更新 Wiki 索引", "indexing");
 				try {
-					updateIndexAfterIngest(l2DataDir, entry.wikiPages);
+					await updateIndexAfterIngest(store, entry.wikiPages);
 				} catch (err) {
 					logger.warn({ err, source: params.title }, "l2_archive: deterministic index update failed");
 				}
 				if (rich && !rich.aggregateWrites?.some((path) => path.replaceAll("\\", "/").toLowerCase() === "wiki/log.md")) {
 					try {
-						appendDeterministicIngestLog(l2DataDir, promptSourceIdentity);
+						await appendDeterministicIngestLog(store, promptSourceIdentity);
 					} catch (err) {
 						const warning = `Deterministic log update failed: ${err instanceof Error ? err.message : String(err)}`;
 						ingestWarnings.push(warning);
@@ -419,7 +420,7 @@ export function createL2Tools(
 
 					entry.status = "indexed";
 					entry.updatedAt = new Date().toISOString();
-					upsertManifest(l2DataDir, entry);
+					await upsertManifest(store, entry);
 
 					// Retrieval is downstream of the same completeness gate as
 					// The reference flow does not index partial writes. A
@@ -448,7 +449,7 @@ export function createL2Tools(
 				} catch (err) {
 					entry.status = "error";
 					entry.updatedAt = new Date().toISOString();
-					upsertManifest(l2DataDir, entry);
+					await upsertManifest(store, entry);
 					throw err;
 					}
 
@@ -506,10 +507,10 @@ export function createL2Tools(
 			if (isEnabled && !isEnabled()) return l2DisabledResult();
 			const l2DataDir = resolveDataDir();
 			const memory = resolveMemory(l2DataDir);
-			ensureL2Directories(l2DataDir);
+			await ensureL2Directories(l2DataDir);
 			const query = params.query ?? "";
 			const result = await queryWikiHybridDetailed(memory, query);
-			if (!durableMode) appendLog(l2DataDir, "query", query, "- L2 query executed through l2_query.");
+			if (!durableMode) await appendLog(l2DataDir, "query", query, "- L2 query executed through l2_query.");
 			return {
 				content: [{ type: "text" as const, text: result.text }],
 				details: { disabled: false, mode: result.mode, hits: result.hits },
@@ -525,7 +526,7 @@ export function createL2Tools(
 		parameters: Type.Object({}),
 		async execute() {
 			if (isEnabled && !isEnabled()) return l2DisabledResult();
-			const report = runL2Lint(resolveDataDir());
+			const report = await runL2Lint(resolveDataDir());
 			return {
 				content: [{ type: "text" as const, text: formatL2LintReport(report) }],
 				details: { disabled: false, ...report },

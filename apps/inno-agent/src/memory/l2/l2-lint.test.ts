@@ -30,12 +30,12 @@ function page(sourceId = "l2src_clean", body = "# Clean\n\nNo links."): string {
 	})}\n${body}`;
 }
 
-function writeCleanFixture(root: string): void {
+async function writeCleanFixture(root: string): Promise<void> {
 	writeText(join(root, "raw/uploads/source.md"), "raw");
 	writeText(join(root, "extracted/source.md"), "extracted");
 	writeText(join(root, "wiki/concepts/clean.md"), page());
 	writeText(join(root, "wiki/index.md"), "- [[concepts/clean]] — Clean\n");
-	upsertManifest(root, {
+	(await upsertManifest(root, {
 		id: "l2src_clean",
 		title: "Clean source",
 		sourceType: "markdown",
@@ -48,7 +48,7 @@ function writeCleanFixture(root: string): void {
 		source: { origin: "user_upload", identity: "source.md" },
 		createdAt: "2026-07-30T00:00:00.000Z",
 		updatedAt: "2026-07-30T00:00:00.000Z",
-	});
+	}));
 }
 
 afterEach(() => {
@@ -56,19 +56,19 @@ afterEach(() => {
 });
 
 describe("L2 structural lint", () => {
-	it("returns a clean report for a traceable indexed page", () => {
+	it("returns a clean report for a traceable indexed page", async () => {
 		const root = makeTempDir();
-		writeCleanFixture(root);
-		expect(runL2Lint(root)).toMatchObject({ pagesChecked: 1, sourcesChecked: 1, errors: 0, warnings: 0, findings: [] });
+		await writeCleanFixture(root);
+		expect((await runL2Lint(root))).toMatchObject({ pagesChecked: 1, sourcesChecked: 1, errors: 0, warnings: 0, findings: [] });
 	});
 
-	it("reports malformed pages, dangling links, provenance, source, manifest, and index drift", () => {
+	it("reports malformed pages, dangling links, provenance, source, manifest, and index drift", async () => {
 		const root = makeTempDir();
-		writeCleanFixture(root);
+		await writeCleanFixture(root);
 		writeText(join(root, "wiki/concepts/broken.md"), "# Missing metadata\n\nSee [[Unknown Topic]].");
 		writeText(join(root, "wiki/entities/invalid.md"), "---\ntitle: [unterminated\n---\ninvalid");
 		writeText(join(root, "wiki/index.md"), "- [[concepts/ghost]] — Ghost\n");
-		upsertManifest(root, {
+		(await upsertManifest(root, {
 			id: "l2src_incomplete",
 			title: "Broken source",
 			sourceType: "markdown",
@@ -81,9 +81,9 @@ describe("L2 structural lint", () => {
 			source: { origin: "user_upload" },
 			createdAt: "2026-07-30T00:00:00.000Z",
 			updatedAt: "2026-07-30T00:00:00.000Z",
-		});
+		}));
 
-		const codes = runL2Lint(root).findings.map((item) => item.code);
+		const codes = (await runL2Lint(root)).findings.map((item) => item.code);
 		expect(codes).toEqual(expect.arrayContaining([
 			"missing_frontmatter",
 			"invalid_frontmatter",
@@ -96,20 +96,20 @@ describe("L2 structural lint", () => {
 		]));
 	});
 
-	it("reports unknown source ids without changing the page", () => {
+	it("reports unknown source ids without changing the page", async () => {
 		const root = makeTempDir();
-		writeCleanFixture(root);
+		await writeCleanFixture(root);
 		const path = join(root, "wiki/concepts/clean.md");
 		writeText(path, page("l2src_unknown"));
 		const before = readFileSync(path, "utf8");
 
-		expect(runL2Lint(root).findings).toContainEqual(expect.objectContaining({ code: "unknown_source_id" }));
+		expect((await runL2Lint(root)).findings).toContainEqual(expect.objectContaining({ code: "unknown_source_id" }));
 		expect(readFileSync(path, "utf8")).toBe(before);
 	});
 
-	it("accepts and indexes a custom schema page type", () => {
+	it("accepts and indexes a custom schema page type", async () => {
 		const root = makeTempDir();
-		writeCleanFixture(root);
+		await writeCleanFixture(root);
 		writeText(join(root, "wiki/SCHEMA.md"), [
 			"# Wiki Schema", "", "## Page Types", "", "| Type | Directory |", "| --- | --- |",
 			"| concept | wiki/concepts/ | Concepts |", "| method | wiki/methods/ | Methods |",
@@ -120,7 +120,7 @@ describe("L2 structural lint", () => {
 		})}\n# Custom method\n`);
 		writeText(join(root, "wiki/index.md"), "- [[concepts/clean]] — Clean\n- [[methods/custom]] — Custom method\n");
 
-		const report = runL2Lint(root);
+		const report = (await runL2Lint(root));
 		expect(report.pagesChecked).toBe(2);
 		expect(report.findings.filter((item) => item.path === "wiki/methods/custom.md")).toEqual([]);
 	});

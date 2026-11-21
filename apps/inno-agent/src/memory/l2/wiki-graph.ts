@@ -14,7 +14,7 @@
  * additive so the existing frontend keeps working.
  */
 
-import { basename, extname, join } from "node:path";
+import { basename, extname } from "node:path";
 import { wikiPathJoin } from "./wiki-paths.js";
 import { UndirectedGraph } from "graphology";
 import louvainImport from "graphology-communities-louvain";
@@ -23,7 +23,7 @@ import louvainImport from "graphology-communities-louvain";
 // interop; pin the one method we use to a local type.
 type LouvainDetailed = (g: unknown) => { communities: Record<string, number>; modularity: number; count: number };
 const louvainDetailed = (louvainImport as unknown as { detailed: LouvainDetailed }).detailed;
-import { readText } from "../../storage/file-store.js";
+import { l2Store, type L2Target } from "./l2-backend.js";
 import { parseFrontmatter } from "./wiki-maintainer.js";
 import { buildAliasIndex, extractOutgoingLinks, normalizeWikiLink, stripParenthetical } from "./wiki-links.js";
 import { listWikiPagePaths } from "./wiki-page-files.js";
@@ -124,11 +124,11 @@ function inferTypeFromPath(wikiPath: string): string {
 }
 
 /** Read all wiki pages (excluding the generated overview). */
-function readAllPages(l2DataDir: string, includeQueries = false): PageRecord[] {
+async function readAllPages(store: ReturnType<typeof l2Store>, includeQueries = false): Promise<PageRecord[]> {
 	const pages: PageRecord[] = [];
-	for (const wikiPath of listWikiPagePaths(l2DataDir)) {
+	for (const wikiPath of await listWikiPagePaths(store)) {
 		if (wikiPath === OVERVIEW_PATH) continue;
-		const { frontmatter, body } = parseFrontmatter(readText(join(l2DataDir, wikiPath)));
+		const { frontmatter, body } = parseFrontmatter(await store.readText(wikiPath));
 		if (!frontmatter) continue;
 		if (!includeQueries && frontmatter.type === "query") continue;
 		pages.push({
@@ -169,8 +169,8 @@ function buildRetrievalAdjacency(pages: PageRecord[]): { outgoing: Map<string, S
  * paths; `[[links]]` resolve with filename-id aliases. Unresolved
  * links remain maintenance findings and never become graph nodes.
  */
-export function buildWikiGraph(l2DataDir: string): WikiGraph {
-	const allPages = readAllPages(l2DataDir, true);
+export async function buildWikiGraph(target: L2Target): Promise<WikiGraph> {
+	const allPages = await readAllPages(l2Store(target), true);
 	const pages = allPages.filter((page) => page.type !== "query");
 	const alias = buildAliasIndex(pages);
 	const pageByPath = new Map(pages.map((p) => [p.path, p]));

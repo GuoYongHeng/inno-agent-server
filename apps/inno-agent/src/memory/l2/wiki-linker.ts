@@ -1,13 +1,12 @@
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync } from "node:fs";
-import { basename, extname, join } from "node:path";
+import { basename, extname } from "node:path";
 import { wikiPathJoin } from "./wiki-paths.js";
 
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ModelAuthProvider } from "./model-auth.js";
 
-import { ensureDir, readText, writeText } from "../../storage/file-store.js";
+import { l2Store, type L2Backend, type L2Target } from "./l2-backend.js";
 import type { ManifestEntry, WikiPageFrontmatter } from "./types.js";
 import { parseFrontmatter, serializeFrontmatter } from "./wiki-maintainer.js";
 import { splitStructuralChunks } from "./structural-chunker.js";
@@ -274,17 +273,16 @@ function relativePagePath(type: LinkablePageType, filename: string): string {
 	return wikiPathJoin("wiki", pageDirForType(type), filename);
 }
 
-function findExistingPage(l2DataDir: string, item: LinkedItem): string {
-	const dir = join(l2DataDir, "wiki", pageDirForType(item.type));
+async function findExistingPage(store: L2Backend, item: LinkedItem): Promise<string> {
 	const slugPath = relativePagePath(item.type, `${slugifyTitle(item.title)}.md`);
-	const slugAbsPath = join(l2DataDir, slugPath);
-	if (existsSync(slugAbsPath)) return slugPath;
-	if (!existsSync(dir)) return slugPath;
+	if (await store.exists(slugPath)) return slugPath;
 
-	for (const file of readdirSync(dir)) {
+	const dirPrefix = wikiPathJoin("wiki", pageDirForType(item.type), "");
+	for (const path of await store.listPaths(dirPrefix)) {
+		const file = basename(path);
 		if (!file.endsWith(".md")) continue;
 		const relativePath = relativePagePath(item.type, file);
-		const content = readText(join(l2DataDir, relativePath));
+		const content = await store.readText(relativePath);
 		const { frontmatter } = parseFrontmatter(content);
 		const title = frontmatter?.title || basename(file, extname(file));
 		if (normalizeWikiLink(title) === normalizeWikiLink(item.title)) return relativePath;
@@ -298,16 +296,16 @@ interface WikiPageReference {
 	path: string;
 }
 
-function readWikiPageReferences(l2DataDir: string): WikiPageReference[] {
+async function readWikiPageReferences(store: L2Backend): Promise<WikiPageReference[]> {
 	const pages: WikiPageReference[] = [];
 	for (const type of ["entity", "concept"] as const) {
-		const dir = join(l2DataDir, "wiki", pageDirForType(type));
-		if (!existsSync(dir)) continue;
-		for (const file of readdirSync(dir)) {
+		const dirPrefix = wikiPathJoin("wiki", pageDirForType(type), "");
+		for (const path of await store.listPaths(dirPrefix)) {
+			const file = basename(path);
 			if (!file.endsWith(".md")) continue;
-			const path = relativePagePath(type, file);
-			const { frontmatter } = parseFrontmatter(readText(join(l2DataDir, path)));
-			pages.push({ title: frontmatter?.title || basename(file, extname(file)), type, path });
+			const pagePath = relativePagePath(type, file);
+			const { frontmatter } = parseFrontmatter(await store.readText(pagePath));
+			pages.push({ title: frontmatter?.title || basename(file, extname(file)), type, path: pagePath });
 		}
 	}
 	return pages.sort((a, b) => a.title.localeCompare(b.title, "zh-CN"));
@@ -326,23 +324,23 @@ function alignItemsWithExistingPages(items: LinkedItem[], existingPages: WikiPag
 	});
 }
 
-function readAllWikiPageAliases(l2DataDir: string): { title: string; path: string }[] {
+async function readAllWikiPageAliases(store: L2Backend): Promise<{ title: string; path: string }[]> {
 	const pages: { title: string; path: string }[] = [];
 	for (const dirName of ["sources", "entities", "concepts", "queries", "comparisons", "synthesis", "analysis"] as const) {
-		const dir = join(l2DataDir, "wiki", dirName);
-		if (!existsSync(dir)) continue;
-		for (const file of readdirSync(dir)) {
+		const dirPrefix = wikiPathJoin("wiki", dirName, "");
+		for (const path of await store.listPaths(dirPrefix)) {
+			const file = basename(path);
 			if (!file.endsWith(".md")) continue;
-			const path = wikiPathJoin("wiki", dirName, file);
-			const { frontmatter } = parseFrontmatter(readText(join(l2DataDir, path)));
-			pages.push({ title: frontmatter?.title || basename(file, extname(file)), path });
+			const pagePath = wikiPathJoin("wiki", dirName, file);
+			const { frontmatter } = parseFrontmatter(await store.readText(pagePath));
+			pages.push({ title: frontmatter?.title || basename(file, extname(file)), path: pagePath });
 		}
 	}
 	return pages;
 }
 
-function downgradeUnresolvedWikilinks(l2DataDir: string, body: string): string {
-	const alias = buildAliasIndex(readAllWikiPageAliases(l2DataDir));
+async function downgradeUnresolvedWikilinks(store: L2Backend, body: string): Promise<string> {
+	const alias = buildAliasIndex(await readAllWikiPageAliases(store));
 	return body.replace(/\[\[([^\]]+)\]\]/g, (full, inner: string) => {
 		const [target, display] = inner.split("|", 2).map((part) => part.trim());
 		return alias.resolve(target) ? full : display || target;
@@ -485,25 +483,23 @@ function addReferenceIfMissing(content: string, entry: ManifestEntry, sourcePage
 	return `${content.trimEnd()}\n\n## 相关资料\n\n${bullet}\n`;
 }
 
-function upsertLinkedPage(
-	l2DataDir: string,
+async function upsertLinkedPage(
+	store: L2Backend,
 	item: LinkedItem,
 	entry: ManifestEntry,
 	sourcePagePath: string,
-): { path: string; status: "created" | "updated" | "unchanged" } {
-	const relativePath = findExistingPage(l2DataDir, item);
-	const absPath = join(l2DataDir, relativePath);
-	ensureDir(join(l2DataDir, "wiki", pageDirForType(item.type)));
+): Promise<{ path: string; status: "created" | "updated" | "unchanged" }> {
+	const relativePath = await findExistingPage(store, item);
 
-	if (!existsSync(absPath)) {
-		writeText(absPath, buildNewPage(item, entry, sourcePagePath));
+	if (!(await store.exists(relativePath))) {
+		await store.writeText(relativePath, buildNewPage(item, entry, sourcePagePath));
 		return { path: relativePath, status: "created" };
 	}
 
-	const existing = readText(absPath);
+	const existing = await store.readText(relativePath);
 	const updated = addReferenceIfMissing(existing, entry, sourcePagePath);
 	if (!updated) return { path: relativePath, status: "unchanged" };
-	writeText(absPath, updated);
+	await store.writeText(relativePath, updated);
 	return { path: relativePath, status: "updated" };
 }
 
@@ -520,7 +516,7 @@ function upsertLinkedPage(
  * the original non-destructive behavior (create-or-append-reference) applies.
  */
 export async function maintainLinkedWikiPages(
-	l2DataDir: string,
+	target: L2Target,
 	entry: ManifestEntry,
 	sourcePagePath: string,
 	sourcePageBody: string,
@@ -535,25 +531,29 @@ export async function maintainLinkedWikiPages(
 		pages: [],
 		sourcePageBody,
 	};
-	const existingPages = readWikiPageReferences(l2DataDir);
+	const store = l2Store(target);
+	const existingPages = await readWikiPageReferences(store);
 	const extracted = await extractLinkedItemsAcrossChunks(model, modelRegistry, entry.title, sourcePageBody);
 	const items = alignItemsWithExistingPages(reconcileSummaryItems(sourcePageBody, extracted), existingPages);
 
 	// Stage 1: read existing definitions for all candidates, build plan.
-	const candidates = items.map((it) => ({
-		title: it.title,
-		type: it.type,
-		description: it.description,
-		tags: it.tags,
-		existingDefinition: readExistingDefinition(l2DataDir, it),
-	}));
+	const candidates: PlanCandidate[] = [];
+	for (const it of items) {
+		candidates.push({
+			title: it.title,
+			type: it.type,
+			description: it.description,
+			tags: it.tags,
+			existingDefinition: await readExistingDefinition(store, it),
+		});
+	}
 	const rawPlan = await planLinkedItems(model, modelRegistry, entry.title, sourcePageBody, candidates, existingPages);
 	const plan = rawPlan ? reconcilePlanItems(rawPlan, candidates, existingPages) : null;
 
 	if (plan) {
 		// Stage 2: write/merge according to plan.
 		for (const p of plan) {
-			const page = upsertPlannedPage(l2DataDir, p, entry, sourcePagePath);
+			const page = await upsertPlannedPage(store, p, entry, sourcePagePath);
 			result.pages.push(page.path);
 			result[page.status].push(page.path);
 			if (page.contested) result.contested.push(page.path);
@@ -561,13 +561,13 @@ export async function maintainLinkedWikiPages(
 	} else {
 		// Fallback: original non-destructive create-or-append-reference.
 		for (const item of items) {
-			const page = upsertLinkedPage(l2DataDir, item, entry, sourcePagePath);
+			const page = await upsertLinkedPage(store, item, entry, sourcePagePath);
 			result.pages.push(page.path);
 			result[page.status].push(page.path);
 		}
 	}
 	result.pages = [...new Set(result.pages)];
-	result.sourcePageBody = downgradeUnresolvedWikilinks(l2DataDir, sourcePageBody);
+	result.sourcePageBody = await downgradeUnresolvedWikilinks(store, sourcePageBody);
 	return result;
 }
 
@@ -698,11 +698,10 @@ function reconcilePlanItems(
 	});
 }
 
-function readExistingDefinition(l2DataDir: string, item: LinkedItem): string | undefined {
-	const rel = findExistingPage(l2DataDir, item);
-	const abs = join(l2DataDir, rel);
-	if (!existsSync(abs)) return undefined;
-	const { body } = parseFrontmatter(readText(abs));
+async function readExistingDefinition(store: L2Backend, item: LinkedItem): Promise<string | undefined> {
+	const rel = await findExistingPage(store, item);
+	if (!(await store.exists(rel))) return undefined;
+	const { body } = parseFrontmatter(await store.readText(rel));
 	const idx = body.indexOf("## 定义");
 	if (idx < 0) return undefined;
 	const rest = body.slice(idx + "## 定义".length);
@@ -825,22 +824,20 @@ function mergeIntoExistingPage(
 	return changed ? { content: next, contested } : null;
 }
 
-function upsertPlannedPage(
-	l2DataDir: string,
+async function upsertPlannedPage(
+	store: L2Backend,
 	item: PlanItem,
 	entry: ManifestEntry,
 	sourcePagePath: string,
-): { path: string; status: "created" | "updated" | "unchanged"; contested: boolean } {
+): Promise<{ path: string; status: "created" | "updated" | "unchanged"; contested: boolean }> {
 	const linked: LinkedItem = { title: item.title, type: item.type, description: item.definition, tags: item.tags };
-	const relativePath = findExistingPage(l2DataDir, linked);
-	const absPath = join(l2DataDir, relativePath);
-	ensureDir(join(l2DataDir, "wiki", pageDirForType(item.type)));
-	if (!existsSync(absPath)) {
-		writeText(absPath, buildNewPage(linked, entry, sourcePagePath, item.relatedTitles));
+	const relativePath = await findExistingPage(store, linked);
+	if (!(await store.exists(relativePath))) {
+		await store.writeText(relativePath, buildNewPage(linked, entry, sourcePagePath, item.relatedTitles));
 		return { path: relativePath, status: "created", contested: false };
 	}
-	const merged = mergeIntoExistingPage(readText(absPath), item, entry, sourcePagePath);
+	const merged = mergeIntoExistingPage(await store.readText(relativePath), item, entry, sourcePagePath);
 	if (!merged) return { path: relativePath, status: "unchanged", contested: false };
-	writeText(absPath, merged.content);
+	await store.writeText(relativePath, merged.content);
 	return { path: relativePath, status: "updated", contested: merged.contested };
 }

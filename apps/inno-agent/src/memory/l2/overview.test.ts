@@ -18,7 +18,7 @@ describe("L2 overview", () => {
 	it("renders missing targets as text instead of duplicating dangling links", async () => {
 		const root = mkdtempSync(join(tmpdir(), "inno-l2-overview-"));
 		tempDirs.push(root);
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 		writeText(
 			join(root, "wiki", "concepts", "known.md"),
 			`${serializeFrontmatter({
@@ -39,7 +39,7 @@ describe("L2 overview", () => {
 		const overview = readFileSync(join(root, "wiki", "analysis", "overview.md"), "utf8");
 		expect(overview).toContain("`Missing Target`");
 		expect(overview).not.toContain("[[Missing Target]]");
-		const dangling = runL2Lint(root).findings.filter((finding) => finding.code === "dangling_link");
+		const dangling = (await runL2Lint(root)).findings.filter((finding) => finding.code === "dangling_link");
 		expect(dangling).toHaveLength(1);
 		expect(dangling[0].path).toBe("wiki/concepts/known.md");
 	});

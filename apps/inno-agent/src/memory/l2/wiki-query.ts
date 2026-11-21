@@ -1,5 +1,4 @@
-import { join } from "node:path";
-import { readText, fileExists } from "../../storage/file-store.js";
+import { l2Store, type L2Target } from "./l2-backend.js";
 import { readManifest } from "./manifest-store.js";
 import type { ManifestEntry } from "./types.js";
 import type { L2Memory } from "./l2-memory.js";
@@ -22,46 +21,53 @@ export interface WikiQueryDetailedResult {
 /**
  * Read the wiki index.
  */
-export function readIndex(l2DataDir: string): string {
-	const indexPath = join(l2DataDir, "wiki", "index.md");
-	if (!fileExists(indexPath)) return "L2 Wiki 尚未初始化，暂无索引。";
-	return readText(indexPath);
+export async function readIndex(target: L2Target): Promise<string> {
+	const store = l2Store(target);
+	if (!(await store.exists("wiki/index.md"))) return "L2 Wiki 尚未初始化，暂无索引。";
+	return store.readText("wiki/index.md");
 }
 
 /**
  * Read a specific wiki page by relative path.
  */
-export function readWikiPage(l2DataDir: string, relativePath: string): string | null {
-	const absPath = join(l2DataDir, relativePath);
-	if (!fileExists(absPath)) return null;
-	return readText(absPath);
+export async function readWikiPage(target: L2Target, relativePath: string): Promise<string | null> {
+	const store = l2Store(target);
+	if (!(await store.exists(relativePath))) return null;
+	return store.readText(relativePath);
 }
 
 /**
  * Search manifest entries by keyword.
  * Searches title, tags, AND wiki page body content for full recall.
  */
-export function searchEntries(l2DataDir: string, query: string): ManifestEntry[] {
-	const entries = readManifest(l2DataDir);
+export async function searchEntries(target: L2Target, query: string): Promise<ManifestEntry[]> {
+	const entries = await readManifest(target);
 	const keywords = query.toLowerCase().split(/\s+/).filter(Boolean);
-	return entries.filter((entry) => {
+	const matched: ManifestEntry[] = [];
+	for (const entry of entries) {
 		// Search title + tags first (fast path)
 		const metaText = [entry.title, ...entry.tags].join(" ").toLowerCase();
-		if (keywords.some((kw) => metaText.includes(kw))) return true;
+		if (keywords.some((kw) => metaText.includes(kw))) {
+			matched.push(entry);
+			continue;
+		}
 		// Fall back to searching wiki page body content
 		for (const wikiPath of entry.wikiPages) {
-			const content = readWikiPage(l2DataDir, wikiPath);
-			if (content && keywords.some((kw) => content.toLowerCase().includes(kw))) return true;
+			const content = await readWikiPage(target, wikiPath);
+			if (content && keywords.some((kw) => content.toLowerCase().includes(kw))) {
+				matched.push(entry);
+				break;
+			}
 		}
-		return false;
-	});
+	}
+	return matched;
 }
 
 /**
  * Query wiki: return index + matched page contents.
  */
-export function queryWiki(l2DataDir: string, query: string): string {
-	const index = readIndex(l2DataDir);
+export async function queryWiki(target: L2Target, query: string): Promise<string> {
+	const index = await readIndex(target);
 	const trimmed = (query ?? "").trim();
 
 	// Empty query → just return the index overview.
@@ -69,7 +75,7 @@ export function queryWiki(l2DataDir: string, query: string): string {
 		return `## Wiki 索引\n\n${index}\n\n---\n\n提示：传入 query 参数（如「Python async」）可定位并返回相关页面内容。`;
 	}
 
-	const matches = searchEntries(l2DataDir, trimmed);
+	const matches = await searchEntries(target, trimmed);
 
 	if (matches.length === 0) {
 		return `## Wiki 索引\n\n${index}\n\n---\n\n未找到与「${trimmed}」相关的内容。`;
@@ -84,7 +90,7 @@ export function queryWiki(l2DataDir: string, query: string): string {
 
 	for (const entry of matches.slice(0, 5)) {
 		for (const wikiPath of entry.wikiPages) {
-			const content = readWikiPage(l2DataDir, wikiPath);
+			const content = await readWikiPage(target, wikiPath);
 			if (content) {
 				sections.push(`### [[${entry.title}]]\n`);
 				sections.push(content);
@@ -101,8 +107,8 @@ export function queryWiki(l2DataDir: string, query: string): string {
  * the substring {@link queryWiki} when the index store is unavailable.
  */
 export async function queryWikiHybridDetailed(l2Memory: L2Memory, query: string): Promise<WikiQueryDetailedResult> {
-	const l2DataDir = l2Memory.dataDir;
-	const index = readIndex(l2DataDir);
+	const store = l2Store(l2Memory.dataDir);
+	const index = await readIndex(store);
 	const trimmed = (query ?? "").trim();
 
 	if (!trimmed) {
@@ -115,9 +121,9 @@ export async function queryWikiHybridDetailed(l2Memory: L2Memory, query: string)
 
 	const results = await l2Memory.search(trimmed, 5);
 	if (results === null) {
-		const matches = searchEntries(l2DataDir, trimmed);
+		const matches = await searchEntries(store, trimmed);
 		return {
-			text: queryWiki(l2DataDir, query),
+			text: await queryWiki(store, query),
 			mode: "substring",
 			hits: matches.slice(0, 5).flatMap((entry) => entry.wikiPages.map((path) => ({
 				path,
@@ -143,7 +149,7 @@ export async function queryWikiHybridDetailed(l2Memory: L2Memory, query: string)
 		"",
 	];
 	for (const r of results) {
-		const content = readWikiPage(l2DataDir, r.path);
+		const content = await readWikiPage(store, r.path);
 		if (content) {
 			sections.push(`### [[${r.title}]]  \`${r.path}\`  (${r.via.join("+")})\n`);
 			sections.push(content);

@@ -168,8 +168,8 @@ describe("DurableSessionService", () => {
 		expect((await inTenant(b, () => service.list(boundB.req))).map((item) => item.id)).toEqual([boundB.summary.id]);
 		expect(readFileSync(join(base, "tenants", "tenant-a", "durable", "sessions.json"), "utf-8")).toContain(boundA.summary.id);
 		expect(readFileSync(join(base, "tenants", "tenant-b", "durable", "sessions.json"), "utf-8")).not.toContain(boundA.summary.id);
-		const archivesA = readManifest(join(base, "tenants", "tenant-a", "l2"));
-		const archivesB = readManifest(join(base, "tenants", "tenant-b", "l2"));
+		const archivesA = await readManifest(join(base, "tenants", "tenant-a", "l2"));
+		const archivesB = await readManifest(join(base, "tenants", "tenant-b", "l2"));
 		expect(archivesA.map((entry) => entry.title)).toEqual(["concept-a"]);
 		expect(archivesB.map((entry) => entry.title)).toEqual(["concept-b"]);
 		expect(channelSends).toEqual(expect.arrayContaining([

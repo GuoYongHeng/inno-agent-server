@@ -206,6 +206,72 @@ CREATE TABLE IF NOT EXISTS l3_index_state (
 );
 `;
 
+/**
+ * L2 wiki storage. `l2_files` holds every text file under the tenant's L2
+ * area (wiki pages, navigation files, extracted text, raw text uploads).
+ * `l2_objects` points at immutable blobs in object storage for binary
+ * originals (PDF, Word, images). `l2_manifest` keeps one JSONB row per
+ * archived source. `l2_pages` is the retrieval index: same whitespace-token
+ * BM25 scheme as `l3_chunks`, with `tokens` produced by the shared CJK-bigram
+ * segmenter and `content_hash`/`mtime_ms` doubling as the incremental
+ * index-state tracked by the SQLite backend.
+ */
+const L2_WIKI_SQL = `
+CREATE TABLE IF NOT EXISTS l2_files (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	path text NOT NULL,
+	content text NOT NULL,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS l2_objects (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	path text NOT NULL,
+	object_key text NOT NULL,
+	sha256 text NOT NULL,
+	bytes bigint NOT NULL,
+	content_type text,
+	created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS l2_manifest (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	id text NOT NULL,
+	entry jsonb NOT NULL,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS l2_pages (
+	rowid bigserial PRIMARY KEY,
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	path text NOT NULL,
+	title text NOT NULL,
+	type text NOT NULL,
+	tags jsonb NOT NULL,
+	source_ids jsonb NOT NULL,
+	body text NOT NULL,
+	tokens text NOT NULL,
+	content_hash text NOT NULL,
+	mtime_ms bigint NOT NULL,
+	version integer NOT NULL DEFAULT 1,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE (tenant_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS l2_pages_bm25 ON l2_pages
+	USING bm25 (rowid, tenant_id, tokens)
+	WITH (
+		key_field = 'rowid',
+		text_fields = '{
+			"tokens": {"tokenizer": {"type": "whitespace"}},
+			"tenant_id": {"tokenizer": {"type": "raw"}}
+		}'
+	);
+`;
+
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
@@ -213,6 +279,7 @@ export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 4, name: "recovery_blobs", sql: RECOVERY_BLOBS_SQL },
 	{ version: 5, name: "stream_journal", sql: STREAM_JOURNAL_SQL },
 	{ version: 6, name: "l3_index", sql: L3_INDEX_SQL },
+	{ version: 7, name: "l2_wiki", sql: L2_WIKI_SQL },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

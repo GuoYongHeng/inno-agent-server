@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { segmentForFts } from "../l3/sqlite-store.js";
-import type { L2IndexStore, L2LexHit, L2PageMeta } from "./l2-index-store.js";
+import type { L2Backend } from "./l2-backend.js";
+import type { L2LexHit, L2PageMeta } from "./l2-index-store.js";
 import { searchL2 } from "./l2-search.js";
 
 function page(path: string, title: string, body: string, sourceIds: string[] = [], type = "concept"): L2PageMeta {
@@ -12,15 +13,15 @@ function lexicalHit(value: L2PageMeta): L2LexHit {
 	return { ...value, bm25: -1 };
 }
 
-function fakeStore(pages: L2PageMeta[], hits: L2LexHit[]): L2IndexStore {
+function fakeStore(pages: L2PageMeta[], hits: L2LexHit[]): L2Backend {
 	return {
-		getAllPages: () => pages,
-		searchLexical: () => hits,
-	} as unknown as L2IndexStore;
+		getAllPages: async () => pages,
+		searchLexical: async () => hits,
+	} as unknown as L2Backend;
 }
 
 describe("L2 retrieval", () => {
-	it("segments CJK runs into discriminative bigrams", () => {
+	it("segments CJK runs into discriminative bigrams", async () => {
 		expect(segmentForFts("学习计划 Agent42")).toBe("学习 习计 计划 agent42");
 	});
 

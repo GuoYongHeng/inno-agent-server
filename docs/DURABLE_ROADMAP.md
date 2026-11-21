@@ -375,7 +375,10 @@ CREATE INDEX durable_sessions_tenant_updated_idx
    - 实现：`L3Backend` 异步接口（`SqliteL3Backend` 本地、`PgL3Backend` 认证模式），表 `l3_chunks`（BM25 索引，`rowid` 为 key field）与 `l3_index_state`。沿用 SQLite 那套 `segmentForFts` CJK 二元分词，把分词结果存进 `tokens` 列并用 whitespace 分词器建索引，查询用 `tokens ||| '…'`（match disjunction）加 `paradedb.score`，因此两个后端的分词、召回与阈值筛选完全一致，不依赖 `chinese_lindera` 的分词质量。重建索引时旧块、新块和状态在同一事务里替换。
    - 索引是派生数据：不导入旧的 `l3/memory.db`，会话在下一次快照时按提交 revision 惰性重建；删除会话时同步清理其块（失败仅留下已被所有权过滤隐藏的块）。
    - 已知限制：召回质量按"词元覆盖率"阈值把关，BM25 只负责取候选；没有跨租户的全局统计，每个租户的 BM25 统计量来自整张表（语料大时 IDF 偏向全局），排序影响有限，阈值不受影响。
-4. **L2 wiki**：manifest 与页面元数据、正文进 PG（链接与引用用 JSONB，`version` 乐观锁，软删除用部分唯一索引，检索用 BM25 索引取代 `l2-index-store`）；`raw/` 下的原始文件文本类小文件进 PG，PDF、Word、图片进对象存储（库中只存对象键与 `sha256`）；`wiki-graph` 继续按需在内存构建。
+4. ✅**L2 wiki（已完成）**：manifest 与页面元数据、正文进 PG；`raw/` 下的原始文件文本类进 PG，PDF、Word、图片进对象存储（库中只存对象键与 `sha256`）；`wiki-graph` 继续按需在内存构建。
+   - 实现：新增 `L2Backend` 异步接口（`memory/l2/l2-backend.ts`），把 L2 的所有读写统一成"后端相对路径"语义——`FileL2Backend` 保持本地文件+SQLite 索引，`PgL2Backend`（`memory/l2/pg-l2-backend.ts`）落到 `l2_files`（全部文本文件：wiki 页面、导航、提取文本、reviews）、`l2_objects`（对象键/sha256/大小/类型，字节在 `ObjectStore`）、`l2_manifest`（每源一行 JSONB）、`l2_pages`（检索索引，沿用 `segmentForFts` CJK 二元分词 + whitespace 分词器 + `tokens ||| '…'` BM25，与 L3 同方案）。服务端按 dir 注册 resolver：`<dataDir>/tenants/<tenantId>/l2` → `PgL2Backend`（pool 用 `tenantStore.database`，对象存储按 `objectStorage` 配置惰性创建），其余路径仍是文件后端；所有调用点（工具、路由、lint、graph、overview、indexer）只跟 `L2Target`（dir 或 backend）打交道，不看具体实现。
+   - 迁移：首次访问时把租户的本地 `l2/` 目录一次性导入（`manifest.jsonl` 逐行进 `l2_manifest`，文本扩展名进 `l2_files`，其余进对象存储，跳过 `index.db*` 与 `ingest-progress`），导入后检索索引从已入库页面重建，目录改名 `l2.migrated`。导入期间用不带 legacyDir 的内部 backend 跑 `indexAllPages`，避免公共方法 `await init()` 自等死锁。
+   - 已知限制：本地/认证两条路径的文件视图语义有差异（PG 没有目录，只有路径键），但都在 `L2Backend` 抽象内；wiki 页面写合并（`wiki-page-merge`）与摘要检查点（`ingest-progress`）仍是非持久的本地缓存，不迁移；两个 worker 并发归档同一内容时去重靠 content hash 读-改-写，非数据库仲裁，依赖 H4 的单 owner 路由。
 
 **第 1 批实现说明**：
 - 抽象为异步的 `RecoveryRecordStore`（`agent/recovery-store.ts`）：本地模式仍是 JSON 文件（目录布局不变），认证模式是 `recovery_records` 表，主键 `(tenant_id, session_id, kind, record_key)`，`record_key` 即工具调用 operation ID 的 SHA-256，所以幂等键就是主键。question、permission、OCR 检查点走它；渠道发件箱用 `recovery_records`（kind `outbox`）加 `recovery_blobs`（快照字节，与记录同事务写入，上限 100 MB）；SSE 流日志用 `stream_turns`/`stream_events`（批量写入保序，结束后 5 分钟可重放）。
