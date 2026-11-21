@@ -134,7 +134,7 @@ legacy 与 durable 此时仍并存：
 - ~~G9 编辑历史消息并重发~~：**已实现**，见下方“G9 实现”。
 - legacy 代码仍在仓库里但已不可达：`pi-runner.ts`、`inno-extension.ts` 等，以及路由里的 legacy 分支、`/api/commands`、MCP/终端/练习相关路由，留给 S4 删除。
 - `maybeAutoGenerateTopic` / `completePromptOnce` 仍被 legacy 流程引用，S4 一并清理。
-- 已存在的 durable 会话：全局技能写在 instructions 里，每次打开运行时都会重建；但新增工具（文档、搜索、调度）是否会加到早就创建的会话上**没有验证**：`harness.root(...)` 的 `agent.tools` 在会话已有根对话时是否重新应用，需要写一个“旧会话重开后能看到新工具”的测试来确认。
+- 已存在的 durable 会话：全局技能写在 instructions 里，每次打开运行时都会重建；新增工具能否加到早就创建的会话**已验证**：`harness.root(...)` 的 `agent` 只在建根时应用，但打开时 `rootConversation.configure(agentConfig)` 重放当前配置——`durable-tools-reopen.test.ts` 钉死该行为（含 fork 后会话）。
 
 **G9 实现（durable 编辑历史消息并重发）**
 
@@ -403,7 +403,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - 租户 `config.json` 复制进 PG（迁移 v9 `tenant_configs`，权威副本）：settings/channels 写路径经 `persistTenantConfig` 双写文件+PG；每个认证请求在租户挂接后 `syncTenantConfigFromStore` 按 `updated_at` 标记把 PG 内容物化成本地文件，文件仍是同步读路径——非 owner worker 接管后才有 provider/channel 配置可跑会话。
 - `owner_worker` 只在 runtime 活跃期间记录（最后一个引用释放即清租约），所以 owner-follow 只作用于活跃 turn 期间的并发请求（abort/status/question-response 等）；空闲会话无主，走哈希。
 
-**已知限制**：channel/job 内部调用方（`runDurableChannelPrompt` 等）仍按租户哈希在固定 worker 上执行，会话 owner 漂到别的 worker 后这些内部 prompt 会被 fencing 拒绝（正确性由 fencing 保证，可用性边缘已记录）；"偷来"的 owner 若在 advisory 锁释放与下次续约重拿锁之间被第三个 worker 撞上，epoch fencing 仍保证单写者，但旧 owner 的会话会被判失败关闭。
+**已知限制**："偷来"的 owner 若在 advisory 锁释放与下次续约重拿锁之间被第三个 worker 撞上，epoch fencing 仍保证单写者，但旧 owner 的会话会被判失败关闭。channel/job 内部 prompt（`runDurableJobPrompt`、`appendAssistantNotification`）在会话被另一 worker 的活跃 turn 持有时不再立即失败：`lease({ busyWaitMs })`（默认 `INNO_DURABLE_JOB_BUSY_WAIT_MS`=120s）有界轮询重试，远端 turn 结束放租后本地认领执行——owner 只在 runtime 活跃期间存在，所以"等远端 turn 结束再接管"等价于排队。若远端 turn 超过等待上限仍按 busy 失败。
 
 **状态（H4 收尾已完成）**：`pg-durable-storage-benchmark.integration.test.ts` 用 pi-durable 官方 `storage-benchmark` 对比 SQLite 与 PG 后端（同一数据集经 `Storage` 契约播种，多样本取 median/mean）。首轮暴露 PG `commit()` 每条 write 3+ 次串行往返（100 条 entry ≈ 300 次查询、median 201ms）；批量化后（`checkGlobalIds` 单条 `ANY()` 查询、`ds_record_ids` 认领与四种表写入各一条 `unnest` 多行 INSERT、文档存在性/版本探测 `ANY()` 化）降至 median 74ms，混合 commit 168→8.4ms，conformance 套件 25 例语义不变。单条读/写仍有 ~0.2–2.7ms 的容器内网络+SQL 固有开销（sqlite 0.01–0.9ms），属预期量级。`durable-sharding.integration.test.ts` 增加 SIGSTOP 僵尸 owner 用例：慢 turn in-flight 时冻结 owner → TCP 不报错故转发带响应头超时 → 租约过期后本地认领 → events 重连驱动 `waitForSubmission` 完成被接管 turn（epoch≥2）→ SIGCONT 后僵尸写被 fencing（无重复 entry）且 worker 可复活重投路由。
 
@@ -431,10 +431,10 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 **H4 之后剩余工作**（最初目标"任意 worker 接管会话"已达成并验证；以下为记录在案的开放项）：
 
-- channel/job 内部调用方（`runDurableChannelPrompt`、调度器、渠道 prompt 等）仍锚定租户哈希 worker，会话 owner 漂移后这些内部 prompt 会被 fencing 拒绝。修复方向：内部调用方也走 `durableSessionOwner` 路由或请求入口。
+- ~~channel/job 内部调用方仍锚定租户哈希 worker，会话 owner 漂移后内部 prompt 被 fencing 拒绝~~ **已缓解**：内部 prompt 通过 `lease({ busyWaitMs })` 有界等待远端活跃 turn 结束后本地认领（超上限仍 busy 失败）。彻底方案（把内部 prompt 转交给 owner worker 执行）需要 inter-worker 认证或 PG 队列，暂未做。
 - 空闲会话无 owner（runtime 引用归零即放租约），owner-follow 只覆盖活跃 turn 期间。若要覆盖空闲会话需在会话目录里持久化"最后活跃 worker"之类的亲和记录。
 - H1 未做项：目录分页、回滚导出命令、`durable_sessions` 专用指标（见 H1 结果段）。
-- 缺"旧会话重开后能看到新工具"的验证测试（S 系遗留：`harness.root(...)` 的 `agent.tools` 在已有根对话时是否重新应用未验证）。
+- ~~缺"旧会话重开后能看到新工具"的验证测试~~ **已覆盖**：`durable-tools-reopen.test.ts` 验证重开后 `configure()` 重放 agent 配置使新注册工具可见，含 fork 后会话变体。
 - E2B 云沙箱仅 mock 验证；真实账号验收需 `E2B_API_KEY`（`e2b-live.integration.test.ts`），上线前必跑并实测暂停/恢复/冷启动/国内延迟。
 - benchmark 现状：单条读/写 ~0.2–2.7ms PG 固有开销可接受；`commit 100 entries` 批量化后仍 ~74–140ms（Docker PG 往返主导），若真实部署往返更低可复跑基线；进一步压缩需减少 fencing UPDATE/unnest INSERT 的往返（如 PREPARE 或单语句复合写）。
 

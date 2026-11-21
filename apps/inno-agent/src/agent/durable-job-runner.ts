@@ -11,7 +11,21 @@ export interface DurableJobPromptOptions {
 	/** Streaming output does not imply an interactive UI (for example, IM cards). */
 	noUi?: boolean;
 	images?: ImageContent[];
+	/**
+	 * How long to wait for a session that is busy on another worker (its owner
+	 * only holds the lease while a turn is active) before giving up. Defaults
+	 * to INNO_DURABLE_JOB_BUSY_WAIT_MS or two minutes; 0 disables waiting.
+	 */
+	busyWaitMs?: number;
 }
+
+/** Internal prompts (scheduler jobs, channel messages) wait briefly for an
+ * active turn on another worker to release the session lease instead of
+ * failing the run outright. */
+export const DURABLE_JOB_BUSY_WAIT_MS = Math.max(
+	0,
+	Number(process.env.INNO_DURABLE_JOB_BUSY_WAIT_MS) || 120_000,
+);
 
 /** Execute one scheduler prompt without passing through legacy JSONL or the
  * process-global prompt queue. Occurrence leases and run ledgers stay in the
@@ -34,7 +48,7 @@ export async function runDurableJobPrompt(
 	let lease: Awaited<ReturnType<DurableSessionService["lease"]>> | undefined;
 	let stream: { stop(): Promise<unknown> } | undefined;
 	try {
-		lease = await service.lease(req, sessionId);
+		lease = await service.lease(req, sessionId, { busyWaitMs: options.busyWaitMs ?? DURABLE_JOB_BUSY_WAIT_MS });
 		const noUi = options.noUi || !options.onEvent;
 		await lease.runtime.bindQuestionTurn({
 			turnId: options.turnId,

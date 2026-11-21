@@ -15,7 +15,7 @@ import { setRequestTenant } from "../tenants/http.js";
 import type { DurableStorageLock, TenantContext, TenantStore } from "../tenants/store.js";
 import { metricsSnapshot, resetMetricsForTests } from "../utils/metrics.js";
 import { createSchedulerTools } from "../scheduler/scheduler-tools.js";
-import { DurableModelNotFoundError, DurableRuntimeDisabledError, DurableSessionService } from "./durable-session-service.js";
+import { DurableModelNotFoundError, DurableRuntimeDisabledError, DurableSessionBusyError, DurableSessionService } from "./durable-session-service.js";
 import { DurableSessionRuntime, type DurableSessionRuntimeOptions } from "./durable-runtime.js";
 
 const roots: string[] = [];
@@ -226,6 +226,81 @@ describe("DurableSessionService", () => {
 		const reread = await service.snapshot(req, session.id);
 		expect(reread.revision).toBe(detail.revision);
 		expect(reread.summary.updatedAt).toBe(detail.summary.updatedAt);
+		});
+	});
+
+	it("waits out a busy remote owner before claiming the session lease", async () => {
+		await runWithoutTenantContext(async () => {
+			const base = root();
+			l3Dirs.push(join(base, "l3"));
+			saveTenantConfig(base, "tenant-a", config("key-a"));
+			const faux = fauxProvider();
+			faux.setResponses([fauxAssistantMessage("done")]);
+			// Two rounds of "remote owner busy" (lock held + live lease), then free.
+			let lockCalls = 0;
+			let claimCalls = 0;
+			const busyStore = {
+				acquireDurableStorageLock: async () => ++lockCalls <= 2 ? null : {
+					lost: false, backendPid: 1, onLost: () => {}, release: async () => {},
+				},
+				claimDurableStorage: async () => ++claimCalls <= 2 ? null : 1,
+				renewDurableStorage: async () => true,
+				releaseDurableStorage: async () => {},
+			} as unknown as TenantStore;
+			const service = new DurableSessionService({
+				dataDir: base,
+				getLocalConfig: () => config("local"),
+				enabled: true,
+				resolveWorkspaceDir: () => base,
+				tenantStore: busyStore,
+				openRuntime: async (options) => {
+					const models = createModels();
+					models.setProvider(faux.provider);
+					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
+				},
+			});
+			services.push(service);
+			const session = await inTenant(tenant("tenant-a"), async (req) => {
+				const created = await service.create(req, { workspaceId: "workspace" });
+				const lease = await service.lease(req, created.id, { busyWaitMs: 6_000 });
+				await lease.release();
+				return created;
+			}, busyStore);
+			expect(session.id).toBeTruthy();
+			expect(lockCalls).toBe(3);
+			expect(claimCalls).toBe(3);
+		});
+	});
+
+	it("gives up waiting once the busy deadline passes", async () => {
+		await runWithoutTenantContext(async () => {
+			const base = root();
+			l3Dirs.push(join(base, "l3"));
+			saveTenantConfig(base, "tenant-a", config("key-a"));
+			const faux = fauxProvider();
+			const alwaysBusy = {
+				acquireDurableStorageLock: async () => null,
+				claimDurableStorage: async () => null,
+				renewDurableStorage: async () => true,
+				releaseDurableStorage: async () => {},
+			} as unknown as TenantStore;
+			const service = new DurableSessionService({
+				dataDir: base,
+				getLocalConfig: () => config("local"),
+				enabled: true,
+				resolveWorkspaceDir: () => base,
+				tenantStore: alwaysBusy,
+				openRuntime: async (options) => {
+					const models = createModels();
+					models.setProvider(faux.provider);
+					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
+				},
+			});
+			services.push(service);
+			await inTenant(tenant("tenant-a"), async (req) => {
+				const created = await service.create(req, { workspaceId: "workspace" });
+				await expect(service.lease(req, created.id, { busyWaitMs: 1_200 })).rejects.toThrow(DurableSessionBusyError);
+			}, alwaysBusy);
 		});
 	});
 

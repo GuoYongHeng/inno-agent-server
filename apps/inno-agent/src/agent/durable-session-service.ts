@@ -786,8 +786,8 @@ export class DurableSessionService {
 		}
 	}
 
-	async appendAssistantNotification(req: IncomingMessage, id: string, text: string, requestId: string): Promise<void> {
-		const lease = await this.lease(req, id);
+	async appendAssistantNotification(req: IncomingMessage, id: string, text: string, requestId: string, options?: { busyWaitMs?: number }): Promise<void> {
+		const lease = await this.lease(req, id, options);
 		try {
 			await lease.runtime.appendAssistantNotification(text, requestId);
 			await this.snapshot(req, id);
@@ -852,7 +852,25 @@ export class DurableSessionService {
 		return entry.closePromise;
 	}
 
-	async lease(req: IncomingMessage, id: string): Promise<DurableSessionLease> {
+	/**
+	 * Lease the session runtime. `busyWaitMs` retries `DurableSessionBusyError`
+	 * until the deadline: a recorded owner only holds the lease while one of its
+	 * turns is active, so a prompt that briefly waits can claim the session
+	 * locally once the remote turn finishes instead of failing outright.
+	 */
+	async lease(req: IncomingMessage, id: string, options?: { busyWaitMs?: number }): Promise<DurableSessionLease> {
+		const deadline = options?.busyWaitMs && options.busyWaitMs > 0 ? Date.now() + options.busyWaitMs : 0;
+		for (;;) {
+			try {
+				return await this.acquireLease(req, id);
+			} catch (error) {
+				if (!(error instanceof DurableSessionBusyError) || Date.now() >= deadline) throw error;
+				await new Promise((resolve) => setTimeout(resolve, 1_000));
+			}
+		}
+	}
+
+	private async acquireLease(req: IncomingMessage, id: string): Promise<DurableSessionLease> {
 		if (!this.options.enabled) throw new DurableRuntimeDisabledError();
 		if (this.closing) throw new Error("Durable session service is shutting down");
 		const record = await this.get(req, id);

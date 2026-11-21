@@ -21,7 +21,7 @@ import { applyProviderProxyBypass } from "./utils/proxy-bypass.js";
 import { ensureDir, readJson, readText, writeJson, writeText } from "./storage/file-store.js";
 import { closeDeferredRuns, configureDeferredRuns } from "./scheduler/deferred-runs.js";
 import { DurableSessionService } from "./agent/durable-session-service.js";
-import { runDurableJobPrompt } from "./agent/durable-job-runner.js";
+import { DURABLE_JOB_BUSY_WAIT_MS, runDurableJobPrompt } from "./agent/durable-job-runner.js";
 import { executeJob, type CreatedJobSession, type DurableJobExecution, type DurableJobExecutor } from "./scheduler/job-runner.js";
 import type { ScheduledJob } from "./scheduler/types.js";
 import { ChannelRegistry } from "./channels/channel.js";
@@ -1064,7 +1064,7 @@ function backgroundTenantRequest(): HttpReq {
 async function executeDurableJob(req: HttpReq, execution: DurableJobExecution): Promise<string> {
 	// A reminder is recorded as a notice in the run's conversation; no model turn.
 	if (execution.notifyOnly) {
-		await durableSessions.appendAssistantNotification(req, execution.sessionId, execution.prompt, execution.requestId);
+		await durableSessions.appendAssistantNotification(req, execution.sessionId, execution.prompt, execution.requestId, { busyWaitMs: DURABLE_JOB_BUSY_WAIT_MS });
 		return execution.prompt;
 	}
 	if (activeDurableJobTurns.has(execution.sessionId)) {

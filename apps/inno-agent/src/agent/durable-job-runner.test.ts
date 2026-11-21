@@ -1,6 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import { describe, expect, it, vi } from "vitest";
-import { runDurableJobPrompt } from "./durable-job-runner.js";
+import { DURABLE_JOB_BUSY_WAIT_MS, runDurableJobPrompt } from "./durable-job-runner.js";
 import type { DurableSessionService } from "./durable-session-service.js";
 
 function fixture(overrides: { pending?: boolean } = {}) {
@@ -101,6 +101,18 @@ describe("runDurableJobPrompt", () => {
 			{ type: "text", text: "Image path hints" },
 			{ type: "text", text: "recalled context" },
 		], "channel-request");
+	});
+
+	it("leases with the default busy wait and honors a per-call override", async () => {
+		const { service } = fixture();
+		await runDurableJobPrompt(req, service, "durable-session", "prompt", {
+			requestId: "job-request", turnId: "job-turn",
+		});
+		expect(service.lease).toHaveBeenCalledWith(req, "durable-session", { busyWaitMs: DURABLE_JOB_BUSY_WAIT_MS });
+		await runDurableJobPrompt(req, service, "durable-session", "prompt", {
+			requestId: "job-request-2", turnId: "job-turn-2", busyWaitMs: 42,
+		});
+		expect(service.lease).toHaveBeenLastCalledWith(req, "durable-session", { busyWaitMs: 42 });
 	});
 
 	it("rejects a pending question before opening a headless run", async () => {
