@@ -723,9 +723,9 @@ function findWorkspaceContentRoot(extractDir: string): string | null {
 
 /**
  * Recursively copy imported content into the new workspace directory.
- * File-by-file (not cpSync) for robustness against asar-unpacked paths in
- * Electron packaged builds. `preset.json` is hub metadata, not content —
- * it only contributes the default workspace name and is not copied.
+ * File-by-file (not cpSync) to skip noise files cleanly. `preset.json` is
+ * hub metadata, not content — it only contributes the default workspace
+ * name and is not copied.
  */
 function copyWorkspaceImportContents(sourceDir: string, targetDir: string): void {
 	ensureDir(targetDir);

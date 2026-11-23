@@ -68,7 +68,6 @@ docker compose -f deploy/docker-compose.yml up -d   # 服务端口 3000,挂载 r
 
 ```bash
 npm run server          # Web UI(API + 已构建前端,端口 3000)
-npm run electron        # 本地运行桌面应用
 
 # 开发模式:后端 :3000 + Vite 热更新 :5173
 npm run dev:server & npm run web:dev
@@ -113,7 +112,7 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
     "wechat": { "enabled": false, "mode": "ilink" }
   },
   "memory": { "l2Enabled": true, "l3Enabled": true },
-  "ui": { "theme": "light", "closeBehavior": "ask" }
+  "ui": { "theme": "light" }
 }
 ```
 
@@ -145,7 +144,7 @@ agent 没有 shell，也没有宿主机执行能力。文件工具（`read`、`w
 四层结构：**用户界面 → 认证与租户应用层 → pi-durable agent 运行时 → 分层记忆。**
 
 ```text
-用户界面          Web UI (React) · 桌面应用 · 飞书 · 微信
+用户界面          Web UI (React) · 飞书 · 微信
         ↓
 应用层            Better Auth · personal tenant · ownership · HTTP/SSE
                   渠道 · 调度器 · 工作区
@@ -171,7 +170,6 @@ Agent 运行时      pi-durable session runtimes（每个会话一个 SQLite）
 apps/inno-agent/           后端(HTTP 服务),TypeScript → dist/
 apps/inno-agent/web/       前端(React 19 + Tailwind 4 + Vite)
 apps/inno-agent/presets/   内置预设工作区(离线兜底)
-electron/                  Electron 主进程(桌面应用)
 scripts/content-hub-server/  自建内容中心 bundle 服务
 runtime/                   本地运行时状态(配置、数据、技能)—— gitignored
 workspace/                 默认 agent 工作目录 —— gitignored
@@ -190,7 +188,7 @@ INNO_PORT=3000 \
 npm run server
 ```
 
-提供 [`deploy/Dockerfile`](./deploy/Dockerfile) 与 [`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 作为起点；完整依赖说明见 [`docs/SYSTEM_DEPENDENCIES.md`](./docs/SYSTEM_DEPENDENCIES.md)。Better Auth + PostgreSQL、租户隔离和公网账号限制见 [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md)；Durable 架构、静态 worker 路由、验收结果和单 owner 部署边界见 [`docs/MULTI_USER_DURABLE.md`](./docs/MULTI_USER_DURABLE.md)。桌面打包说明见 [`ELECTRON_BUILD.md`](./ELECTRON_BUILD.md)。
+提供 [`deploy/Dockerfile.backend`](./deploy/Dockerfile.backend)（后端 API）、[`deploy/Dockerfile.frontend`](./deploy/Dockerfile.frontend)（nginx + 前端）与 [`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 作为起点；完整依赖说明见 [`docs/SYSTEM_DEPENDENCIES.md`](./docs/SYSTEM_DEPENDENCIES.md)。Better Auth + PostgreSQL、租户隔离和公网账号限制见 [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md)；Durable 架构、静态 worker 路由、验收结果和单 owner 部署边界见 [`docs/MULTI_USER_DURABLE.md`](./docs/MULTI_USER_DURABLE.md)。
 
 ## 使用案例与文档
 

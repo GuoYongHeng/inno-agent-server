@@ -10,7 +10,6 @@ const mocks = vi.hoisted(() => ({
 	refresh: vi.fn(),
 	refreshUntilTopic: vi.fn(),
 	openSession: vi.fn(),
-	ensureWindowForPanel: vi.fn(),
 	appStore: {
 		workspaceWidth: 640,
 		workspaceMode: "half" as "collapsed" | "quarter" | "half" | "full",
@@ -41,7 +40,6 @@ vi.mock("./notebook-store.js", () => ({ notebookStore: { loadAll: vi.fn() } }));
 vi.mock("./app-store.js", () => ({
 	appStore: mocks.appStore,
 }));
-vi.mock("./window-expansion.js", () => ({ ensureWindowForPanel: mocks.ensureWindowForPanel }));
 vi.mock("./workspace-store.js", () => ({
 	workspaceStore: {
 		streamingPreview: null,
@@ -99,7 +97,6 @@ describe("ChatStore stream ownership", () => {
 		mocks.submitChatQuestion.mockResolvedValue({ accepted: true });
 		mocks.getChatStatus.mockResolvedValue(activeSnapshot());
 		mocks.getSession.mockResolvedValue({ messages: [], messageCount: 0, sessionRevision: "0:0" });
-		mocks.ensureWindowForPanel.mockResolvedValue("unavailable");
 		mocks.appStore.workspaceWidth = 640;
 		mocks.appStore.workspaceMode = "half";
 	});
@@ -307,7 +304,6 @@ describe("ChatStore stream ownership", () => {
 
 		const store = new ChatStoreImpl();
 		await store.send("generate notes");
-		await vi.waitFor(() => expect(mocks.ensureWindowForPanel).toHaveBeenCalledWith("right", 640, "half"));
 		await vi.waitFor(() => expect(mocks.appStore.setRightPanelTab).toHaveBeenCalledWith("preview"));
 		expect(mocks.appStore.setWorkspaceWidth).toHaveBeenCalledWith(640);
 		expect(mocks.appStore.setWorkspaceMode).toHaveBeenCalledWith("half");

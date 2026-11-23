@@ -1,32 +1,29 @@
-import type { ReactNode } from "react";
 import { PanelLeftOpen, PanelRightClose, PanelRightOpen } from "lucide-react";
 
-interface DesktopWindowChromeProps {
+interface PanelTogglesProps {
 	showWorkspaceControl: boolean;
 	sidebarCollapsed: boolean;
 	workspaceCollapsed: boolean;
-	btwControl?: ReactNode;
 	onToggleSidebar: () => void;
 	onToggleWorkspace: () => void;
 }
 
 /**
- * Renderer-owned macOS window chrome. Electron keeps the traffic lights in
- * the hidden title-bar area; the overlay is limited to the renderer control
- * so the page headers below remain reliable drag surfaces and click targets.
+ * Floating panel controls overlaid on the app shell: the collapsed-sidebar
+ * expand button (the collapsed rail renders nothing itself) and the workspace
+ * panel toggle anchored to the header's right edge.
  *
  * The sidebar toggle only renders while the sidebar is collapsed — the
  * expanded sidebar carries its own collapse button inside its header, so no
  * floating control ever overlaps the brand row (reference-app pattern).
  */
-export function DesktopWindowChrome({
+export function PanelToggles({
 	showWorkspaceControl,
 	sidebarCollapsed,
 	workspaceCollapsed,
-	btwControl,
 	onToggleSidebar,
 	onToggleWorkspace,
-}: DesktopWindowChromeProps) {
+}: PanelTogglesProps) {
 	return (
 		<div className="inno-window-chrome" aria-label="窗口工具栏">
 			{sidebarCollapsed ? (
@@ -40,11 +37,6 @@ export function DesktopWindowChrome({
 					>
 						<PanelLeftOpen size={15} />
 					</button>
-				</div>
-			) : null}
-			{btwControl ? (
-				<div className="inno-window-chrome-right-actions">
-					{btwControl}
 				</div>
 			) : null}
 			{showWorkspaceControl ? (

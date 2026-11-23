@@ -119,12 +119,8 @@ export interface InnoSchedulerConfig {
 	timezone: string;
 }
 
-/** What should happen when the desktop window's close button is clicked. */
-export type InnoCloseBehavior = "ask" | "hide" | "quit";
-
 export interface InnoUiConfig {
 	theme: string;
-	closeBehavior: InnoCloseBehavior;
 	/** Allow $...$ inline math. Disabled by default so currency stays plain text. */
 	mathSingleDollar: boolean;
 }
@@ -469,10 +465,7 @@ export function normalizeSchedulerConfig(scheduler: Partial<InnoSchedulerConfig>
 
 export function normalizeUiConfig(ui: Partial<InnoUiConfig> | undefined): InnoUiConfig {
 	const theme = typeof ui?.theme === "string" && ui.theme.trim() ? ui.theme.trim() : "light";
-	const closeBehavior: InnoCloseBehavior = ui?.closeBehavior === "hide" || ui?.closeBehavior === "quit"
-		? ui.closeBehavior
-		: "ask";
-	return { theme, closeBehavior, mathSingleDollar: ui?.mathSingleDollar === true };
+	return { theme, mathSingleDollar: ui?.mathSingleDollar === true };
 }
 
 /**

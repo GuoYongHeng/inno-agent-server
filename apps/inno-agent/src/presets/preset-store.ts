@@ -264,8 +264,8 @@ export async function ensurePresetAvailable(
 
 /**
  * Recursively copy a preset's content into a destination workspace directory.
- * Uses file-by-file read/write (not cpSync) for robustness against
- * asar-unpacked paths in Electron packaged builds. Skips `preset.json`.
+ * Uses file-by-file read/write (not cpSync) to skip noise files cleanly.
+ * Skips `preset.json`.
  */
 function copyPresetContents(sourceDir: string, targetDir: string): void {
 	if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });

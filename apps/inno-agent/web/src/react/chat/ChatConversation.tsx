@@ -80,7 +80,7 @@ interface ChatConversationProps {
 	sessionOpening?: boolean;
 	/** Existing-workspace switcher rendered next to the title. */
 	workspaceControl?: ReactNode;
-	/** Reserve room for the desktop chrome's workspace button when collapsed. */
+	/** Reserve room for the floating workspace toggle when collapsed. */
 	workspaceCollapsed?: boolean;
 	/** When the session sidebar is collapsed its floating expand button overlaps the header's left edge. */
 	sidebarCollapsed?: boolean;

@@ -70,7 +70,6 @@ docker compose -f deploy/docker-compose.yml up -d   # serves on :3000, mounts ru
 
 ```bash
 npm run server          # Web UI (API + built frontend on :3000)
-npm run electron        # Desktop app locally
 
 # Dev: backend on :3000 + Vite HMR on :5173
 npm run dev:server & npm run web:dev
@@ -115,7 +114,7 @@ Each account configures its own provider/model in Settings. This is a restricted
     "wechat": { "enabled": false, "mode": "ilink" }
   },
   "memory": { "l2Enabled": true, "l3Enabled": true },
-  "ui": { "theme": "light", "closeBehavior": "ask" }
+  "ui": { "theme": "light" }
 }
 ```
 
@@ -147,7 +146,7 @@ The skill library and Simple Mode presets are fetched from a remote **content hu
 Four layers: **user interfaces → authenticated application services → pi-durable agent runtime → tenant-scoped memory.**
 
 ```text
-User Interfaces      Web UI (React) · Desktop · Feishu · WeChat
+User Interfaces      Web UI (React) · Feishu · WeChat
         ↓
 Application Layer    Better Auth · personal tenants · ownership · HTTP/SSE
                      Channels · scheduler · workspaces
@@ -174,7 +173,6 @@ apps/inno-agent/           Backend (HTTP server), TypeScript → dist/
 apps/inno-agent/web/       Frontend (React 19 + Tailwind 4 + Vite)
 apps/inno-agent/presets/   Bundled preset workspaces (offline fallback)
 apps/showcase/             Static showcase viewer for recorded replay cases
-electron/                  Electron main process (desktop app)
 scripts/content-hub-server/  Self-hosted Content Hub bundle service
 runtime/                   Local runtime state (config, data, skills) — gitignored
 workspace/                 Default agent working directory — gitignored
@@ -193,7 +191,7 @@ INNO_PORT=3000 \
 npm run server
 ```
 
-A [`deploy/Dockerfile`](./deploy/Dockerfile) and [`deploy/docker-compose.yml`](./deploy/docker-compose.yml) are provided as starting points; see [`docs/SYSTEM_DEPENDENCIES.md`](./docs/SYSTEM_DEPENDENCIES.md) for the full dependency reference. Better Auth + PostgreSQL setup, tenant isolation, and public-account limitations are in [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md). The Durable architecture, static worker routing, verification results, and single-owner deployment boundary are in [`docs/MULTI_USER_DURABLE.md`](./docs/MULTI_USER_DURABLE.md). Desktop packaging notes are in [`ELECTRON_BUILD.md`](./ELECTRON_BUILD.md).
+A [`deploy/Dockerfile.backend`](./deploy/Dockerfile.backend) (API), [`deploy/Dockerfile.frontend`](./deploy/Dockerfile.frontend) (nginx + web UI) and [`deploy/docker-compose.yml`](./deploy/docker-compose.yml) are provided as starting points; see [`docs/SYSTEM_DEPENDENCIES.md`](./docs/SYSTEM_DEPENDENCIES.md) for the full dependency reference. Better Auth + PostgreSQL setup, tenant isolation, and public-account limitations are in [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md). The Durable architecture, static worker routing, verification results, and single-owner deployment boundary are in [`docs/MULTI_USER_DURABLE.md`](./docs/MULTI_USER_DURABLE.md).
 
 ## Showcase Viewer
 

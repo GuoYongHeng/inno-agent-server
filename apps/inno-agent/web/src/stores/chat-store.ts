@@ -5,7 +5,6 @@ import type { ChatAttachments, ChatMessage, ChatStreamEvent, ChatToolRecord, Cha
 import { notebookStore } from "./notebook-store.js";
 import { appStore } from "./app-store.js";
 import { workspaceStore, type StreamingWorkspacePreview } from "./workspace-store.js";
-import { ensureWindowForPanel } from "./window-expansion.js";
 import { applyChatTraceEvent, finalizeTraceSteps, traceStepsFromEvents, traceTerminalState } from "../utils/chat-trace.js";
 import type { JobRunStreamEvent } from "../types/jobs.js";
 import { skillMessageFromContent } from "../react/chat/skill-message-collapse.js";
@@ -1333,18 +1332,6 @@ const FILE_EXTENSIONS = [
 const FILE_PATH_RE = new RegExp(`(?:^|[\\s"'\\\`“”‘’（(])((?:[\\w.-]+\\/)*[\\w.-]+\\.(${FILE_EXTENSIONS}))(?:$|[\\s"'\\\`“”‘’）),，。:：])`, "i");
 
 async function revealWorkspacePreview(): Promise<void> {
-	const currentMode = appStore.workspaceMode;
-	const opensSplitPanel = currentMode !== "full";
-	const targetMode = currentMode === "collapsed" || currentMode === "quarter" ? "half" : currentMode;
-	const targetWidth = appStore.workspaceWidth < 560 ? 640 : appStore.workspaceWidth;
-
-	if (opensSplitPanel) {
-		// Desktop: grow the native window first. Browser users have no desktop
-		// bridge, so ensureWindowForPanel returns "unavailable" and the local
-		// fitPanelLayout fallback below still opens the panel safely.
-		await ensureWindowForPanel("right", targetWidth, targetMode);
-	}
-
 	appStore.setRightPanelTab("preview");
 	if (appStore.workspaceWidth < 560) appStore.setWorkspaceWidth(640);
 	if (appStore.workspaceMode === "collapsed" || appStore.workspaceMode === "quarter") {

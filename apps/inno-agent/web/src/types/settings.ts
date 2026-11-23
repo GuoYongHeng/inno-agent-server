@@ -71,7 +71,6 @@ export interface ChannelsSettingsPayload {
 	};
 }
 
-export type WindowCloseBehavior = "ask" | "hide" | "quit";
 
 export interface SandboxSettings {
 	enabled?: boolean;
@@ -128,7 +127,7 @@ export interface InnoSettings {
 	};
 	memory?: { l2Enabled: boolean; l3Enabled: boolean };
 	smartInput?: SmartInputSettings;
-	ui?: { theme: string; closeBehavior: WindowCloseBehavior; mathSingleDollar: boolean };
+	ui?: { theme: string; mathSingleDollar: boolean };
 }
 
 /** One literal keyword → allowed file formats with optional exclusions. */

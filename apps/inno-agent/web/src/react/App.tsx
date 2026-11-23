@@ -1,11 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { MessageCircleQuestion } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { appStore, pageFromSearch, type AppPage, type WorkspaceMode } from "../stores/app-store.js";
 import { settingsStore } from "../stores/settings-store.js";
 import { themeStore, type ThemeId } from "../stores/theme-store.js";
 import { sessionsStore } from "../stores/sessions-store.js";
-import { btwStore } from "../stores/btw-store.js";
 import { workspacesStore } from "../stores/workspaces-store.js";
 import { chatStore } from "../stores/chat-store.js";
 import { useStoreSnapshot } from "./hooks.js";
@@ -14,14 +12,13 @@ import { ChatCenter } from "./ChatCenter.js";
 import { FeaturePage } from "./FeaturePage.js";
 import { SessionSidebar } from "./SessionSidebar.js";
 import { WorkspacePanel } from "./WorkspacePanel.js";
-import { DesktopWindowChrome } from "./DesktopWindowChrome.js";
+import { PanelToggles } from "./PanelToggles.js";
 import { SettingsOverlay } from "./settings/SettingsOverlay.js";
 import {
 	CHAT_ONLY_BP,
 	fitPanelLayout,
 	WORKSPACE_DEFAULT_WIDTH,
 } from "../stores/app-layout.js";
-import { ensureWindowForPanel } from "../stores/window-expansion.js";
 
 let initializationPromise: Promise<void> | null = null;
 
@@ -37,7 +34,6 @@ function initializeApp(): Promise<void> {
 
 export function App() {
 	const { t } = useTranslation();
-	const isDesktopWindow = Boolean(window.innoDesktop);
 	const [workspaceNarrowHint, setWorkspaceNarrowHint] = useState(false);
 	const workspaceHintTimerRef = useRef<number | null>(null);
 	const showWorkspaceNarrowHint = useCallback(() => {
@@ -54,22 +50,6 @@ export function App() {
 		workspaceMode: appStore.workspaceMode,
 		workspaceWidth: appStore.workspaceWidth,
 	}));
-	const currentSessionId = useStoreSnapshot(sessionsStore, () => sessionsStore.currentSessionId);
-	const btwPanelVisible = useStoreSnapshot(btwStore, () => btwStore.isVisible && btwStore.activeSessionId === sessionsStore.currentSessionId);
-	// The BtwPanel only mounts inside ChatCenter, so the desktop chrome button
-	// must hide on feature pages — clicking it there would open nothing.
-	const desktopBtwControl = isDesktopWindow && app.page === "chat" && app.workspaceMode === "collapsed" && currentSessionId ? (
-		<button
-			type="button"
-			className={`inno-window-chrome-button inno-window-chrome-btw-button ${btwPanelVisible ? "is-active" : ""}`}
-			title="随便问问"
-			aria-label="随便问问"
-			aria-expanded={btwPanelVisible}
-			onClick={() => void btwStore.openOrRestore(currentSessionId)}
-		>
-			<MessageCircleQuestion size={15} />
-		</button>
-	) : undefined;
 	useEffect(() => {
 		void initializeApp();
 		const onPopState = () => {
@@ -219,19 +199,15 @@ export function App() {
 		}
 
 		if (appStore.sidebarCollapsed) {
-			const leftResult = await ensureWindowForPanel("left");
-			if (leftResult === "busy") return;
 			appStore.setSidebarCollapsed(false);
 		}
 
-		const rightResult = await ensureWindowForPanel("right", previewWidth, "half");
-		if (rightResult === "busy") return;
 		// Do not force the sidebar closed here: setWorkspaceMode below already
 		// collapses it if (and only if) that is what makes the panel fit.
 		appStore.setRightPanelTab("preview");
 		appStore.setWorkspaceWidth(previewWidth);
 		appStore.setWorkspaceMode("half");
-	}, [isNarrow, ensureWindowForPanel]);
+	}, [isNarrow]);
 
 	const openFilePreview = useCallback(async (minimumWidth: number) => {
 		// Full mode is already the reading surface; selecting another file should
@@ -244,30 +220,11 @@ export function App() {
 		const previewWidth = appStore.workspaceMode === "collapsed"
 			? minimumWidth
 			: Math.max(minimumWidth, appStore.workspaceWidth);
-		const result = await ensureWindowForPanel("right", previewWidth, "half");
-		if (result === "busy") return;
 		// Do not force the sidebar closed here: setWorkspaceWidth/setWorkspaceMode
 		// below already collapse it if (and only if) that is what makes the panel fit.
 		appStore.setWorkspaceWidth(previewWidth);
 		appStore.setWorkspaceMode("half");
-	}, [isNarrow, ensureWindowForPanel]);
-
-	const openSidebar = useCallback(() => {
-		void (async () => {
-			const result = await ensureWindowForPanel("left");
-			if (result === "busy") return;
-			// If the display cannot fit both optional columns, the store fits the
-			// workspace or closes it so the clicked panel still responds.
-			appStore.setSidebarCollapsed(false);
-		})();
-	}, [ensureWindowForPanel]);
-	const toggleSidebar = useCallback(() => {
-		if (appStore.sidebarCollapsed) {
-			void openSidebar();
-			return;
-		}
-		appStore.setSidebarCollapsed(true);
-	}, [openSidebar]);
+	}, [isNarrow]);
 
 	const setWorkspaceMode = useCallback((mode: WorkspaceMode) => {
 		if (mode === "collapsed" || app.workspaceMode !== "collapsed") {
@@ -279,8 +236,6 @@ export function App() {
 			// workspace view. Restore the reference width when an older saved
 			// value is only wide enough for the narrow single-pane fallback.
 			const requestedWidth = Math.max(app.workspaceWidth, WORKSPACE_DEFAULT_WIDTH);
-			const result = await ensureWindowForPanel("right", requestedWidth, "half");
-			if (result === "busy") return;
 			// Do not force the sidebar closed here: setWorkspaceMode below already
 			// collapses it if (and only if) that is what makes the panel fit, and
 			// otherwise leaves the layout untouched instead of collapsing for nothing.
@@ -291,11 +246,12 @@ export function App() {
 			// an explicit hint.
 			if (appStore.workspaceMode === "collapsed") showWorkspaceNarrowHint();
 		})();
-	}, [app.workspaceMode, ensureWindowForPanel, showWorkspaceNarrowHint]);
+	}, [app.workspaceMode, showWorkspaceNarrowHint]);
 	const toggleWorkspace = useCallback(() => {
 		setWorkspaceMode(app.workspaceMode === "collapsed" ? "half" : "collapsed");
 	}, [app.workspaceMode, setWorkspaceMode]);
 	const setWorkspaceWidth = useCallback((width: number) => appStore.setWorkspaceWidth(width), []);
+	const toggleSidebar = useCallback(() => appStore.toggleSidebar(), []);
 
 	// Feature pages occupy the whole center column; the right workspace panel is
 	// a chat-only surface. Its mode/width state is preserved (not mutated) so
@@ -307,7 +263,7 @@ export function App() {
 		<>
 			<InnoDndProvider>
 				<div
-					className={`app-layout app-layout--${isDesktopWindow ? "desktop" : "browser"} app-layout--sidebar-${app.sidebarCollapsed ? "collapsed" : "expanded"} app-layout--workspace-${layoutWorkspaceMode}`}
+					className={`app-layout app-layout--browser app-layout--sidebar-${app.sidebarCollapsed ? "collapsed" : "expanded"} app-layout--workspace-${layoutWorkspaceMode}`}
 					style={{ "--inno-workspace-width": `${app.workspaceWidth}px` } as React.CSSProperties}
 				>
 					<SessionSidebar collapsed={app.sidebarCollapsed} />
@@ -325,11 +281,10 @@ export function App() {
 							onPreviewFile={openFilePreview}
 						/>
 					) : null}
-					<DesktopWindowChrome
+					<PanelToggles
 						showWorkspaceControl={chatVisible}
 						sidebarCollapsed={app.sidebarCollapsed}
 						workspaceCollapsed={app.workspaceMode === "collapsed"}
-						btwControl={desktopBtwControl}
 						onToggleSidebar={toggleSidebar}
 						onToggleWorkspace={toggleWorkspace}
 					/>

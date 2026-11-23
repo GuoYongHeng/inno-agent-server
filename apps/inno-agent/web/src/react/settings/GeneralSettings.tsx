@@ -4,7 +4,6 @@ import { themeStore, THEME_IDS, THEME_PREVIEW_COLORS } from "../../stores/theme-
 import { settingsStore } from "../../stores/settings-store.js";
 import { setLocale } from "../../i18n/index.js";
 import { useStoreSnapshot } from "../hooks.js";
-import type { WindowCloseBehavior } from "../../types/settings.js";
 import { SettingsSection, SettingsCard, SettingsRow } from "./primitives.js";
 import { Switch } from "../ui/Switch.js";
 
@@ -55,33 +54,6 @@ function LanguageSelect() {
 	);
 }
 
-function CloseBehaviorSelect() {
-	const { t } = useTranslation();
-	const state = useStoreSnapshot(settingsStore, () => ({
-		behavior: settingsStore.settings?.ui?.closeBehavior ?? "ask",
-		isSaving: settingsStore.isSavingCloseBehavior,
-		isReady: settingsStore.settings !== null,
-	}));
-
-	function handleChange(value: string) {
-		if (value !== "ask" && value !== "hide" && value !== "quit") return;
-		void settingsStore.saveCloseBehavior(value as WindowCloseBehavior).catch(() => undefined);
-	}
-
-	return (
-		<select
-			className="rounded-md border border-[var(--inno-border)] bg-[var(--inno-surface)] px-2 py-1 text-xs"
-			value={state.behavior}
-			disabled={!state.isReady || state.isSaving}
-			onChange={(e) => handleChange(e.target.value)}
-		>
-			<option value="ask">{t("settings.closeBehavior.options.ask")}</option>
-			<option value="hide">{t("settings.closeBehavior.options.hide")}</option>
-			<option value="quit">{t("settings.closeBehavior.options.quit")}</option>
-		</select>
-	);
-}
-
 function MarkdownMathToggle() {
 	const { t } = useTranslation();
 	const state = useStoreSnapshot(settingsStore, () => ({
@@ -116,13 +88,6 @@ export function GeneralSettings() {
 					label={t("settings.language")}
 					description={t("settings.sections.general.languageDesc", "切换界面显示语言")}
 					control={<LanguageSelect />}
-				/>
-			</SettingsCard>
-			<SettingsCard>
-				<SettingsRow
-					label={t("settings.closeBehavior.title")}
-					description={t("settings.sections.general.closeBehaviorDesc", "设置点击窗口关闭按钮时的处理方式；选择后会在所有平台记住。")}
-					control={<CloseBehaviorSelect />}
 				/>
 			</SettingsCard>
 			<SettingsCard>

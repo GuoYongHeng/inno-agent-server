@@ -1059,8 +1059,8 @@ export function SessionSidebar({ collapsed }: SessionSidebarProps) {
 		})();
 	}, [t]);
 
-	/* The desktop window chrome owns the collapsed-state toggle. Keeping the
-	   sidebar itself empty here avoids a duplicate floating expand button. */
+	/* The floating expand control lives outside the sidebar (PanelToggles), so
+	   the collapsed rail renders nothing itself and stays out of its way. */
 
 	if (collapsed) {
 		return (
@@ -1100,8 +1100,8 @@ export function SessionSidebar({ collapsed }: SessionSidebarProps) {
 							<RefreshCw size={14} />
 						</button>
 						{/* Collapse lives inside the sidebar header (reference-app
-							pattern); the floating chrome toggle only reappears as the
-							expand button once the rail is hidden. */}
+							pattern); the floating expand button only reappears
+							once the rail is hidden. */}
 						<button
 							className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--inno-text-subtle)] transition-colors hover:bg-[var(--inno-surface)] hover:text-[var(--inno-text-muted)]"
 							title={t("sidebar.collapse")}

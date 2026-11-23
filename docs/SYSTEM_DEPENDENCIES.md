@@ -32,7 +32,7 @@
 | **unzip** | `/usr/bin/unzip` | [`server.ts:642`](apps/inno-agent/src/server.ts#L642) [`server.ts:719`](apps/inno-agent/src/server.ts#L719) | 1. 技能包 ZIP 解压安装<br>2. ZIP 文件内容校验（`unzip -Z1`） |
 | **zip** | `/usr/bin/zip` | [`server.ts:688`](apps/inno-agent/src/server.ts#L688) | 工作区目录下载时打包为 ZIP 归档 |
 
-> ⚠️ **注意**：当前 `deploy/Dockerfile` 的 runtime 阶段只安装了 `unzip`，缺少 `zip`。如需支持工作区下载功能，需补充安装 `zip`。
+> ⚠️ **注意**：当前 `deploy/Dockerfile.backend` 的 runtime 阶段只安装了 `unzip`，缺少 `zip`。如需支持工作区下载功能，需补充安装 `zip`。
 
 ### 2.2 安装命令（Debian/Ubuntu）
 
@@ -158,10 +158,6 @@ pip install torch torchvision  # 深度学习框架
 |------|----------|----------|------|
 | **sharp** | `@img/sharp-<platform>/` | 无（捆绑 libvips） | 图像处理，通过 `@llamaindex/liteparse` 间接依赖。libvips 已预编译捆绑在所有主要平台上。 |
 | **koffi** | 编译的 `.node` 二进制 | `dlopen`/`dlsym`（Unix） | C FFI 接口，用于动态加载系统共享库。通过 `@hyzyla/pdfium` 间接依赖。 |
-
-### 4.2 Electron 相关
-
-`package.json` 的 `build.asarUnpack` 只保留 `apps/inno-agent/presets/**/*` 与 `apps/inno-agent/scripts/**/*`（预设模板与 pptx→svg 转换脚本需要以真实文件形式存在）。
 
 ---
 

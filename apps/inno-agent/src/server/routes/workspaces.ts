@@ -201,12 +201,9 @@ const MAX_PPTX_BYTES = 50 * 1024 * 1024;
 const execFileAsync = promisify(execFile);
 let cachedPythonExe: string | null | undefined;
 
-/** Absolute path to the vendored pptx_to_svg CLI (dev = repo, prod = bundled). */
+/** Absolute path to the vendored pptx_to_svg CLI. */
 function pptxScriptPath(codeDir: string): string {
-	// In a packaged Electron app, codeDir points inside app.asar but the script
-	// is unpacked (asarUnpack) to app.asar.unpacked — Python can't read asar.
-	const base = codeDir.replace(/app\.asar([\\/])/, "app.asar.unpacked$1");
-	return join(base, "scripts", "pptx_to_svg.py");
+	return join(codeDir, "scripts", "pptx_to_svg.py");
 }
 
 /** Resolve a usable Python executable, caching the result. */

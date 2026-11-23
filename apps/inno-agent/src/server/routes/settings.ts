@@ -609,23 +609,6 @@ export async function handleSettingsRoutes(
 		return true;
 	}
 
-	// PUT /api/settings/close-behavior — persist the cross-platform window-close preference
-	if (method === "PUT" && url === "/api/settings/close-behavior") {
-		const body = (await readBody(req)) as Record<string, unknown>;
-		const closeBehavior = body.closeBehavior;
-		if (closeBehavior !== "ask" && closeBehavior !== "hide" && closeBehavior !== "quit") {
-			json(res, 400, { error: "closeBehavior must be one of ask, hide, quit" });
-			return true;
-		}
-		config.ui = {
-			...normalizeUiConfig(config.ui),
-			closeBehavior,
-		};
-		await save(config);
-		json(res, 200, safeSettings());
-		return true;
-	}
-
 	// PUT /api/settings/markdown — persist user-facing Markdown parsing preferences
 	if (method === "PUT" && url === "/api/settings/markdown") {
 		const body = (await readBody(req)) as Record<string, unknown>;

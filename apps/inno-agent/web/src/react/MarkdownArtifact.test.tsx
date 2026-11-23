@@ -430,7 +430,7 @@ describe("MarkdownArtifact", () => {
 
 	it("can opt in to single-dollar math without changing LaTeX delimiters", () => {
 		const previous = settingsStore.settings;
-		settingsStore.settings = { ui: { theme: "light", closeBehavior: "ask", mathSingleDollar: true } } as typeof previous;
+		settingsStore.settings = { ui: { theme: "light", mathSingleDollar: true } } as typeof previous;
 		try {
 			const { container } = render(<MarkdownArtifact content="变量 $x+1$，价格仍可由用户自行决定写法。" />);
 			expect(container.querySelector(".katex")).not.toBeNull();

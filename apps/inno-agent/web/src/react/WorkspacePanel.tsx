@@ -9,7 +9,6 @@ import { getMaximumWorkspaceWidth, WORKSPACE_MAX_WIDTH, WORKSPACE_MIN_WIDTH, WOR
 import { appStore } from "../stores/app-store.js";
 import { workspaceStore } from "../stores/workspace-store.js";
 import type { WorkspaceTreeNode } from "../types/workspace.js";
-import { ensureWindowForPanel } from "../stores/window-expansion.js";
 import { useStoreSnapshot } from "./hooks.js";
 import { isDynamicImportError, recoverFromDynamicImportError } from "../utils/dynamic-import-recovery.js";
 
@@ -156,14 +155,9 @@ function WorkspacePanelContent({ mode, width, onModeChange, onWidthChange, onPre
 
 	const commitResize = useCallback(async (nextWidth: number) => {
 		const generation = ++resizeCommitGenerationRef.current;
-		// When the current chat column is already at its baseline width, the
-		// renderer cannot fit a wider workspace without first making more room.
-		// Electron can expand the host window; browser builds safely fall back to
-		// the existing fitPanelLayout constraint inside onWidthChange.
-		await ensureWindowForPanel("right", nextWidth, mode);
-		// The host-window resize can emit a second renderer resize event after
-		// ensureWindowForPanel resolves. Commit after those fit passes settle so
-		// the requested workspace width is not overwritten by the old width.
+		// A window resize can emit a second renderer resize event while the
+		// commit is pending. Commit after those fit passes settle so the
+		// requested workspace width is not overwritten by the old width.
 		await waitForWindowLayoutToSettle();
 		if (generation !== resizeCommitGenerationRef.current) return;
 		onWidthChange(nextWidth);
@@ -267,34 +261,6 @@ function WorkspacePanelContent({ mode, width, onModeChange, onWidthChange, onPre
 		setIsResizing(true);
 		if (event.currentTarget.setPointerCapture) {
 			event.currentTarget.setPointerCapture(event.pointerId);
-		}
-
-		// On desktop, include the amount of host-window space that can still be
-		// expanded on either edge. The commit uses the right edge first and moves
-		// the window left when the right edge is already at the display boundary.
-		const getWindowWidthCapacity = window.innoDesktop?.getWindowWidthCapacity;
-		if (getWindowWidthCapacity) {
-			void Promise.all([
-				getWindowWidthCapacity("right").catch(() => 0),
-				getWindowWidthCapacity("left").catch(() => 0),
-			]).then(([rightCapacity, leftCapacity]) => {
-				const active = resizeStartRef.current;
-				if (!active || active.pointerId !== event.pointerId) return;
-				const expandedViewportWidth = window.innerWidth
-					+ Math.max(0, Math.round(rightCapacity))
-					+ Math.max(0, Math.round(leftCapacity));
-				resizeMaxWidthRef.current = Math.min(
-					WORKSPACE_MAX_WIDTH,
-					Math.max(
-						resizeMaxWidthRef.current,
-						getMaximumWorkspaceWidth(expandedViewportWidth, appStore.sidebarCollapsed, mode),
-					),
-				);
-				const maxWidth = resizeMaxWidthRef.current;
-				setResizeLimitReached(
-					resizePreviewWidthRef.current !== null && resizePreviewWidthRef.current >= maxWidth,
-				);
-			});
 		}
 	}, [mode, width]);
 

@@ -10,7 +10,6 @@
 		"apps/inno-agent/web",
 		"apps/showcase"
 	],
-	"main": "electron/main.js",
 	"scripts": {
 		"test": "vitest run",
 		"test:integration": "vitest run --config vitest.integration.config.ts",
@@ -24,94 +23,12 @@
 		"dev:server": "npm --workspace inno-agent run server --",
 		"restart": "bash restart-dev.sh",
 		"restart:fast": "bash restart-dev.sh --skip-build",
-		"electron": "electron .",
-		"electron:build": "npm run build && electron-builder --mac",
-		"electron:build:win": "npm run build && electron-builder --win",
 		"showcase:dev": "npm run dev --workspace inno-agent-showcase",
 		"showcase:build": "npm run build --workspace inno-agent-showcase",
-		"electron:build:mac:signed": "bash scripts/build-mac-signed.sh",
-		"electron:package:mac:signed": "node scripts/check-mac-signing.cjs && electron-builder --config build/electron-builder.mac-signed.cjs --mac dmg --arm64 --publish never && bash scripts/verify-mac-release.sh",
-		"test:mac-signing": "node --test scripts/check-mac-signing.test.cjs",
 		"durable:export-catalog": "npm --workspace inno-agent run durable:export-catalog --"
 	},
 	"engines": {
 		"node": ">=22.19.0"
-	},
-	"build": {
-		"appId": "com.inno.agent",
-		"productName": "Inno Agent",
-		"directories": {
-			"output": "dist-electron"
-		},
-		"files": [
-			"electron/**/*",
-			"apps/inno-agent/dist/**/*",
-			"apps/inno-agent/web/dist/**/*",
-			"apps/inno-agent/presets/**/*",
-			"apps/inno-agent/scripts/**/*",
-			"node_modules/**/*",
-			"!node_modules/.cache/**/*"
-		],
-		"asarUnpack": [
-			"apps/inno-agent/presets/**/*",
-			"apps/inno-agent/scripts/**/*"
-		],
-		"mac": {
-			"icon": "build/icon.icns",
-			"target": [
-				{
-					"target": "dmg",
-					"arch": [
-						"arm64"
-					]
-				}
-			],
-			"category": "public.app-category.productivity",
-			"darkModeSupport": true
-		},
-		"dmg": {
-			"title": "Inno Agent"
-		},
-		"linux": {
-			"icon": "build/icon.png",
-			"category": "Education",
-			"artifactName": "${name}-${version}-${arch}.${ext}",
-			"target": [
-				{
-					"target": "AppImage",
-					"arch": [
-						"arm64",
-						"x64"
-					]
-				}
-			]
-		},
-		"win": {
-			"icon": "build/icon.png",
-			"target": [
-				{
-					"target": "nsis",
-					"arch": [
-						"x64"
-					]
-				},
-				{
-					"target": "msi",
-					"arch": [
-						"x64"
-					]
-				}
-			]
-		},
-		"nsis": {
-			"oneClick": false,
-			"allowToChangeInstallationDirectory": true,
-			"perMachine": false
-		},
-		"msi": {
-			"oneClick": false,
-			"perMachine": false
-		}
 	},
 	"devDependencies": {
 		"@tailwindcss/vite": "^4.1.7",
@@ -119,8 +36,6 @@
 		"@testing-library/react": "^16.3.2",
 		"@types/node": "^24.3.0",
 		"concurrently": "^9.2.1",
-		"electron": "^42.3.0",
-		"electron-builder": "^26.8.1",
 		"jsdom": "^30.0.1",
 		"shx": "^0.4.0",
 		"tailwindcss": "^4.1.7",

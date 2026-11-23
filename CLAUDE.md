@@ -9,9 +9,7 @@ This is an npm workspaces monorepo (Node.js >=22.19.0, ES modules) for **Inno Ag
 - `apps/inno-agent/` — backend (HTTP server), TypeScript, compiles to `dist/`. Entry point is `dist/server.js`.
 - `apps/inno-agent/web/` — frontend (React 19 + Tailwind 4 + Vite), workspace `inno-agent-web`.
 - `apps/showcase/` — separate static demo viewer for exported replay cases (workspace `inno-agent-showcase`); its data export pipeline was removed together with the legacy runtime.
-- `electron/` — Electron main process (`main.js` + `loading.html`) for desktop builds.
-- `build/` — desktop app icons (`icon.icns`, `icon.png`, `icon.svg`).
-- `scripts/` — Electron packaging scripts (`build-mac.sh`, signing/verification helpers) and the self-hosted content hub server (`content-hub-server/`).
+- `scripts/` — the self-hosted content hub server (`content-hub-server/`) and dev/eval helpers.
 - `docs/` — screenshots, use-case guides, `SYSTEM_DEPENDENCIES.md`, and the durable runtime/roadmap docs.
 - `runtime/` — local runtime state (config, data, skills); gitignored. Mapped to `INNO_*` env vars.
 - `workspace/` — default agent working directory; gitignored.
@@ -22,7 +20,7 @@ PI SDK packages used: `@earendil-works/pi-durable` and `@earendil-works/pi-ai` (
 
 Key dependencies: `cron-parser` (scheduler), `@larksuiteoapi/node-sdk` (Feishu), `typebox` (validation), `undici` (HTTP client), `better-auth` + `pg` (optional multi-user auth), `graphology` + `graphology-communities-louvain` (wiki knowledge graph), `yaml` (YAML parsing), `@llamaindex/liteparse` (document parsing), `@tavily/core` (web search). The `ask_user_question` schema/validation is vendored from `@juicesharp/rpiv-ask-user-question` (MIT) under `src/agent/ask-user-question/`.
 
-Tests run with `npm test` (`vitest run`, root script) and also execute in the test and release CI. The PostgreSQL-free suite is 124 files (956 tests), covering durable faux-model concurrency/tenant/configured-model/request-dedup/memory/OCR/channel-outbox/question/permission-recovery/cancellation/topic-generation/model-switch/edit-and-resend/context-usage/L3-indexing/scheduler/SIGKILL recovery/storage-lock-loss behavior, durable shard routing, workspace replica push/pull, structured attachment/inline-image projection, route units and a real-server smoke suite, and web chat trace/timeline components. Coverage for channels/scheduler/L3 is tracked in `docs/quality-remediation-plan.md`. The `npm run test:integration` suite separately exercises Better Auth with `INNO_MULTI_USER_ENABLED=true`, tenant provisioning/ownership, cross-tenant session/workspace denial, tenant-scoped BTW and memory storage, per-tenant provider credentials, channel identity isolation, atomic scheduled-run leases, durable storage advisory-lock contention, forwarding between workers including session-owner routing and cross-worker takeover after SIGKILL and after SIGSTOP zombie ownership (forward timeout, lease expiry, epoch fencing), cross-worker workspace-file restoration via the object-store replica, SSE reconnect replay, SIGKILL/restart recovery, durable cancellation, workspace attachments/inline images, topic generation and tenant-isolated L3 recall against a real temporary PostgreSQL instance and local fake model endpoints. These integration tests need a **ParadeDB** PostgreSQL 17 (the schema creates `vector`, `pg_trgm` and `pg_search`): set `INNO_TEST_DATABASE_URL`, or let `db/test-postgres.ts` start a disposable `paradedb/paradedb:v0.25.11-pg17` container through docker (override with `INNO_TEST_PARADEDB_IMAGE`). The suite (17 files, 110 tests plus 5 env-gated skips, including the PostgreSQL session catalog, sandbox quota store, numbered-migration runner, recovery records, channel outbox, SSE journal, L3 index, L2 wiki backend, and the pi-durable `PgDurableStorage` — verified through pi-durable's official `createStorageConformance` suite plus lease-fencing, legacy SQLite import and a `storage-benchmark` comparison against the SQLite backend; plus a live E2B test that runs only with `E2B_API_KEY` and an S3 object-store test that runs only with `INNO_TEST_S3_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`, e.g. a local MinIO) was verified passing against ParadeDB v0.25.11. The TypeScript build (`npm run build`) remains the primary sanity check. No ESLint or Prettier configuration exists.
+Tests run with `npm test` (`vitest run`, root script) and also execute in the test and release CI. The PostgreSQL-free suite is 123 files (951 tests), covering durable faux-model concurrency/tenant/configured-model/request-dedup/memory/OCR/channel-outbox/question/permission-recovery/cancellation/topic-generation/model-switch/edit-and-resend/context-usage/L3-indexing/scheduler/SIGKILL recovery/storage-lock-loss behavior, durable shard routing, workspace replica push/pull, structured attachment/inline-image projection, route units and a real-server smoke suite, and web chat trace/timeline components. Coverage for channels/scheduler/L3 is tracked in `docs/quality-remediation-plan.md`. The `npm run test:integration` suite separately exercises Better Auth with `INNO_MULTI_USER_ENABLED=true`, tenant provisioning/ownership, cross-tenant session/workspace denial, tenant-scoped BTW and memory storage, per-tenant provider credentials, channel identity isolation, atomic scheduled-run leases, durable storage advisory-lock contention, forwarding between workers including session-owner routing and cross-worker takeover after SIGKILL and after SIGSTOP zombie ownership (forward timeout, lease expiry, epoch fencing), cross-worker workspace-file restoration via the object-store replica, SSE reconnect replay, SIGKILL/restart recovery, durable cancellation, workspace attachments/inline images, topic generation and tenant-isolated L3 recall against a real temporary PostgreSQL instance and local fake model endpoints. These integration tests need a **ParadeDB** PostgreSQL 17 (the schema creates `vector`, `pg_trgm` and `pg_search`): set `INNO_TEST_DATABASE_URL`, or let `db/test-postgres.ts` start a disposable `paradedb/paradedb:v0.25.11-pg17` container through docker (override with `INNO_TEST_PARADEDB_IMAGE`). The suite (17 files, 110 tests plus 5 env-gated skips, including the PostgreSQL session catalog, sandbox quota store, numbered-migration runner, recovery records, channel outbox, SSE journal, L3 index, L2 wiki backend, and the pi-durable `PgDurableStorage` — verified through pi-durable's official `createStorageConformance` suite plus lease-fencing, legacy SQLite import and a `storage-benchmark` comparison against the SQLite backend; plus a live E2B test that runs only with `E2B_API_KEY` and an S3 object-store test that runs only with `INNO_TEST_S3_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`, e.g. a local MinIO) was verified passing against ParadeDB v0.25.11. The TypeScript build (`npm run build`) remains the primary sanity check. No ESLint or Prettier configuration exists.
 
 When a PR changes the test count, the size of `server.ts`, or other structural facts stated in this file, update this file in the same PR — AI agents read it as ground truth.
 
@@ -40,7 +38,6 @@ Three tsconfig files, each self-contained (no `extends` chain):
 
 - **[README.md](./README.md)** — full project overview, design rationale, features, deployment, contributing.
 - **[QUICKSTART.md](./QUICKSTART.md)** — 5-minute setup guide (Chinese) with provider config examples.
-- **[ELECTRON_BUILD.md](./ELECTRON_BUILD.md)** — Electron packaging notes (Chinese).
 - **[apps/inno-agent/README.md](./apps/inno-agent/README.md)** — backend API route table and project structure (Chinese).
 - **[docs/SYSTEM_DEPENDENCIES.md](./docs/SYSTEM_DEPENDENCIES.md)** — full system-level dependency reference (build-time, runtime, Python environment, native modules). Essential for Docker/deployment work.
 - **[docs/MULTI_USER_DURABLE.md](./docs/MULTI_USER_DURABLE.md)** — multi-user Durable refactor overview, tenant isolation, storage/recovery semantics, real-service acceptance results, and production limitations.
@@ -123,25 +120,9 @@ bash restart-dev.sh --help       # list all options
 
 Supports `--mode dev|prod`, `--skip-build`, `--port <N>`, `--web-port <N>` (custom Vite dev port), `--tail` (follow server.log after starting). Environment variables: `INNO_MODE`, `INNO_WEB_PORT`. Equivalent npm shortcuts: `npm run restart` (full), `npm run restart:fast` (skip build).
 
-### Electron desktop builds
-
-```bash
-npm run electron              # Run desktop app locally
-npm run electron:build        # Package macOS DMG (arm64)
-npm run electron:build:win    # Package Windows NSIS + MSI (x64)
-```
-
-`electron/main.js` spawns the Node server as a child process (`ELECTRON_RUN_AS_NODE=1`), shows a loading window while polling `/health`, then opens the main window. First launch creates a default config at `~/.inno-agent/config/config.json`.
-
-### Electron build scripts
-
-- **`scripts/build-mac.sh`** — local macOS packaging script (alternative to CI). Supports `--bump patch|minor|major` for version increment and `--open` to open the output DMG.
-
 ### CI/CD
 
-GitHub Actions workflows (`.github/workflows/`):
-- `release-mac.yml` — macOS Electron DMG builds on ARM64 (`macos-14` runner), triggered by `v*.*.*` tags or workflow_dispatch with optional version override. Has commented-out code signing + notarization block.
-- `release-win.yml` — Windows NSIS + MSI builds on x64 (`windows-latest` runner), same trigger and version-override pattern.
+GitHub Actions workflow `.github/workflows/test.yml` runs `npm ci`, `npm test`, `npm run test:integration` and `npm run build` on Ubuntu. There are no desktop release workflows: the Electron client was dropped when the backend became a distributed, multi-worker service.
 
 ## Design Philosophy
 
@@ -175,7 +156,7 @@ When editing path-related code, change `runtime.ts` rather than hard-coding path
 
 ### Agent runtime (pi-durable)
 
-Every conversation is a **durable session**: one pi-durable harness over one `Storage` per session — a SQLite file in local/desktop mode (`<tenant data root>/durable/storage/<id>/session.sqlite`), PostgreSQL in authenticated mode (`PgDurableStorage` in `agent/pg-durable-storage.ts`, porting pi-durable's `SqliteStorage` onto shared `ds_*` tables scoped by `session_id` with JSON-text record columns; a legacy `session.sqlite` is imported once and renamed `session.sqlite.migrated`). A session catalog sits beside it behind the async `SessionCatalog` interface (`agent/session-catalog.ts`): local/desktop mode keeps `sessions.json` (`FileSessionCatalog`, read-modify-write under a cross-process `storage/file-lock.ts` lock); authenticated mode uses PostgreSQL (`PgSessionCatalog`, table `durable_sessions`, tenant-scoped rows written in the same transaction as `resource_ownership`; a tenant's legacy `sessions.json` is imported once on first access and renamed to `sessions.json.migrated`). Every `DurableSessionService` catalog method (`get`/`list`/`create`/`rename`/…) is async. There is no global "active session" and no prompt queue; the web UI and every background caller address a session by ID. `INNO_DURABLE_ENABLED` no longer exists — durable is always on, and `POST /api/sessions` accepts `runtime` only for older clients (anything but `"durable"` is rejected).
+Every conversation is a **durable session**: one pi-durable harness over one `Storage` per session — a SQLite file in local (single-node, file-backed) mode (`<tenant data root>/durable/storage/<id>/session.sqlite`), PostgreSQL in authenticated mode (`PgDurableStorage` in `agent/pg-durable-storage.ts`, porting pi-durable's `SqliteStorage` onto shared `ds_*` tables scoped by `session_id` with JSON-text record columns; a legacy `session.sqlite` is imported once and renamed `session.sqlite.migrated`). A session catalog sits beside it behind the async `SessionCatalog` interface (`agent/session-catalog.ts`): local/desktop mode keeps `sessions.json` (`FileSessionCatalog`, read-modify-write under a cross-process `storage/file-lock.ts` lock); authenticated mode uses PostgreSQL (`PgSessionCatalog`, table `durable_sessions`, tenant-scoped rows written in the same transaction as `resource_ownership`; a tenant's legacy `sessions.json` is imported once on first access and renamed to `sessions.json.migrated`). Every `DurableSessionService` catalog method (`get`/`list`/`create`/`rename`/…) is async. There is no global "active session" and no prompt queue; the web UI and every background caller address a session by ID. `INNO_DURABLE_ENABLED` no longer exists — durable is always on, and `POST /api/sessions` accepts `runtime` only for older clients (anything but `"durable"` is rejected).
 
 Key files in `apps/inno-agent/src/agent/`:
 
@@ -210,7 +191,7 @@ Durable specifics worth knowing:
 - `INNO_MULTI_USER_ENABLED=true` requires Better Auth at startup. Local and authenticated mode run the same session code; authenticated mode adds tenant roots, ownership checks and per-tenant provider config.
 - Unsupported capabilities (host shell, delete, rename, MCP, subagents) are absent, not emulated; a shell exists only inside the remote sandbox when it is enabled. See `docs/DURABLE_RUNTIME.md` and `docs/DURABLE_ROADMAP.md`.
 
-The Electron main process (`electron/main.js`) spawns the server as a child process with `ELECTRON_RUN_AS_NODE=1`. `server.ts` imports `source-map-support/register` at the top for readable stack traces and calls `applyRuntimeEnvironment` from `runtime.ts` before anything else runs.
+`server.ts` imports `source-map-support/register` at the top for readable stack traces and calls `applyRuntimeEnvironment` from `runtime.ts` before anything else runs.
 
 ### LLM Fetch Logger (`src/utils/fetch-logger.ts`)
 
@@ -296,7 +277,7 @@ Plain Node `http.createServer` (no framework), ~1300 lines plus route domains ex
 - `PATCH /api/settings/content-hub` — update content hub config.
 - `PATCH /api/settings/memory` — toggle L2/L3 memory.
 - `PATCH /api/settings/theme` — persist UI theme preference.
-- `GET /health` — health check (polled by Electron loading screen).
+- `GET /health` — health check (used by the container health checks and the nginx proxy).
 
 Static frontend is served from `paths.webDistDir = apps/inno-agent/web/dist` when present. Skills are read from `paths.skillsDir` (defaults to `<home>/skills`).
 
@@ -347,18 +328,14 @@ Pino-based logger with daily rotation to `<INNO_DATA_DIR>/log/server-YYYY-MM-DD.
 
 ## Docker
 
-### Production image (`deploy/Dockerfile`)
+### Production images (`deploy/Dockerfile.backend`, `deploy/Dockerfile.frontend`)
 
-Deployment manifests live under `deploy/` (`Dockerfile`, `Dockerfile.base`, `docker-compose.yml`). A multi-stage build using a custom base image (`inno-agent-base:v0.1`) from Alibaba Cloud Container Registry that pre-installs all system dependencies:
+Deployment manifests live under `deploy/` (`Dockerfile.backend`, `Dockerfile.frontend`, `nginx.conf.template`, `docker-compose.yml`). The frontend and backend ship as two images: `Dockerfile.frontend` builds the Vite bundle and serves it with nginx, which reverse-proxies `/api` and `/health` (SSE-safe: no buffering, long timeouts, 200m uploads) to `BACKEND_URL` (default `http://inno-agent:3000`); `Dockerfile.backend` compiles only the TypeScript server (no `web/dist`, so it is API-only). Compose publishes only the frontend (`3000:80`); with auth enabled add the public origin to `INNO_TRUSTED_ORIGINS`. The backend image is a multi-stage build on `node:22-bookworm` (there is no custom base image):
 
-- **Build stage**: installs build tools for native npm modules (python3, make, g++), configures Tsinghua mirrors, runs `npm ci` + `npm run build`, then `npm prune --production`.
-- **Runtime stage**: copies only `dist/` artifacts and production `node_modules`. Sets `NODE_ENV=production` and all `INNO_*` env vars for a production layout (`/etc/inno-agent` for config, `/var/lib/inno-agent` for data/skills, `/srv/inno-workspace` for workspace). Exposes port 3000.
-- **`deploy/docker-compose.yml`**: single service mapping port 3000, with volume mounts for `runtime/config/`, `runtime/data/`, `runtime/skills/`, and `workspace/` (paths relative to `deploy/`; build context is the repo root).
+- **Build stage**: installs build tools for native npm modules (python3, make, g++), configures Tsinghua mirrors, runs `npm ci` + the backend `tsc` build.
+- **Runtime stage**: installs python3 (pptx→svg converter) and copies `dist/`, `scripts/` and the full `node_modules` (no pruning). Sets `NODE_ENV=production` and all `INNO_*` env vars for a production layout (`/etc/inno-agent` for config, `/var/lib/inno-agent` for data/skills, `/srv/inno-workspace` for workspace). Exposes port 3000.
+- **`deploy/docker-compose.yml`**: `frontend` (nginx, host port 3000→80) and `inno-agent` (backend, internal 3000) services, with volume mounts for `runtime/config/`, `runtime/data/`, `runtime/skills/`, and `workspace/` (paths relative to `deploy/`; build context is the repo root).
 - **`.dockerignore`**: excludes `node_modules/`, `dist/`, `runtime/`, `workspace/`, `.env`, `.git`.
-
-### Base image (`deploy/Dockerfile.base`)
-
-Separate Dockerfile for building the custom base image. Based on `node:22-bookworm`, pre-installs all system dependencies (make, g++, unzip, zip, bash, wget, ca-certificates) plus Miniforge (Python >= 3.11 with scientific computing packages). See [docs/SYSTEM_DEPENDENCIES.md](./docs/SYSTEM_DEPENDENCIES.md) for the full dependency reference.
 
 ## Configuration
 

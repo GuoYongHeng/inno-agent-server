@@ -294,8 +294,8 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	const isWelcome = sessions.isWelcome;
 	const hasConversationStatus = Boolean(chat.pendingQuestion || chat.pendingPermission || sessions.busyBlocker);
 	const btwPanelOpen = useStoreSnapshot(btwStore, () => btwStore.isVisible);
-	// Sidebar/workspace layout shifts (e.g. after desktop window expansion) move
-	// the composer by translation without resizing it, so neither window resize
+	// Sidebar/workspace layout shifts move the composer by translation without
+	// resizing it, so neither window resize
 	// nor ResizeObserver fires. Track the layout values that shift the chat
 	// column and use them to nudge the floating panel to re-anchor.
 	const appLayout = useStoreSnapshot(appStore, () => ({
@@ -1559,7 +1559,7 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	const smartToastNode = smartToast ? (
 		<div className={`inno-smart-toast ${smartToast.error ? "is-error" : ""}`} role="status">{smartToast.message}</div>
 	) : null;
-	const btwControl = !isWelcome && sessions.currentSessionId && (!window.innoDesktop || appLayout.workspaceMode !== "collapsed") ? (
+	const btwControl = !isWelcome && sessions.currentSessionId ? (
 		<button
 			type="button"
 			className={`inno-conversation-btw-control flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--inno-text-subtle)] transition-colors hover:bg-[var(--inno-surface-muted)] hover:text-[var(--inno-text)] disabled:opacity-50 ${btwPanelOpen ? "bg-[var(--inno-accent-soft)] text-[var(--inno-accent)]" : ""}`}

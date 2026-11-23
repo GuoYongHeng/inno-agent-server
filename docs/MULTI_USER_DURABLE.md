@@ -10,7 +10,7 @@
 
 本次重构在不修改 PI SDK 内核的前提下加入两条路径：
 
-- 保留 CLI、Desktop 和 local server 的 legacy 行为；
+- 保留 local server 的文件存储模式（CLI 与 Desktop 已移除）；
 - 使用 `pi-durable` 为 Web 多用户服务提供独立会话并发、持久执行和崩溃恢复；
 - 使用 Better Auth + PostgreSQL 提供账号、personal tenant 和资源所有权；
 - 让模型配置、L2/L3、OCR、频道、工作区和后台任务按 tenant 隔离；
@@ -20,7 +20,7 @@
 
 | 维度 | Legacy | Durable |
 |---|---|---|
-| 默认场景 | CLI、Desktop、local server | 多用户 Web 服务；local 可显式启用 |
+| 默认场景 | local server | 多用户 Web 服务；local 可显式启用 |
 | 会话存储 | PI JSONL | 每个 session 一个 SQLite 数据库 |
 | 会话 ID | legacy session/`.jsonl` helper | `durable-<uuid>` |
 | 并发 | 单例 AgentSession + 全局 prompt queue | 独立 session 并发，不经过 legacy 全局队列 |

@@ -85,7 +85,6 @@ export function ChatWelcome({
 		: presets;
 	return (
 		<section className="relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-[var(--inno-chat-bg)]">
-			<div className="inno-chat-top-drag-region" aria-hidden="true" />
 			{topOverlay}
 			{smartToast}
 			{/* Soft radial glow behind the welcome column */}
