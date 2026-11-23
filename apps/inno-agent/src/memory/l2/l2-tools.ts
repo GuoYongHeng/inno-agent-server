@@ -82,6 +82,7 @@ export function createL2Tools(
 	restrictToWorkspace = false,
 	durableMode = false,
 	richGeneration?: RichGenerationProvider,
+	getFiles?: () => import("../../workspace/workspace-files.js").WorkspaceFileAccess | undefined,
 ): ToolRegistration[] {
 	const resolveDataDir = () => typeof l2DataDirInput === "function" ? l2DataDirInput() : l2DataDirInput;
 	const resolveMemory = (dataDir: string) => typeof l2Memory === "function"
@@ -151,8 +152,51 @@ export function createL2Tools(
 			let content: string;
 			let resolvedFilePath: string | undefined;
 
+			let fileRelPath: string | undefined;
+			const files = getFiles?.();
 			if (isFileType && params.filePath) {
 				// File-based: parse with LiteParse
+				if (files && restrictToWorkspace) {
+					const rel = files.toRelative(params.filePath);
+					if (!rel) {
+						return {
+							content: [{ type: "text" as const, text: "归档文件必须位于当前工作区内，且不能通过符号链接指向工作区外。" }],
+							details: { error: "outside_workspace" },
+						};
+					}
+					const entry = await files.stat(rel);
+					if (!entry || entry.kind !== "file") {
+						return {
+							content: [{ type: "text" as const, text: "归档文件必须位于当前工作区内，且不能通过符号链接指向工作区外。" }],
+							details: { error: "outside_workspace" },
+						};
+					}
+					fileRelPath = rel;
+					resolvedFilePath = rel;
+
+					let parsed;
+					try {
+						reportProgress("正在解析文件", "parsing");
+						const outcome = await files.withLocalFile(rel, async (localPath) => await parseDocument(localPath));
+						if (outcome === null) {
+							return {
+								content: [{ type: "text" as const, text: "归档文件必须位于当前工作区内，且不能通过符号链接指向工作区外。" }],
+								details: { error: "outside_workspace" },
+							};
+						}
+						parsed = outcome;
+						reportProgress(`已提取 ${parsed.pageCount} 页，正在生成摘要`, "parsed");
+					} catch (err) {
+						logger.warn({ err, filePath: resolvedFilePath }, "l2_archive: failed to parse document");
+						const msg = err instanceof DocumentParseError ? err.message : String(err);
+						return {
+							content: [{ type: "text" as const, text: `文件解析失败: ${msg}` }],
+							details: { error: err instanceof DocumentParseError ? err.code : "parse_error" },
+						};
+					}
+					content = parsed.text;
+					throwIfAborted(signal);
+				} else {
 				const workspaceDir = getActiveWorkspaceDir?.() || process.env.INNO_WORKSPACE_DIR || process.cwd();
 				const pathCheck = restrictToWorkspace
 					? checkWorkspaceMutationPath(workspaceDir, params.filePath)
@@ -184,6 +228,7 @@ export function createL2Tools(
 
 					content = parsed.text;
 					throwIfAborted(signal);
+				}
 			} else if (params.content) {
 				// Text-based: use content directly
 				content = params.content;
@@ -232,9 +277,12 @@ export function createL2Tools(
 					const existingRawPath = retryingSameContent && existing?.rawPath && (await store.exists(existing.rawPath))
 					? existing.rawPath
 					: undefined;
-				const rawPath = existingRawPath ?? (resolvedFilePath
-					? await saveRawFile(store, params.title, resolvedFilePath, sourceType)
-					: await saveRaw(store, params.title, content, sourceType, params.url));
+				const rawPath = existingRawPath ?? (fileRelPath !== undefined
+					? (await getFiles!()!.withLocalFile(fileRelPath, (localPath) => saveRawFile(store, params.title, localPath, sourceType))
+						?? await saveRaw(store, params.title, content, sourceType, params.url))
+					: resolvedFilePath
+						? await saveRawFile(store, params.title, resolvedFilePath, sourceType)
+						: await saveRaw(store, params.title, content, sourceType, params.url));
 
 				const id = existing?.id ?? `l2src_${randomUUID().slice(0, 8)}`;
 				const tags = params.tags ?? [];

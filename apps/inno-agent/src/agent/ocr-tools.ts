@@ -28,6 +28,8 @@ export interface OcrToolOptions {
 	restrictToWorkspace?: boolean;
 	/** Fixed workspace for native durable execution. Legacy uses its adapter context. */
 	workspaceDir?: string;
+	/** Workspace file access seam; defaults to local resolution over workspaceDir. */
+	files?: import("../workspace/workspace-files.js").WorkspaceFileAccess;
 	/** Persist submit/result checkpoints for replay-safe durable tool calls. */
 	durable?: {
 		records: RecoveryRecordStore;
@@ -151,6 +153,7 @@ async function submitJob(
 	workspaceDir: string,
 	signal: AbortSignal,
 	restrictToWorkspace: boolean,
+	files?: import("../workspace/workspace-files.js").WorkspaceFileAccess,
 ): Promise<string> {
 	const headers = authHeaders(cfg.token);
 	const endpoint = cfg.baseUrl;
@@ -176,16 +179,29 @@ async function submitJob(
 	}
 
 	// Local file mode — multipart/form-data with file, model, optionalPayload.
-	const localPath = resolveLocalPath(filePath, workspaceDir, restrictToWorkspace);
-	if (!localPath || !existsSync(localPath) || !statSync(localPath).isFile()) {
-		throw new Error(`找不到图片文件：${filePath}`);
+	let buffer: Buffer;
+	let uploadName: string;
+	if (files) {
+		const rel = files.toRelative(filePath);
+		const body = rel ? await files.read(rel) : null;
+		if (!body) {
+			throw new Error(`找不到图片文件：${filePath}`);
+		}
+		buffer = Buffer.from(body);
+		uploadName = basename(rel!);
+	} else {
+		const localPath = resolveLocalPath(filePath, workspaceDir, restrictToWorkspace);
+		if (!localPath || !existsSync(localPath) || !statSync(localPath).isFile()) {
+			throw new Error(`找不到图片文件：${filePath}`);
+		}
+		buffer = readFileSync(localPath);
+		uploadName = basename(localPath);
 	}
-	const buffer = readFileSync(localPath);
 	const form = new FormData();
 	form.set("model", cfg.model);
 	form.set("optionalPayload", JSON.stringify(OPTIONAL_PAYLOAD));
 	// Uint8Array copy so the Blob owns a plain ArrayBuffer (not Node's pooled one).
-	form.set("file", new Blob([new Uint8Array(buffer)]), basename(localPath));
+	form.set("file", new Blob([new Uint8Array(buffer)]), uploadName);
 
 	const resp = await fetch(endpoint, {
 		method: "POST",
@@ -339,6 +355,7 @@ export function createOcrTools(configHolder: ConfigHolder, options: OcrToolOptio
 							options.workspaceDir ?? process.cwd(),
 							requestSignal(signal),
 							Boolean(options.restrictToWorkspace),
+							options.files,
 						);
 						if (durable && operationId) {
 							checkpoint = { operationId, filePath, jobId };

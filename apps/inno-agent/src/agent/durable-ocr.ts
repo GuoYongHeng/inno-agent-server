@@ -10,6 +10,7 @@ export interface DurableOcrToolOptions {
 	records?: RecoveryRecordStore;
 	checkpointDir?: string;
 	workspaceDir: string;
+	files?: import("../workspace/workspace-files.js").WorkspaceFileAccess;
 	ocrApi?: InnoConfig["ocrApi"];
 }
 
@@ -21,6 +22,7 @@ export function createDurableOcrRegistrations(options: DurableOcrToolOptions): T
 	return createOcrTools(holder, {
 		restrictToWorkspace: true,
 		workspaceDir: options.workspaceDir,
+		files: options.files,
 		durable: {
 			records: options.records ?? new FileRecoveryStore(() => {
 				if (!options.checkpointDir) throw new Error("OCR checkpoints need a records store or a checkpoint directory");

@@ -1,11 +1,14 @@
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { createL2Tools } from "../memory/l2/l2-tools.js";
+import type { WorkspaceFileAccess } from "../workspace/workspace-files.js";
 import { createL3Tools, type ScopedL3Memory } from "../memory/l3/l3-tools.js";
 
 export interface DurableMemoryToolOptions {
 	sessionId: string;
 	l2DataDir: string;
 	workspaceDir: string;
+	/** Workspace file access seam for l2_archive file parsing/materialization. */
+	files?: WorkspaceFileAccess;
 	l2Enabled: boolean;
 	l3?: {
 		memory: Pick<ScopedL3Memory, "recall">;
@@ -23,6 +26,8 @@ export function createDurableMemoryTools(options: DurableMemoryToolOptions): Too
 		() => options.workspaceDir,
 		true,
 		true,
+		undefined,
+		() => options.files,
 	);
 	const l3Tools = options.l3
 		? createL3Tools(options.l3.memory, () => options.sessionId, () => options.l3!.enabled)

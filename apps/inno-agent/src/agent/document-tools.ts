@@ -4,14 +4,17 @@ import { existsSync } from "node:fs";
 import { resolve, isAbsolute } from "node:path";
 import { parseDocument, screenshotDocument, DocumentParseError } from "../memory/l2/document-parser.js";
 import { logger } from "../logger.js";
-import { checkWorkspaceMutationPath } from "./workspace-path-guard.js";
 import { defineInnoTool } from "./inno-tool.js";
+import { LocalWorkspaceFileAccess } from "../workspace/local-workspace-file-access.js";
+import type { WorkspaceFileAccess } from "../workspace/workspace-files.js";
 
 export interface DocumentToolOptions {
 	restrictToWorkspace?: boolean;
 	/** Session workspace. Durable sessions pass it explicitly; the legacy adapter
 	 * supplies the session cwd instead. */
 	workspaceDir?: string;
+	/** Workspace file access seam; defaults to a local access over workspaceDir. */
+	files?: WorkspaceFileAccess;
 }
 
 /**
@@ -52,34 +55,58 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolRegi
 			// the runtime's default workspace and can be different from the
 			// workspace bound to the current chat session.
 			const workspaceDir = options.workspaceDir || process.env.INNO_WORKSPACE_DIR || process.cwd();
-			const pathCheck = options.restrictToWorkspace
-				? checkWorkspaceMutationPath(workspaceDir, typed.filePath)
-				: {
-					allowed: true,
+			const files = options.files
+				?? new LocalWorkspaceFileAccess({ root: workspaceDir });
+			let resolvedPath: string;
+			let relPath: string | undefined;
+			if (options.restrictToWorkspace) {
+				const rel = files.toRelative(typed.filePath);
+				if (!rel) {
+					return {
+						content: [{ type: "text" as const, text: "文件路径必须位于当前工作区内，且不能通过符号链接指向工作区外。" }],
+						details: { error: "outside_workspace", filePath: typed.filePath, pageCount: 0, textLength: 0 },
+					};
+				}
+				relPath = rel;
+				resolvedPath = rel;
+			} else {
+				const pathCheck = {
+					allowed: true as const,
 					resolvedPath: isAbsolute(typed.filePath) ? typed.filePath : resolve(workspaceDir, typed.filePath),
 				};
-			if (!pathCheck.allowed || !pathCheck.resolvedPath) {
-				return {
-					content: [{ type: "text" as const, text: "文件路径必须位于当前工作区内，且不能通过符号链接指向工作区外。" }],
-					details: { error: pathCheck.reason ?? "outside_workspace", filePath: typed.filePath, pageCount: 0, textLength: 0 },
-				};
+				resolvedPath = pathCheck.resolvedPath;
 			}
-			const resolvedPath = pathCheck.resolvedPath;
 
 			// Check file existence before attempting parse
 			reportProgress("正在检查文件", "checking");
-			if (!existsSync(resolvedPath)) {
-				return {
-					content: [{ type: "text" as const, text: `文件不存在: ${typed.filePath}` }],
-					details: { error: "file_not_found", filePath: resolvedPath, pageCount: 0, textLength: 0 },
-				};
+			if (relPath === undefined) {
+				if (!existsSync(resolvedPath)) {
+					return {
+						content: [{ type: "text" as const, text: `文件不存在: ${typed.filePath}` }],
+						details: { error: "file_not_found", filePath: resolvedPath, pageCount: 0, textLength: 0 },
+					};
+				}
 			}
 
 			// Parse document
 			let parsed;
 			try {
 				reportProgress("正在解析文档", "parsing");
-				parsed = await parseDocument(resolvedPath);
+				if (relPath !== undefined) {
+					const outcome = await files.withLocalFile(relPath, async (localPath) => {
+						resolvedPath = localPath;
+						return await parseDocument(localPath);
+					});
+					if (outcome === null) {
+						return {
+							content: [{ type: "text" as const, text: `文件不存在: ${typed.filePath}` }],
+							details: { error: "file_not_found", filePath: typed.filePath, pageCount: 0, textLength: 0 },
+						};
+					}
+					parsed = outcome;
+				} else {
+					parsed = await parseDocument(resolvedPath);
+				}
 				reportProgress(`已读取 ${parsed.pageCount} 页，正在整理内容`, "parsed");
 			} catch (err) {
 				logger.warn({ err, filePath: resolvedPath }, "parse_document tool: document parsing failed");
@@ -118,7 +145,10 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolRegi
 			if (typed.includeScreenshots) {
 				try {
 					reportProgress("正在生成页面截图", "screenshots");
-					const screenshots = await screenshotDocument(resolvedPath);
+					const takeShots = async (path: string) => await screenshotDocument(path);
+					const screenshots = relPath !== undefined
+						? await files.withLocalFile(relPath, (localPath) => takeShots(localPath)) ?? []
+						: await takeShots(resolvedPath);
 					for (const shot of screenshots) {
 						content.push({
 							type: "image",

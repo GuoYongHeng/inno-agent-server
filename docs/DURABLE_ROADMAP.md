@@ -440,12 +440,13 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - **部署形态变更（已完成）**：产品定位转为分布式部署的后端 + 浏览器 Web UI，不再提供 Electron 桌面客户端。已删除 `electron/`、`build/`、mac/win/linux 打包脚本与发布工作流、`package.json` 的 `electron*` 脚本与依赖，以及前端 `window.innoDesktop` 桥接、窗口宽度扩展、`ui.closeBehavior` 配置与 `PUT /api/settings/close-behavior`。部署清单统一放在 `deploy/`：`Dockerfile.backend`（仅 API）、`Dockerfile.frontend`（nginx + 静态前端，反代 `/api`、`/health`）、`docker-compose.yml`；原单体 `Dockerfile` 与 `Dockerfile.base` 已删除。浏览器版面板开关保留为 `PanelToggles`。
 - benchmark 现状：单条读/写 ~0.2–2.7ms PG 固有开销可接受；`commit 100 entries` 批量化后仍 ~74–140ms（Docker PG 往返主导），若真实部署往返更低可复跑基线；进一步压缩需减少 fencing UPDATE/unnest INSERT 的往返（如 PREPARE 或单语句复合写）。
 
-### H5 无状态后端：会话文件离开 worker 磁盘（进行中：S0、S1 已完成，其余未开始）
+### H5 无状态后端：会话文件离开 worker 磁盘（进行中：S0、S1、S2 已完成，其余未开始）
 
 **进度**（实施顺序：S0 → S1 → S2 → S3 → S4 → 阶段 6，每一步系统保持一致、可上线）：
 - S0 已完成：T0.2 故障注入测试（`agent/durable-tool-replay.test.ts`）。
 - S1 已完成：T1.1/T1.2（迁移 v12、`WorkspaceStore` 接口与 `ObjectWorkspaceStore`/`LocalFsWorkspaceStore` 两个实现、14 项共用契约测试、复制器支持空目录）；T1.3 的读路由部分（目录树、文件内容、raw、下载文件夹、office/pptx 预览改读 `WorkspaceStore`；认证模式且对象存储为 `s3`/`fs` 时读对象存储与 PG 清单，不碰 worker 磁盘）；S1c（`workspace_change` 事件发布前先 `replica.push`，按工作区排队合并、10 秒上限，`drain()` 保证 `done` 不会先于最后一次变化事件，见 `server/replica-push.ts`）。
-- 未开始：T1.3 的写路由（随阶段 3 一起迁）、T1.4、T1.5、阶段 2 到 6。
+- S2 已完成（T2.1 到 T2.5，行为不变的重构）：新增 `WorkspaceFileAccess` 接口（`workspace/workspace-files.ts`：`toRelative`/`stat`/`read`/`withLocalFile`/`withLocalDir`）与两个实现——`LocalWorkspaceFileAccess`（真实目录，沿用 `checkWorkspaceMutationPath` 的判定，不复制文件）和 `StoreWorkspaceFileAccess`（任意 `WorkspaceStore`，需要真实路径时物化到 0700 临时目录并保证清理）。`parse_document`、`ocr_image`、`send_file_to_channel`（发件箱快照在临时文件清理前完成）、`l2_archive` 的文件分支、工作区上下文（`agent.md`、`.skills`）都改走该接口；`durable-session-service` 每次打开运行时创建一个 `LocalWorkspaceFileAccess`，所以当前行为与改造前一致。三个实现共用契约测试，五类工具有 Local 与 Store(对象存储) 的结果一致性测试。阶段 3 换执行目录时只需改 `durable-session-service` 里的接线。
+- 未开始：T1.3 的写路由与 T1.4 附件上传（随阶段 3 一起迁到 `WorkspaceStore`）、T1.5、T2.6、阶段 3 到 6。
 - 守卫：对象存储未配置（默认 `memory`）时，认证模式仍读本地磁盘并在启动时告警。原因：内存对象存储进程重启后字节丢失而清单仍在，面板会列出打不开的文件，且复制器的本地状态认为已推送，不会重传。
 
 **S1 实施中的发现**：
@@ -453,6 +454,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - 对象删除、移动、`deleteAll` 在清单提交后尽力删除对象，失败只记日志，没有清理孤儿对象的任务；需要一个按 `list(prefix)` 对比清单的清扫器。
 - `starts_with(rel_path, prefix)` 在 `(tenant_id, workspace_id)` 主键前缀范围内做顺序扫描，随工作区文件数线性增长；存在性与最大 mtime 检查已改为单条聚合查询（`summarizeWorkspacePrefix`），列表与遍历仍取回子树全部行（上限 10 万行）。
 - 行为差异：`normalizeWorkspacePath` 比旧的 `normalizeWorkspaceRelativePath` 严格，反斜杠输入现在返回 404（原先改写为 `/`）；指向工作区外的符号链接不再列出（原先作为无子节点显示）；认证模式下目录树的 `root` 为空字符串（前端不使用）。
+- S2 中仅 Store 实现才有的差异：`parse_document` 的 `details.filePath` 是临时物化路径；`l2_archive` 经接口找不到文件时返回 `outside_workspace`（原为解析错误）；工作区技能的 `<location>` 指向物化出的 `.skills` 目录；`toRelative` 对 `a\b` 这类 POSIX 合法但不可寻址的名字返回 null。遗留在 `node:fs` 上的只有 `restrictToWorkspace === false` 的本地模式分支和未传 `files` 的旧调用方，工具层之外 `ChannelToolsDeps.workspaceDir` 与 `workspaceRegistry` 回退仍为非 durable 调用方保留。
 - S1c 对后续的约束：推送源是会话的持久本地目录 `state.workspaceRoot`；阶段 3 把执行目录换成每任务临时目录时，推送必须改为以实际物化的目录为源。10 秒上限意味着极大的变化突发可能在最后字节落地前发布事件，面板下一个事件会补上。
 
 **动机**：现在 `read`/`write`/`edit` 固定注册（`durable-session-service.ts` 里 `workspaceTools: true`）并写 worker 本地磁盘；本地文件模式下磁盘是唯一状态，无法横向扩展。H4 的 workspace 复制只把本地盘变成"可恢复的缓存"：写入先落本地，worker 在一轮对话中途死亡会丢这一轮的写入。目标是后端不再持有任何会话文件。

@@ -55,11 +55,12 @@ import { PgDurableStorage } from "./pg-durable-storage.js";
 import type { PersistedQuestion, QuestionBridgeResult, QuestionResponseStatus } from "./question-types.js";
 import type { PermissionDecision, PermissionResponseStatus } from "./permission-types.js";
 import { INNO_SYSTEM_PROMPT } from "./system-prompt.js";
-import { buildWorkspaceContextSections } from "./workspace-context.js";
+import { buildWorkspaceContextSectionsFrom } from "./workspace-context.js";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { buildDurableContextUsage, unavailableContextUsage, type UsageMessage } from "./context-usage.js";
 import type { SessionContextUsage } from "../shared/context-usage.js";
 import { createDocumentTools } from "./document-tools.js";
+import { LocalWorkspaceFileAccess } from "../workspace/local-workspace-file-access.js";
 import { buildGlobalSkillsSection } from "./skills.js";
 import { createTavilyTools } from "./tavily-tools.js";
 import { formatRecallForPrompt, ScopedL3Memory } from "../memory/l3/l3-tools.js";
@@ -957,6 +958,7 @@ export class DurableSessionService {
 						}
 						const workspaceDir = this.options.resolveWorkspaceDir(id, workspaceId);
 						if (!workspaceDir) throw new Error(`Durable session workspace not found: ${record.workspaceId}`);
+						const workspaceFiles = new LocalWorkspaceFileAccess({ root: workspaceDir });
 						if (tenant && this.options.workspaceReplica) {
 							replicaDir = { tenant, workspaceId, dir: workspaceDir };
 							await this.options.workspaceReplica.pull(tenant, workspaceId, workspaceDir);
@@ -976,6 +978,7 @@ export class DurableSessionService {
 							sessionId: id,
 							l2DataDir: join(tenantDataRoot, "l2"),
 							workspaceDir,
+							files: workspaceFiles,
 							l2Enabled: config.memory?.l2Enabled !== false,
 							l3: { memory: l3Memory, enabled: config.memory?.l3Enabled !== false },
 						};
@@ -983,6 +986,7 @@ export class DurableSessionService {
 							sessionId: id,
 							records: this.ocrStore(req, tenantDataRoot),
 							workspaceDir,
+							files: workspaceFiles,
 							ocrApi: config.ocrApi,
 						};
 						const baseChannelRegistry = this.options.getChannelRegistry?.();
@@ -990,6 +994,7 @@ export class DurableSessionService {
 							sessionId: id,
 							outbox: this.channelOutbox(req, tenantDataRoot),
 							workspaceDir,
+							files: workspaceFiles,
 							channelRegistry: bindChannelRegistry(req, baseChannelRegistry, this.options.tenantStore),
 						} : undefined;
 						const sandboxManager = this.options.getSandboxManager?.();
@@ -1022,7 +1027,7 @@ export class DurableSessionService {
 								sandbox
 									? sandbox.rebasePaths(buildGlobalSkillsSection(this.options.skillsDir) ?? "")
 									: buildGlobalSkillsSection(this.options.skillsDir),
-								...buildWorkspaceContextSections(workspaceDir).map((section) => sandbox ? sandbox.rebasePaths(section) : section),
+								...(await buildWorkspaceContextSectionsFrom(workspaceFiles)).map((section) => sandbox ? sandbox.rebasePaths(section) : section),
 							].filter((section): section is string => Boolean(section)).join("\n\n"),
 							...(sandbox ? { sandbox } : {}),
 							workspaceDir,
@@ -1034,9 +1039,10 @@ export class DurableSessionService {
 							questions: {
 								store: this.questionStore(req, id),
 								workspaceDir,
+								files: workspaceFiles,
 							},
 							extraTools: [
-								...createDocumentTools({ restrictToWorkspace: true, workspaceDir }),
+								...createDocumentTools({ restrictToWorkspace: true, workspaceDir, files: workspaceFiles }),
 								...createTavilyTools({ current: config }),
 								...bindToolsToTenant(this.options.getSchedulerTools?.() ?? [], tenant, this.options.tenantStore),
 							],

@@ -238,6 +238,8 @@ export class DurableQuestionStore {
 export interface DurableQuestionToolOptions {
 	store: DurableQuestionStore;
 	workspaceDir: string;
+	/** Reserved workspace file access seam; the question tool does not read files today. */
+	files?: import("../workspace/workspace-files.js").WorkspaceFileAccess;
 }
 
 /** Replay-safe re-entry presents the same persisted question after reopen. A

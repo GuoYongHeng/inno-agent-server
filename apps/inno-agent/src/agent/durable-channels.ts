@@ -9,6 +9,8 @@ export interface DurableChannelToolOptions {
 	outbox?: ChannelOutbox;
 	outboxDir?: string;
 	workspaceDir: string;
+	/** Workspace file access seam for send_file_to_channel resolution/snapshot. */
+	files?: import("../workspace/workspace-files.js").WorkspaceFileAccess;
 	channelRegistry: ChannelRegistry;
 }
 
@@ -19,6 +21,7 @@ export function createDurableChannelRegistrations(options: DurableChannelToolOpt
 	return createChannelTools({
 		channelRegistry: options.channelRegistry,
 		workspaceDir: options.workspaceDir,
+		files: options.files,
 		allowWorkspaceFallback: true,
 		durable: {
 			outbox: resolveChannelOutbox(options),
