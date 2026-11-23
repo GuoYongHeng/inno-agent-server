@@ -453,6 +453,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 **已定设计**：
 - 普通会话不依赖执行环境：聊天、L2/L3 记忆、联网搜索、提问、OCR、文档解析都不需要文件系统，状态在 PG 与对象存储。
 - 附件进对象存储：上传直接写对象存储并登记 `workspace_files`，`parse_document`/`ocr_image`/`send_file_to_channel` 改为按对象取字节，不再按宿主机路径读。
+- 能力扩展靠技能，不靠新增工具：内置工具集保持很小（`read`/`write`/`edit`/`bash` 加少数内置工具），新能力以技能形式提供（全局技能目录与工作区 `.skills/`，说明进提示词，脚本由模型经 `bash`/`read` 执行）。因此执行环境（含 `bash`）是唯一关键抽象，`SandboxBackend` 的文件与命令接口必须稳定，任何 provider 都要满足。内置工具若要访问文件，只能通过注入的 `env` 或 `WorkspaceStore`，不得直接 `import node:fs` 读写工作区路径。
 - 工作面板与对象存储的交互（参考业界主流：AWS 预签名 URL 指南、Vercel Blob 客户端直传）：元数据（目录树、列表、改名、删除、移动、权限检查）与小文件/文本保存走后端 `WorkspaceStore` API；大文件上传、下载与二进制预览走预签名 URL 浏览器直连对象存储，后端不在字节路径上。面板始终读取对象存储与 PG 清单，不读 worker 磁盘；后端服务器只做计算，不留会话状态。
 - 模型自己调用才创建执行环境：`bash`/`read`/`write`/`edit` 被调用时才懒创建（`GuardedSandboxBackend` 本就以"尚未就绪"启动，由 `activate()` 占配额并连接）。
 - 一次任务的流程：首次调用文件/命令工具 → 新建执行环境 → 从 OSS 拉工作区所需文件 → 执行 → 变化文件推回 OSS 并更新 `workspace_files` → 销毁。下一次任务重新创建，重复同一流程。前端预览/下载走对象存储。认证模式下不再有写 worker 持久目录的本地文件工具。
@@ -485,8 +486,9 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 | T2.1 | `parse_document` 从 `WorkspaceStore` 取字节；需要本地路径时用系统临时目录，用完即删，不作为状态 | M |
 | T2.2 | `ocr_image` 同上 | M |
 | T2.3 | `send_file_to_channel` 同上 | S |
-| T2.4 | 审计其余约 15 个引用 `workspaceDir` 的文件（`durable-memory`、`durable-channels`、`durable-questions`、`l2-tools` 等），逐个判断是本地路径还是应改走存储 | M |
-| T2.5 | `workspace-context` 的 `agent.md`、`.skills` 改从 `WorkspaceStore` 读取 | S |
+| T2.4 | 审计其余约 15 个引用 `workspaceDir` 的文件（`durable-memory`、`durable-channels`、`durable-questions`、`l2-tools` 等），逐个判断是本地路径还是应改走存储；改造完成后手写的 `HOST_PATH_TOOLS` 清单（`durable-runtime.ts`）及 `pullBeforeHostPathTools` 即可删除 | M |
+| T2.5 | `workspace-context` 的 `agent.md`、工作区 `.skills/` 改从 `WorkspaceStore` 读取 | S |
+| T2.6 | 全局技能的来源：目前全局技能目录（`INNO_SKILLS_DIR`）是 worker 本地磁盘上的状态，没有复制，换 worker 技能就丢。改为来自共享存储（对象存储，按清单同步）或随后端镜像分发，二选一待定；技能列表与说明由共享来源生成，不读 worker 本地目录；激活执行环境时把全局技能同步进环境（沿用 `SANDBOX_SKILLS_ROOT` 路径约定） | M |
 
 阶段 3：无状态执行环境（第 3 批，依赖 T0.2 与 T1.1，最关键）
 
@@ -498,7 +500,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 | T3.3 | 推送时机：写文件类工具调用完成且无命令在运行时增量推送，避免推到写了一半的文件 | M |
 | T3.4 | 生命周期：任务结束或 runtime 关闭时最终推送并销毁执行环境；更新孤儿清理（`sandbox:fsck`，另需覆盖本地临时目录），环境 ID 只用于进行中任务 | M |
 | T3.5 | 工具集：认证模式下 `read`/`write`/`edit`/`bash` 全部经 provider 执行，去掉写 worker 持久目录的 `WorkspaceFileEnv`；由配置选择 provider（本地/E2B 协议） | M |
-| T3.6 | 提示词里的路径改写（`rebasePaths`、`promptSection`）适配新流程 | S |
+| T3.6 | 提示词里的路径改写（`rebasePaths`、`promptSection`）适配新流程，同时覆盖全局技能与工作区技能的路径 | S |
 
 阶段 4：清理
 
@@ -543,9 +545,12 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - 执行环境把产物推回 OSS 的方式：第一版由后端 worker 经 provider 的文件接口读出再上传 OSS；沙箱阶段可评估让沙箱用预签名 URL 直传 OSS（需放行 OSS 域名并把预签名范围限定在该租户前缀）。
 - 浏览器直传时对象元数据里没有 `sha256`（`S3ObjectStore.put` 目前把 `sha256` 写进对象元数据供清单校验）：改用签名里的校验和头，或 `HeadObject` 后由后端补算；所用 OSS 对校验和头的支持程度需实测。
 - 增量推送的触发粒度（每次写文件类工具调用后，还是固定间隔）。
+- 全局技能的分发方式（T2.6）：对象存储同步（无需重新发版即可更新技能，但要处理同步与缓存）还是随后端镜像分发（简单，更新要发版）。
+- 技能需要 API 密钥时的注入方式（按租户注入到执行环境，不写进技能文件）；第一期本地执行可暂缓，迁移到沙箱时需要。
 
 **已知风险**：
 - 第一期工具（含 `bash`）在 worker 上本地执行，没有隔离；该风险已知并接受，迁移到沙箱后消失。
+- 技能脚本依赖 `bash` 与运行环境：技能需要的 Python 包、命令行工具必须预装在后端镜像（第一期）或沙箱模板（后期），否则每个任务都要重装；技能访问外网时，迁移到沙箱后需在出口白名单里放行对应域名。
 - 只在结束时同步会丢中途产物，故需增量推送；环境在两次推送之间死亡仍会丢这一小段。
 - 每次任务都是冷启动：依赖、虚拟环境和缓存不保留（`WorkspaceSync` 本就忽略 `.venv`、`node_modules`）；本地 provider 依赖 worker 镜像里预装的工具，沙箱阶段依赖模板预装。
 - 新环境是空盘，工作区文件多时首次拉取较慢；沿用单文件 20 MiB、5000 个文件、深度 24 的上限，并考虑按需拉取。
