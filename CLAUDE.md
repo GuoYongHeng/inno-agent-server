@@ -347,16 +347,16 @@ Pino-based logger with daily rotation to `<INNO_DATA_DIR>/log/server-YYYY-MM-DD.
 
 ## Docker
 
-### Production image (`Dockerfile`)
+### Production image (`deploy/Dockerfile`)
 
-A multi-stage build using a custom base image (`inno-agent-base:v0.1`) from Alibaba Cloud Container Registry that pre-installs all system dependencies:
+Deployment manifests live under `deploy/` (`Dockerfile`, `Dockerfile.base`, `docker-compose.yml`). A multi-stage build using a custom base image (`inno-agent-base:v0.1`) from Alibaba Cloud Container Registry that pre-installs all system dependencies:
 
 - **Build stage**: installs build tools for native npm modules (python3, make, g++), configures Tsinghua mirrors, runs `npm ci` + `npm run build`, then `npm prune --production`.
 - **Runtime stage**: copies only `dist/` artifacts and production `node_modules`. Sets `NODE_ENV=production` and all `INNO_*` env vars for a production layout (`/etc/inno-agent` for config, `/var/lib/inno-agent` for data/skills, `/srv/inno-workspace` for workspace). Exposes port 3000.
-- **`docker-compose.yml`**: single service mapping port 3000, with volume mounts for `runtime/config/`, `runtime/data/`, `runtime/skills/`, and `workspace/`.
+- **`deploy/docker-compose.yml`**: single service mapping port 3000, with volume mounts for `runtime/config/`, `runtime/data/`, `runtime/skills/`, and `workspace/` (paths relative to `deploy/`; build context is the repo root).
 - **`.dockerignore`**: excludes `node_modules/`, `dist/`, `runtime/`, `workspace/`, `.env`, `.git`.
 
-### Base image (`Dockerfile.base`)
+### Base image (`deploy/Dockerfile.base`)
 
 Separate Dockerfile for building the custom base image. Based on `node:22-bookworm`, pre-installs all system dependencies (make, g++, unzip, zip, bash, wget, ca-certificates) plus Miniforge (Python >= 3.11 with scientific computing packages). See [docs/SYSTEM_DEPENDENCIES.md](./docs/SYSTEM_DEPENDENCIES.md) for the full dependency reference.
 

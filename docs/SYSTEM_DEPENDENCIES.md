@@ -32,7 +32,7 @@
 | **unzip** | `/usr/bin/unzip` | [`server.ts:642`](apps/inno-agent/src/server.ts#L642) [`server.ts:719`](apps/inno-agent/src/server.ts#L719) | 1. 技能包 ZIP 解压安装<br>2. ZIP 文件内容校验（`unzip -Z1`） |
 | **zip** | `/usr/bin/zip` | [`server.ts:688`](apps/inno-agent/src/server.ts#L688) | 工作区目录下载时打包为 ZIP 归档 |
 
-> ⚠️ **注意**：当前 Dockerfile 的 runtime 阶段只安装了 `unzip`，缺少 `zip`。如需支持工作区下载功能，需补充安装 `zip`。
+> ⚠️ **注意**：当前 `deploy/Dockerfile` 的 runtime 阶段只安装了 `unzip`，缺少 `zip`。如需支持工作区下载功能，需补充安装 `zip`。
 
 ### 2.2 安装命令（Debian/Ubuntu）
 

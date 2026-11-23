@@ -67,7 +67,7 @@ S1 对齐 → S2 解耦共享代码 → S3 切换入口 → S4 物理删除 → 
 - 只有一个运行时：pi-durable。本地/桌面与多用户共用同一执行路径，区别只在认证、租户根目录和 PG 支撑的所有权检查。
 - `INNO_DURABLE_ENABLED` 不再是开关；`runtime: "durable"` 请求字段、`durableRequired`、`durable_required` 409、legacy 会话 ID 判断全部删除。
 - 移除依赖：`pi-coding-agent`、`pi-sandbox`、`pi-subagents`、`pi-mcp-adapter`、`pi-web-access`、`@gotgenes/pi-permission-system`、`@injaneity/pi-computer-use`、`@juicesharp/rpiv-todo`、`@juicesharp/rpiv-ask-user-question`、`node-pty`；`@earendil-works/pi-web-ui` 在 web 端的使用范围需先核对，决定能否一并移除 root 里的旧版 `pi-ai`。
-- Docker/Electron：`Dockerfile.base` 的 `bubblewrap`、`socat` 可移除；`scripts/after-pack.cjs` 和 `build.asarUnpack` 里 `node-pty` 相关条目可移除；`restart-dev.sh` 的 `--sandbox` 移除。
+- Docker/Electron：`deploy/Dockerfile.base` 的 `bubblewrap`、`socat` 可移除；`scripts/after-pack.cjs` 和 `build.asarUnpack` 里 `node-pty` 相关条目可移除；`restart-dev.sh` 的 `--sandbox` 移除。
 - 加固完成后：任一 worker 可接管任一会话，状态进 PG（加对象存储），执行在沙箱中。
 
 ## 5. 设计原则
@@ -191,7 +191,7 @@ S4 期间发现并修复的回归：
 
 - **依赖**：后端移除 `@earendil-works/pi-coding-agent`、`@gotgenes/pi-permission-system`、`@injaneity/pi-computer-use`、`@juicesharp/rpiv-ask-user-question`、`@juicesharp/rpiv-todo`、`node-pty`、`pi-mcp-adapter`、`pi-sandbox`、`pi-subagents`、`pi-web-access`、`ws`、`@types/ws`、`jiti`；前端移除 `@juicesharp/rpiv-ask-user-question`、`pi-subagents`、`@xterm/*`。锁文件重新生成：删除 256 个包，保留下来的包版本零变化；`npm ci` 干净重装后构建与测试通过。`@earendil-works/pi-web-ui` 保留（前端仍在用）。
 - **`ask_user_question`**：采用"拷进仓库"方案。questionnaire 的 schema、校验和响应信封（约 300 行，MIT）放在 `src/agent/ask-user-question/`，附上游 LICENSE 并带来源注释，durable 不再通过 jiti 加载外部包。新增了对应的单元测试。
-- **打包与镜像**：删除 `scripts/after-pack.cjs` 和 `build.afterPack`（它只为 `node-pty` 的 `spawn-helper` 存在），`asarUnpack` 去掉 `node-pty`、`pi-computer-use`、`@homebridge`；`Dockerfile.base` 去掉沙箱用的 `bubblewrap`、`socat`、`ripgrep`；`restart-dev.sh` 去掉 `--sandbox`；Electron 默认配置去掉 `subagents`；`config.example.json` 去掉 `subagents`、`mcp`、`plugins`。
+- **打包与镜像**：删除 `scripts/after-pack.cjs` 和 `build.afterPack`（它只为 `node-pty` 的 `spawn-helper` 存在），`asarUnpack` 去掉 `node-pty`、`pi-computer-use`、`@homebridge`；`deploy/Dockerfile.base` 去掉沙箱用的 `bubblewrap`、`socat`、`ripgrep`；`restart-dev.sh` 去掉 `--sandbox`；Electron 默认配置去掉 `subagents`；`config.example.json` 去掉 `subagents`、`mcp`、`plugins`。
 - **顺带清理**：未使用的 `WEB_ACCESS_PROMPT_HINT`、前端 `TodoWidget`、上下文用量里的 `mcp` 分类、指向旧插件的注释。
 - **文档**：重写 `CLAUDE.md`（480 → 约 420 行，全部按现状）；`README.md`、`README.zh-CN.md`、`QUICKSTART.md`、`apps/inno-agent/README.md`、`docs/AUTHENTICATION.md`、`docs/SYSTEM_DEPENDENCIES.md`、`docs/features/context-usage.md` 同步更新；`docs/PERMISSIONS_AND_SANDBOX.md` 改写为 `docs/PERMISSIONS.md`（没有 shell、没有沙箱，只有工作区文件边界和写入审批）；`DURABLE_RUNTIME.md`、`MULTI_USER_DURABLE.md`、`quality-remediation-plan.md`、`apps/showcase/*` 加了说明性提示。**这几份仍保留大量与旧运行时对比的历史描述**，读的时候以文件开头的说明为准，没有逐段重写。
 - **发布说明要点**：移除的能力（CLI、bash 与终端、MCP、子代理、系统沙箱、权限三档模式、computer-use、codemode、斜杠命令里的智能体命令、回放案例导出）；旧 JSONL 会话历史不再可见（文件仍在磁盘上，可手动清理 `data/sessions/*.jsonl`）；`config.json` 里的 `plugins`、`mcp`、`subagents` 字段会在下次保存时被丢弃。

@@ -2,7 +2,9 @@ services:
   # File-backed runtime: keep exactly one replica and stop it before replacement.
   # PostgreSQL metadata does not make the data/workspace volumes shareable.
   inno-agent:
-    build: .
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
     ports:
       - "3000:3000"
     environment:
@@ -20,10 +22,10 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ./runtime/config:/etc/inno-agent
-      - ./runtime/data:/var/lib/inno-agent/data
-      - ./runtime/skills:/var/lib/inno-agent/skills
-      - ./workspace:/srv/inno-workspace
+      - ../runtime/config:/etc/inno-agent
+      - ../runtime/data:/var/lib/inno-agent/data
+      - ../runtime/skills:/var/lib/inno-agent/skills
+      - ../workspace:/srv/inno-workspace
 
   postgres:
     image: postgres:18-alpine

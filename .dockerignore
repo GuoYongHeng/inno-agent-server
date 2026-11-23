@@ -8,8 +8,7 @@ workspace
 .git
 .gitignore
 *.md
-!Dockerfile
-docker-compose.yml
+deploy
 .env
 .DS_Store
 electron/loading.html

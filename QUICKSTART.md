@@ -134,4 +134,4 @@ npm run web:dev        # 终端 2 — Vite :5173（代理 /api 到 :3000）
 - 写入审批与文件访问边界:[docs/PERMISSIONS.md](./docs/PERMISSIONS.md)
 - 自定义 skill：把 `<skill-name>.zip` 通过 Web UI 的 Skills 页面上传，或直接放进 `runtime/skills/<name>/`
 - 配 Feishu / WeChat 渠道：编辑 `runtime/config/config.json` 的 `channels` 块
-- 部署到生产：参考 README 的 Production Shape 一节，或用 `Dockerfile` / `docker-compose.yml`
+- 部署到生产：参考 README 的 Production Shape 一节，或用 `deploy/` 目录下的 `Dockerfile` / `docker-compose.yml`

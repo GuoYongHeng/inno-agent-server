@@ -5,7 +5,7 @@
 # 和 Miniforge (Python >= 3.11) 科学计算环境。
 #
 # 构建：
-#   docker build -f Dockerfile.base -t inno-agent-base:latest .
+#   docker build -f deploy/Dockerfile.base -t inno-agent-base:latest .
 #
 # 使用（在应用 Dockerfile 中）：
 #   FROM inno-agent-base:latest

@@ -61,7 +61,7 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
 ### 方式 B —— Docker
 
 ```bash
-docker compose up -d   # 服务端口 3000,挂载 runtime/ 与 workspace/
+docker compose -f deploy/docker-compose.yml up -d   # 服务端口 3000,挂载 runtime/ 与 workspace/
 ```
 
 ## 运行模式
@@ -190,7 +190,7 @@ INNO_PORT=3000 \
 npm run server
 ```
 
-提供 [`Dockerfile`](./Dockerfile) 与 [`docker-compose.yml`](./docker-compose.yml) 作为起点；完整依赖说明见 [`docs/SYSTEM_DEPENDENCIES.md`](./docs/SYSTEM_DEPENDENCIES.md)。Better Auth + PostgreSQL、租户隔离和公网账号限制见 [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md)；Durable 架构、静态 worker 路由、验收结果和单 owner 部署边界见 [`docs/MULTI_USER_DURABLE.md`](./docs/MULTI_USER_DURABLE.md)。桌面打包说明见 [`ELECTRON_BUILD.md`](./ELECTRON_BUILD.md)。
+提供 [`deploy/Dockerfile`](./deploy/Dockerfile) 与 [`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 作为起点；完整依赖说明见 [`docs/SYSTEM_DEPENDENCIES.md`](./docs/SYSTEM_DEPENDENCIES.md)。Better Auth + PostgreSQL、租户隔离和公网账号限制见 [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md)；Durable 架构、静态 worker 路由、验收结果和单 owner 部署边界见 [`docs/MULTI_USER_DURABLE.md`](./docs/MULTI_USER_DURABLE.md)。桌面打包说明见 [`ELECTRON_BUILD.md`](./ELECTRON_BUILD.md)。
 
 ## 使用案例与文档
 

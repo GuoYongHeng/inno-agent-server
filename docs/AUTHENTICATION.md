@@ -19,7 +19,7 @@ npm run auth:migrate --workspace inno-agent
 
 The request path and normal server startup never create or alter tables. Startup fails if required auth configuration is missing, PostgreSQL is unavailable, or the schema has not been migrated. The reviewed Better Auth schema is pinned at `apps/inno-agent/src/db/better-auth-schema.sql`; `npm run auth:schema --workspace inno-agent` prints migration SQL for the configured database.
 
-For local development, `docker compose up postgres` starts PostgreSQL. Do not reuse the example password or secret in a real deployment.
+For local development, `docker compose -f deploy/docker-compose.yml up postgres` starts PostgreSQL. Do not reuse the example password or secret in a real deployment.
 
 ## Start the restricted multi-user runtime
 

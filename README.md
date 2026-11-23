@@ -63,7 +63,7 @@ Open **http://localhost:3000**. See **[QUICKSTART.md](./QUICKSTART.md)** (中文
 ### Option B — Docker
 
 ```bash
-docker compose up -d   # serves on :3000, mounts runtime/ and workspace/
+docker compose -f deploy/docker-compose.yml up -d   # serves on :3000, mounts runtime/ and workspace/
 ```
 
 ## Run Modes
@@ -193,7 +193,7 @@ INNO_PORT=3000 \
 npm run server
 ```
 
-A [`Dockerfile`](./Dockerfile) and [`docker-compose.yml`](./docker-compose.yml) are provided as starting points; see [`docs/SYSTEM_DEPENDENCIES.md`](./docs/SYSTEM_DEPENDENCIES.md) for the full dependency reference. Better Auth + PostgreSQL setup, tenant isolation, and public-account limitations are in [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md). The Durable architecture, static worker routing, verification results, and single-owner deployment boundary are in [`docs/MULTI_USER_DURABLE.md`](./docs/MULTI_USER_DURABLE.md). Desktop packaging notes are in [`ELECTRON_BUILD.md`](./ELECTRON_BUILD.md).
+A [`deploy/Dockerfile`](./deploy/Dockerfile) and [`deploy/docker-compose.yml`](./deploy/docker-compose.yml) are provided as starting points; see [`docs/SYSTEM_DEPENDENCIES.md`](./docs/SYSTEM_DEPENDENCIES.md) for the full dependency reference. Better Auth + PostgreSQL setup, tenant isolation, and public-account limitations are in [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md). The Durable architecture, static worker routing, verification results, and single-owner deployment boundary are in [`docs/MULTI_USER_DURABLE.md`](./docs/MULTI_USER_DURABLE.md). Desktop packaging notes are in [`ELECTRON_BUILD.md`](./ELECTRON_BUILD.md).
 
 ## Showcase Viewer
 
