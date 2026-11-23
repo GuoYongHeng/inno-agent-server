@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, lstatSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, posix } from "node:path";
+import { resolveContainedPath } from "../utils/path-safety.js";
 import {
 	SandboxFsError,
 	SandboxRunError,
@@ -15,10 +16,12 @@ import {
 } from "./sandbox-backend.js";
 
 /**
- * Test double: a "sandbox" that is a directory on the host and a shell that runs
- * there. It provides NO isolation and exists only so the sandbox adapter,
- * lifecycle and sync code can be exercised without a cloud account. Absolute
- * sandbox paths map under the sandbox's own root directory.
+ * A "sandbox" that is a directory on the host and a shell that runs there.
+ * File operations are contained under the root (lexically AND through
+ * symlinks: an escaping link fails with permission_denied instead of being
+ * followed). The shell itself is NOT confined — commands run with the
+ * backend's cwd but can reach the whole host filesystem; this backend
+ * provides no isolation.
  */
 export class LocalDirSandbox implements SandboxBackend {
 	killed = false;
@@ -28,12 +31,26 @@ export class LocalDirSandbox implements SandboxBackend {
 	metadata: Record<string, string> = {};
 	constructor(readonly id: string, readonly root: string) {}
 
+	/** Path followed to read/write/run — must stay inside the root, symlinks resolved. */
 	private host(path: string): string {
+		const rel = posix.normalize(path).replace(/^\/+/, "");
+		const contained = resolveContainedPath(this.root, rel);
+		if (!contained) throw new SandboxFsError("permission_denied", `Path escapes the sandbox root: ${path}`, path);
+		return contained;
+	}
+
+	/**
+	 * Path that is only lstat'd/removed/renamed (never followed): the entry
+	 * itself may be a symlink pointing anywhere, but its containing directory
+	 * must still be inside the root.
+	 */
+	private hostLstat(path: string): string {
+		this.host(posix.dirname(posix.normalize(path)));
 		return join(this.root, posix.normalize(path));
 	}
 
 	private entry(path: string, followLinks = true): SandboxEntry {
-		const host = this.host(path);
+		const host = followLinks ? this.host(path) : this.hostLstat(path);
 		try {
 			const stats = followLinks ? statSync(host) : lstatSync(host);
 			return {
@@ -100,7 +117,7 @@ export class LocalDirSandbox implements SandboxBackend {
 	async remove(path: string): Promise<void> {
 		try {
 			this.entry(path, false);
-			rmSync(this.host(path), { recursive: true });
+			rmSync(this.hostLstat(path), { recursive: true });
 		} catch (error) {
 			throw fsError(error, path);
 		}
@@ -109,7 +126,7 @@ export class LocalDirSandbox implements SandboxBackend {
 	async rename(from: string, to: string): Promise<void> {
 		try {
 			mkdirSync(dirname(this.host(to)), { recursive: true });
-			renameSync(this.host(from), this.host(to));
+			renameSync(this.hostLstat(from), this.host(to));
 		} catch (error) {
 			throw fsError(error, from);
 		}

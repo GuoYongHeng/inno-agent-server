@@ -4,6 +4,7 @@ import type { InnoSandboxConfig } from "../config.js";
 import { incCounter, observeMs } from "../utils/metrics.js";
 import { GuardedSandboxBackend, InMemorySandboxQuotaStore, quotaMessage, type SandboxQuotaStore } from "./sandbox-quota.js";
 import type { SandboxBackend, SandboxProvider } from "./sandbox-backend.js";
+import type { TenantContext } from "../tenants/store.js";
 import { WorkspaceSync } from "./workspace-sync.js";
 
 /** Where a session's workspace and the shared skills live inside its sandbox. */
@@ -40,6 +41,17 @@ export interface BindSandboxInput {
 	countTenantSandboxes?(): Promise<number>;
 	/** Persist a newly created sandbox's ID on the session. */
 	persistSandboxId(sandboxId: string): Promise<void>;
+	/** Workspace this session runs in; local providers use it for replica sync. */
+	workspaceId?: string;
+	/** Tenant the session belongs to; local providers use it for replica sync. */
+	tenantContext?: TenantContext;
+}
+
+/** Anything the durable session service can bind a runtime to: a remote
+ * sandbox provider or a local execution backend. */
+export interface SandboxBindingProvider {
+	bind(input: BindSandboxInput): Promise<SandboxRuntimeBinding>;
+	destroy(sandboxId: string): Promise<void>;
 }
 
 /** Creates, reconnects, pauses and destroys per-session sandboxes, within per-tenant limits. */

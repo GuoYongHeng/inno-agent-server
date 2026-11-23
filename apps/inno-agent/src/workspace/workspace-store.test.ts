@@ -9,7 +9,7 @@ import { LocalFsWorkspaceStore } from "./local-fs-workspace-store.js";
 import { ObjectWorkspaceStore } from "./object-workspace-store.js";
 import { workspaceObjectKey } from "./workspace-object-key.js";
 import { runWorkspaceStoreContract } from "./workspace-store.contract.js";
-import { WorkspaceStoreError, type WorkspaceStore } from "./workspace-store.js";
+import type { WorkspaceStore } from "./workspace-store.js";
 
 const roots: string[] = [];
 

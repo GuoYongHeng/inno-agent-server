@@ -1,5 +1,5 @@
 import { incCounter, observeMs } from "../utils/metrics.js";
-import type { SandboxManager, SandboxRuntimeBinding } from "../sandbox/sandbox-session.js";
+import type { SandboxBindingProvider, SandboxRuntimeBinding } from "../sandbox/sandbox-session.js";
 import {
 	DURABLE_ID_PATTERN,
 	FileSessionCatalog,
@@ -138,7 +138,7 @@ export interface DurableSessionServiceOptions {
 	/** PostgreSQL pool for authenticated tenants' recovery records; without it every scope keeps JSON files. */
 	recoveryPool?: Pool;
 	/** When set, every session runs its shell and file tools in a remote sandbox. */
-	getSandboxManager?: () => SandboxManager | undefined;
+	getSandboxManager?: () => SandboxBindingProvider | undefined;
 	openRuntime?: typeof DurableSessionRuntime.open;
 	completeTopic?: typeof completeConfiguredDurablePrompt;
 	completeChat?: typeof completeConfiguredDurableChat;
@@ -1004,6 +1004,8 @@ export class DurableSessionService {
 								...(tenant ? { tenantId: tenant.tenantId } : {}),
 								...(record.sandboxId ? { sandboxId: record.sandboxId } : {}),
 								hostWorkspaceDir: workspaceDir,
+								workspaceId,
+								...(tenant ? { tenantContext: tenant } : {}),
 								countTenantSandboxes: async () => (await this.catalogFor(req).list(req)).filter((entry) => entry.sandboxId).length,
 								...(this.options.skillsDir ? { hostSkillsDir: this.options.skillsDir } : {}),
 								stateDir: join(this.root(req), "storage", id),

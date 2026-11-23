@@ -5,8 +5,9 @@ import "source-map-support/register.js";
 import { auditDurableData } from "./agent/durable-audit.js";
 import { PgSessionCatalog } from "./agent/pg-session-catalog.js";
 import { createSandboxManager } from "./sandbox/index.js";
+import { LocalExecManager } from "./sandbox/local-exec-manager.js";
 import { PgSandboxQuotaStore } from "./sandbox/pg-sandbox-quota.js";
-import type { SandboxManager } from "./sandbox/sandbox-session.js";
+import type { SandboxBindingProvider } from "./sandbox/sandbox-session.js";
 import { renderPrometheus } from "./utils/metrics.js";
 import { createServer, type IncomingMessage as HttpReq } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -1048,14 +1049,19 @@ async function recordJobRunSession(sessionId: string, req?: HttpReq): Promise<vo
 // ---------------------------------------------------------------------------
 
 // Platform-level sandbox, built on first use because the config is loaded lazily.
-let sandboxManager: SandboxManager | null | undefined;
-function getSandboxManager(): SandboxManager | undefined {
+// Without a remote sandbox, INNO_EXEC_BACKEND=local runs every tool — bash
+// included — on this worker inside the session's workspace directory
+// (roadmap H5 phase 1); any other value keeps the workspace-file-only env.
+let sandboxManager: SandboxBindingProvider | null | undefined;
+function getSandboxManager(): SandboxBindingProvider | undefined {
 	if (sandboxManager === undefined) {
 		const sandboxConfig = normalizeSandboxConfig(config?.sandbox);
 		sandboxManager = sandboxConfig.enabled
 			? createSandboxManager(sandboxConfig, auth.tenantStore ? new PgSandboxQuotaStore(auth.tenantStore.database) : undefined)
-			: null;
-		if (sandboxManager) console.log(`[inno-server] sandbox enabled (${sandboxConfig.provider}, approval: ${sandboxConfig.requireApproval})`);
+			: process.env.INNO_EXEC_BACKEND === "local"
+				? new LocalExecManager({ ...(workspaceReplica ? { replica: workspaceReplica } : {}) })
+				: null;
+		if (sandboxManager) console.log(`[inno-server] ${sandboxConfig.enabled ? `sandbox enabled (${sandboxConfig.provider}, approval: ${sandboxConfig.requireApproval})` : "local execution backend enabled (bash runs on this worker)"}`);
 	}
 	return sandboxManager ?? undefined;
 }

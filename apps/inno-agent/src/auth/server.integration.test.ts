@@ -252,6 +252,32 @@ beforeAll(async () => {
 					return;
 				}
 			}
+			if (body.includes("durable-bash-write")) {
+				const request = JSON.parse(body) as { messages?: Array<{ role?: string }> };
+				const toolResults = request.messages?.filter((message) => message.role === "tool").length ?? 0;
+				if (toolResults === 0) {
+					res.writeHead(200, { "Content-Type": "text/event-stream" });
+					res.end([
+						`data: ${JSON.stringify({
+							id: "tenant-stub", object: "chat.completion.chunk", created: 0, model: "tenant-model",
+							choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{
+								index: 0, id: "durable-bash-write-call", type: "function",
+								function: { name: "bash", arguments: JSON.stringify({ command: "echo bash-content > bash-made.txt" }) },
+							}] }, finish_reason: null }],
+						})}`,
+						"",
+						`data: ${JSON.stringify({
+							id: "tenant-stub", object: "chat.completion.chunk", created: 0, model: "tenant-model",
+							choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+						})}`,
+						"",
+						"data: [DONE]",
+						"",
+						"",
+					].join("\n"));
+					return;
+				}
+			}
 			const questionPrompt = body.includes("durable-question");
 			if (questionPrompt) {
 				const request = JSON.parse(body) as { messages?: Array<{ role?: string }> };
@@ -2326,6 +2352,78 @@ describe("workspace read routes in authenticated mode", () => {
 			]) {
 				expect((await providerApi(providerOrigin, cookieB, path)).status, path).toBe(404);
 			}
+		} finally {
+			await stopServer(providerChild, providerHome);
+			await rm(objectStoreDir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("local exec backend runs bash on the worker and replicates the file", async () => {
+		const objectStoreDir = await mkdtemp(join(tmpdir(), "inno-localexec-objects-"));
+		const { child: providerChild, origin: providerOriginChild, home: providerHome } = await startProviderServer({
+			INNO_OBJECT_STORAGE_PROVIDER: "fs",
+			INNO_OBJECT_STORAGE_DIR: objectStoreDir,
+			INNO_EXEC_BACKEND: "local",
+		});
+		try {
+			const cookie = await providerRegister(providerOriginChild, "local-exec@example.com");
+			expect((await providerApi(providerOriginChild, cookie, "/api/settings/providers", {
+				method: "PUT",
+				body: JSON.stringify({
+					providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-bash-write-secret",
+					api: "openai-completions", makeDefault: true,
+					models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
+				}),
+			})).status).toBe(200);
+			const created = await providerApi(providerOriginChild, cookie, "/api/sessions", {
+				method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
+			});
+			expect(created.status).toBe(201);
+			const session = await created.json() as { id: string; workspaceId: string };
+
+			const response = await providerApi(providerOriginChild, cookie, "/api/chat/stream", {
+				method: "POST",
+				body: JSON.stringify({
+					sessionId: session.id,
+					prompt: "durable-bash-write",
+					clientRequestId: "durable-bash-write-request",
+				}),
+			});
+			expect(response.status).toBe(200);
+			const streamed = await readDurableStream(response);
+			expect(streamed).toContain('"toolName":"bash"');
+			expect(streamed).toContain('"type":"done"');
+
+			// The file bash wrote is in the fs object store, not just the worker's disk.
+			const readObjects = async (dir: string): Promise<string[]> => {
+				const out: string[] = [];
+				for (const entry of await readdir(dir, { withFileTypes: true })) {
+					const full = join(dir, entry.name);
+					if (entry.isDirectory()) out.push(...await readObjects(full));
+					else out.push(full);
+				}
+				return out;
+			};
+			const objectPaths = await readObjects(objectStoreDir);
+			const contents = await Promise.all(objectPaths.map((path) => readFile(path)));
+			expect(contents.some((bytes) => bytes.includes("bash-content"))).toBe(true);
+
+			// After the worker's local copy is deleted, panel reads still work
+			// from the manifest + object store.
+			const metaPool = new Pool({ connectionString: postgres.databaseUrl });
+			let relPath: string;
+			try {
+				const result = await metaPool.query<{ rel_path: string }>(
+					"SELECT rel_path FROM tenant_workspaces WHERE workspace_id = $1", [session.workspaceId],
+				);
+				relPath = result.rows[0]!.rel_path;
+			} finally {
+				await metaPool.end();
+			}
+			await rm(join(providerHome, "workspace", relPath), { recursive: true, force: true });
+			const raw = await providerApi(providerOriginChild, cookie, `/api/workspace/raw?workspaceId=${session.workspaceId}&path=bash-made.txt`);
+			expect(raw.status).toBe(200);
+			expect(await raw.text()).toBe("bash-content\n");
 		} finally {
 			await stopServer(providerChild, providerHome);
 			await rm(objectStoreDir, { recursive: true, force: true });

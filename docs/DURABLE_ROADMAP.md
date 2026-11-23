@@ -440,13 +440,15 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - **部署形态变更（已完成）**：产品定位转为分布式部署的后端 + 浏览器 Web UI，不再提供 Electron 桌面客户端。已删除 `electron/`、`build/`、mac/win/linux 打包脚本与发布工作流、`package.json` 的 `electron*` 脚本与依赖，以及前端 `window.innoDesktop` 桥接、窗口宽度扩展、`ui.closeBehavior` 配置与 `PUT /api/settings/close-behavior`。部署清单统一放在 `deploy/`：`Dockerfile.backend`（仅 API）、`Dockerfile.frontend`（nginx + 静态前端，反代 `/api`、`/health`）、`docker-compose.yml`；原单体 `Dockerfile` 与 `Dockerfile.base` 已删除。浏览器版面板开关保留为 `PanelToggles`。
 - benchmark 现状：单条读/写 ~0.2–2.7ms PG 固有开销可接受；`commit 100 entries` 批量化后仍 ~74–140ms（Docker PG 往返主导），若真实部署往返更低可复跑基线；进一步压缩需减少 fencing UPDATE/unnest INSERT 的往返（如 PREPARE 或单语句复合写）。
 
-### H5 无状态后端：会话文件离开 worker 磁盘（进行中：S0、S1、S2 已完成，其余未开始）
+### H5 无状态后端：会话文件离开 worker 磁盘（进行中：S0、S1、S2、S3 核心已完成，其余未开始）
 
 **进度**（实施顺序：S0 → S1 → S2 → S3 → S4 → 阶段 6，每一步系统保持一致、可上线）：
 - S0 已完成：T0.2 故障注入测试（`agent/durable-tool-replay.test.ts`）。
 - S1 已完成：T1.1/T1.2（迁移 v12、`WorkspaceStore` 接口与 `ObjectWorkspaceStore`/`LocalFsWorkspaceStore` 两个实现、14 项共用契约测试、复制器支持空目录）；T1.3 的读路由部分（目录树、文件内容、raw、下载文件夹、office/pptx 预览改读 `WorkspaceStore`；认证模式且对象存储为 `s3`/`fs` 时读对象存储与 PG 清单，不碰 worker 磁盘）；S1c（`workspace_change` 事件发布前先 `replica.push`，按工作区排队合并、10 秒上限，`drain()` 保证 `done` 不会先于最后一次变化事件，见 `server/replica-push.ts`）。
 - S2 已完成（T2.1 到 T2.5，行为不变的重构）：新增 `WorkspaceFileAccess` 接口（`workspace/workspace-files.ts`：`toRelative`/`stat`/`read`/`withLocalFile`/`withLocalDir`）与两个实现——`LocalWorkspaceFileAccess`（真实目录，沿用 `checkWorkspaceMutationPath` 的判定，不复制文件）和 `StoreWorkspaceFileAccess`（任意 `WorkspaceStore`，需要真实路径时物化到 0700 临时目录并保证清理）。`parse_document`、`ocr_image`、`send_file_to_channel`（发件箱快照在临时文件清理前完成）、`l2_archive` 的文件分支、工作区上下文（`agent.md`、`.skills`）都改走该接口；`durable-session-service` 每次打开运行时创建一个 `LocalWorkspaceFileAccess`，所以当前行为与改造前一致。三个实现共用契约测试，五类工具有 Local 与 Store(对象存储) 的结果一致性测试。阶段 3 换执行目录时只需改 `durable-session-service` 里的接线。
-- 未开始：T1.3 的写路由与 T1.4 附件上传（随阶段 3 一起迁到 `WorkspaceStore`）、T1.5、T2.6、阶段 3 到 6。
+- S3 核心已完成（T3.0/T3.1/T3.2 的本地一期）：`INNO_EXEC_BACKEND=local` 时 `LocalExecManager`（`sandbox/local-exec-manager.ts`）经 `SandboxRuntimeBinding` 把会话工作目录挂成 `LocalDirSandbox`，`bash` 随绑定自动注册，本地与认证模式都生效；env 走 `SandboxExecutionEnv`，路径语义与真实沙箱一致。`beforeTurn` 增量 `replica.pull`（面板经对象存储的写、其他 worker 的写在下一轮前可见），`pullToHost`（每轮 settle 后）与 `release` 增量 `replica.push`。远程沙箱开启时 E2B 优先，开关默认 `persistent`（不启用本地 bash）。`LocalDirSandbox` 已生产化：文件操作做 realpath containment（逃逸符号链接报 permission_denied 而非跟随），shell 本身不隔离（第一期已知并接受）。集成测试证明：`INNO_EXEC_BACKEND=local` + fs 对象存储下 bash 写文件 → 字节进对象存储 → 删本地目录后面板照常读。
+- S3 的取舍（与阶段 3 原方案的偏差）：没有做"每任务一个临时目录"——工作目录仍是 `resolveWorkspaceDir` 的稳定路径，但作为可随时丢弃的工作副本存在（pull 可重建，push 只删除自身状态文件里已知的文件，所以从未拉取的 worker 上写路由+push 是安全的）。写路由与附件上传因此不需要改动，对象存储直写面板仍留待 T1.4。T3.5/T4 的孤儿目录清理、遗留临时目录清扫仍未做。
+- 未开始：T1.4 附件/写路由走对象存储（可选）、T1.5、T2.6、T3.3 到 T3.6、阶段 4 到 6。
 - 守卫：对象存储未配置（默认 `memory`）时，认证模式仍读本地磁盘并在启动时告警。原因：内存对象存储进程重启后字节丢失而清单仍在，面板会列出打不开的文件，且复制器的本地状态认为已推送，不会重传。
 
 **S1 实施中的发现**：
