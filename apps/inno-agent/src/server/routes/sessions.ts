@@ -22,6 +22,7 @@ export interface SessionsRouteContext {
 	paths: RuntimePaths;
 	tenantStore?: TenantStore | null;
 	workspaceReplica?: WorkspaceReplica | null;
+	objectStorageDurable?: boolean;
 	durableSessions: DurableHttpContext["service"];
 	getContentSource: () => RemoteContentSource;
 	getCachedPresetAvailability?: (presetId: string) => boolean | null;
@@ -54,6 +55,8 @@ export async function handleSessionsRoutes(
 				service: durableSessions,
 				workspaceRegistry,
 				tenantStore,
+				workspaceReplica,
+				objectStorageDurable: ctx.objectStorageDurable,
 			});
 		}
 	}

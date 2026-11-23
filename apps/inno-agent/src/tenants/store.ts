@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import type { Pool, PoolClient } from "pg";
 import { logger } from "../logger.js";
+import { WorkspaceStoreError } from "../workspace/workspace-store.js";
 import { withTenantTransaction } from "./schema.js";
 
 export type ResourceKind = "session" | "workspace" | "job" | "channel" | "memory" | "terminal" | "permission";
@@ -15,6 +16,16 @@ export interface TenantContext {
 export interface LegacyResourceSet {
 	sessions: string[];
 	workspaces: string[];
+}
+
+export type WorkspaceFileKind = "file" | "directory";
+
+/** One row of the `workspace_files` manifest (files AND explicit directories). */
+export interface WorkspaceFileRow {
+	relPath: string;
+	kind: WorkspaceFileKind;
+	size: number;
+	mtimeMs: number;
 }
 
 export interface LegacyMigrationReport {
@@ -490,12 +501,193 @@ export class TenantStore {
 	}
 
 	/** The remote file listing for one workspace replica. */
-	async listWorkspaceFiles(context: TenantContext, workspaceId: string): Promise<Array<{ relPath: string; size: number; mtimeMs: number }>> {
-		const rows = await this.pool.query<{ rel_path: string; size: string; mtime_ms: string }>(
-			"SELECT rel_path, size, mtime_ms FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2",
+	async listWorkspaceFiles(context: TenantContext, workspaceId: string): Promise<WorkspaceFileRow[]> {
+		const rows = await this.pool.query<{ rel_path: string; kind: string; size: string; mtime_ms: string }>(
+			"SELECT rel_path, kind, size, mtime_ms FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2",
 			[context.tenantId, workspaceId],
 		);
-		return rows.rows.map((row) => ({ relPath: row.rel_path, size: Number(row.size), mtimeMs: Number(row.mtime_ms) }));
+		return rows.rows.map((row) => ({
+			relPath: row.rel_path,
+			kind: row.kind === "directory" ? "directory" : "file",
+			size: Number(row.size),
+			mtimeMs: Number(row.mtime_ms),
+		}));
+	}
+
+	/** One manifest row, or null. */
+	async getWorkspaceFile(context: TenantContext, workspaceId: string, relPath: string): Promise<WorkspaceFileRow | null> {
+		const rows = await this.pool.query<{ rel_path: string; kind: string; size: string; mtime_ms: string }>(
+			"SELECT rel_path, kind, size, mtime_ms FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2 AND rel_path = $3",
+			[context.tenantId, workspaceId, relPath],
+		);
+		const row = rows.rows[0];
+		return row ? {
+			relPath: row.rel_path,
+			kind: row.kind === "directory" ? "directory" : "file",
+			size: Number(row.size),
+			mtimeMs: Number(row.mtime_ms),
+		} : null;
+	}
+
+	/**
+	 * Manifest rows whose rel_path equals `prefix` or sits under `prefix + "/"`,
+	 * in rel_path order, capped at `limit` rows. `""` lists the whole workspace.
+	 */
+	async listWorkspaceFilesUnder(
+		context: TenantContext,
+		workspaceId: string,
+		prefix: string,
+		limit: number,
+	): Promise<WorkspaceFileRow[]> {
+		const rows = await this.pool.query<{ rel_path: string; kind: string; size: string; mtime_ms: string }>(
+			`SELECT rel_path, kind, size, mtime_ms FROM workspace_files
+			 WHERE tenant_id = $1 AND workspace_id = $2 AND starts_with(rel_path, $3)
+			 ORDER BY rel_path LIMIT $4`,
+			[context.tenantId, workspaceId, prefix, limit],
+		);
+		return rows.rows.map((row) => ({
+			relPath: row.rel_path,
+			kind: row.kind === "directory" ? "directory" : "file",
+			size: Number(row.size),
+			mtimeMs: Number(row.mtime_ms),
+		}));
+	}
+
+	/**
+	 * Cheap existence/mtime probe under `prefix` (`""` = whole workspace):
+	 * whether any descendant row exists and the newest mtime among them,
+	 * without materializing the rows.
+	 */
+	async summarizeWorkspacePrefix(
+		context: TenantContext,
+		workspaceId: string,
+		prefix: string,
+	): Promise<{ count: number; maxMtimeMs: number }> {
+		const rows = await this.pool.query<{ count: string; max_mtime_ms: string | null }>(
+			`SELECT COUNT(*)::text AS count, MAX(mtime_ms)::text AS max_mtime_ms
+			 FROM workspace_files
+			 WHERE tenant_id = $1 AND workspace_id = $2 AND starts_with(rel_path, $3)`,
+			[context.tenantId, workspaceId, prefix],
+		);
+		const row = rows.rows[0];
+		return { count: Number(row?.count ?? 0), maxMtimeMs: Number(row?.max_mtime_ms ?? 0) };
+	}
+
+	/** Upsert one manifest row (file or directory). */
+	async putWorkspaceFile(context: TenantContext, workspaceId: string, row: WorkspaceFileRow): Promise<void> {
+		await this.pool.query(
+			`INSERT INTO workspace_files (tenant_id, workspace_id, rel_path, kind, size, mtime_ms, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, NOW())
+			 ON CONFLICT (tenant_id, workspace_id, rel_path)
+			 DO UPDATE SET kind = EXCLUDED.kind, size = EXCLUDED.size,
+				mtime_ms = EXCLUDED.mtime_ms, updated_at = NOW()`,
+			[context.tenantId, workspaceId, row.relPath, row.kind, row.size, row.mtimeMs],
+		);
+	}
+
+	/**
+	 * Delete the row at `path` plus, when `descendants`, every row under
+	 * `path + "/"`, in one transaction. Returns the removed rows so callers can
+	 * clean up file objects afterwards.
+	 */
+	async deleteWorkspaceFiles(
+		context: TenantContext,
+		workspaceId: string,
+		path: string,
+		descendants: boolean,
+	): Promise<WorkspaceFileRow[]> {
+		const client = await this.pool.connect();
+		try {
+			return await withTenantTransaction(client, async () => {
+				const removed = await client.query<{ rel_path: string; kind: string; size: string; mtime_ms: string }>(
+					`DELETE FROM workspace_files
+					 WHERE tenant_id = $1 AND workspace_id = $2
+					   AND (rel_path = $3 OR ($4 AND starts_with(rel_path, $5)))
+					 RETURNING rel_path, kind, size, mtime_ms`,
+					[context.tenantId, workspaceId, path, descendants, path === "" ? "" : `${path}/`],
+				);
+				return removed.rows.map((row) => ({
+					relPath: row.rel_path,
+					kind: row.kind === "directory" ? "directory" as const : "file" as const,
+					size: Number(row.size),
+					mtimeMs: Number(row.mtime_ms),
+				}));
+			});
+		} finally {
+			client.release();
+		}
+	}
+
+	/**
+	 * Rewrite a path subtree to a new prefix in ONE transaction: the row at
+	 * `from` and every `from + "/"` descendant becomes `to` / `to + "/…"`.
+	 * Throws `WorkspaceStoreError("exists")` when the destination path or a
+	 * descendant of it already has a row, and a plain Error when the source
+	 * subtree changed underneath (moved count mismatch).
+	 */
+	async moveWorkspaceFiles(
+		context: TenantContext,
+		workspaceId: string,
+		from: string,
+		to: string,
+	): Promise<WorkspaceFileRow[]> {
+		const client = await this.pool.connect();
+		try {
+			return await withTenantTransaction(client, async () => {
+				const conflicts = await client.query(
+					`SELECT 1 FROM workspace_files
+					 WHERE tenant_id = $1 AND workspace_id = $2
+					   AND (rel_path = $3 OR starts_with(rel_path, $4)) LIMIT 1`,
+					[context.tenantId, workspaceId, to, `${to}/`],
+				);
+				if ((conflicts.rowCount ?? 0) > 0) {
+					throw new WorkspaceStoreError("exists", `destination exists: ${to}`, to);
+				}
+				const source = await client.query<{ rel_path: string; kind: string; size: string; mtime_ms: string }>(
+					`SELECT rel_path, kind, size, mtime_ms FROM workspace_files
+					 WHERE tenant_id = $1 AND workspace_id = $2
+					   AND (rel_path = $3 OR starts_with(rel_path, $4))
+					 FOR UPDATE`,
+					[context.tenantId, workspaceId, from, `${from}/`],
+				);
+				if (source.rows.length === 0) return [];
+				const moved: WorkspaceFileRow[] = source.rows.map((row) => ({
+					relPath: row.rel_path,
+					kind: row.kind === "directory" ? "directory" : "file",
+					size: Number(row.size),
+					mtimeMs: Number(row.mtime_ms),
+				}));
+				await client.query(
+					`DELETE FROM workspace_files
+					 WHERE tenant_id = $1 AND workspace_id = $2
+					   AND (rel_path = $3 OR starts_with(rel_path, $4))`,
+					[context.tenantId, workspaceId, from, `${from}/`],
+				);
+				await client.query(
+					`INSERT INTO workspace_files (tenant_id, workspace_id, rel_path, kind, size, mtime_ms, updated_at)
+					 SELECT $1, $2, rel_path, kind, size, mtime_ms, NOW()
+					 FROM unnest($3::text[], $4::text[], $5::bigint[], $6::double precision[]) AS t(rel_path, kind, size, mtime_ms)`,
+					[
+						context.tenantId, workspaceId,
+						moved.map((row) => to + row.relPath.slice(from.length)),
+						moved.map((row) => row.kind),
+						moved.map((row) => row.size),
+						moved.map((row) => row.mtimeMs),
+					],
+				);
+				return moved;
+			});
+		} finally {
+			client.release();
+		}
+	}
+
+	/** Drop every manifest row of the workspace. */
+	async deleteAllWorkspaceFiles(context: TenantContext, workspaceId: string): Promise<void> {
+		await this.pool.query(
+			"DELETE FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2",
+			[context.tenantId, workspaceId],
+		);
 	}
 
 	/**
@@ -505,7 +697,7 @@ export class TenantStore {
 	async syncWorkspaceFiles(
 		context: TenantContext,
 		workspaceId: string,
-		upserts: Array<{ relPath: string; size: number; mtimeMs: number }>,
+		upserts: Array<{ relPath: string; size: number; mtimeMs: number; kind?: WorkspaceFileKind }>,
 		deletes: string[],
 	): Promise<void> {
 		const client = await this.pool.connect();
@@ -513,12 +705,19 @@ export class TenantStore {
 			await withTenantTransaction(client, async () => {
 				if (upserts.length > 0) {
 					await client.query(
-						`INSERT INTO workspace_files (tenant_id, workspace_id, rel_path, size, mtime_ms, updated_at)
-						 SELECT $1, $2, rel_path, size, mtime_ms, NOW()
-						 FROM unnest($3::text[], $4::bigint[], $5::double precision[]) AS t(rel_path, size, mtime_ms)
+						`INSERT INTO workspace_files (tenant_id, workspace_id, rel_path, kind, size, mtime_ms, updated_at)
+						 SELECT $1, $2, rel_path, kind, size, mtime_ms, NOW()
+						 FROM unnest($3::text[], $4::text[], $5::bigint[], $6::double precision[]) AS t(rel_path, kind, size, mtime_ms)
 						 ON CONFLICT (tenant_id, workspace_id, rel_path)
-						 DO UPDATE SET size = EXCLUDED.size, mtime_ms = EXCLUDED.mtime_ms, updated_at = NOW()`,
-						[context.tenantId, workspaceId, upserts.map((f) => f.relPath), upserts.map((f) => f.size), upserts.map((f) => f.mtimeMs)],
+						 DO UPDATE SET kind = EXCLUDED.kind, size = EXCLUDED.size,
+							mtime_ms = EXCLUDED.mtime_ms, updated_at = NOW()`,
+						[
+							context.tenantId, workspaceId,
+							upserts.map((f) => f.relPath),
+							upserts.map((f) => f.kind ?? "file"),
+							upserts.map((f) => f.size),
+							upserts.map((f) => f.mtimeMs),
+						],
 					);
 				}
 				if (deletes.length > 0) {

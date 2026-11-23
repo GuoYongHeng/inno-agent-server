@@ -24,8 +24,14 @@ import { isWithin } from "../../utils/path-safety.js";
 import { TEMP_WORKSPACE_ID, type WorkspaceMeta, type WorkspaceRegistry } from "../../workspace/workspace-registry.js";
 import type { TenantStore } from "../../tenants/store.js";
 import { claimRequestResource, getRequestTenant, ownsRequestResource, releaseRequestResource } from "../../tenants/http.js";
-import { resolveRequestWorkspace } from "../../tenants/workspaces.js";
+import { resolveRequestWorkspace, resolveRequestWorkspaceForRead } from "../../tenants/workspaces.js";
 import type { WorkspaceReplica } from "../../workspace/workspace-replica.js";
+import { LocalFsWorkspaceStore } from "../../workspace/local-fs-workspace-store.js";
+import {
+	normalizeWorkspacePath,
+	WorkspaceStoreError,
+	type WorkspaceStore,
+} from "../../workspace/workspace-store.js";
 import {
 	canonicalTreeRoot,
 	contentDispositionAttachment,
@@ -63,6 +69,11 @@ export interface WorkspacesRouteContext {
 	scheduleSkillsReload: () => void;
 	durableSessions: DurableHttpContext["service"];
 	workspaceReplica?: WorkspaceReplica | null;
+	/**
+	 * server.ts resolves the per-request WorkspaceStore: object-store backed in
+	 * authenticated mode, local fs otherwise. Absent in tests → local fs.
+	 */
+	workspaceStoreFor?: (req: HttpReq) => WorkspaceStore;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +118,8 @@ function workspaceSkillNode(root: string, skillName: string): { name: string; pa
 // Deep enough to cover nested output conventions (e.g. skill runs that nest
 // <skill>/<slug>/<timestamp>/<artifact>/<file>), while still bounded so a
 // pathological tree cannot hang the request.
-function readWorkspaceTree(rootDir: string, dir: string, depth = 0, seen: ReadonlySet<string> = new Set()): WorkspaceTreeNode[] {
+// Exported for the store-parity test: the reference local-fs implementation.
+export function readWorkspaceTree(rootDir: string, dir: string, depth = 0, seen: ReadonlySet<string> = new Set()): WorkspaceTreeNode[] {
 	if (depth > WORKSPACE_TREE_MAX_DEPTH) return [];
 	const realRoot = canonicalTreeRoot(rootDir);
 	let entries: Dirent<string>[];
@@ -156,6 +168,86 @@ function readWorkspaceTree(rootDir: string, dir: string, depth = 0, seen: Readon
 			return node;
 		})
 		.filter((node): node is WorkspaceTreeNode => node !== null);
+}
+
+/**
+ * Build the `/api/workspace/tree` children from ONE `store.walk("")` pass —
+ * identical shape to `readWorkspaceTree`: directories first in zh-CN order,
+ * 200 entries per directory, `WORKSPACE_TREE_MAX_DEPTH` depth cap, ignored
+ * names already omitted by walk. Works for both stores; the manifest store
+ * yields implied directories explicitly so empty folders appear.
+ * Known difference vs the legacy reader: a symlink escaping the workspace
+ * root was listed as a childless node by `readWorkspaceTree` but is hidden by
+ * the store (same rule as `list`); directory `size` is 0 rather than the
+ * filesystem's own directory size.
+ */
+export async function workspaceTreeFromStore(store: WorkspaceStore, wsId: string): Promise<WorkspaceTreeNode[]> {
+	const dirChildren = new Map<string, Map<string, WorkspaceTreeNode>>();
+	const childrenOf = (dir: string): Map<string, WorkspaceTreeNode> => {
+		let children = dirChildren.get(dir);
+		if (!children) { children = new Map(); dirChildren.set(dir, children); }
+		return children;
+	};
+	childrenOf("");
+	for await (const entry of store.walk(wsId, "")) {
+		const segments = entry.path.split("/");
+		if (segments.length - 1 > WORKSPACE_TREE_MAX_DEPTH) continue;
+		const node: WorkspaceTreeNode = {
+			name: entry.name,
+			path: entry.path,
+			type: entry.kind,
+			size: entry.size,
+			updatedAt: new Date(entry.mtimeMs).toISOString(),
+		};
+		childrenOf(segments.slice(0, -1).join("/")).set(entry.name, node);
+		if (entry.kind === "directory" && segments.length <= WORKSPACE_TREE_MAX_DEPTH) {
+			childrenOf(entry.path);
+		}
+	}
+	const build = (dir: string): WorkspaceTreeNode[] => {
+		return [...(dirChildren.get(dir)?.values() ?? [])]
+			.sort((a, b) => Number(b.type === "directory") - Number(a.type === "directory")
+				|| a.name.localeCompare(b.name, "zh-CN"))
+			.slice(0, 200)
+			.map((node) => node.type === "directory" ? { ...node, children: build(node.path) } : node);
+	};
+	return build("");
+}
+
+/**
+ * Map a WorkspaceStoreError onto the status the legacy filesystem code
+ * produced for the same request shape (bad/missing paths were all 404).
+ */
+function workspaceReadStatus(error: unknown): number | null {
+	if (!(error instanceof WorkspaceStoreError)) return null;
+	if (error.code === "too_large") return 413;
+	if (error.code === "limit_exceeded") return 500;
+	return 404;
+}
+
+/**
+ * A real local path for tools that need one (document parser, pptx
+ * converter). LocalFs resolves the existing file; other stores materialize
+ * the bytes into a fresh temp dir that the caller must `cleanup()`.
+ */
+async function materializeWorkspaceFile(
+	store: WorkspaceStore,
+	wsId: string,
+	relPath: string,
+	localPath: (wsId: string, rel: string) => string | null,
+): Promise<{ filePath: string; cleanup: () => void } | null> {
+	if (store instanceof LocalFsWorkspaceStore) {
+		const filePath = localPath(wsId, relPath);
+		if (!filePath || !existsSync(filePath) || !statSync(filePath).isFile()) return null;
+		return { filePath, cleanup: () => undefined };
+	}
+	const read = await store.read(wsId, relPath);
+	if (!read) return null;
+	const dir = join(tmpdir(), `inno-wsread-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+	mkdirSync(dir, { recursive: true });
+	const filePath = join(dir, basename(relPath));
+	writeFileSync(filePath, read.body);
+	return { filePath, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 /**
@@ -345,13 +437,28 @@ export async function handleWorkspacesRoutes(
 		return true;
 	}
 
+	// Per-request workspace store: object store + manifest for tenants, the
+	// local directory otherwise. Read routes below never touch the worker's
+	// disk in authenticated mode.
+	const store = ctx.workspaceStoreFor?.(req)
+		?? new LocalFsWorkspaceStore({ resolveRoot: (id) => workspaceRegistry.resolveWorkspaceDir(id) });
+	let readWorkspaceMeta: { id: string; name: string } | null = null;
+
 	// Read-only file routes carry workspaceId in the query. Resolve tmp once and
-	// rewrite the local URL so every downstream helper uses the private directory.
+	// rewrite the local URL so every downstream helper uses the private id.
+	// The manifest-backed store reads without materializing; the local fallback
+	// must materialize/pull first because the worker's disk is its source of
+	// truth (a takeover worker's dir would otherwise read empty).
 	if ((method === "GET" || method === "HEAD") && url.startsWith("/api/workspace/")) {
 		const requested = new URL(url, "http://localhost");
-		const workspace = await resolveWorkspace(requested.searchParams.get("workspaceId"));
-		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
-		requested.searchParams.set("workspaceId", workspace.id);
+		const resolved = store instanceof LocalFsWorkspaceStore
+			? await resolveWorkspace(requested.searchParams.get("workspaceId"))
+			: await resolveRequestWorkspaceForRead(
+				req, workspaceRegistry, tenantStore, requested.searchParams.get("workspaceId"), ctx.workspaceReplica,
+			);
+		readWorkspaceMeta = resolved ? { id: resolved.id, name: resolved.name } : null;
+		if (!readWorkspaceMeta) { json(res, 404, { error: "Workspace not found" }); return true; }
+		requested.searchParams.set("workspaceId", readWorkspaceMeta.id);
 		url = `${requested.pathname}${requested.search}`;
 	}
 
@@ -399,19 +506,40 @@ export async function handleWorkspacesRoutes(
 	// --- Workspace API ---
 	if (method === "GET" && url.split("?")[0] === "/api/workspace/tree") {
 		const wsId = workspaceIdFromQuery(url);
-		const root = workspaceRegistry.resolveWorkspaceDir(wsId);
-		if (!root) { json(res, 404, { error: "Workspace not found" }); return true; }
-		ensureDir(root);
-		const stat = statSync(root);
+		let root = "";
+		let name = readWorkspaceMeta?.name ?? wsId;
+		let size = 0;
+		let updatedAt = new Date(0).toISOString();
+		if (store instanceof LocalFsWorkspaceStore) {
+			const dir = workspaceRegistry.resolveWorkspaceDir(wsId);
+			if (!dir) { json(res, 404, { error: "Workspace not found" }); return true; }
+			ensureDir(dir);
+			const stat = statSync(dir);
+			root = dir;
+			name = basename(dir);
+			size = stat.size;
+			updatedAt = stat.mtime.toISOString();
+		} else {
+			const rootStat = await store.stat(wsId, "");
+			if (rootStat) updatedAt = new Date(rootStat.mtimeMs).toISOString();
+		}
+		let children: WorkspaceTreeNode[];
+		try {
+			children = await workspaceTreeFromStore(store, wsId);
+		} catch (error) {
+			const status = workspaceReadStatus(error);
+			json(res, status ?? 500, { error: error instanceof Error ? error.message : "Workspace not found" });
+			return true;
+		}
 		json(res, 200, {
 			root,
 			workspaceId: wsId,
-			name: basename(root),
+			name,
 			path: "",
 			type: "directory",
-			size: stat.size,
-			updatedAt: stat.mtime.toISOString(),
-			children: readWorkspaceTree(root, root),
+			size,
+			updatedAt,
+			children,
 		});
 		return true;
 	}
@@ -420,52 +548,67 @@ export async function handleWorkspacesRoutes(
 		const params = new URL(url, "http://localhost").searchParams;
 		const requestedPath = params.get("path") ?? "";
 		const wsId = workspaceIdFromQuery(url);
-		const root = workspaceRegistry.resolveWorkspaceDir(wsId);
-		if (!root) { json(res, 404, { error: "Workspace not found" }); return true; }
-		const filePath = safeWorkspacePath(wsId, requestedPath);
-		if (!filePath || !existsSync(filePath) || !statSync(filePath).isFile()) {
+		let relPath: string;
+		let entry;
+		try {
+			relPath = normalizeWorkspacePath(requestedPath);
+			entry = await store.stat(wsId, relPath);
+		} catch (error) {
+			const status = workspaceReadStatus(error);
+			json(res, status ?? 500, { error: "Workspace file not found" });
+			return true;
+		}
+		if (!entry || entry.kind !== "file") {
 			json(res, 404, { error: "Workspace file not found" });
 			return true;
 		}
-		const stat = statSync(filePath);
-		const kind = workspaceFileKind(filePath);
-		const contentType = contentTypeForWorkspaceFile(filePath);
+		const kind = workspaceFileKind(relPath);
+		const contentType = contentTypeForWorkspaceFile(relPath);
+		const updatedAt = new Date(entry.mtimeMs).toISOString();
 		const forceText = params.get("forceText") === "1";
 		if (!forceText && (kind === "binary" || kind === "pdf" || kind === "image" || kind === "office")) {
-			const relPath = workspaceRelativePath(root, filePath);
 			const rawUrl = `/api/workspace/raw?workspaceId=${encodeURIComponent(wsId)}&path=${encodeURIComponent(relPath)}`;
-			const format = kind === "office" ? officeFormat(filePath) : undefined;
+			const format = kind === "office" ? officeFormat(relPath) : undefined;
 			// pptx is rendered as SVG via the Python converter; docx/xlsx are
 			// rendered client-side from the raw bytes, so they need no previewUrl.
-			let previewUrl: string | undefined;
-			if (format === "pptx") {
-				previewUrl = `/api/workspace/pptx-preview?workspaceId=${encodeURIComponent(wsId)}&path=${encodeURIComponent(relPath)}`;
-			}
+			const previewUrl = format === "pptx"
+				? `/api/workspace/pptx-preview?workspaceId=${encodeURIComponent(wsId)}&path=${encodeURIComponent(relPath)}`
+				: undefined;
 			json(res, 200, {
 				path: relPath,
-				name: basename(filePath),
+				name: basename(relPath),
 				kind,
 				format,
 				mimeType: contentType,
-				size: stat.size,
-				updatedAt: stat.mtime.toISOString(),
+				size: entry.size,
+				updatedAt,
 				url: rawUrl,
 				previewUrl,
 			});
 			return true;
 		}
-		if (stat.size > 1024 * 1024) {
+		if (entry.size > 1024 * 1024) {
 			json(res, 413, { error: "File is too large to preview as text" });
 			return true;
 		}
+		let body: Uint8Array;
+		try {
+			const read = await store.read(wsId, relPath);
+			if (!read) { json(res, 404, { error: "Workspace file not found" }); return true; }
+			body = read.body;
+		} catch (error) {
+			const status = workspaceReadStatus(error);
+			json(res, status ?? 500, { error: "Workspace file not found" });
+			return true;
+		}
 		json(res, 200, {
-			path: workspaceRelativePath(root, filePath),
-			name: basename(filePath),
+			path: relPath,
+			name: basename(relPath),
 			kind: forceText ? "text" : kind,
 			mimeType: forceText ? "text/plain; charset=utf-8" : contentType,
-			size: stat.size,
-			updatedAt: stat.mtime.toISOString(),
-			content: readFileSync(filePath, "utf-8"),
+			size: entry.size,
+			updatedAt,
+			content: Buffer.from(body).toString("utf-8"),
 		});
 		return true;
 	}
@@ -475,22 +618,30 @@ export async function handleWorkspacesRoutes(
 		const requestedPath = params.get("path") ?? "";
 		const wantsDownload = params.get("download") === "1";
 		const wsId = workspaceIdFromQuery(url);
-		const filePath = safeWorkspacePath(wsId, requestedPath);
-		if (!filePath || !existsSync(filePath) || !statSync(filePath).isFile()) {
+		let relPath: string;
+		let read;
+		try {
+			relPath = normalizeWorkspacePath(requestedPath);
+			read = await store.read(wsId, relPath);
+		} catch (error) {
+			const status = workspaceReadStatus(error);
+			json(res, status ?? 500, { error: "Workspace file not found" });
+			return true;
+		}
+		if (!read || read.entry.kind !== "file") {
 			json(res, 404, { error: "Workspace file not found" });
 			return true;
 		}
-		const content = readFileSync(filePath);
 		const headers: Record<string, string | number> = {
-			"Content-Type": contentTypeForWorkspaceFile(filePath),
-			"Content-Length": content.length,
+			"Content-Type": contentTypeForWorkspaceFile(relPath),
+			"Content-Length": read.body.length,
 			"Cache-Control": "no-store",
 		};
 		if (wantsDownload) {
-			headers["Content-Disposition"] = contentDispositionAttachment(basename(filePath));
+			headers["Content-Disposition"] = contentDispositionAttachment(basename(relPath));
 		}
 		res.writeHead(200, headers);
-		res.end(method === "GET" ? content : undefined);
+		res.end(method === "GET" ? Buffer.from(read.body) : undefined);
 		return true;
 	}
 
@@ -499,16 +650,55 @@ export async function handleWorkspacesRoutes(
 		const params = new URL(url, "http://localhost").searchParams;
 		const requestedPath = params.get("path") ?? "";
 		const wsId = workspaceIdFromQuery(url);
-		const root = workspaceRegistry.resolveWorkspaceDir(wsId);
-		if (!root) { json(res, 404, { error: "Workspace not found" }); return true; }
-		// Empty path → zip the whole workspace root.
-		const dirPath = requestedPath ? safeWorkspacePath(wsId, requestedPath) : root;
-		if (!dirPath || !existsSync(dirPath) || !statSync(dirPath).isDirectory()) {
-			json(res, 404, { error: "Workspace folder not found" });
+		let relPath: string;
+		let zipSource: string;
+		let cleanup: (() => void) | null = null;
+		try {
+			relPath = normalizeWorkspacePath(requestedPath);
+			const entry = await store.stat(wsId, relPath);
+			if (!entry || entry.kind !== "directory") {
+				json(res, 404, { error: "Workspace folder not found" });
+				return true;
+			}
+			if (store instanceof LocalFsWorkspaceStore) {
+				// Empty path → zip the whole workspace root (symlink-safe `zip -y`).
+				const root = workspaceRegistry.resolveWorkspaceDir(wsId);
+				const dirPath = requestedPath ? safeWorkspacePath(wsId, requestedPath) : root;
+				if (!dirPath || !existsSync(dirPath) || !statSync(dirPath).isDirectory()) {
+					json(res, 404, { error: "Workspace folder not found" });
+					return true;
+				}
+				zipSource = dirPath;
+			} else {
+				// Object store: materialize the subtree into a temp dir, preserving
+				// paths relative to the requested directory.
+				const staging = join(tmpdir(), `inno-wszip-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+				mkdirSync(staging, { recursive: true });
+				cleanup = () => rmSync(staging, { recursive: true, force: true });
+				const prefix = relPath === "" ? "" : `${relPath}/`;
+				for await (const item of store.walk(wsId, relPath)) {
+					const rel = item.path.slice(prefix.length);
+					const target = join(staging, ...rel.split("/"));
+					if (item.kind === "directory") {
+						mkdirSync(target, { recursive: true });
+						continue;
+					}
+					const read = await store.read(wsId, item.path);
+					if (!read) continue;
+					mkdirSync(dirname(target), { recursive: true });
+					writeFileSync(target, read.body);
+				}
+				zipSource = staging;
+			}
+		} catch (error) {
+			cleanup?.();
+			const status = workspaceReadStatus(error);
+			json(res, status ?? 500, { error: "Workspace folder not found" });
 			return true;
 		}
-		const archiveName = `${basename(dirPath) || basename(root) || "workspace"}.zip`;
+		const archiveName = `${basename(relPath) || basename(zipSource) || readWorkspaceMeta?.name || "workspace"}.zip`;
 		if (method === "HEAD") {
+			cleanup?.();
 			res.writeHead(200, {
 				"Content-Type": "application/zip",
 				"Content-Disposition": contentDispositionAttachment(archiveName),
@@ -518,7 +708,7 @@ export async function handleWorkspacesRoutes(
 			return true;
 		}
 		try {
-			const zipData = zipDirectory(dirPath);
+			const zipData = zipDirectory(zipSource);
 			res.writeHead(200, {
 				"Content-Type": "application/zip",
 				"Content-Length": zipData.length,
@@ -529,6 +719,8 @@ export async function handleWorkspacesRoutes(
 		} catch (err) {
 			logger.error({ err }, "failed to create zip archive");
 			json(res, 500, { error: err instanceof Error ? err.message : "Failed to create zip archive" });
+		} finally {
+			cleanup?.();
 		}
 		return true;
 	}
@@ -538,16 +730,28 @@ export async function handleWorkspacesRoutes(
 		const params = new URL(url, "http://localhost").searchParams;
 		const requestedPath = params.get("path") ?? "";
 		const wsId = workspaceIdFromQuery(url);
-		const filePath = safeWorkspacePath(wsId, requestedPath);
-		if (!filePath || !existsSync(filePath) || !statSync(filePath).isFile()) {
+		let relPath: string;
+		let materialized: { filePath: string; cleanup: () => void } | null = null;
+		try {
+			relPath = normalizeWorkspacePath(requestedPath);
+			materialized = await materializeWorkspaceFile(
+				store, wsId, relPath,
+				(id, rel) => safeWorkspacePath(id, rel),
+			);
+		} catch (error) {
+			const status = workspaceReadStatus(error);
+			json(res, status ?? 500, { error: "Workspace file not found" });
+			return true;
+		}
+		if (!materialized) {
 			json(res, 404, { error: "Workspace file not found" });
 			return true;
 		}
 		try {
 			const { parseDocument } = await import("../../memory/l2/document-parser.js");
-			const parsed = await parseDocument(filePath);
+			const parsed = await parseDocument(materialized.filePath);
 			json(res, 200, {
-				name: basename(filePath),
+				name: basename(relPath),
 				pageCount: parsed.pageCount,
 				text: parsed.text,
 				pages: parsed.pages,
@@ -555,6 +759,8 @@ export async function handleWorkspacesRoutes(
 		} catch (err) {
 			logger.warn({ err }, "failed to parse office document");
 			json(res, 422, { error: err instanceof Error ? err.message : "Failed to parse document" });
+		} finally {
+			materialized.cleanup();
 		}
 		return true;
 	}
@@ -564,19 +770,37 @@ export async function handleWorkspacesRoutes(
 		const params = new URL(url, "http://localhost").searchParams;
 		const requestedPath = params.get("path") ?? "";
 		const wsId = workspaceIdFromQuery(url);
-		const filePath = safeWorkspacePath(wsId, requestedPath);
-		if (!filePath || !existsSync(filePath) || !statSync(filePath).isFile()) {
+		let relPath: string;
+		let entry;
+		try {
+			relPath = normalizeWorkspacePath(requestedPath);
+			entry = await store.stat(wsId, relPath);
+		} catch (error) {
+			const status = workspaceReadStatus(error);
+			json(res, status ?? 500, { error: "Workspace file not found" });
+			return true;
+		}
+		if (!entry || entry.kind !== "file") {
 			json(res, 404, { error: "Workspace file not found" });
 			return true;
 		}
-		if (statSync(filePath).size > MAX_PPTX_BYTES) {
+		if (entry.size > MAX_PPTX_BYTES) {
 			json(res, 413, { error: "Presentation is too large to preview" });
 			return true;
 		}
+		let materialized: { filePath: string; cleanup: () => void } | null = null;
 		try {
-			const result = await convertPptxToSvg(paths.codeDir, filePath);
+			materialized = await materializeWorkspaceFile(
+				store, wsId, relPath,
+				(id, rel) => safeWorkspacePath(id, rel),
+			);
+			if (!materialized) {
+				json(res, 404, { error: "Workspace file not found" });
+				return true;
+			}
+			const result = await convertPptxToSvg(paths.codeDir, materialized.filePath);
 			json(res, 200, {
-				name: basename(filePath),
+				name: basename(relPath),
 				slideCount: result.slides.length,
 				slides: result.slides,
 				canvasPx: result.canvasPx,
@@ -587,6 +811,8 @@ export async function handleWorkspacesRoutes(
 				error: err instanceof Error ? err.message : "Failed to render presentation",
 				code: "PPTX_CONVERT_FAILED",
 			});
+		} finally {
+			materialized?.cleanup();
 		}
 		return true;
 	}

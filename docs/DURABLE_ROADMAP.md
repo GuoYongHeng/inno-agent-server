@@ -440,7 +440,20 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - **部署形态变更（已完成）**：产品定位转为分布式部署的后端 + 浏览器 Web UI，不再提供 Electron 桌面客户端。已删除 `electron/`、`build/`、mac/win/linux 打包脚本与发布工作流、`package.json` 的 `electron*` 脚本与依赖，以及前端 `window.innoDesktop` 桥接、窗口宽度扩展、`ui.closeBehavior` 配置与 `PUT /api/settings/close-behavior`。部署清单统一放在 `deploy/`：`Dockerfile.backend`（仅 API）、`Dockerfile.frontend`（nginx + 静态前端，反代 `/api`、`/health`）、`docker-compose.yml`；原单体 `Dockerfile` 与 `Dockerfile.base` 已删除。浏览器版面板开关保留为 `PanelToggles`。
 - benchmark 现状：单条读/写 ~0.2–2.7ms PG 固有开销可接受；`commit 100 entries` 批量化后仍 ~74–140ms（Docker PG 往返主导），若真实部署往返更低可复跑基线；进一步压缩需减少 fencing UPDATE/unnest INSERT 的往返（如 PREPARE 或单语句复合写）。
 
-### H5 无状态后端：会话文件离开 worker 磁盘（方案已定，未实施）
+### H5 无状态后端：会话文件离开 worker 磁盘（进行中：S0、S1 已完成，其余未开始）
+
+**进度**（实施顺序：S0 → S1 → S2 → S3 → S4 → 阶段 6，每一步系统保持一致、可上线）：
+- S0 已完成：T0.2 故障注入测试（`agent/durable-tool-replay.test.ts`）。
+- S1 已完成：T1.1/T1.2（迁移 v12、`WorkspaceStore` 接口与 `ObjectWorkspaceStore`/`LocalFsWorkspaceStore` 两个实现、14 项共用契约测试、复制器支持空目录）；T1.3 的读路由部分（目录树、文件内容、raw、下载文件夹、office/pptx 预览改读 `WorkspaceStore`；认证模式且对象存储为 `s3`/`fs` 时读对象存储与 PG 清单，不碰 worker 磁盘）；S1c（`workspace_change` 事件发布前先 `replica.push`，按工作区排队合并、10 秒上限，`drain()` 保证 `done` 不会先于最后一次变化事件，见 `server/replica-push.ts`）。
+- 未开始：T1.3 的写路由（随阶段 3 一起迁）、T1.4、T1.5、阶段 2 到 6。
+- 守卫：对象存储未配置（默认 `memory`）时，认证模式仍读本地磁盘并在启动时告警。原因：内存对象存储进程重启后字节丢失而清单仍在，面板会列出打不开的文件，且复制器的本地状态认为已推送，不会重传。
+
+**S1 实施中的发现**：
+- 复制器上限（5000 个文件、单文件 20 MiB、深度 24）远低于 `WorkspaceStore` 的 192 MiB 单文件上限与无限深度：本地创建的超限文件不会复制，两种实现在边界处行为不一致，需在写路由迁移时统一。
+- 对象删除、移动、`deleteAll` 在清单提交后尽力删除对象，失败只记日志，没有清理孤儿对象的任务；需要一个按 `list(prefix)` 对比清单的清扫器。
+- `starts_with(rel_path, prefix)` 在 `(tenant_id, workspace_id)` 主键前缀范围内做顺序扫描，随工作区文件数线性增长；存在性与最大 mtime 检查已改为单条聚合查询（`summarizeWorkspacePrefix`），列表与遍历仍取回子树全部行（上限 10 万行）。
+- 行为差异：`normalizeWorkspacePath` 比旧的 `normalizeWorkspaceRelativePath` 严格，反斜杠输入现在返回 404（原先改写为 `/`）；指向工作区外的符号链接不再列出（原先作为无子节点显示）；认证模式下目录树的 `root` 为空字符串（前端不使用）。
+- S1c 对后续的约束：推送源是会话的持久本地目录 `state.workspaceRoot`；阶段 3 把执行目录换成每任务临时目录时，推送必须改为以实际物化的目录为源。10 秒上限意味着极大的变化突发可能在最后字节落地前发布事件，面板下一个事件会补上。
 
 **动机**：现在 `read`/`write`/`edit` 固定注册（`durable-session-service.ts` 里 `workspaceTools: true`）并写 worker 本地磁盘；本地文件模式下磁盘是唯一状态，无法横向扩展。H4 的 workspace 复制只把本地盘变成"可恢复的缓存"：写入先落本地，worker 在一轮对话中途死亡会丢这一轮的写入。目标是后端不再持有任何会话文件。
 
@@ -467,15 +480,15 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 | 任务 | 内容 | 产出 | 规模 |
 |---|---|---|---|
-| T0.2 | 核实 pi-durable 恢复语义：工具执行中途 worker 死亡，已提交的 `bash` 调用恢复时是否重放。读文档与源码的结论是：工具未声明 `replay: "safe"` 时默认按 `unsafe` 处理（`harness/tool.js`），恢复时不重跑，模型收到带已提交输出的 `interrupted` 错误结果；pi-durable 自带的 `bash`/`write`/`edit` 未声明 `replay`。仍需用故障注入测试验证，不靠读文档 | 重放结论；是否需要任务幂等/"已执行"标记 | M |
+| T0.2 | 核实 pi-durable 恢复语义：工具执行中途 worker 死亡，已提交的 `bash` 调用恢复时是否重放。读文档与源码的结论是：工具未声明 `replay: "safe"` 时默认按 `unsafe` 处理（`harness/tool.js`），恢复时不重跑，模型收到带已提交输出的 `interrupted` 错误结果；pi-durable 自带的 `bash`/`write`/`edit` 未声明 `replay`。**已验证（`agent/durable-tool-replay.test.ts`，故障注入，3/3 通过，重复运行 3 次稳定）**：SIGKILL 后重开，内置 `bash` 与未声明 `replay` 的自定义工具都不会被重跑（计数文件保持 1 行），轮次正常结束，模型收到 `isError` 且文本含 `interrupted` 的结果，崩溃前已提交的部分输出（约每 100ms 一次进度提交）保留在结果里；声明 `replay: "safe"` 的对照工具会被重跑（计数 2），证明不是假阴性。结论：不需要任务幂等标记，进行中任务崩溃由模型看到"被中断"后自行决定是否重试 | 重放结论已定；无需幂等标记 | M（已完成） |
 
 阶段 1：对象存储版工作区服务（第 1 批）
 
 | 任务 | 内容 | 规模 |
 |---|---|---|
-| T1.1 | 定义 `WorkspaceStore` 接口（列表/读/写/删/改名/移动/stat）并实现对象存储版：数据来自 `ObjectStore` 与 PG 的 `workspace_files`；复用 `tenantObjectKey`；使用虚拟路径并沿用现有路径遍历防护规则；大目录分页。`ObjectStore` 接口保持现状（底层为 `@aws-sdk/client-s3`） | L |
+| T1.1 | **（接口已定，见 `workspace/workspace-store.ts`；清单表加 `kind` 列的迁移 v12 表示目录，空目录是一行 `kind='directory'` 的清单行，没有对应对象；改名/移动目录为"逐个复制字节 → 单事务改清单 → 删旧对象"，清单晚于字节、删除时清单先于字节）** 定义 `WorkspaceStore` 接口（列表/读/写/删/改名/移动/stat）并实现对象存储版：数据来自 `ObjectStore` 与 PG 的 `workspace_files`；复用 `tenantObjectKey`；使用虚拟路径并沿用现有路径遍历防护规则；大目录分页。`ObjectStore` 接口保持现状（底层为 `@aws-sdk/client-s3`） | L |
 | T1.2 | 本地文件版实现（本地模式仍为文件存储），与对象存储版共用同一接口；由"认证模式且已配置对象存储"选择实现 | M |
-| T1.3 | `routes/workspaces.ts`（约 1100 行）迁移到 `WorkspaceStore`：目录树、读写、新建、重命名、删除、移动、上传、下载 zip、技能上传、导入；认证模式下 `resolveRequestWorkspace` 不再创建本地目录；重写相关测试 | L |
+| T1.3 | `routes/workspaces.ts`（约 1100 行）迁移到 `WorkspaceStore`，**分两步**：先迁读路由（目录树、文件内容、raw、下载文件夹、office/pptx 预览——后两者调用 LibreOffice/Python，需把对象取到系统临时文件，转换后删除），此时执行仍在本地持久目录、H4 复制负责把数据推进对象存储；写路由（保存、新建、重命名、删除、移动、上传、技能上传、导入）在执行环境切到临时目录（阶段 3）时一并迁移，避免面板写对象存储而 agent 仍读本地目录的不一致；认证模式下 `resolveRequestWorkspace` 不再创建本地目录；重写相关测试 | L |
 | T1.4 | 聊天附件与内联图片的上传路径改写到 `WorkspaceStore` | M |
 | T1.5 | 预签名直连（叠加项，第一期可先用后端代理跑通再做，依赖 T1.1）：`ObjectStore` 增加可选 `presign`（引入 `@aws-sdk/s3-request-presigner`，与已用的 `@aws-sdk/client-s3` 同一套 SDK）；上传流程为"后端按租户前缀生成 key 并写 `pending` 清单行 → 返回短有效期预签名 PUT → 浏览器直传 → 完成回调后端 `HeadObject` 校验大小与校验和 → 改为 `ready`"，回调按 key 幂等 upsert；下载与二进制预览按需签发短有效期 GET；大于 100 MB 用分片上传；桶保持私有并配置 CORS；清单只存 key，不存 URL | M |
 

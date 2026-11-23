@@ -569,11 +569,14 @@ it("restores a session's workspace files on the takeover worker", async () => {
 	expect(upload.status).toBe(201);
 	const listingPool = new Pool({ connectionString: postgres.databaseUrl });
 	try {
-		const rows = await listingPool.query<{ n: string }>(
-			"SELECT COUNT(*)::text AS n FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2",
+		const rows = await listingPool.query<{ files: string; dirs: string }>(
+			`SELECT COUNT(*) FILTER (WHERE kind = 'file')::text AS files,
+					COUNT(*) FILTER (WHERE kind = 'directory')::text AS dirs
+			 FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2`,
 			[tenantId, session.workspaceId],
 		);
-		expect(Number(rows.rows[0]?.n)).toBe(1);
+		expect(Number(rows.rows[0]?.files)).toBe(1);
+		expect(Number(rows.rows[0]?.dirs)).toBe(1);
 	} finally {
 		await listingPool.end();
 	}

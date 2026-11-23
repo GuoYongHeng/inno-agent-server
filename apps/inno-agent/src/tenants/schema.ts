@@ -445,6 +445,18 @@ CREATE TABLE IF NOT EXISTS workspace_files (
 );
 `;
 
+/**
+ * Directories as manifest rows (`ObjectWorkspaceStore`, H5): a directory is a
+ * row with kind='directory', size 0 and no object. Implied directories (parent
+ * segments of file rows) never get rows; explicit rows exist so empty
+ * directories survive listing and replication. Existing rows stay files.
+ */
+const WORKSPACE_FILE_KIND_SQL = `
+ALTER TABLE workspace_files
+	ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'file'
+	CHECK (kind IN ('file','directory'));
+`;
+
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
@@ -457,6 +469,7 @@ export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 9, name: "tenant_config", sql: TENANT_CONFIG_SQL },
 	{ version: 10, name: "session_affinity", sql: SESSION_AFFINITY_SQL },
 	{ version: 11, name: "workspace_replica", sql: WORKSPACE_REPLICA_SQL },
+	{ version: 12, name: "workspace_file_kind", sql: WORKSPACE_FILE_KIND_SQL },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

@@ -51,6 +51,15 @@ export function normalizeObjectStorageConfig(raw: RawObjectStorageConfig | undef
 	};
 }
 
+/**
+ * Whether the provider keeps bytes beyond this process. The `memory` store
+ * loses objects on restart — manifests must not treat it as the source of
+ * truth for reads (the local workspace dir is, with the replica as mirror).
+ */
+export function isDurableObjectStorageProvider(provider: InnoObjectStorageConfig["provider"]): boolean {
+	return provider !== "memory";
+}
+
 export function createObjectStore(config: InnoObjectStorageConfig): ObjectStore {
 	if (config.provider === "memory") return new MemoryObjectStore();
 	if (config.provider === "fs") {

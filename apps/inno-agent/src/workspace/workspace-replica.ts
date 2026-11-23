@@ -1,12 +1,12 @@
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { logger } from "../logger.js";
-import { tenantObjectKey } from "../object-store/object-store.js";
 import type { ObjectStore } from "../object-store/object-store.js";
 import { readJson, writeJson } from "../storage/file-store.js";
 import type { TenantContext, TenantStore } from "../tenants/store.js";
 import { incCounter } from "../utils/metrics.js";
 import { isWithin } from "../utils/path-safety.js";
+import { workspaceObjectKey, workspaceObjectPrefix } from "./workspace-object-key.js";
 import { TEMP_WORKSPACE_ID, type WorkspaceMeta, type WorkspaceRegistry } from "./workspace-registry.js";
 
 /**
@@ -30,6 +30,8 @@ const MAX_DEPTH = 24;
 interface ReplicaStamp {
 	size: number;
 	mtimeMs: number;
+	/** Absent in state files written before directory replication: a file. */
+	kind?: "file" | "directory";
 }
 
 interface ReplicaState {
@@ -60,7 +62,7 @@ export class WorkspaceReplica {
 	) {}
 
 	private objectKey(context: TenantContext, workspaceId: string, rel: string): string {
-		return tenantObjectKey(context.tenantId, "workspaces", b64(workspaceId), b64(rel));
+		return workspaceObjectKey(context.tenantId, workspaceId, rel);
 	}
 
 	private statePath(context: TenantContext, workspaceId: string): string {
@@ -86,7 +88,7 @@ export class WorkspaceReplica {
 
 	async deleteWorkspace(context: TenantContext, workspaceId: string): Promise<void> {
 		await this.store.deleteWorkspaceRow(context, workspaceId);
-		await this.objects.deletePrefix(tenantObjectKey(context.tenantId, "workspaces", b64(workspaceId)) + "/");
+		await this.objects.deletePrefix(workspaceObjectPrefix(context.tenantId, workspaceId));
 		rmSync(this.statePath(context, workspaceId), { force: true });
 	}
 
@@ -154,11 +156,17 @@ export class WorkspaceReplica {
 			for (const entry of entries) {
 				if (IGNORED_DIRS.has(entry.name)) continue;
 				const full = join(current, entry.name);
-				if (entry.isDirectory()) walk(full, depth + 1);
-				else if (entry.isFile()) {
+				const rel = relative(dir, full).split(sep).join("/");
+				if (entry.isDirectory()) {
+					// Directories (including empty ones) replicate as manifest rows so
+					// another worker reconstructs them before any file arrives inside.
+					out.set(rel, { size: 0, mtimeMs: statSync(full).mtimeMs, kind: "directory" });
+					if (out.size >= MAX_FILES) return;
+					walk(full, depth + 1);
+				} else if (entry.isFile()) {
 					const stats = statSync(full);
 					if (stats.size > MAX_FILE_BYTES) { incCounter("inno_workspace_replica_skipped_total"); continue; }
-					out.set(relative(dir, full).split(sep).join("/"), { size: stats.size, mtimeMs: stats.mtimeMs });
+					out.set(rel, { size: stats.size, mtimeMs: stats.mtimeMs, kind: "file" });
 					if (out.size >= MAX_FILES) return;
 				}
 			}
@@ -176,18 +184,28 @@ export class WorkspaceReplica {
 		if (!existsSync(dir)) { this.saveState(context, workspaceId, state); return report; }
 		for (const [rel, stamp] of this.hostFiles(dir)) {
 			const known = state.files[rel];
-			if (known && known.size === stamp.size && known.mtimeMs === stamp.mtimeMs) continue;
+			if (known && (known.kind ?? "file") === stamp.kind && known.size === stamp.size && known.mtimeMs === stamp.mtimeMs) continue;
+			if (stamp.kind === "directory") {
+				// No object: a directory exists only as a manifest row.
+				state.files[rel] = stamp;
+				upserts.push({ relPath: rel, ...stamp });
+				continue; // directories upload no object, so `uploaded` stays object-count
+			}
 			await this.objects.put(this.objectKey(context, workspaceId, rel), new Uint8Array(readFileSync(join(dir, ...rel.split("/")))));
 			state.files[rel] = stamp;
 			upserts.push({ relPath: rel, ...stamp });
 			report.uploaded++;
 		}
 		for (const rel of Object.keys(state.files)) {
+			const stamp = state.files[rel]!;
 			const target = join(dir, ...rel.split("/"));
 			let gone = false;
-			try { gone = !lstatSync(target).isFile(); } catch { gone = true; }
+			try {
+				const stats = lstatSync(target);
+				gone = (stamp.kind ?? "file") === "directory" ? !stats.isDirectory() : !stats.isFile();
+			} catch { gone = true; }
 			if (!gone) continue;
-			await this.objects.delete(this.objectKey(context, workspaceId, rel));
+			if ((stamp.kind ?? "file") !== "directory") await this.objects.delete(this.objectKey(context, workspaceId, rel));
 			delete state.files[rel];
 			deletes.push(rel);
 			report.deleted++;
@@ -213,6 +231,17 @@ export class WorkspaceReplica {
 			if (ignored(row.relPath)) { report.skipped++; continue; }
 			const target = join(dir, ...row.relPath.split("/"));
 			if (!isWithin(dir, target)) { report.skipped++; continue; }
+			if (row.kind === "directory") {
+				// Directory rows carry no object; materialize the folder (empty
+				// directories created on another worker appear locally).
+				try {
+					mkdirSync(target, { recursive: true });
+					const mtimeSec = row.mtimeMs / 1000;
+					try { utimesSync(target, mtimeSec, mtimeSec); } catch { /* mtime best-effort */ }
+					state.files[row.relPath] = { size: 0, mtimeMs: row.mtimeMs, kind: "directory" };
+				} catch { report.skipped++; }
+				continue;
+			}
 			let local: ReplicaStamp | null = null;
 			try {
 				const stats = lstatSync(target);
@@ -228,7 +257,7 @@ export class WorkspaceReplica {
 			writeFileSync(target, body);
 			const mtimeSec = row.mtimeMs / 1000;
 			try { utimesSync(target, mtimeSec, mtimeSec); } catch { /* mtime best-effort */ }
-			state.files[row.relPath] = { size: row.size, mtimeMs: row.mtimeMs };
+			state.files[row.relPath] = { size: row.size, mtimeMs: row.mtimeMs, kind: "file" };
 			report.downloaded++;
 		}
 		this.saveState(context, workspaceId, state);

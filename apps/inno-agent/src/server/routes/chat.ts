@@ -21,6 +21,8 @@ export interface ChatRouteContext {
 	workspaceRegistry: WorkspaceRegistry;
 	tenantStore?: TenantStore | null;
 	durableSessions: DurableHttpContext["service"];
+	workspaceReplica?: DurableHttpContext["workspaceReplica"];
+	objectStorageDurable?: boolean;
 }
 
 /** /api/chat* route domain. Returns true when the request was handled. */
@@ -32,7 +34,11 @@ export async function handleChatRoutes(
 	ctx: ChatRouteContext,
 ): Promise<boolean> {
 	const { workspaceRegistry, tenantStore, durableSessions } = ctx;
-	const durableContext: DurableHttpContext = { service: durableSessions, workspaceRegistry, tenantStore };
+	const durableContext: DurableHttpContext = {
+		service: durableSessions, workspaceRegistry, tenantStore,
+		workspaceReplica: ctx.workspaceReplica ?? null,
+		objectStorageDurable: ctx.objectStorageDurable,
+	};
 
 	const ownsSession = (sessionId: string) => ownsRequestResource(req, tenantStore, "session", sessionId);
 	const denySession = () => { json(res, 404, { error: "Session not found" }); return true; };
@@ -112,7 +118,7 @@ export async function handleChatRoutes(
 		try {
 			await restored?.store.markCancelled(state.sessionId, state.turnId);
 			await durableSessions.abort(req, state.sessionId, state.turnId);
-			if (restored) void ensureDurableStreamProjection(req, durableSessions, restored);
+			if (restored) void ensureDurableStreamProjection(req, durableSessions, restored, durableContext);
 		} catch (error) {
 			logger.error({ err: error, sessionId: state.sessionId, turnId: state.turnId }, "durable chat abort failed");
 			json(res, 500, { error: error instanceof Error ? error.message : String(error) });
@@ -183,7 +189,7 @@ export async function handleChatRoutes(
 			if (["done", "error", "aborted"].includes(envelope.event.type)) finishResponse();
 		});
 		if (restored && !state.terminalEventPublished) {
-			void ensureDurableStreamProjection(req, durableSessions, restored);
+			void ensureDurableStreamProjection(req, durableSessions, restored, durableContext);
 		}
 		if (state.terminalEventPublished && !ended) finishResponse();
 		res.on("close", () => { clearInterval(eventsHeartbeat); unsub(); });

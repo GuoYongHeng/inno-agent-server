@@ -11,7 +11,7 @@ import { WorkspaceReplica } from "./workspace-replica.js";
 class FakeStore {
 	workspaces = new Map<string, { workspaceId: string; relPath: string; name: string; isTemp: boolean; createdAt: string; updatedAt: string }>();
 	bindings = new Map<string, string>();
-	files = new Map<string, { relPath: string; size: number; mtimeMs: number }>();
+	files = new Map<string, { relPath: string; size: number; mtimeMs: number; kind: "file" | "directory" }>();
 
 	async upsertWorkspaceRow(_ctx: TenantContext, ws: { workspaceId: string; relPath: string; name: string; isTemp: boolean }) {
 		this.workspaces.set(ws.workspaceId, { ...ws, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
@@ -37,10 +37,10 @@ class FakeStore {
 		const prefix = `${workspaceId}/`;
 		return [...this.files.entries()]
 			.filter(([key]) => key.startsWith(prefix))
-			.map(([, { relPath, size, mtimeMs }]) => ({ relPath, size, mtimeMs }));
+			.map(([, { relPath, size, mtimeMs, kind }]) => ({ relPath, size, mtimeMs, kind }));
 	}
-	async syncWorkspaceFiles(_ctx: TenantContext, workspaceId: string, upserts: Array<{ relPath: string; size: number; mtimeMs: number }>, deletes: string[]) {
-		for (const up of upserts) this.files.set(`${workspaceId}/${up.relPath}`, { relPath: up.relPath, size: up.size, mtimeMs: up.mtimeMs });
+	async syncWorkspaceFiles(_ctx: TenantContext, workspaceId: string, upserts: Array<{ relPath: string; size: number; mtimeMs: number; kind?: "file" | "directory" }>, deletes: string[]) {
+		for (const up of upserts) this.files.set(`${workspaceId}/${up.relPath}`, { relPath: up.relPath, size: up.size, mtimeMs: up.mtimeMs, kind: up.kind ?? "file" });
 		for (const del of deletes) this.files.delete(`${workspaceId}/${del}`);
 	}
 }
@@ -81,7 +81,8 @@ describe("WorkspaceReplica", () => {
 		await replica.replicateWorkspace(ctx, ws);
 		const report = await replica.push(ctx, ws.id, dir);
 		expect(report.uploaded).toBe(2);
-		expect((await store.listWorkspaceFiles(ctx, ws.id)).map((f) => f.relPath).sort()).toEqual(["notes/想法.md", "readme.txt"]);
+		expect((await store.listWorkspaceFiles(ctx, ws.id)).filter((f) => f.kind === "file").map((f) => f.relPath).sort()).toEqual(["notes/想法.md", "readme.txt"]);
+		expect((await store.listWorkspaceFiles(ctx, ws.id)).find((f) => f.relPath === "notes")?.kind).toBe("directory");
 
 		// Simulate takeover on a fresh worker: new registry/state, same store+objects.
 		const freshRoot = mkdtempSync(join(tmpdir(), "inno-replica-b-"));
@@ -125,6 +126,45 @@ describe("WorkspaceReplica", () => {
 		const report = await replica.push(ctx, ws.id, dir);
 		expect(report.uploaded).toBe(1);
 		expect((await store.listWorkspaceFiles(ctx, ws.id)).map((f) => f.relPath)).toEqual(["keep.js"]);
+	});
+
+	it("round-trips an empty directory push -> pull on a fresh worker", async () => {
+		const ws = registry.createWorkspace({ name: "空目录工作区" });
+		const dir = registry.resolveWorkspaceDir(ws.id)!;
+		mkdirSync(join(dir, "empty", "nested"), { recursive: true });
+		await replica.replicateWorkspace(ctx, ws);
+		await replica.push(ctx, ws.id, dir);
+
+		const rows = await store.listWorkspaceFiles(ctx, ws.id);
+		expect(rows.map((row) => `${row.kind}:${row.relPath}`).sort()).toEqual(["directory:empty", "directory:empty/nested"]);
+		// Directories have manifest rows only — no objects.
+		expect(await objects.list("tenants/")).toEqual([]);
+
+		const freshRoot = mkdtempSync(join(tmpdir(), "inno-replica-d-"));
+		try {
+			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"), join(freshRoot, "data"));
+			registryB.ensureBootstrapped();
+			const replicaB = new WorkspaceReplica(objects, store as never, registryB, join(freshRoot, "state"));
+			await replicaB.materializeWorkspace(ctx, ws.id);
+			const dirB = registryB.resolveWorkspaceDir(ws.id)!;
+			expect(existsSync(join(dirB, "empty", "nested"))).toBe(true);
+		} finally {
+			rmSync(freshRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("propagates removal of an empty directory", async () => {
+		const ws = registry.createWorkspace({ name: "删除目录工作区" });
+		const dir = registry.resolveWorkspaceDir(ws.id)!;
+		mkdirSync(join(dir, "soon-gone"), { recursive: true });
+		await replica.replicateWorkspace(ctx, ws);
+		await replica.push(ctx, ws.id, dir);
+		expect((await store.listWorkspaceFiles(ctx, ws.id)).map((row) => row.relPath)).toEqual(["soon-gone"]);
+
+		rmSync(join(dir, "soon-gone"), { recursive: true });
+		const report = await replica.push(ctx, ws.id, dir);
+		expect(report.deleted).toBe(1);
+		expect(await store.listWorkspaceFiles(ctx, ws.id)).toEqual([]);
 	});
 
 	it("materializes a session's workspace from the replicated binding", async () => {

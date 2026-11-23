@@ -669,9 +669,11 @@ describe("session and workspace tenant isolation", () => {
 			method: "POST", body: JSON.stringify({ isTemp: true }),
 		})).json() as { id: string };
 		expect(tempA.id).not.toBe(tempB.id);
-		const treeA = await (await api(cookieA, `/api/workspace/tree?workspaceId=${tempA.id}`)).json() as { root: string };
-		const treeB = await (await api(cookieB, `/api/workspace/tree?workspaceId=${tempB.id}`)).json() as { root: string };
-		expect(treeA.root).not.toBe(treeB.root);
+		// Authenticated reads are served from the object store, so `root` is ""
+		// for both; the per-tenant workspace ids still differ.
+		const treeA = await (await api(cookieA, `/api/workspace/tree?workspaceId=${tempA.id}`)).json() as { root: string; workspaceId: string };
+		const treeB = await (await api(cookieB, `/api/workspace/tree?workspaceId=${tempB.id}`)).json() as { root: string; workspaceId: string };
+		expect(treeA.workspaceId).not.toBe(treeB.workspaceId);
 
 		// An existing file without an explicit legacy-owner assignment is hidden
 		// even from the authenticated user who originally created it.
@@ -2127,5 +2129,206 @@ describe("durable session HTTP boundary", () => {
 		expect(detail.messages.filter((message) => message.role === "user" && message.content === "durable-restart-prompt")).toHaveLength(1);
 		expect(detail.messages.some((message) => message.role === "assistant" && message.content === "tenant stub response")).toBe(true);
 		expect(providerRequests.filter((request) => request.body.includes("durable-restart-prompt"))).toHaveLength(2);
+	}, 60_000);
+});
+
+describe("workspace read routes in authenticated mode", () => {
+	const startProviderServer = async (
+		env: Record<string, string>,
+	): Promise<{ child: ChildProcess; origin: string; home: string }> => {
+		const providerHome = await mkdtemp(join(tmpdir(), "inno-server-wsread-"));
+		await mkdir(join(providerHome, "config"), { recursive: true });
+		await writeFile(join(providerHome, "config", "config.json"), JSON.stringify({
+			defaultProvider: "dummy",
+			defaultModel: "dummy-model",
+			providers: { dummy: { baseUrl: "http://127.0.0.1:9", apiKey: "x", api: "openai-completions", models: [{ id: "dummy-model" }] } },
+		}));
+		const port = await freePort();
+		const providerOrigin = `http://127.0.0.1:${port}`;
+		const providerChild = spawn(process.execPath, ["--import", "tsx", resolve(root, "apps/inno-agent/src/server.ts")], {
+			cwd: root,
+			env: {
+				...process.env,
+				INNO_HOME: providerHome,
+				INNO_CONFIG_DIR: join(providerHome, "config"),
+				INNO_DATA_DIR: join(providerHome, "data"),
+				INNO_SKILLS_DIR: join(providerHome, "skills"),
+				INNO_WORKSPACE_DIR: join(providerHome, "workspace"),
+				INNO_PORT: String(port),
+				INNO_HOST: "127.0.0.1",
+				INNO_AUTH_MODE: "better-auth",
+				INNO_MULTI_USER_ENABLED: "true",
+				INNO_DURABLE_ENABLED: "true",
+				DATABASE_URL: postgres.databaseUrl,
+				BETTER_AUTH_SECRET: SECRET,
+				BETTER_AUTH_URL: providerOrigin,
+				...env,
+			},
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let providerOutput = "";
+		providerChild.stdout?.on("data", (chunk) => { providerOutput += chunk; });
+		providerChild.stderr?.on("data", (chunk) => { providerOutput += chunk; });
+		const deadline = Date.now() + 20_000;
+		while (true) {
+			if (providerChild.exitCode !== null) throw new Error(`Provider server exited: ${providerOutput}`);
+			try {
+				if ((await fetch(`${providerOrigin}/health`)).ok) break;
+			} catch {}
+			if (Date.now() > deadline) throw new Error(`Provider server startup timed out: ${providerOutput}`);
+			await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+		}
+		return { child: providerChild, origin: providerOrigin, home: providerHome };
+	};
+
+	const stopServer = async (providerChild: ChildProcess, providerHome: string) => {
+		if (providerChild.exitCode === null) {
+			providerChild.kill("SIGTERM");
+			await new Promise<void>((resolveExit) => providerChild.once("exit", () => resolveExit()));
+		}
+		await rm(providerHome, { recursive: true, force: true });
+	};
+
+	const providerApi = (providerOrigin: string, cookie: string, path: string, init: RequestInit = {}): Promise<Response> =>
+		fetch(`${providerOrigin}${path}`, {
+			...init,
+			headers: {
+				Cookie: cookie,
+				Origin: providerOrigin,
+				...(init.body ? { "Content-Type": "application/json" } : {}),
+				...init.headers,
+			},
+		});
+
+	const providerRegister = async (providerOrigin: string, email: string): Promise<string> => {
+		const response = await fetch(`${providerOrigin}/api/auth/sign-up/email`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Origin: providerOrigin },
+			body: JSON.stringify({ name: email, email, password: "tenant-test-password-123" }),
+		});
+		expect(response.status).toBe(200);
+		return response.headers.get("set-cookie")!.split(";", 1)[0]!;
+	};
+
+	it("memory provider keeps reads on the local disk (regression)", async () => {
+		const cookieA = await registerUser("ws-mem-a@example.com");
+		const cookieB = await registerUser("ws-mem-b@example.com");
+		const created = await api(cookieA, "/api/workspaces", {
+			method: "POST", body: JSON.stringify({ name: "Memory read" }),
+		});
+		expect(created.status).toBe(201);
+		const workspace = await created.json() as { id: string };
+		const upload = await api(cookieA, "/api/workspace/upload", {
+			method: "POST",
+			body: JSON.stringify({
+				workspaceId: workspace.id,
+				files: [{ path: "note.txt", dataBase64: Buffer.from("local bytes").toString("base64") }],
+			}),
+		});
+		expect(upload.status).toBe(201);
+		// With the default (memory) object store the panel still reads the
+		// worker's disk — the pre-S1b behaviour.
+		expect((await api(cookieA, `/api/workspace/tree?workspaceId=${workspace.id}`)).status).toBe(200);
+		const file = await api(cookieA, `/api/workspace/file?workspaceId=${workspace.id}&path=note.txt`);
+		expect(file.status).toBe(200);
+		expect(await file.json()).toMatchObject({ content: "local bytes" });
+		const raw = await api(cookieA, `/api/workspace/raw?workspaceId=${workspace.id}&path=note.txt`);
+		expect(raw.status).toBe(200);
+		expect(await raw.text()).toBe("local bytes");
+		expect((await api(cookieB, `/api/workspace/file?workspaceId=${workspace.id}&path=note.txt`)).status).toBe(404);
+	}, 60_000);
+
+	it("fs provider serves reads from the object store after the local dir is deleted", async () => {
+		const objectStoreDir = await mkdtemp(join(tmpdir(), "inno-wsread-objects-"));
+		const { child: providerChild, origin: providerOrigin, home: providerHome } = await startProviderServer({
+			INNO_OBJECT_STORAGE_PROVIDER: "fs",
+			INNO_OBJECT_STORAGE_DIR: objectStoreDir,
+		});
+		try {
+			const cookieA = await providerRegister(providerOrigin, "ws-read-a@example.com");
+			const cookieB = await providerRegister(providerOrigin, "ws-read-b@example.com");
+			const created = await providerApi(providerOrigin, cookieA, "/api/workspaces", {
+				method: "POST", body: JSON.stringify({ name: "Read store workspace" }),
+			});
+			expect(created.status).toBe(201);
+			const workspace = await created.json() as { id: string };
+
+			const upload = await providerApi(providerOrigin, cookieA, "/api/workspace/upload", {
+				method: "POST",
+				body: JSON.stringify({
+					workspaceId: workspace.id,
+					files: [
+						{ path: "docs/readme.md", dataBase64: Buffer.from("# store readme").toString("base64") },
+						{ path: "bin/blob.bin", dataBase64: Buffer.from([0, 1, 2, 255, 128]).toString("base64") },
+					],
+				}),
+			});
+			expect(upload.status).toBe(201);
+			expect((await providerApi(providerOrigin, cookieA, "/api/workspace/create", {
+				method: "POST",
+				body: JSON.stringify({ workspaceId: workspace.id, path: "empty-dir", type: "directory" }),
+			})).status).toBe(201);
+
+			// Delete the worker's local copy: reads must come from object storage.
+			const metaPool = new Pool({ connectionString: postgres.databaseUrl });
+			let relPath: string;
+			try {
+				const result = await metaPool.query<{ rel_path: string }>(
+					"SELECT rel_path FROM tenant_workspaces WHERE workspace_id = $1", [workspace.id],
+				);
+				relPath = result.rows[0]!.rel_path;
+			} finally {
+				await metaPool.end();
+			}
+			const localDir = join(providerHome, "workspace", relPath);
+			expect(existsSync(localDir)).toBe(true);
+			await rm(localDir, { recursive: true, force: true });
+
+			const tree = await providerApi(providerOrigin, cookieA, `/api/workspace/tree?workspaceId=${workspace.id}`);
+			expect(tree.status).toBe(200);
+			const treeBody = await tree.json() as {
+				root: string;
+				children: Array<{ name: string; type: string; children?: Array<{ name: string }> }>;
+			};
+			expect(treeBody.root).toBe("");
+			expect(treeBody.children.map((node) => `${node.type}:${node.name}`).sort())
+				.toEqual(["directory:bin", "directory:docs", "directory:empty-dir"]);
+			expect(treeBody.children.find((node) => node.name === "docs")?.children?.map((node) => node.name))
+				.toEqual(["readme.md"]);
+
+			const fileText = await providerApi(providerOrigin, cookieA, `/api/workspace/file?workspaceId=${workspace.id}&path=${encodeURIComponent("docs/readme.md")}`);
+			expect(fileText.status).toBe(200);
+			expect(await fileText.json()).toMatchObject({ kind: "markdown", content: "# store readme" });
+
+			const fileBinary = await providerApi(providerOrigin, cookieA, `/api/workspace/file?workspaceId=${workspace.id}&path=bin/blob.bin`);
+			expect(fileBinary.status).toBe(200);
+			const binaryBody = await fileBinary.json() as { kind: string; url?: string; content?: string };
+			expect(binaryBody.kind).toBe("binary");
+			expect(binaryBody.url).toContain("/api/workspace/raw?");
+			expect(binaryBody.content).toBeUndefined();
+
+			const raw = await providerApi(providerOrigin, cookieA, `/api/workspace/raw?workspaceId=${workspace.id}&path=bin/blob.bin`);
+			expect(raw.status).toBe(200);
+			expect([...new Uint8Array(await raw.arrayBuffer())]).toEqual([0, 1, 2, 255, 128]);
+
+			const zipResponse = await providerApi(providerOrigin, cookieA, `/api/workspace/download-folder?workspaceId=${workspace.id}`);
+			expect(zipResponse.status).toBe(200);
+			const zip = Buffer.from(await zipResponse.arrayBuffer());
+			expect(zip.includes("docs/readme.md")).toBe(true);
+			expect(zip.includes("bin/blob.bin")).toBe(true);
+			expect(zip.includes("empty-dir/")).toBe(true);
+
+			for (const path of [
+				`/api/workspace/tree?workspaceId=${workspace.id}`,
+				`/api/workspace/file?workspaceId=${workspace.id}&path=docs/readme.md`,
+				`/api/workspace/raw?workspaceId=${workspace.id}&path=docs/readme.md`,
+				`/api/workspace/download-folder?workspaceId=${workspace.id}`,
+			]) {
+				expect((await providerApi(providerOrigin, cookieB, path)).status, path).toBe(404);
+			}
+		} finally {
+			await stopServer(providerChild, providerHome);
+			await rm(objectStoreDir, { recursive: true, force: true });
+		}
 	}, 60_000);
 });

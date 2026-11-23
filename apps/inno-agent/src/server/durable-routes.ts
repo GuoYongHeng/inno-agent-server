@@ -16,16 +16,21 @@ import {
 	type StreamEventEnvelope,
 } from "../chat/stream-registry.js";
 import { logger } from "../logger.js";
-import { releaseRequestResource } from "../tenants/http.js";
+import { getRequestTenant, releaseRequestResource } from "../tenants/http.js";
 import type { TenantStore } from "../tenants/store.js";
 import type { WorkspaceRegistry } from "../workspace/workspace-registry.js";
+import type { WorkspaceReplica } from "../workspace/workspace-replica.js";
 import { json, matchRoute, readBody } from "./http-helpers.js";
+import { createReplicaPushGate, workspaceChangePublisher } from "./replica-push.js";
 import { createWorkspaceChangeMonitor } from "./workspace-change-monitor.js";
 
 export interface DurableHttpContext {
 	service: DurableSessionService;
 	workspaceRegistry: WorkspaceRegistry;
 	tenantStore?: TenantStore | null;
+	workspaceReplica?: WorkspaceReplica | null;
+	/** True when the shared object store keeps bytes past a restart (s3/fs). */
+	objectStorageDurable?: boolean;
 }
 
 function errorStatus(error: unknown): number {
@@ -83,11 +88,12 @@ export function ensureDurableStreamProjection(
 	req: HttpReq,
 	service: DurableSessionService,
 	context: DurableStreamContext,
+	httpCtx?: DurableHttpContext,
 ): Promise<void> {
 	if (context.state.terminalEventPublished) return Promise.resolve();
 	const existing = durableProjections.get(context.state.turnId);
 	if (existing) return existing;
-	const operation = streamDurableTurn(req, context, service).finally(() => {
+	const operation = streamDurableTurn(req, context, service, httpCtx).finally(() => {
 		durableProjections.delete(context.state.turnId);
 	});
 	durableProjections.set(context.state.turnId, operation);
@@ -252,6 +258,7 @@ async function streamDurableTurn(
 	req: HttpReq,
 	context: DurableStreamContext,
 	service: DurableSessionService,
+	httpCtx?: DurableHttpContext,
 ): Promise<void> {
 	const { state, store } = context;
 	const projector = new DurableSseProjector();
@@ -274,6 +281,20 @@ async function streamDurableTurn(
 			turnId: state.turnId,
 			emit: (event) => publishDurableEvent(context, event),
 		});
+		// Panel reads come from the manifest + object store in authenticated
+		// mode: push the local writes BEFORE publishing workspace_change so the
+		// browser's refetch never sees a missing file. Coalesced and bounded —
+		// a burst produces at most two pushes and a stalled push never blocks
+		// the stream. Only with a durable object provider + replica + tenant.
+		const requestTenant = getRequestTenant(req);
+		const replica = httpCtx?.workspaceReplica ?? null;
+		const pushGate = replica && httpCtx?.objectStorageDurable === true && requestTenant && state.workspaceRoot
+			? createReplicaPushGate(async () => { await replica.push(requestTenant, state.workspaceId, state.workspaceRoot!); })
+			: null;
+		const publishChange = workspaceChangePublisher(
+			(event) => publishDurableEvent(context, event as ChatStreamEvent),
+			pushGate,
+		);
 		workspaceMonitor = createWorkspaceChangeMonitor(state.workspaceRoot, (event) => {
 			const changeEvent = event as {
 				type: string;
@@ -296,7 +317,7 @@ async function streamDurableTurn(
 				logger.warn({ err: error, sessionId: state.sessionId, turnId: state.turnId }, "durable workspace activity write failed");
 			}
 			if (!state.terminalEventPublished) {
-				publishDurableEvent(context, { ...changeEvent, workspaceId: state.workspaceId } as ChatStreamEvent);
+				publishChange({ ...changeEvent, workspaceId: state.workspaceId });
 			}
 		});
 		const activeStream = await lease.runtime.watch(async (events) => {
@@ -338,6 +359,9 @@ async function streamDurableTurn(
 		await activeStream.stop();
 		stream = undefined;
 		await workspaceMonitor?.settle();
+		// Publish every pending workspace_change (replica push included) before the
+		// terminal event below, so `done` can never overtake a file refresh.
+		await publishChange.drain();
 		closeWorkspaceMonitor();
 		await lease.release();
 		lease = undefined;
@@ -437,7 +461,7 @@ export async function handleDurableChatRoutes(
 			if (live?.sessionId === sessionId && (live.status === "queued" || live.status === "running")) {
 				// The original or recovered projection holds the runtime lease until
 				// the final response. Restart it if its previous owner disappeared.
-				if (restored) void ensureDurableStreamProjection(req, ctx.service, restored);
+				if (restored) void ensureDurableStreamProjection(req, ctx.service, restored, ctx);
 				resumed = true;
 			} else {
 				try {
@@ -478,7 +502,7 @@ export async function handleDurableChatRoutes(
 			const restored = await restoreDurableStream(req, ctx.service, sessionId, turnId);
 			const live = restored?.state ?? streamRegistry.getByTurn(turnId);
 			if (live?.sessionId === sessionId && (live.status === "queued" || live.status === "running")) {
-				if (restored) void ensureDurableStreamProjection(req, ctx.service, restored);
+				if (restored) void ensureDurableStreamProjection(req, ctx.service, restored, ctx);
 				resumed = true;
 			} else {
 				try {
@@ -621,7 +645,7 @@ export async function handleDurableChatRoutes(
 		clearInterval(heartbeat);
 		unsubscribe();
 	});
-	await ensureDurableStreamProjection(req, ctx.service, streamContext);
+	await ensureDurableStreamProjection(req, ctx.service, streamContext, ctx);
 	finish();
 	streamRegistry.cleanupExpiredTurns();
 	return true;

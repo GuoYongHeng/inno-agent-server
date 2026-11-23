@@ -55,7 +55,7 @@ import { handleSessionsRoutes } from "./server/routes/sessions.js";
 import { handleWikiRoutes } from "./server/routes/wiki.js";
 import { setL2BackendResolver } from "./memory/l2/l2-backend.js";
 import { PgL2Backend } from "./memory/l2/pg-l2-backend.js";
-import { createObjectStore, normalizeObjectStorageConfig, type ObjectStore } from "./object-store/index.js";
+import { createObjectStore, isDurableObjectStorageProvider, normalizeObjectStorageConfig, type ObjectStore } from "./object-store/index.js";
 import { handlePresetsRoutes } from "./server/routes/presets.js";
 import { loadSkillsFromDir } from "./agent/skills.js";
 import { createSchedulerTools } from "./scheduler/scheduler-tools.js";
@@ -71,12 +71,14 @@ import { applyRuntimeEnvironment, parseRuntimeArgs, resolveRuntimePaths } from "
 import { createGracefulShutdownHandler, installProcessFallbacks } from "./utils/process-fallback.js";
 import { DEFAULT_WORKSPACE_ID, TEMP_WORKSPACE_ID, WorkspaceRegistry, type WorkspaceMeta } from "./workspace/workspace-registry.js";
 import { WorkspaceReplica } from "./workspace/workspace-replica.js";
+import { LocalFsWorkspaceStore } from "./workspace/local-fs-workspace-store.js";
+import { ObjectWorkspaceStore } from "./workspace/object-workspace-store.js";
 import type { RemoteContentSource } from "./content-source/index.js";
 import { ContentHubCatalog } from "./content-source/catalog-service.js";
 import { readAuthRuntimeConfig, readListenConfig } from "./auth/config.js";
 import { assertSignUpAllowed, isPublicApiRequest, isTrustedOrigin, requireSession } from "./auth/http.js";
 import { createAuthRuntime } from "./auth/runtime.js";
-import { createBackgroundRequest, setRequestTenant } from "./tenants/http.js";
+import { createBackgroundRequest, getRequestTenant, setRequestTenant } from "./tenants/http.js";
 import { syncTenantConfigFromStore } from "./tenants/config.js";
 import { forwardDurableTenantRequest, readDurableShardConfig } from "./tenants/durable-tenant-router.js";
 import { resolveCurrentTenantDataRoot, resolveRequestTenantDataRoot } from "./tenants/paths.js";
@@ -133,6 +135,13 @@ const getSharedObjectStore = (): ObjectStore => {
 	}
 	return sharedObjectStore;
 };
+/**
+ * The in-memory object store loses all bytes on restart, so manifest-backed
+ * reads would list files whose objects are gone forever. Only s3/fs providers
+ * may back the workspace-panel read path; "memory" keeps the old disk reads.
+ */
+const objectStorageIsDurable = (): boolean =>
+	isDurableObjectStorageProvider(normalizeObjectStorageConfig(config?.objectStorage).provider);
 if (auth.tenantStore) {
 	const l2Pool = auth.tenantStore.database;
 	const tenantL2Root = resolve(dataDir, "tenants");
@@ -211,6 +220,9 @@ async function ensureBootstrapped(): Promise<void> {
 		workspaceRegistry.ensureBootstrapped();
 		if (auth.tenantStore) {
 			workspaceReplica = new WorkspaceReplica(getSharedObjectStore(), auth.tenantStore, workspaceRegistry, join(dataDir, "workspaces", "replica"));
+			if (!objectStorageIsDurable()) {
+				logger.warn("object storage is in-memory: workspace panel reads this worker's disk; not safe for takeover");
+			}
 		}
 		try {
 			const sessionFiles = existsSync(paths.sessionDir)
@@ -1203,7 +1215,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	// --- Sessions API (extracted to server/routes/sessions.ts) ---
 	sessions: (req, res, method, url) => handleSessionsRoutes(req, res, method, url, {
 		workspaceRegistry, paths, getContentSource, tenantStore: auth.tenantStore, durableSessions,
-		workspaceReplica,
+		workspaceReplica, objectStorageDurable: objectStorageIsDurable(),
 		getCachedPresetAvailability: (presetId) => contentHubCatalog.getCachedPresetAvailability(presetId),
 	}),
 
@@ -1216,6 +1228,17 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		workspaceRegistry, dataDir, paths, tenantStore: auth.tenantStore,
 		installSkillZip, installSkillMarkdown, scheduleSkillsReload, importWorkspaceZip, durableSessions,
 		workspaceReplica,
+		// Read routes serve from the manifest + object store in authenticated
+		// mode; local mode (and any test without a tenant) uses the filesystem.
+		workspaceStoreFor: (request) => {
+			const tenant = getRequestTenant(request);
+			if (tenant && auth.tenantStore && objectStorageIsDurable()) {
+				return new ObjectWorkspaceStore({ objects: getSharedObjectStore(), store: auth.tenantStore, context: tenant });
+			}
+			// memory provider: bytes die with the process — the local dir stays
+			// the source of truth even for authenticated requests.
+			return new LocalFsWorkspaceStore({ resolveRoot: (id) => workspaceRegistry.resolveWorkspaceDir(id) });
+		},
 	}),
 
 	// --- Presets API (extracted to server/routes/presets.ts) ---
@@ -1244,6 +1267,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	// --- Chat API (extracted to server/routes/chat.ts) ---
 	chat: (req, res, method, url) => handleChatRoutes(req, res, method, url, {
 		workspaceRegistry, tenantStore: auth.tenantStore, durableSessions,
+		workspaceReplica, objectStorageDurable: objectStorageIsDurable(),
 	}),
 });
 

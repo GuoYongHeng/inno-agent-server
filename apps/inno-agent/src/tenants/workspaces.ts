@@ -36,3 +36,43 @@ export async function resolveRequestWorkspace(
 	if (replica) await replica.replicateWorkspace(tenant, workspace);
 	return workspace;
 }
+
+/**
+ * Read-path resolution: same ownership rules as `resolveRequestWorkspace` but
+ * never materializes files — authenticated reads are served from the manifest
+ * + object store, so pulling the replica onto this worker's disk would be
+ * wasted I/O. The tmp mapping still claims the `tmp-<tenantId>` id and
+ * replicates its registry row (a brand-new tenant's tmp workspace must exist),
+ * it just skips the file pull. Returns the resolvable id + display name only.
+ */
+export async function resolveRequestWorkspaceForRead(
+	req: IncomingMessage,
+	registry: WorkspaceRegistry,
+	store: TenantStore | null | undefined,
+	workspaceId?: string | null,
+	replica?: WorkspaceReplica | null,
+): Promise<{ id: string; name: string } | null> {
+	const tenant = getRequestTenant(req);
+	const requestedId = workspaceId?.trim() || TEMP_WORKSPACE_ID;
+	if (!tenant) {
+		const ws = registry.getWorkspace(requestedId);
+		return ws ? { id: ws.id, name: ws.name } : null;
+	}
+	if (!store) throw new Error("Tenant store is required for an authenticated request");
+	if (requestedId !== TEMP_WORKSPACE_ID) {
+		if (!await ownsRequestResource(req, store, "workspace", requestedId)) return null;
+		const row = await store.getWorkspaceRow(tenant, requestedId);
+		return row ? { id: row.workspaceId, name: row.name } : null;
+	}
+	const tempId = `tmp-${tenant.tenantId}`;
+	let workspace = registry.getWorkspace(tempId);
+	if (!workspace) {
+		const row = await store.getWorkspaceRow(tenant, tempId);
+		workspace = registry.createWorkspace({ isTemp: true, tempId, name: row?.name });
+	}
+	if (!await store.ownsResource(tenant, "workspace", tempId)) {
+		await store.claimResource(tenant, "workspace", tempId);
+	}
+	if (replica) await replica.replicateWorkspace(tenant, workspace);
+	return { id: workspace.id, name: workspace.name };
+}
