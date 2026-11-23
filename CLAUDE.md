@@ -334,7 +334,7 @@ Deployment manifests live under `deploy/` (`Dockerfile.backend`, `Dockerfile.fro
 
 - **Build stage**: installs build tools for native npm modules (python3, make, g++), configures Tsinghua mirrors, runs `npm ci` + the backend `tsc` build.
 - **Runtime stage**: installs python3 (pptx→svg converter) and copies `dist/`, `scripts/` and the full `node_modules` (no pruning). Sets `NODE_ENV=production` and all `INNO_*` env vars for a production layout (`/etc/inno-agent` for config, `/var/lib/inno-agent` for data/skills, `/srv/inno-workspace` for workspace). Exposes port 3000.
-- **`deploy/docker-compose.yml`**: `frontend` (nginx, host port 3000→80) and `inno-agent` (backend, internal 3000) services, with volume mounts for `runtime/config/`, `runtime/data/`, `runtime/skills/`, and `workspace/` (paths relative to `deploy/`; build context is the repo root).
+- **`deploy/docker-compose.yml`**: `frontend` (nginx, host port 3000→80) and `inno-agent` (backend, internal 3000) services, with volume mounts for `runtime/config/`, `runtime/data/`, `runtime/skills/`, and `workspace/` (paths relative to `deploy/`; build context is the repo root). The backend loads the repo-root `.env` through an optional `env_file` (`../.env`); keys under `environment:` override it. Compose's own variable substitution reads `deploy/.env` (the project directory is the compose file's directory), not the root `.env`.
 - **`.dockerignore`**: excludes `node_modules/`, `dist/`, `runtime/`, `workspace/`, `.env`, `.git`.
 
 ## Configuration

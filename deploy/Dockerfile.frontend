@@ -16,6 +16,8 @@ COPY vendor/ vendor/
 RUN npm config set registry https://registry.npmmirror.com && npm ci
 
 COPY apps/inno-agent/web/src apps/inno-agent/web/src/
+# The web sources import types/helpers shared with the backend (web/src -> ../../../src/shared).
+COPY apps/inno-agent/src/shared apps/inno-agent/src/shared/
 COPY apps/inno-agent/web/public apps/inno-agent/web/public/
 COPY apps/inno-agent/web/vite.config.ts apps/inno-agent/web/index.html apps/inno-agent/web/
 
