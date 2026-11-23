@@ -440,6 +440,119 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - **部署形态变更（已完成）**：产品定位转为分布式部署的后端 + 浏览器 Web UI，不再提供 Electron 桌面客户端。已删除 `electron/`、`build/`、mac/win/linux 打包脚本与发布工作流、`package.json` 的 `electron*` 脚本与依赖，以及前端 `window.innoDesktop` 桥接、窗口宽度扩展、`ui.closeBehavior` 配置与 `PUT /api/settings/close-behavior`。部署清单统一放在 `deploy/`：`Dockerfile.backend`（仅 API）、`Dockerfile.frontend`（nginx + 静态前端，反代 `/api`、`/health`）、`docker-compose.yml`；原单体 `Dockerfile` 与 `Dockerfile.base` 已删除。浏览器版面板开关保留为 `PanelToggles`。
 - benchmark 现状：单条读/写 ~0.2–2.7ms PG 固有开销可接受；`commit 100 entries` 批量化后仍 ~74–140ms（Docker PG 往返主导），若真实部署往返更低可复跑基线；进一步压缩需减少 fencing UPDATE/unnest INSERT 的往返（如 PREPARE 或单语句复合写）。
 
+### H5 无状态后端：会话文件离开 worker 磁盘（方案已定，未实施）
+
+**动机**：现在 `read`/`write`/`edit` 固定注册（`durable-session-service.ts` 里 `workspaceTools: true`）并写 worker 本地磁盘；本地文件模式下磁盘是唯一状态，无法横向扩展。H4 的 workspace 复制只把本地盘变成"可恢复的缓存"：写入先落本地，worker 在一轮对话中途死亡会丢这一轮的写入。目标是后端不再持有任何会话文件。
+
+**核心决定：执行环境是一次性的，OSS 是唯一状态来源。** 执行环境（本地临时目录或沙箱）不依赖暂停/恢复/快照，也不要求共享存储；任务结束把变化推回 OSS 后环境即销毁。业界做法（OpenAI Code Interpreter 要求把容器当临时的并自行保存数据、Cloudflare Sandbox 把目录备份到 R2 后可销毁沙箱、Perplexity SPACE 的无状态控制面）都在把状态移出编排层。
+
+**统一执行抽象层（已存在，沿用）**：所有工具执行都经 `sandbox/sandbox-backend.ts` 的 `SandboxBackend`/`SandboxProvider`（文件读写/列表/`run`/销毁），上层（`SandboxExecutionEnv`、同步、生命周期）只依赖该接口。分两期实施，抽象层不变：
+- 第一期：由本地 provider 实现——每个任务在 worker 上建一个临时目录，全部工具（含 `bash`）在其中本地执行。起点是 `sandbox/local-backend.ts` 的 `LocalDirSandbox`（目前仅测试替身），需做成可用于生产的实现（临时目录生命周期、崩溃后的残留清理、并发上限）。第一期本地执行没有隔离，该风险已知并接受，随迁移到沙箱消失。
+- 后期：把 provider 换成实现 E2B 协议的沙箱（`E2BSandboxProvider` 已有），上层与同步流程不改。
+
+**已定设计**：
+- 普通会话不依赖执行环境：聊天、L2/L3 记忆、联网搜索、提问、OCR、文档解析都不需要文件系统，状态在 PG 与对象存储。
+- 附件进对象存储：上传直接写对象存储并登记 `workspace_files`，`parse_document`/`ocr_image`/`send_file_to_channel` 改为按对象取字节，不再按宿主机路径读。
+- 工作面板与对象存储的交互（参考业界主流：AWS 预签名 URL 指南、Vercel Blob 客户端直传）：元数据（目录树、列表、改名、删除、移动、权限检查）与小文件/文本保存走后端 `WorkspaceStore` API；大文件上传、下载与二进制预览走预签名 URL 浏览器直连对象存储，后端不在字节路径上。面板始终读取对象存储与 PG 清单，不读 worker 磁盘；后端服务器只做计算，不留会话状态。
+- 模型自己调用才创建执行环境：`bash`/`read`/`write`/`edit` 被调用时才懒创建（`GuardedSandboxBackend` 本就以"尚未就绪"启动，由 `activate()` 占配额并连接）。
+- 一次任务的流程：首次调用文件/命令工具 → 新建执行环境 → 从 OSS 拉工作区所需文件 → 执行 → 变化文件推回 OSS 并更新 `workspace_files` → 销毁。下一次任务重新创建，重复同一流程。前端预览/下载走对象存储。认证模式下不再有写 worker 持久目录的本地文件工具。
+- 配额与并发按任务计；E2B 沙箱的 ID 仅用于进行中任务与孤儿清理（`sandbox:fsck`），不再长期保存为会话状态。
+
+**可复用**：`workspace-replica.ts` 的上传/下载/清单逻辑、`workspace_files` 与 `session_workspaces` 表、`WorkspaceSync` 的清单 diff 机制（宿主侧换成 OSS 与 PG 清单）、`GuardedSandboxBackend` 的懒就绪机制、`SandboxBackend`/`SandboxProvider` 抽象与 `LocalDirSandbox`。
+
+**任务拆分**（S/M/L 仅表示相对难度，不代表工期）：
+
+阶段 0：先核实一个不确定项
+
+| 任务 | 内容 | 产出 | 规模 |
+|---|---|---|---|
+| T0.2 | 核实 pi-durable 恢复语义：工具执行中途 worker 死亡，已提交的 `bash` 调用恢复时是否重放。读文档与源码的结论是：工具未声明 `replay: "safe"` 时默认按 `unsafe` 处理（`harness/tool.js`），恢复时不重跑，模型收到带已提交输出的 `interrupted` 错误结果；pi-durable 自带的 `bash`/`write`/`edit` 未声明 `replay`。仍需用故障注入测试验证，不靠读文档 | 重放结论；是否需要任务幂等/"已执行"标记 | M |
+
+阶段 1：对象存储版工作区服务（第 1 批）
+
+| 任务 | 内容 | 规模 |
+|---|---|---|
+| T1.1 | 定义 `WorkspaceStore` 接口（列表/读/写/删/改名/移动/stat）并实现对象存储版：数据来自 `ObjectStore` 与 PG 的 `workspace_files`；复用 `tenantObjectKey`；使用虚拟路径并沿用现有路径遍历防护规则；大目录分页。`ObjectStore` 接口保持现状（底层为 `@aws-sdk/client-s3`） | L |
+| T1.2 | 本地文件版实现（本地模式仍为文件存储），与对象存储版共用同一接口；由"认证模式且已配置对象存储"选择实现 | M |
+| T1.3 | `routes/workspaces.ts`（约 1100 行）迁移到 `WorkspaceStore`：目录树、读写、新建、重命名、删除、移动、上传、下载 zip、技能上传、导入；认证模式下 `resolveRequestWorkspace` 不再创建本地目录；重写相关测试 | L |
+| T1.4 | 聊天附件与内联图片的上传路径改写到 `WorkspaceStore` | M |
+| T1.5 | 预签名直连（叠加项，第一期可先用后端代理跑通再做，依赖 T1.1）：`ObjectStore` 增加可选 `presign`（引入 `@aws-sdk/s3-request-presigner`，与已用的 `@aws-sdk/client-s3` 同一套 SDK）；上传流程为"后端按租户前缀生成 key 并写 `pending` 清单行 → 返回短有效期预签名 PUT → 浏览器直传 → 完成回调后端 `HeadObject` 校验大小与校验和 → 改为 `ready`"，回调按 key 幂等 upsert；下载与二进制预览按需签发短有效期 GET；大于 100 MB 用分片上传；桶保持私有并配置 CORS；清单只存 key，不存 URL | M |
+
+阶段 2：按路径读文件的工具改道（第 2 批，依赖 T1.1，可与阶段 3 并行）
+
+| 任务 | 内容 | 规模 |
+|---|---|---|
+| T2.1 | `parse_document` 从 `WorkspaceStore` 取字节；需要本地路径时用系统临时目录，用完即删，不作为状态 | M |
+| T2.2 | `ocr_image` 同上 | M |
+| T2.3 | `send_file_to_channel` 同上 | S |
+| T2.4 | 审计其余约 15 个引用 `workspaceDir` 的文件（`durable-memory`、`durable-channels`、`durable-questions`、`l2-tools` 等），逐个判断是本地路径还是应改走存储 | M |
+| T2.5 | `workspace-context` 的 `agent.md`、`.skills` 改从 `WorkspaceStore` 读取 | S |
+
+阶段 3：无状态执行环境（第 3 批，依赖 T0.2 与 T1.1，最关键）
+
+| 任务 | 内容 | 规模 |
+|---|---|---|
+| T3.0 | 本地 `SandboxProvider`（第一期实现）：每任务一个临时目录，`create` 建目录、`destroy` 删目录；全部工具含 `bash` 在其中本地执行；worker 启动时清理崩溃遗留的临时目录；并发任务数上限。在 `LocalDirSandbox` 基础上改造，并通过现有 `SandboxExecutionEnv` 一致性套件 | M |
+| T3.1 | 懒激活：把 `beforeTurn` 里的急切激活改为"文件/命令工具被调用时才激活"；配额与并发改为按任务计 | M |
+| T3.2 | 同步层：`WorkspaceSync` 的宿主侧换成 `WorkspaceStore`；激活时按清单拉取，之后增量推送且幂等；保留忽略目录与 20 MiB/5000 个文件/深度 24 的上限；定义删除的传播规则 | L |
+| T3.3 | 推送时机：写文件类工具调用完成且无命令在运行时增量推送，避免推到写了一半的文件 | M |
+| T3.4 | 生命周期：任务结束或 runtime 关闭时最终推送并销毁执行环境；更新孤儿清理（`sandbox:fsck`，另需覆盖本地临时目录），环境 ID 只用于进行中任务 | M |
+| T3.5 | 工具集：认证模式下 `read`/`write`/`edit`/`bash` 全部经 provider 执行，去掉写 worker 持久目录的 `WorkspaceFileEnv`；由配置选择 provider（本地/E2B 协议） | M |
+| T3.6 | 提示词里的路径改写（`rebasePaths`、`promptSection`）适配新流程 | S |
+
+阶段 4：清理
+
+| 任务 | 内容 | 规模 |
+|---|---|---|
+| T4.1 | 删除认证模式下已无用的本地目录复制路径（本地模式保留）；该处代码是 H4 刚做的，需谨慎 | M |
+| T4.2 | 增加指标（同步字节数/耗时、激活延迟）；更新 `CLAUDE.md`、roadmap、`.env.example` | S |
+
+阶段 5：验证（本地 provider）
+
+| 任务 | 内容 | 规模 |
+|---|---|---|
+| T5.1 | 集成测试：任务进行中 SIGKILL worker，另一 worker 接管，已推送的产物完整，遗留临时目录被清理 | L |
+| T5.2 | 多租户隔离：存储键、清单、下载接口的跨租户拒绝测试 | M |
+| T5.3 | 性能基线：拉取耗时随文件数的变化，据此决定是否做按需拉取 | M |
+
+阶段 6：接入真实沙箱（后期，抽象层不变）
+
+| 任务 | 内容 | 规模 |
+|---|---|---|
+| T6.1 | 对自部署的 E2B 协议服务跑 live 验收：下方清单加无状态流程用例（创建 → 同步进去 → 执行 → 同步出来 → 销毁）；`e2b-live.integration.test.ts` 的暂停/恢复用例改为可跳过 | M |
+| T6.2 | 按 T6.1 的缺口清单在 `e2b-backend.ts` 里补绕开方案 | M |
+| T6.3 | 配置切换 provider 到 E2B 协议沙箱；补"杀沙箱"故障用例（任务进行中沙箱死亡，已推送产物完整） | M |
+
+依赖与并行：T0.2、T1.1 互不依赖，可同时开始；T1.2/T1.3/T1.4 依赖 T1.1；阶段 2 依赖 T1.1，可与阶段 3 并行；阶段 3 依赖 T0.2 与 T1.1（T3.0 不依赖 T1.1，可更早开始）；阶段 4、5 在其后；阶段 6 在阶段 5 之后择机进行，不阻塞前面任何阶段。
+
+**决策点**：
+1. 本地模式保留文件存储（T1.2）；若连本地模式也一并去掉，工作量会明显增大。
+2. 工作面板与对象存储的交互采用业界主流的组合：元数据与小文件走后端 API，大文件字节走预签名直连（T1.5）；第一期可先全部走后端代理，T1.5 作为叠加项。`ObjectStore` 接口现有方法保持不变，仅新增可选的 `presign`。
+3. 增量推送粒度：倾向于每次写文件类工具调用后推送一次。
+
+**E2B 协议 live 验收清单**（T6.1 使用；只依赖 `create`/命令/文件/`kill`，不依赖暂停与快照；第三方实现的兼容性文档通常按 Python SDK 测试，本项目用 JS SDK，故必须实测）：
+- 文件：`read`/`write`/`list`（含 `depth`）/`getInfo`/`makeDir`/`remove`/`rename`，含二进制与中文文件名。
+- 命令：`commands.run` 流式 `onStdout`、退出码、超时、`AbortSignal` 中止；中止与超时路径依赖命令句柄的 `kill()`，部分实现不暴露按 pid 的杀进程接口，需确认句柄级 `kill()` 可用。
+- 创建时的网络策略：`allowInternetAccess=false` 与 `network.denyOut/allowOut` 白名单是否真正生效。
+- 孤儿清理：`Sandbox.list` 的状态/元数据过滤能否支撑 `sandbox:fsck`（有的实现不支持按时间排序与过滤）。
+- 生命周期：`setTimeout`/`connect` 的超时语义（固定截止时间 vs 空闲窗口），确认一次性任务下的保活与回收行为。
+- 工作区路径：`/home/user/workspace` 对沙箱用户可写（部分实现默认 root 用户）。
+- SDK 版本：服务端声明支持的 SDK 版本与 `package.json` 里 `e2b` 的版本是否一致，差异需实测覆盖。
+
+**待定项**：
+- 执行环境把产物推回 OSS 的方式：第一版由后端 worker 经 provider 的文件接口读出再上传 OSS；沙箱阶段可评估让沙箱用预签名 URL 直传 OSS（需放行 OSS 域名并把预签名范围限定在该租户前缀）。
+- 浏览器直传时对象元数据里没有 `sha256`（`S3ObjectStore.put` 目前把 `sha256` 写进对象元数据供清单校验）：改用签名里的校验和头，或 `HeadObject` 后由后端补算；所用 OSS 对校验和头的支持程度需实测。
+- 增量推送的触发粒度（每次写文件类工具调用后，还是固定间隔）。
+
+**已知风险**：
+- 第一期工具（含 `bash`）在 worker 上本地执行，没有隔离；该风险已知并接受，迁移到沙箱后消失。
+- 只在结束时同步会丢中途产物，故需增量推送；环境在两次推送之间死亡仍会丢这一小段。
+- 每次任务都是冷启动：依赖、虚拟环境和缓存不保留（`WorkspaceSync` 本就忽略 `.venv`、`node_modules`）；本地 provider 依赖 worker 镜像里预装的工具，沙箱阶段依赖模板预装。
+- 新环境是空盘，工作区文件多时首次拉取较慢；沿用单文件 20 MiB、5000 个文件、深度 24 的上限，并考虑按需拉取。
+- 预览与文件树改读对象存储后延迟升高，大目录需分页。
+- 对象存储文件级"后写覆盖"，并行任务写同一路径会互相覆盖；预签名 URL 在有效期内可重复使用，同样是后写覆盖。
+- 预签名 URL 本身相当于公开资源：必须短有效期、限定单个对象与方法，桶保持私有；key 一律由服务端生成，不接受客户端指定。
+
 ## 8. 测试策略
 
 - 先跑基线并保存各测试文件通过情况；删除 legacy 时同时删除只测 legacy 的测试，并在 PR 里列出被删测试及原因，避免静默降低覆盖。
