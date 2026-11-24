@@ -16,6 +16,8 @@ export interface InnoObjectStorageConfig {
 	fsRoot?: string;
 	bucket?: string;
 	endpoint?: string;
+	/** Browser-facing endpoint for presigned URLs when it differs from `endpoint`. */
+	publicEndpoint?: string;
 	region: string;
 	accessKeyId?: string;
 	secretAccessKey?: string;
@@ -27,6 +29,7 @@ export type RawObjectStorageConfig = Partial<InnoObjectStorageConfig>;
 export function normalizeObjectStorageConfig(raw: RawObjectStorageConfig | undefined, env: NodeJS.ProcessEnv = process.env): InnoObjectStorageConfig {
 	const text = (value: unknown, fallback?: string) => (typeof value === "string" && value.trim() ? value.trim() : fallback?.trim() || undefined);
 	const endpoint = text(raw?.endpoint, env.INNO_OBJECT_STORAGE_ENDPOINT);
+	const publicEndpoint = text(raw?.publicEndpoint, env.INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT);
 	const bucket = text(raw?.bucket, env.INNO_OBJECT_STORAGE_BUCKET);
 	const accessKeyId = text(raw?.accessKeyId, env.INNO_OBJECT_STORAGE_ACCESS_KEY_ID);
 	const secretAccessKey = text(raw?.secretAccessKey, env.INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY);
@@ -41,6 +44,7 @@ export function normalizeObjectStorageConfig(raw: RawObjectStorageConfig | undef
 		...(fsRoot ? { fsRoot } : {}),
 		...(bucket ? { bucket } : {}),
 		...(endpoint ? { endpoint } : {}),
+		...(publicEndpoint ? { publicEndpoint } : {}),
 		region: text(raw?.region, env.INNO_OBJECT_STORAGE_REGION) ?? "us-east-1",
 		...(accessKeyId ? { accessKeyId } : {}),
 		...(secretAccessKey ? { secretAccessKey } : {}),
@@ -72,6 +76,7 @@ export function createObjectStore(config: InnoObjectStorageConfig): ObjectStore 
 	const s3: S3ObjectStoreConfig = {
 		bucket: config.bucket,
 		...(config.endpoint ? { endpoint: config.endpoint } : {}),
+		...(config.publicEndpoint ? { publicEndpoint: config.publicEndpoint } : {}),
 		region: config.region,
 		accessKeyId: config.accessKeyId,
 		secretAccessKey: config.secretAccessKey,

@@ -15,6 +15,14 @@ export interface S3ObjectStoreConfig {
 	bucket: string;
 	/** Alibaba Cloud OSS: https://oss-cn-hangzhou.aliyuncs.com. MinIO: http://127.0.0.1:9000. AWS S3 when omitted. */
 	endpoint?: string;
+	/**
+	 * Endpoint presigned URLs are generated against, when it differs from the
+	 * one the server itself uses (e.g. OSS 内网 endpoint for API calls +
+	 * 公网 endpoint for browsers, or `minio:9000` inside compose + a
+	 * host-published port for the dev browser). SigV4 signs the host, so the
+	 * URL must be issued against exactly the address the client will reach.
+	 */
+	publicEndpoint?: string;
 	region: string;
 	accessKeyId: string;
 	secretAccessKey: string;
@@ -31,20 +39,23 @@ function isNotFound(err: unknown): boolean {
 
 export class S3ObjectStore implements ObjectStore {
 	private readonly client: S3Client;
+	/** Signs presigned URLs when `publicEndpoint` differs from the API endpoint. */
+	private readonly signClient: S3Client;
 	private readonly bucket: string;
 
 	constructor(config: S3ObjectStoreConfig, client?: S3Client) {
 		this.bucket = config.bucket;
-		const options: S3ClientConfig = {
+		const options = (endpoint?: string): S3ClientConfig => ({
 			region: config.region,
-			...(config.endpoint ? { endpoint: config.endpoint } : {}),
+			...(endpoint ? { endpoint } : {}),
 			forcePathStyle: config.forcePathStyle,
 			credentials: { accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey },
 			// OSS and MinIO do not implement the SDK's newer default checksum trailers.
 			requestChecksumCalculation: "WHEN_REQUIRED",
 			responseChecksumValidation: "WHEN_REQUIRED",
-		};
-		this.client = client ?? new S3Client(options);
+		});
+		this.client = client ?? new S3Client(options(config.endpoint));
+		this.signClient = config.publicEndpoint ? new S3Client(options(config.publicEndpoint)) : this.client;
 	}
 
 	async put(key: string, body: Uint8Array, options?: PutObjectOptions): Promise<ObjectMeta> {
@@ -118,7 +129,7 @@ export class S3ObjectStore implements ObjectStore {
 	}
 
 	async presignPut(key: string, options?: PresignOptions): Promise<string> {
-		return getSignedUrl(this.client, new PutObjectCommand({
+		return getSignedUrl(this.signClient, new PutObjectCommand({
 			Bucket: this.bucket,
 			Key: key,
 			...(options?.contentType ? { ContentType: options.contentType } : {}),
@@ -126,7 +137,7 @@ export class S3ObjectStore implements ObjectStore {
 	}
 
 	async presignGet(key: string, options?: PresignOptions): Promise<string> {
-		return getSignedUrl(this.client, new GetObjectCommand({
+		return getSignedUrl(this.signClient, new GetObjectCommand({
 			Bucket: this.bucket,
 			Key: key,
 			...(options?.contentDisposition ? { ResponseContentDisposition: options.contentDisposition } : {}),

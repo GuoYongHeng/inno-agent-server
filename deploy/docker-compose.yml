@@ -25,9 +25,23 @@ services:
       # Use better-auth for any non-local deployment.
       INNO_ALLOW_UNAUTHENTICATED_NETWORK: "true"
       # DATABASE_URL: postgresql://inno:inno@postgres:5432/inno
+      # Workspace files live in the stack's MinIO (manifest rows stay in
+      # PostgreSQL once auth is on). SDK calls use the internal endpoint;
+      # presigned upload/download URLs are issued against the host-published
+      # port so the browser can reach them.
+      INNO_OBJECT_STORAGE_PROVIDER: s3
+      INNO_OBJECT_STORAGE_ENDPOINT: http://minio:9000
+      INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT: http://localhost:9000
+      INNO_OBJECT_STORAGE_REGION: us-east-1
+      INNO_OBJECT_STORAGE_BUCKET: inno
+      INNO_OBJECT_STORAGE_ACCESS_KEY_ID: inno
+      INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-inno-minio-secret-change-me}
+      INNO_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
     depends_on:
       postgres:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     volumes:
       - ../runtime/config:/etc/inno-agent
       - ../runtime/data:/var/lib/inno-agent/data
@@ -72,5 +86,53 @@ services:
       timeout: 2s
       retries: 20
 
+  # S3-compatible object store for workspace files. Docker Hub's minio/minio
+  # images are gone since upstream went source-only; pgsty/minio is the
+  # Pigsty-maintained community build of the same AGPL MinIO.
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: inno
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-inno-minio-secret-change-me}
+    # The API port is published on localhost so browser presigned URLs
+    # (INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT) resolve. Keep it loopback-only.
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  # One-shot bucket bootstrap. Reuses the backend image — its node_modules
+  # already carry @aws-sdk/client-s3, so no mc image is needed.
+  minio-init:
+    image: inno-agent-backend:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    working_dir: /app/apps/inno-agent
+    entrypoint:
+      - node
+      - -e
+      - |
+        const { S3Client, CreateBucketCommand } = require("@aws-sdk/client-s3");
+        const s3 = new S3Client({ endpoint: "http://minio:9000", region: "us-east-1", forcePathStyle: true,
+          credentials: { accessKeyId: "inno", secretAccessKey: process.env.MINIO_ROOT_PASSWORD } });
+        s3.send(new CreateBucketCommand({ Bucket: "inno" }))
+          .catch((e) => { if (!/AlreadyOwnedByYou|AlreadyExists/.test(e && e.name || "")) throw e; })
+          .then(() => console.log("minio bucket ready"));
+    environment:
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-inno-minio-secret-change-me}
+    depends_on:
+      minio:
+        condition: service_healthy
+
 volumes:
   postgres-data:
+  minio-data:
