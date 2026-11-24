@@ -97,9 +97,18 @@ execute(params, api, context)
 ## 6. 存储布局与单 owner 规则
 
 ```text
-<dataDir>/tenants/<verifiedTenantId>/
-└── workspaces/              # 工作区本地物化副本（对象存储是真源）
+<workspaceDir>/ (INNO_WORKSPACE_DIR)
+├── .tmp/                          # 临时工作区
+├── <slug>-<hash>/                 # 命名工作区（workspace 文件本地副本）
+└── .channels/<tenantId>/<channel>/  # 渠道工作区本地副本
+
+<dataDir>/
+├── workspaces/registry.json       # workspace 元信息 scratch（真源 tenant_workspaces）
+├── workspaces/replica/            # 对象存储 pull/push 状态
+└── tenants/<verifiedTenantId>/    # 附件记录、文件访问追踪、渠道暂存等元数据 scratch（无文件字节）
 ```
+
+工作区文件字节真源在对象存储（`tenants/<t>/workspaces/<ws>/<path>` 键）；本地副本只是 pull 出来的工作缓存，丢失后可重建。
 
 会话 durable storage、catalog、L2/L3 记忆、jobs/check-ins、渠道台账（default targets、dedupe、run log、chat-session 绑定、wechat token）与 question/permission/outbox 恢复记录全部在 PostgreSQL（`ds_*`、`durable_sessions`、`tenant_jobs`、`tenant_job_runs`、`tenant_checkins`、`tenant_checkin_occurrences`、`tenant_state`、`recovery_records`）。
 
