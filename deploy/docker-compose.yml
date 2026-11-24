@@ -24,14 +24,23 @@ services:
       # Compose publishes this unauthenticated local-mode port intentionally.
       # Use better-auth for any non-local deployment.
       INNO_ALLOW_UNAUTHENTICATED_NETWORK: "true"
+      # Uncomment the whole block for better-auth multi-user mode (tenant
+      # metadata, L2/L3 memory and workspace manifests move into ParadeDB).
       # DATABASE_URL: postgresql://inno:inno@postgres:5432/inno
+      # INNO_AUTH_MODE: better-auth
+      # INNO_MULTI_USER_ENABLED: "true"
+      # BETTER_AUTH_SECRET: replace-with-at-least-32-random-characters
+      # BETTER_AUTH_URL: http://localhost:3000
+      # INNO_TRUSTED_ORIGINS: http://localhost:3000
       # Workspace files live in the stack's MinIO (manifest rows stay in
       # PostgreSQL once auth is on). SDK calls use the internal endpoint;
       # presigned upload/download URLs are issued against the host-published
-      # port so the browser can reach them.
+      # port so the browser can reach them — on a remote host set
+      # INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT to the reachable MinIO URL.
+      # In unauthenticated local mode nothing writes to it; MinIO just sits ready.
       INNO_OBJECT_STORAGE_PROVIDER: s3
       INNO_OBJECT_STORAGE_ENDPOINT: http://minio:9000
-      INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT: http://localhost:9000
+      INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT: ${INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT:-http://localhost:9000}
       INNO_OBJECT_STORAGE_REGION: us-east-1
       INNO_OBJECT_STORAGE_BUCKET: inno
       INNO_OBJECT_STORAGE_ACCESS_KEY_ID: inno
@@ -74,6 +83,7 @@ services:
   # L2/L3 memory layers require BM25 search, which stock postgres lacks.
   postgres:
     image: paradedb/paradedb:v0.22.2-pg17
+    restart: unless-stopped
     environment:
       POSTGRES_USER: inno
       POSTGRES_PASSWORD: inno
