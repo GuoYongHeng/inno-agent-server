@@ -25,6 +25,10 @@ services:
       INNO_WORKSPACE_DIR: /srv/inno-workspace
       INNO_PORT: 3000
       INNO_HOST: 0.0.0.0
+      # local exec: bash/file tools run inside this container (the container
+      # is the isolation boundary; there is no remote sandbox in compose).
+      # Unset for the persistent backend — file tools only, no bash.
+      INNO_EXEC_BACKEND: local
       # Compose publishes this unauthenticated local-mode port intentionally.
       # Use better-auth for any non-local deployment.
       INNO_ALLOW_UNAUTHENTICATED_NETWORK: "true"
