@@ -166,6 +166,3 @@ describe("PgDurableStorage lease and fencing", () => {
 		}
 	});
 });
-
-describe("PgDurableStorage legacy import", () => {
-});

@@ -138,6 +138,3 @@ describe("PgChannelOutbox", () => {
 	});
 
 });
-
-describe("OCR checkpoints on PostgreSQL", () => {
-});
