@@ -69,6 +69,7 @@ async function startWorker(worker: Worker): Promise<void> {
 			INNO_DURABLE_STORAGE_LEASE_MS: "2000",
 			INNO_DURABLE_FORWARD_TIMEOUT_MS: "3000",
 			INNO_OBJECT_STORAGE_PROVIDER: "fs",
+			INNO_WORKER_TOKEN: "shard-worker-token",
 			INNO_OBJECT_STORAGE_DIR: objectStoreDir,
 			DATABASE_URL: postgres.databaseUrl,
 			BETTER_AUTH_SECRET: SECRET,
@@ -618,3 +619,64 @@ it("restores a session's workspace files on the takeover worker", async () => {
 	expect(existsSync(restored)).toBe(true);
 	expect(readFileSync(restored, "utf8")).toBe("workspace replica content");
 }, 60_000);
+
+it("serves internal durable prompts on the worker-token endpoint", async () => {
+	// The previous test killed the hash owner (either worker); restart the dead one.
+	await Promise.all(Object.values(workers).map(async (worker) => {
+		if (worker.child && (worker.child.exitCode !== null || worker.child.signalCode !== null)) {
+			await startWorker(worker);
+		}
+	}));
+	const email = "internal-prompt@example.com";
+	const registered = await fetch(`${publicOrigin}/api/auth/sign-up/email`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Origin: publicOrigin },
+		body: JSON.stringify({ name: "Internal prompt", email, password: "internal-prompt-password-123" }),
+	});
+	expect(registered.status).toBe(200);
+	const cookie = registered.headers.get("set-cookie")?.split(";", 1)[0]!;
+	expect((await api(workers["worker-a"], cookie, "/api/sessions")).status).toBe(200);
+	const configured = await api(workers["worker-a"], cookie, "/api/settings/providers", {
+		method: "PUT",
+		body: JSON.stringify({
+			providerId: "shared", baseUrl: providerOrigin, apiKey: "internal-prompt-secret",
+			api: "openai-completions", makeDefault: true,
+			models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
+		}),
+	});
+	expect(configured.status, await configured.text()).toBe(200);
+	const created = await api(workers["worker-a"], cookie, "/api/sessions", {
+		method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
+	});
+	expect(created.status).toBe(201);
+	const session = await created.json() as { id: string };
+	// The session has no live owner yet; whichever worker the job hits claims
+	// the lease — the endpoint runs the prompt locally by design.
+	const target = workers["worker-b"];
+	const internal = (body: unknown, token = "shard-worker-token") => fetch(`${target.origin}/api/internal/durable-prompt`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", "x-inno-worker-token": token },
+		body: JSON.stringify(body),
+	});
+
+	expect((await internal({ sessionId: session.id, prompt: "" })).status).toBe(400);
+	expect((await internal({ sessionId: session.id, prompt: "x" }, "wrong-token")).status).toBe(404);
+	expect((await internal({ sessionId: "missing-session", prompt: "x" })).status).toBe(404);
+	const ran = await internal({
+		sessionId: session.id, prompt: "internal forwarded prompt",
+		requestId: "internal-test-request", turnId: "internal-test-turn",
+	});
+	const ranText = await ran.text();
+	expect(ran.status, ranText).toBe(200);
+	expect(JSON.parse(ranText)).toEqual({ text: "shard response" });
+	// The forwarded turn is persisted in the session's durable entries.
+	const entriesPool = new Pool({ connectionString: postgres.databaseUrl });
+	try {
+		const entries = await entriesPool.query<{ record: string }>(
+			"SELECT record FROM ds_entries WHERE session_id = $1", [session.id]);
+		expect(JSON.stringify(entries.rows.map((rowEntry) => rowEntry.record)))
+			.toContain("internal forwarded prompt");
+	} finally {
+		await entriesPool.end();
+	}
+});

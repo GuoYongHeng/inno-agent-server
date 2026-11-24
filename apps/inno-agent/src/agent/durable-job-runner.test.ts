@@ -1,7 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import { DURABLE_JOB_BUSY_WAIT_MS, runDurableJobPrompt } from "./durable-job-runner.js";
-import type { DurableSessionService } from "./durable-session-service.js";
+import { DurableSessionBusyError, type DurableSessionService } from "./durable-session-service.js";
 
 function fixture(overrides: { pending?: boolean } = {}) {
 	const binding = vi.fn();
@@ -121,5 +121,32 @@ describe("runDurableJobPrompt", () => {
 			requestId: "job-request", turnId: "job-turn",
 		})).rejects.toThrow("pending question");
 		expect(service.lease).not.toHaveBeenCalled();
+	});
+
+	it("forwards to the owner worker when the lease stays busy", async () => {
+		const { service } = fixture();
+		service.lease = vi.fn(async () => { throw new DurableSessionBusyError(); });
+		const forwardToOwner = vi.fn(async () => "forwarded answer");
+		await expect(runDurableJobPrompt(req, service, "durable-session", "job prompt", {
+			requestId: "job-request", turnId: "job-turn", forwardToOwner,
+		})).resolves.toBe("forwarded answer");
+		expect(forwardToOwner).toHaveBeenCalledWith({
+			sessionId: "durable-session", prompt: "job prompt",
+			requestId: "job-request", turnId: "job-turn",
+		});
+	});
+
+	it("rethrows busy when forwarding is impossible and never forwards image prompts", async () => {
+		const { service } = fixture();
+		service.lease = vi.fn(async () => { throw new DurableSessionBusyError(); });
+		const forwardToOwner = vi.fn(async () => null);
+		await expect(runDurableJobPrompt(req, service, "durable-session", "job prompt", {
+			requestId: "job-request", turnId: "job-turn", forwardToOwner,
+		})).rejects.toThrow(DurableSessionBusyError);
+		await expect(runDurableJobPrompt(req, service, "durable-session", "image prompt", {
+			requestId: "job-request", turnId: "job-turn", forwardToOwner,
+			images: [{ type: "image", data: "a", mimeType: "image/png" } as never],
+		})).rejects.toThrow(DurableSessionBusyError);
+		expect(forwardToOwner).toHaveBeenCalledOnce();
 	});
 });

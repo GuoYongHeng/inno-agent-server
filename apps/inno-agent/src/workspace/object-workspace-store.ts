@@ -94,11 +94,19 @@ export class ObjectWorkspaceStore implements WorkspaceStore {
 		};
 	}
 
-	/** Ancestor paths that resolve to a FILE row reject directory-ish writes. */
-	private async checkAncestors(workspaceId: string, path: string): Promise<void> {
+	/**
+	 * Ancestor paths that resolve to a FILE row reject directory-ish writes;
+	 * missing ancestors gain an explicit directory row so the manifest keeps
+	 * the replica push's shape (empty dirs survive a pull round-trip).
+	 */
+	private async ensureAncestors(workspaceId: string, path: string): Promise<void> {
 		for (const ancestor of parentChain(path)) {
 			const row = await this.row(workspaceId, ancestor);
 			if (row?.kind === "file") fail("not_directory", `not a directory: ${ancestor}`, ancestor);
+			if (!row) {
+				await this.options.store.putWorkspaceFile(this.options.context, workspaceId,
+					{ relPath: ancestor, kind: "directory", size: 0, mtimeMs: Date.now() });
+			}
 		}
 	}
 
@@ -179,7 +187,7 @@ export class ObjectWorkspaceStore implements WorkspaceStore {
 		if (!existing && (await this.summarize(workspaceId, target)).count > 0) {
 			fail("is_directory", `is a directory: ${target}`, target);
 		}
-		await this.checkAncestors(workspaceId, target);
+		await this.ensureAncestors(workspaceId, target);
 		// Bytes first: the manifest row is written only once the object exists,
 		// so a crash can never leave a row pointing at missing bytes.
 		await this.options.objects.put(this.key(workspaceId, target), body);
@@ -202,7 +210,7 @@ export class ObjectWorkspaceStore implements WorkspaceStore {
 		if (!existing && (await this.summarize(workspaceId, target)).count > 0) {
 			fail("is_directory", `is a directory: ${target}`, target);
 		}
-		await this.checkAncestors(workspaceId, target);
+		await this.ensureAncestors(workspaceId, target);
 		const row: WorkspaceFileRow = { relPath: target, kind: "file", size, mtimeMs: Date.now() };
 		await this.options.store.putWorkspaceFile(this.options.context, workspaceId, row);
 		return this.entryOf(row);
@@ -213,7 +221,7 @@ export class ObjectWorkspaceStore implements WorkspaceStore {
 		if (target === "") return { path: "", name: "", kind: "directory", size: 0, mtimeMs: 0 };
 		const existing = await this.row(workspaceId, target);
 		if (existing?.kind === "file") fail("not_directory", `not a directory: ${target}`, target);
-		await this.checkAncestors(workspaceId, target);
+		await this.ensureAncestors(workspaceId, target);
 		const row: WorkspaceFileRow = { relPath: target, kind: "directory", size: 0, mtimeMs: Date.now() };
 		await this.options.store.putWorkspaceFile(this.options.context, workspaceId, row);
 		return this.entryOf(row);
@@ -254,7 +262,7 @@ export class ObjectWorkspaceStore implements WorkspaceStore {
 		if (dstRow || (await this.summarize(workspaceId, destination)).count > 0) {
 			fail("exists", `destination exists: ${destination}`, destination);
 		}
-		await this.checkAncestors(workspaceId, destination);
+		await this.ensureAncestors(workspaceId, destination);
 
 		const moved = [...(srcRow ? [srcRow] : []), ...srcRows];
 		const files = moved.filter((row) => row.kind === "file");

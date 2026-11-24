@@ -403,7 +403,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - 租户 `config.json` 复制进 PG（迁移 v9 `tenant_configs`，权威副本）：settings/channels 写路径经 `persistTenantConfig` 双写文件+PG；每个认证请求在租户挂接后 `syncTenantConfigFromStore` 按 `updated_at` 标记把 PG 内容物化成本地文件，文件仍是同步读路径——非 owner worker 接管后才有 provider/channel 配置可跑会话。
 - `owner_worker` 只在 runtime 活跃期间记录（最后一个引用释放即清租约），所以 owner-follow 只作用于活跃 turn 期间的并发请求（abort/status/question-response 等）；空闲会话无主，但走 `last_worker` 亲和（迁移 v10：每次认领记录、释放保留），把会话路由回最后持租约、也就持有其本地文件的 worker；亲和目标不可达时照常回退本地认领并改写亲和。
 
-**已知限制**："偷来"的 owner 若在 advisory 锁释放与下次续约重拿锁之间被第三个 worker 撞上，epoch fencing 仍保证单写者，但旧 owner 的会话会被判失败关闭。channel/job 内部 prompt（`runDurableJobPrompt`、`appendAssistantNotification`）在会话被另一 worker 的活跃 turn 持有时不再立即失败：`lease({ busyWaitMs })`（默认 `INNO_DURABLE_JOB_BUSY_WAIT_MS`=120s）有界轮询重试，远端 turn 结束放租后本地认领执行——owner 只在 runtime 活跃期间存在，所以"等远端 turn 结束再接管"等价于排队。若远端 turn 超过等待上限仍按 busy 失败。
+**已知限制**："偷来"的 owner 若在 advisory 锁释放与下次续约重拿锁之间被第三个 worker 撞上，epoch fencing 仍保证单写者，但旧 owner 的会话会被判失败关闭。channel/job 内部 prompt（`runDurableJobPrompt`、`appendAssistantNotification`）在会话被另一 worker 的活跃 turn 持有时不再立即失败：`lease({ busyWaitMs })`（默认 `INNO_DURABLE_JOB_BUSY_WAIT_MS`=120s）有界轮询重试，远端 turn 结束放租后本地认领执行——owner 只在 runtime 活跃期间存在，所以"等远端 turn 结束再接管"等价于排队。超过等待上限时按 `durableSessionRouteHint` 把 prompt 转交给 owner worker 的 `POST /api/internal/durable-prompt`（`INNO_WORKER_TOKEN` 认证）执行；未配置 token 或 owner 不可达时仍按 busy 失败。
 
 **状态（H4 收尾已完成）**：`pg-durable-storage-benchmark.integration.test.ts` 用 pi-durable 官方 `storage-benchmark` 对比 SQLite 与 PG 后端（同一数据集经 `Storage` 契约播种，多样本取 median/mean）。首轮暴露 PG `commit()` 每条 write 3+ 次串行往返（100 条 entry ≈ 300 次查询、median 201ms）；批量化后（`checkGlobalIds` 单条 `ANY()` 查询、`ds_record_ids` 认领与四种表写入各一条 `unnest` 多行 INSERT、文档存在性/版本探测 `ANY()` 化）降至 median 74ms，混合 commit 168→8.4ms，conformance 套件 25 例语义不变。单条读/写仍有 ~0.2–2.7ms 的容器内网络+SQL 固有开销（sqlite 0.01–0.9ms），属预期量级。`durable-sharding.integration.test.ts` 增加 SIGSTOP 僵尸 owner 用例：慢 turn in-flight 时冻结 owner → TCP 不报错故转发带响应头超时 → 租约过期后本地认领 → events 重连驱动 `waitForSubmission` 完成被接管 turn（epoch≥2）→ SIGCONT 后僵尸写被 fencing（无重复 entry）且 worker 可复活重投路由。
 
@@ -431,7 +431,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 **H4 之后剩余工作**（最初目标"任意 worker 接管会话"已达成并验证；以下为记录在案的开放项）：
 
-- ~~channel/job 内部调用方仍锚定租户哈希 worker，会话 owner 漂移后内部 prompt 被 fencing 拒绝~~ **已缓解**：内部 prompt 通过 `lease({ busyWaitMs })` 有界等待远端活跃 turn 结束后本地认领（超上限仍 busy 失败）。彻底方案（把内部 prompt 转交给 owner worker 执行）需要 inter-worker 认证或 PG 队列，暂未做。
+- ~~channel/job 内部调用方仍锚定租户哈希 worker，会话 owner 漂移后内部 prompt 被 fencing 拒绝~~ **已解决**：内部 prompt 先经 `lease({ busyWaitMs })` 有界等待远端活跃 turn 结束；超时仍 busy 时按 routeHint 转交给 owner worker——`POST /api/internal/durable-prompt`（`x-inno-worker-token` 共享密钥认证，未配置 `INNO_WORKER_TOKEN` 时端点 404），接收端从 `durable_sessions` 行解析租户与 `tenants.owner_user_id`（`tenant_memberships` join 需要真实 userId）、同步租户配置后本地执行。分片部署应为所有 worker 配置同一 token；未配置时退化为 busy 失败（同旧行为）。
 - ~~空闲会话无 owner，owner-follow 只覆盖活跃 turn 期间~~ **已实现会话亲和**：迁移 v10 给 `ds_metadata` 加 `last_worker`（每次认领写入、释放时保留），`durableSessionRouteHint` 一次查询返回 `{owner, affinity}`；路由目标顺序 live owner → last_worker → 租户哈希，目标不可达照旧本地回退认领（亲和自动自愈迁移）。sharding 集成测试端到端验证：SIGKILL 接管后，重启的哈希 owner 收到的空闲会话请求被转发到最后认领 worker。
 - ~~workspace 目录与 registry 仍是 worker 本地、未复制~~ **已实现 workspace→对象存储复制**（`workspace/workspace-replica.ts` + 迁移 v11）：registry 行复制到 `tenant_workspaces`、会话绑定复制到 `session_workspaces`（FK 级联）、文件清单复制到 `workspace_files`，文件字节进 `tenants/<t>/workspaces/<ws>/<path>` 对象（base64url 编码路径段）。同步点：会话打开（`lease()`，持租约后）物化 registry 行+绑定并 `pull` 缺失文件；runtime 关闭（持租约内）`push` 增量；workspace 文件写路由（file/create/rename/delete/move/upload/skills）与 workspace/绑定变更端点同步复制。**已知限制**：文件级 last-writer-wins——两个 worker 同时写同一共享 workspace 会互相覆盖（无 OT/合并）；push 在 runtime 关闭与路由写时触发，worker 在 turn 中途死亡丢当轮写入；pull 只在物化/会话打开时发生，远端 push 不会主动推给另一 worker 的本地副本；`memory` 对象存储是进程内的，跨 worker 部署需 `INNO_OBJECT_STORAGE_PROVIDER=s3` 或 `fs`（`fs` 供单机多进程/测试，`INNO_OBJECT_STORAGE_DIR`）。新增 `FsObjectStore` 与跨 worker 集成测试：owner 上传文件→SIGKILL→存活 worker 认领打开会话→文件内容恢复验证。
 - ~~H1 未做项：目录分页、回滚导出命令、`durable_sessions` 专用指标~~ **已全部补齐**：`SessionCatalog.listPage` 提供 `(updated_at, id)` 游标分页，`GET /api/sessions?limit=&cursor=` 返回 `{sessions, nextCursor}`（无参数保持旧数组响应，前端未改）；`npm run durable:export-catalog -- --data-dir <dir> [--tenant <id>]` 把 PG 目录导出回每租户的 `durable/sessions.json`（`sessions.json.migrated` 只是导入时快照，回滚需先导出）；指标改专用名 `inno_durable_sessions_{get,list,insert,update,remove}_ms` + `inno_durable_sessions` gauge（list 时刷新）。
@@ -562,7 +562,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 **待定项**：
 - 执行环境把产物推回 OSS 的方式：第一版由后端 worker 经 provider 的文件接口读出再上传 OSS；沙箱阶段可评估让沙箱用预签名 URL 直传 OSS（需放行 OSS 域名并把预签名范围限定在该租户前缀）。
-- 浏览器直传时对象元数据里没有 `sha256`（`S3ObjectStore.put` 目前把 `sha256` 写进对象元数据供清单校验）：改用签名里的校验和头，或 `HeadObject` 后由后端补算；所用 OSS 对校验和头的支持程度需实测。
+- ~~浏览器直传时对象元数据里没有 `sha256`~~ **已定**：`upload/complete` 反正要 GET 全量字节做本地镜像，后端直接 `sha256Hex` 校验——前端用 `crypto.subtle` 算 sha256 随 complete 请求带上（非安全上下文拿不到 subtle 时省略，行为同旧版），不符则删对象返 422、不写清单行。没有用 S3 checksum 头方案：各家 OSS 支持程度不一且需要实测，后端校验对 provider 无要求、零额外请求。
 - 增量推送的触发粒度（每次写文件类工具调用后，还是固定间隔）。
 - ~~全局技能的分发方式（T2.6）~~ 已定：随后端镜像分发（见 T2.6）。
 - 技能需要 API 密钥时的注入方式（按租户注入到执行环境，不写进技能文件）；第一期本地执行可暂缓，迁移到沙箱时需要。

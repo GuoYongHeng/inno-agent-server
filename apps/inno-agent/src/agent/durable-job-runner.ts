@@ -2,7 +2,7 @@ import type { IncomingMessage } from "node:http";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { UserInput } from "@earendil-works/pi-durable";
 import { DurableSseProjector } from "./durable-projection.js";
-import type { DurableSessionService } from "./durable-session-service.js";
+import { DurableSessionBusyError, type DurableSessionService } from "./durable-session-service.js";
 
 export interface DurableJobPromptOptions {
 	requestId: string;
@@ -17,6 +17,21 @@ export interface DurableJobPromptOptions {
 	 * to INNO_DURABLE_JOB_BUSY_WAIT_MS or two minutes; 0 disables waiting.
 	 */
 	busyWaitMs?: number;
+	/**
+	 * When the lease stays busy past `busyWaitMs`, hand the prompt to the
+	 * worker that owns the session (`POST /api/internal/durable-prompt`) and
+	 * return its result. Returns null when no forward is possible — the busy
+	 * error then propagates as before. Text-only: prompts carrying `images`
+	 * are never forwarded. Forwarded runs are event-less (`onEvent` cannot
+	 * stream across workers; the final text is still returned).
+	 */
+	forwardToOwner?: (execution: {
+		sessionId: string;
+		prompt: string;
+		requestId: string;
+		turnId: string;
+		notifyOnly?: boolean;
+	}) => Promise<string | null>;
 }
 
 /** Internal prompts (scheduler jobs, channel messages) wait briefly for an
@@ -90,6 +105,14 @@ export async function runDurableJobPrompt(
 		await service.snapshot(req, sessionId);
 		void service.maybeAutoGenerateTopic(req, sessionId);
 		return result.text;
+	} catch (error) {
+		if (error instanceof DurableSessionBusyError && options.forwardToOwner && !options.images?.length) {
+			const forwarded = await options.forwardToOwner({
+				sessionId, prompt, requestId: options.requestId, turnId: options.turnId,
+			});
+			if (forwarded !== null) return forwarded;
+		}
+		throw error;
 	} finally {
 		if (stream) await stream.stop().catch(() => undefined);
 		if (lease) {

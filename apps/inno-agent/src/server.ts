@@ -9,8 +9,8 @@ import { LocalExecManager } from "./sandbox/local-exec-manager.js";
 import { PgSandboxQuotaStore } from "./sandbox/pg-sandbox-quota.js";
 import type { SandboxBindingProvider } from "./sandbox/sandbox-session.js";
 import { renderPrometheus } from "./utils/metrics.js";
-import { createServer, type IncomingMessage as HttpReq } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createServer, type IncomingMessage as HttpReq, type ServerResponse } from "node:http";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,7 +21,7 @@ import { installFetchLogger } from "./utils/fetch-logger.js";
 import { applyProviderProxyBypass } from "./utils/proxy-bypass.js";
 import { ensureDir, readJson, readText, writeJson, writeText } from "./storage/file-store.js";
 import { closeDeferredRuns, configureDeferredRuns } from "./scheduler/deferred-runs.js";
-import { DurableSessionService } from "./agent/durable-session-service.js";
+import { DurableSessionBusyError, DurableSessionService } from "./agent/durable-session-service.js";
 import { DURABLE_JOB_BUSY_WAIT_MS, runDurableJobPrompt } from "./agent/durable-job-runner.js";
 import { executeJob, type CreatedJobSession, type DurableJobExecution, type DurableJobExecutor } from "./scheduler/job-runner.js";
 import type { ScheduledJob } from "./scheduler/types.js";
@@ -38,7 +38,7 @@ import { ScopedJobStore } from "./scheduler/scoped-job-store.js";
 import { CheckInStore } from "./checkins/check-in-store.js";
 import { CronScheduler } from "./scheduler/cron-scheduler.js";
 import { TenantCronScheduler } from "./scheduler/tenant-cron-scheduler.js";
-import { HttpError, json } from "./server/http-helpers.js";
+import { HttpError, json, readBody } from "./server/http-helpers.js";
 import { serveStatic } from "./server/static-serve.js";
 import { createRouteDispatcher } from "./server/route-dispatch.js";
 import {
@@ -81,6 +81,7 @@ import { readAuthRuntimeConfig, readListenConfig } from "./auth/config.js";
 import { assertSignUpAllowed, isPublicApiRequest, isTrustedOrigin, requireSession } from "./auth/http.js";
 import { createAuthRuntime } from "./auth/runtime.js";
 import { createBackgroundRequest, getRequestTenant, setRequestTenant } from "./tenants/http.js";
+import type { TenantContext } from "./tenants/store.js";
 import { syncTenantConfigFromStore } from "./tenants/config.js";
 import { forwardDurableTenantRequest, readDurableShardConfig } from "./tenants/durable-tenant-router.js";
 import { resolveCurrentTenantDataRoot, resolveRequestTenantDataRoot } from "./tenants/paths.js";
@@ -272,12 +273,14 @@ async function ensureBootstrapped(): Promise<void> {
 			images?: ImageContent[],
 		) => {
 			const turnId = `channel-${randomUUID()}`;
+			const tenant = getCurrentTenant();
 			return runDurableJobPrompt(backgroundTenantRequest(), durableSessions, sessionId, prompt, {
 				requestId: `channel-request-${randomUUID()}`,
 				turnId,
 				onEvent,
 				images,
 				noUi: true,
+				...(tenant ? { forwardToOwner: (payload: InternalPromptPayload) => forwardJobToOwner(tenant, payload) } : {}),
 			});
 		};
 		const dispatcherOptions: Omit<PersonalChannelDispatcherOptions, "channelRegistry" | "channelsDataDir"> = {
@@ -1126,6 +1129,92 @@ const durableSessions = new DurableSessionService({
 
 const activeDurableJobTurns = new Map<string, string>();
 
+// Worker-to-worker internal prompt forwarding: when a session's lease is held
+// by another worker past the busy wait, internal prompts (scheduler jobs,
+// channel inbound) are handed to the owner over POST /api/internal/durable-prompt
+// authenticated by the shared INNO_WORKER_TOKEN. Without the token the endpoint
+// is 404 and forwarding is off — the busy error propagates exactly as before.
+const workerToken = process.env.INNO_WORKER_TOKEN?.trim() ?? "";
+const INTERNAL_FORWARD_TIMEOUT_MS = 600_000;
+const INTERNAL_PROMPT_PATH = "/api/internal/durable-prompt";
+
+interface InternalPromptPayload {
+	sessionId: string;
+	prompt: string;
+	requestId: string;
+	turnId: string;
+	notifyOnly?: boolean;
+}
+
+/** Forward an internal prompt to the worker recorded as the session owner. */
+async function forwardJobToOwner(tenant: TenantContext, execution: InternalPromptPayload): Promise<string | null> {
+	if (!workerToken || !durableShardConfig || !auth.tenantStore) return null;
+	const hint = await auth.tenantStore.durableSessionRouteHint(tenant, execution.sessionId);
+	const owner = hint.owner ?? hint.affinity;
+	if (!owner || owner === durableShardConfig.localShardId) return null;
+	const base = durableShardConfig.targets[owner];
+	if (!base) return null;
+	try {
+		const response = await fetch(new URL(INTERNAL_PROMPT_PATH, base), {
+			method: "POST",
+			headers: { "content-type": "application/json", "x-inno-worker-token": workerToken },
+			body: JSON.stringify(execution),
+			// The remote turn runs to completion inside this request; the timeout
+			// must exceed the longest expected job turn.
+			signal: AbortSignal.timeout(INTERNAL_FORWARD_TIMEOUT_MS),
+		});
+		if (!response.ok) return null;
+		const data = await response.json() as { text?: unknown };
+		return typeof data.text === "string" ? data.text : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Execute a forwarded internal prompt on the owner worker (no re-forward). */
+async function handleInternalDurablePrompt(req: HttpReq, res: ServerResponse): Promise<void> {
+	const presented = typeof req.headers["x-inno-worker-token"] === "string" ? req.headers["x-inno-worker-token"] : "";
+	const authenticated = Boolean(workerToken)
+		&& presented.length === workerToken.length
+		&& timingSafeEqual(Buffer.from(presented), Buffer.from(workerToken));
+	if (!authenticated) { json(res, 404, { error: "Not found" }); return; }
+	await ensureBootstrapped();
+	if (!auth.tenantStore) { json(res, 503, { error: "Internal prompts require a tenant store" }); return; }
+	const body = await readBody(req) as Record<string, unknown>;
+	const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+	const prompt = typeof body.prompt === "string" ? body.prompt : "";
+	if (!sessionId || !prompt) { json(res, 400, { error: "sessionId and prompt are required" }); return; }
+	const requestId = typeof body.requestId === "string" && body.requestId ? body.requestId : `internal-${randomUUID()}`;
+	const turnId = typeof body.turnId === "string" && body.turnId ? body.turnId : `internal-${randomUUID()}`;
+	// The tenant comes from the session's own catalog row, never from the body;
+	// tenant_memberships joins need the owning user, taken from the tenant row.
+	const row = await auth.tenantStore.database.query<{ tenant_id: string; owner_user_id: string }>(
+		`SELECT sessions.tenant_id, tenants.owner_user_id
+		 FROM durable_sessions sessions JOIN tenants ON tenants.id = sessions.tenant_id
+		 WHERE sessions.id = $1`, [sessionId]);
+	const found = row.rows[0];
+	if (!found) { json(res, 404, { error: "Session not found" }); return; }
+	const breq = createBackgroundRequest({ tenantId: found.tenant_id, userId: found.owner_user_id, role: "owner" }, auth.tenantStore);
+	// Internal prompts bypass the cookie gate where tenant config is normally
+	// materialised — sync it here so the tenant's model/provider config exists.
+	await syncTenantConfigFromStore(auth.tenantStore, dataDir, found.tenant_id);
+	try {
+		if (body.notifyOnly === true) {
+			await durableSessions.appendAssistantNotification(breq, sessionId, prompt, requestId, { busyWaitMs: DURABLE_JOB_BUSY_WAIT_MS });
+			json(res, 200, { text: prompt });
+			return;
+		}
+		const text = await runDurableJobPrompt(breq, durableSessions, sessionId, prompt, {
+			requestId, turnId, noUi: true, busyWaitMs: DURABLE_JOB_BUSY_WAIT_MS,
+		});
+		json(res, 200, { text });
+	} catch (error) {
+		if (error instanceof DurableSessionBusyError) { json(res, 409, { error: "Session is busy" }); return; }
+		logger.error({ err: error, sessionId }, "internal durable prompt failed");
+		json(res, 500, { error: error instanceof Error ? error.message : String(error) });
+	}
+}
+
 function backgroundTenantRequest(): HttpReq {
 	const tenant = getCurrentTenant();
 	if (!tenant) return createBackgroundRequest();
@@ -1135,9 +1224,21 @@ function backgroundTenantRequest(): HttpReq {
 }
 
 async function executeDurableJob(req: HttpReq, execution: DurableJobExecution): Promise<string> {
+	const tenant = getRequestTenant(req);
+	const forward = tenant
+		? (payload: InternalPromptPayload) => forwardJobToOwner(tenant, payload)
+		: undefined;
 	// A reminder is recorded as a notice in the run's conversation; no model turn.
 	if (execution.notifyOnly) {
-		await durableSessions.appendAssistantNotification(req, execution.sessionId, execution.prompt, execution.requestId, { busyWaitMs: DURABLE_JOB_BUSY_WAIT_MS });
+		try {
+			await durableSessions.appendAssistantNotification(req, execution.sessionId, execution.prompt, execution.requestId, { busyWaitMs: DURABLE_JOB_BUSY_WAIT_MS });
+		} catch (error) {
+			if (forward && error instanceof DurableSessionBusyError) {
+				const text = await forward({ ...execution, notifyOnly: true });
+				if (text !== null) return text;
+			}
+			throw error;
+		}
 		return execution.prompt;
 	}
 	if (activeDurableJobTurns.has(execution.sessionId)) {
@@ -1145,7 +1246,10 @@ async function executeDurableJob(req: HttpReq, execution: DurableJobExecution): 
 	}
 	activeDurableJobTurns.set(execution.sessionId, execution.turnId);
 	try {
-		return await runDurableJobPrompt(req, durableSessions, execution.sessionId, execution.prompt, execution);
+		return await runDurableJobPrompt(req, durableSessions, execution.sessionId, execution.prompt, {
+			...execution,
+			...(forward ? { forwardToOwner: forward } : {}),
+		});
 	} finally {
 		if (activeDurableJobTurns.get(execution.sessionId) === execution.turnId) {
 			activeDurableJobTurns.delete(execution.sessionId);
@@ -1355,6 +1459,14 @@ const server = createServer(async (req, response) => {
 				durableRequired: true,
 				user: session?.principal ?? null,
 			});
+			return;
+		}
+
+		// Worker-to-worker prompt forwarding: token-authenticated, deliberately
+		// outside the cookie gate and the durable shard forwarder (it is already
+		// running on the intended owner; a busy session answers 409).
+		if (method === "POST" && path === INTERNAL_PROMPT_PATH) {
+			await handleInternalDurablePrompt(req, res);
 			return;
 		}
 
