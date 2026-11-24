@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { logger } from "../logger.js";
 import { incCounter, observeMs } from "../utils/metrics.js";
 import type { WorkspaceReplica } from "../workspace/workspace-replica.js";
+import { createReplicaPushGate } from "../server/replica-push.js";
 import { LocalDirSandbox } from "./local-backend.js";
 import { SandboxRunError, type SandboxBackend } from "./sandbox-backend.js";
 import type { BindSandboxInput, SandboxBindingProvider, SandboxRuntimeBinding } from "./sandbox-session.js";
@@ -24,14 +25,19 @@ export interface LocalExecManagerOptions {
 /**
  * Lazily materialises the real backend on the first file/command call so a
  * session that never touches the workspace never takes a concurrency slot.
+ * Mutating calls fire `onMutated` once they settle; while a command is
+ * running the trigger is deferred until it exits so a push never captures a
+ * half-written file.
  */
 class GatedLocalBackend implements SandboxBackend {
 	private inner: LocalDirSandbox | null = null;
+	private inflightRuns = 0;
 	constructor(
 		readonly id: string,
 		private readonly root: string,
 		private readonly acquire: () => boolean,
 		private readonly busyMessage: string,
+		private readonly onMutated?: () => void,
 	) {}
 
 	private delegate(): LocalDirSandbox {
@@ -42,17 +48,48 @@ class GatedLocalBackend implements SandboxBackend {
 		return this.inner;
 	}
 
+	private mutated(): void {
+		// Mutations during a command are covered by the push fired when it exits.
+		if (this.inflightRuns === 0) this.onMutated?.();
+	}
+
 	// All methods are async so an over-cap denial rejects like a normal
 	// backend failure instead of throwing synchronously at the call site.
 	readFile = async (path: string) => this.delegate().readFile(path);
-	writeFile = async (path: string, data: Uint8Array | string) => this.delegate().writeFile(path, data);
+	writeFile = async (path: string, data: Uint8Array | string) => {
+		const result = await this.delegate().writeFile(path, data);
+		this.mutated();
+		return result;
+	};
 	list = async (path: string) => this.delegate().list(path);
 	listTree = async (path: string, maxDepth: number) => this.delegate().listTree(path, maxDepth);
 	stat = async (path: string) => this.delegate().stat(path);
-	makeDir = async (path: string) => this.delegate().makeDir(path);
-	remove = async (path: string) => this.delegate().remove(path);
-	rename = async (from: string, to: string) => this.delegate().rename(from, to);
-	run = async (command: string, options?: Parameters<LocalDirSandbox["run"]>[1]) => this.delegate().run(command, options);
+	makeDir = async (path: string) => {
+		const result = await this.delegate().makeDir(path);
+		this.mutated();
+		return result;
+	};
+	remove = async (path: string) => {
+		const result = await this.delegate().remove(path);
+		this.mutated();
+		return result;
+	};
+	rename = async (from: string, to: string) => {
+		const result = await this.delegate().rename(from, to);
+		this.mutated();
+		return result;
+	};
+	run = async (command: string, options?: Parameters<LocalDirSandbox["run"]>[1]) => {
+		this.inflightRuns++;
+		try {
+			return await this.delegate().run(command, options);
+		} finally {
+			this.inflightRuns--;
+			// A command may itself write files, and a mutation during it was
+			// deferred — one push after it exits covers both.
+			if (this.inflightRuns === 0) this.onMutated?.();
+		}
+	};
 	keepAlive = async (ms: number) => this.delegate().keepAlive(ms);
 	pause = async () => this.delegate().pause();
 	/** The root is the shared workspace directory — never delete it. */
@@ -74,8 +111,12 @@ class GatedLocalBackend implements SandboxBackend {
  */
 export class LocalExecManager implements SandboxBindingProvider {
 	private active = 0;
+	/** The binding pulls/pushes the replica itself when one is configured. */
+	readonly syncsWorkspaceReplica: boolean;
 
-	constructor(private readonly options: LocalExecManagerOptions = {}) {}
+	constructor(private readonly options: LocalExecManagerOptions = {}) {
+		this.syncsWorkspaceReplica = Boolean(options.replica);
+	}
 
 	private tryAcquire(): boolean {
 		const max = this.options.maxConcurrent ?? 0;
@@ -130,6 +171,12 @@ export class LocalExecManager implements SandboxBindingProvider {
 			await push();
 		};
 
+		// Coalesce mutation-triggered pushes: a burst of file writes (or a
+		// script touching many files) collapses into at most two syncs.
+		const syncEnabled = Boolean(replica && tenant && workspaceId);
+		const pushGate = syncEnabled ? createReplicaPushGate(push) : undefined;
+		const onMutated = pushGate ? () => void pushGate() : undefined;
+
 		return {
 			backend: new GatedLocalBackend(`local-${input.sessionId}`, dir, () => {
 				if (slotHeld) return true;
@@ -137,7 +184,7 @@ export class LocalExecManager implements SandboxBindingProvider {
 				slotHeld = true;
 				incCounter("inno_local_exec_activations_total");
 				return true;
-			}, "本地执行并发已满，请稍后重试"),
+			}, "本地执行并发已满，请稍后重试", onMutated),
 			remoteRoot: "/",
 			requireApproval: this.options.requireApproval ?? false,
 			commandTimeoutSeconds: this.options.commandTimeoutSeconds ?? 600,

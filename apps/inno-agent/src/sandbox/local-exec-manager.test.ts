@@ -100,6 +100,35 @@ describe("LocalExecManager", () => {
 		await second.release();
 	});
 
+	it("pushes incrementally after mutations, coalescing bursts", async () => {
+		const { workspace } = setup();
+		const pushes: number[] = [];
+		const replica = {
+			pull: async () => {},
+			push: async () => { pushes.push(Date.now()); await new Promise((resolve) => setTimeout(resolve, 20)); },
+		};
+		const binding = await new LocalExecManager({ replica: replica as never })
+			.bind(input({
+				hostWorkspaceDir: workspace, workspaceId: "ws1",
+				tenantContext: { tenantId: "t", userId: "u", role: "owner" as const },
+			}));
+
+		await binding.backend.writeFile("/a.txt", "x");
+		await binding.backend.writeFile("/b.txt", "y");
+		await binding.backend.writeFile("/c.txt", "z");
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		// Three writes coalesce into at most two pushes.
+		expect(pushes.length).toBeGreaterThanOrEqual(1);
+		expect(pushes.length).toBeLessThanOrEqual(2);
+
+		// A read does not trigger a push.
+		const count = pushes.length;
+		await binding.backend.readFile("/a.txt");
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		expect(pushes.length).toBe(count);
+		await binding.release();
+	});
+
 	it("never fails the turn on replica errors", async () => {
 		const { workspace } = setup();
 		const replica = {

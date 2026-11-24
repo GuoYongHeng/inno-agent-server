@@ -50,6 +50,9 @@ export interface BindSandboxInput {
 /** Anything the durable session service can bind a runtime to: a remote
  * sandbox provider or a local execution backend. */
 export interface SandboxBindingProvider {
+	/** When true the provider keeps the workspace dir in sync with durable
+	 * storage itself, so the session service skips its own pull/push. */
+	readonly syncsWorkspaceReplica?: boolean;
 	bind(input: BindSandboxInput): Promise<SandboxRuntimeBinding>;
 	destroy(sandboxId: string): Promise<void>;
 }

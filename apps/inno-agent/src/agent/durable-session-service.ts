@@ -28,6 +28,7 @@ import {
 	buildAttachmentContext,
 	parseChatAttachments,
 	validateChatAttachments,
+	validateChatAttachmentsInStore,
 	type ChatAttachments,
 } from "../server/attachments.js";
 import {
@@ -61,6 +62,8 @@ import { buildDurableContextUsage, unavailableContextUsage, type UsageMessage } 
 import type { SessionContextUsage } from "../shared/context-usage.js";
 import { createDocumentTools } from "./document-tools.js";
 import { LocalWorkspaceFileAccess } from "../workspace/local-workspace-file-access.js";
+import { LocalFsWorkspaceStore } from "../workspace/local-fs-workspace-store.js";
+import type { WorkspaceStore } from "../workspace/workspace-store.js";
 import { buildGlobalSkillsSection } from "./skills.js";
 import { createTavilyTools } from "./tavily-tools.js";
 import { formatRecallForPrompt, ScopedL3Memory } from "../memory/l3/l3-tools.js";
@@ -154,6 +157,12 @@ export interface DurableSessionServiceOptions {
 		pull: (tenant: TenantContext, workspaceId: string, dir: string) => Promise<void>;
 		push: (tenant: TenantContext, workspaceId: string, dir: string) => Promise<void>;
 	};
+	/**
+	 * Per-request workspace store (T1.4): when it is manifest-backed,
+	 * attachment validation and inline-image persistence go through the store
+	 * and mirror onto the worker's disk, instead of trusting the local dir.
+	 */
+	workspaceStoreFor?: (req: IncomingMessage) => WorkspaceStore;
 }
 
 /** Re-enter the verified tenant for tools that read tenant-scoped stores, since
@@ -671,6 +680,16 @@ export class DurableSessionService {
 		return operation;
 	}
 
+	/**
+	 * Returns the manifest-backed store for this request, or null when the
+	 * request resolves to the local-filesystem store (local mode, or
+	 * non-durable object storage) — callers then keep the disk-based path.
+	 */
+	private workspaceStore(req: IncomingMessage): WorkspaceStore | null {
+		const store = this.options.workspaceStoreFor?.(req);
+		return store && !(store instanceof LocalFsWorkspaceStore) ? store : null;
+	}
+
 	async prepareAttachments(req: IncomingMessage, id: string, raw: unknown): Promise<PreparedDurableAttachments | null> {
 		const parsed = parseChatAttachments(raw);
 		if (!parsed) return null;
@@ -678,7 +697,10 @@ export class DurableSessionService {
 		if (!record) throw new Error("Durable session not found");
 		const workspaceRoot = this.options.resolveWorkspaceDir(id, record.workspaceId);
 		if (!workspaceRoot) throw new Error(`Durable session workspace not found: ${record.workspaceId}`);
-		const attachments = validateChatAttachments(parsed, workspaceRoot);
+		const store = this.workspaceStore(req);
+		const attachments = store
+			? await validateChatAttachmentsInStore(parsed, store, record.workspaceId)
+			: validateChatAttachments(parsed, workspaceRoot);
 		const context = buildAttachmentContext(attachments);
 		if (!context) return null;
 		return { attachments, context, workspaceId: record.workspaceId, workspaceRoot };
@@ -693,6 +715,17 @@ export class DurableSessionService {
 		if (!workspaceRoot) throw new Error(`Durable session workspace not found: ${record.workspaceId}`);
 		const paths = persistInlineImages(parsed, workspaceRoot, requestId);
 		if (paths.length !== parsed.length) throw new Error("Failed to persist every durable inline image");
+		// Mirror into the manifest store so the files are durable immediately —
+		// the local copy above is what the model reads during this turn.
+		const store = this.workspaceStore(req);
+		if (store && record.workspaceId) {
+			for (const [index, image] of parsed.entries()) {
+				const rel = paths[index];
+				if (!rel) continue;
+				await store.write(record.workspaceId, rel, Buffer.from(image.data, "base64"))
+					.catch((error) => logger.warn({ err: error, workspaceId: record.workspaceId, rel }, "failed to mirror inline image into workspace store"));
+			}
+		}
 		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
 		const model = config.providers[record.provider]?.models.find((candidate) => candidate.id === record.modelId);
 		if (!model) throw new Error(`Configured durable model not found: ${record.provider}/${record.modelId}`);
@@ -959,8 +992,17 @@ export class DurableSessionService {
 						const workspaceDir = this.options.resolveWorkspaceDir(id, workspaceId);
 						if (!workspaceDir) throw new Error(`Durable session workspace not found: ${record.workspaceId}`);
 						const workspaceFiles = new LocalWorkspaceFileAccess({ root: workspaceDir });
+						// A replica-aware binding (local exec) pushes on settle and
+						// release — the close-time mirror push is only needed when
+						// nothing else syncs the directory.
+						const bindingSyncs = this.options.getSandboxManager?.()?.syncsWorkspaceReplica === true;
 						if (tenant && this.options.workspaceReplica) {
-							replicaDir = { tenant, workspaceId, dir: workspaceDir };
+							// The pull seeds the dir for prompt building
+							// (agent.md/.skills are read during open) — keep it
+							// even when the binding syncs. The close-time push is
+							// skipped then: the binding already pushes on every
+							// settle and on release.
+							if (!bindingSyncs) replicaDir = { tenant, workspaceId, dir: workspaceDir };
 							await this.options.workspaceReplica.pull(tenant, workspaceId, workspaceDir);
 						}
 						const tenantDataRoot = resolveRequestTenantDataRoot(req, this.options.dataDir);

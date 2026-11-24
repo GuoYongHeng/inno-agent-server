@@ -74,6 +74,7 @@ import { DEFAULT_WORKSPACE_ID, TEMP_WORKSPACE_ID, WorkspaceRegistry, type Worksp
 import { WorkspaceReplica } from "./workspace/workspace-replica.js";
 import { LocalFsWorkspaceStore } from "./workspace/local-fs-workspace-store.js";
 import { ObjectWorkspaceStore } from "./workspace/object-workspace-store.js";
+import type { WorkspaceStore } from "./workspace/workspace-store.js";
 import type { RemoteContentSource } from "./content-source/index.js";
 import { ContentHubCatalog } from "./content-source/catalog-service.js";
 import { readAuthRuntimeConfig, readListenConfig } from "./auth/config.js";
@@ -143,6 +144,20 @@ const getSharedObjectStore = (): ObjectStore => {
  */
 const objectStorageIsDurable = (): boolean =>
 	isDurableObjectStorageProvider(normalizeObjectStorageConfig(config?.objectStorage).provider);
+/**
+ * Per-request workspace store: manifest + object store for authenticated
+ * tenants on durable object storage; the local filesystem otherwise. Shared
+ * by the workspace routes and the durable session service (T1.4).
+ */
+const workspaceStoreForRequest = (request: HttpReq): WorkspaceStore => {
+	const tenant = getRequestTenant(request);
+	if (tenant && auth.tenantStore && objectStorageIsDurable()) {
+		return new ObjectWorkspaceStore({ objects: getSharedObjectStore(), store: auth.tenantStore, context: tenant });
+	}
+	// memory provider: bytes die with the process — the local dir stays
+	// the source of truth even for authenticated requests.
+	return new LocalFsWorkspaceStore({ resolveRoot: (id) => workspaceRegistry.resolveWorkspaceDir(id) });
+};
 if (auth.tenantStore) {
 	const l2Pool = auth.tenantStore.database;
 	const tenantL2Root = resolve(dataDir, "tenants");
@@ -1094,6 +1109,7 @@ const durableSessions = new DurableSessionService({
 	}),
 	tenantStore: auth.tenantStore,
 	getSandboxManager,
+	workspaceStoreFor: workspaceStoreForRequest,
 	...(auth.tenantStore ? {
 		recoveryPool: auth.tenantStore.database,
 		pgCatalog: new PgSessionCatalog(auth.tenantStore.database, (req) => join(resolveRequestTenantDataRoot(req, dataDir), "durable", "sessions.json")),
@@ -1239,15 +1255,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		workspaceReplica,
 		// Read routes serve from the manifest + object store in authenticated
 		// mode; local mode (and any test without a tenant) uses the filesystem.
-		workspaceStoreFor: (request) => {
-			const tenant = getRequestTenant(request);
-			if (tenant && auth.tenantStore && objectStorageIsDurable()) {
-				return new ObjectWorkspaceStore({ objects: getSharedObjectStore(), store: auth.tenantStore, context: tenant });
-			}
-			// memory provider: bytes die with the process — the local dir stays
-			// the source of truth even for authenticated requests.
-			return new LocalFsWorkspaceStore({ resolveRoot: (id) => workspaceRegistry.resolveWorkspaceDir(id) });
-		},
+		workspaceStoreFor: workspaceStoreForRequest,
 	}),
 
 	// --- Presets API (extracted to server/routes/presets.ts) ---

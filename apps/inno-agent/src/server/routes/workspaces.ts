@@ -4,6 +4,7 @@ import type { Dirent } from "node:fs";
 import {
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
@@ -476,6 +477,86 @@ export async function handleWorkspacesRoutes(
 		if (normalizedPath.startsWith("/") || /^[A-Za-z]:\//.test(normalizedPath)) return null;
 		return safeJoinReal(root, normalizedPath);
 	};
+
+	// --- Object-store write path (T1.4) -------------------------------------
+	// With a manifest-backed store, mutations write bytes + rows directly and
+	// then mirror into the worker's local copy (when one exists), so running
+	// sessions and persistent-mode tools see the change immediately while the
+	// manifest stays the source of truth. Resolution never materializes files.
+	const storeBacked = !(store instanceof LocalFsWorkspaceStore);
+	const resolveWriteWorkspace = (workspaceId?: string | null) => storeBacked
+		? resolveRequestWorkspaceForRead(req, workspaceRegistry, tenantStore, workspaceId ?? null, ctx.workspaceReplica)
+		: resolveWorkspace(workspaceId);
+	const storeStatus = (error: unknown): number =>
+		error instanceof WorkspaceStoreError
+			? error.code === "not_found" ? 404
+				: error.code === "exists" ? 409
+				: error.code === "too_large" ? 413
+				: 400
+			: 500;
+	const mirrorWrite = (wsId: string, rel: string, data: Uint8Array | string) => {
+		const target = safeWorkspacePath(wsId, rel);
+		if (!target) return;
+		ensureDir(dirname(target));
+		writeFileSync(target, data);
+	};
+	const mirrorMkdir = (wsId: string, rel: string) => {
+		const target = safeWorkspacePath(wsId, rel);
+		if (target) mkdirSync(target, { recursive: true });
+	};
+	const mirrorRemove = (wsId: string, rel: string) => {
+		const target = safeWorkspacePath(wsId, rel);
+		if (target && existsSync(target)) rmSync(target, { recursive: true, force: true });
+	};
+	const mirrorMove = (wsId: string, from: string, to: string) => {
+		const src = safeWorkspacePath(wsId, from);
+		const dst = safeWorkspacePath(wsId, to);
+		if (!src || !dst || !existsSync(src) || existsSync(dst)) return;
+		ensureDir(dirname(dst));
+		renameSync(src, dst);
+	};
+	/** Install a skill package into a temp dir, sync `<ws>/.skills/<name>` into
+	 * the store, then mirror the install into the local copy when one exists. */
+	const installWorkspaceSkill = async (wsId: string, fileName: string, data: Buffer) => {
+		const ext = extname(fileName).toLowerCase();
+		const skillsRoot = mkdtempSync(join(tmpdir(), "inno-skill-install-"));
+		try {
+			const skill = ext === ".zip"
+				? installSkillZip(fileName, data, skillsRoot)
+				: installSkillMarkdown(fileName, data, skillsRoot);
+			const skillDir = join(skillsRoot, skill.name);
+			const storeRel = `${WORKSPACE_PRIVATE_SKILLS_DIR}/${skill.name}`;
+			if (storeBacked) {
+				await store.remove(wsId, storeRel, { recursive: true }).catch((error) => {
+					if (!(error instanceof WorkspaceStoreError && error.code === "not_found")) throw error;
+				});
+				const copyTree = async (dir: string, rel: string): Promise<void> => {
+					await store.mkdir(wsId, rel);
+					for (const child of readdirSync(dir, { withFileTypes: true })) {
+						if (child.isDirectory()) await copyTree(join(dir, child.name), `${rel}/${child.name}`);
+						else await store.write(wsId, `${rel}/${child.name}`, new Uint8Array(readFileSync(join(dir, child.name))));
+					}
+				};
+				await copyTree(skillDir, storeRel);
+			}
+			const localSkillsRoot = safeWorkspacePath(wsId, WORKSPACE_PRIVATE_SKILLS_DIR);
+			if (localSkillsRoot) {
+				if (ext === ".zip") installSkillZip(fileName, data, localSkillsRoot);
+				else installSkillMarkdown(fileName, data, localSkillsRoot);
+			}
+			const stat = statSync(skillDir);
+			return {
+				name: skill.name,
+				path: storeRel,
+				type: "directory" as const,
+				size: stat.size,
+				updatedAt: stat.mtime.toISOString(),
+			};
+		} finally {
+			rmSync(skillsRoot, { recursive: true, force: true });
+		}
+	};
+
 	const switchableSession = async (sessionId: string): Promise<{ hasHistory: boolean } | null> => {
 		const session = await durableSessions.get(req, sessionId);
 		if (!session) {
@@ -822,12 +903,29 @@ export async function handleWorkspacesRoutes(
 	if (method === "PUT" && url === "/api/workspace/file") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const requestedWsId = workspaceIdFromBody(body);
-		const workspace = await resolveWorkspace(requestedWsId);
-		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
-		const wsId = workspace.id;
 		const filePath = typeof body.path === "string" ? body.path.trim() : "";
 		const content = typeof body.content === "string" ? body.content : "";
 		if (!filePath) { json(res, 400, { error: "Missing path" }); return true; }
+		if (storeBacked) {
+			const workspace = await resolveWriteWorkspace(requestedWsId);
+			if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
+			const wsId = workspace.id;
+			try {
+				const rel = normalizeWorkspacePath(filePath);
+				const existing = await store.stat(wsId, rel);
+				if (!existing || existing.kind !== "file") { json(res, 404, { error: "File not found" }); return true; }
+				const bytes = new TextEncoder().encode(content);
+				const entry = await store.write(wsId, rel, bytes);
+				mirrorWrite(wsId, rel, bytes);
+				json(res, 200, { path: filePath, saved: true, size: entry.size, updatedAt: new Date(entry.mtimeMs).toISOString() });
+			} catch (error) {
+				json(res, storeStatus(error), { error: error instanceof Error ? error.message : String(error) });
+			}
+			return true;
+		}
+		const workspace = await resolveWorkspace(requestedWsId);
+		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
+		const wsId = workspace.id;
 		const fullPath = safeWorkspacePath(wsId, filePath);
 		if (!fullPath) { json(res, 400, { error: "Invalid path" }); return true; }
 		if (!existsSync(fullPath) || !statSync(fullPath).isFile()) {
@@ -843,14 +941,35 @@ export async function handleWorkspacesRoutes(
 	if (method === "POST" && url === "/api/workspace/create") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const requestedWsId = workspaceIdFromBody(body);
+		const itemPath = typeof body.path === "string" ? body.path.trim() : "";
+		const itemType = body.type === "directory" ? "directory" : "file";
+		if (!itemPath) { json(res, 400, { error: "Missing path" }); return true; }
+		if (storeBacked) {
+			const workspace = await resolveWriteWorkspace(requestedWsId);
+			if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
+			const wsId = workspace.id;
+			try {
+				const rel = normalizeWorkspacePath(itemPath);
+				if (await store.stat(wsId, rel)) { json(res, 409, { error: "Already exists" }); return true; }
+				const entry = itemType === "directory"
+					? await store.mkdir(wsId, rel)
+					: await store.write(wsId, rel, new Uint8Array());
+				if (itemType === "directory") mirrorMkdir(wsId, rel);
+				else mirrorWrite(wsId, rel, new Uint8Array());
+				json(res, 201, {
+					name: entry.name, path: rel, type: itemType, size: entry.size,
+					updatedAt: new Date(entry.mtimeMs).toISOString(),
+				});
+			} catch (error) {
+				json(res, storeStatus(error), { error: error instanceof Error ? error.message : String(error) });
+			}
+			return true;
+		}
 		const workspace = await resolveWorkspace(requestedWsId);
 		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
 		const wsId = workspace.id;
 		const root = workspaceRegistry.resolveWorkspaceDir(wsId);
 		if (!root) { json(res, 404, { error: "Workspace not found" }); return true; }
-		const itemPath = typeof body.path === "string" ? body.path.trim() : "";
-		const itemType = body.type === "directory" ? "directory" : "file";
-		if (!itemPath) { json(res, 400, { error: "Missing path" }); return true; }
 		const fullPath = safeWorkspacePath(wsId, itemPath);
 		if (!fullPath) { json(res, 400, { error: "Invalid path" }); return true; }
 		if (existsSync(fullPath)) { json(res, 409, { error: "Already exists" }); return true; }
@@ -875,15 +994,39 @@ export async function handleWorkspacesRoutes(
 	if (method === "POST" && url === "/api/workspace/rename") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const requestedWsId = workspaceIdFromBody(body);
+		const oldPath = typeof body.oldPath === "string" ? body.oldPath.trim() : "";
+		const newPath = typeof body.newPath === "string" ? body.newPath.trim() : "";
+		if (!oldPath || !newPath) { json(res, 400, { error: "Missing oldPath or newPath" }); return true; }
+		if (oldPath === newPath) { json(res, 400, { error: "Paths are identical" }); return true; }
+		if (storeBacked) {
+			const workspace = await resolveWriteWorkspace(requestedWsId);
+			if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
+			const wsId = workspace.id;
+			try {
+				const relOld = normalizeWorkspacePath(oldPath);
+				const relNew = normalizeWorkspacePath(newPath);
+				if (relOld === relNew) { json(res, 400, { error: "Paths are identical" }); return true; }
+				if (!await store.stat(wsId, relOld)) { json(res, 404, { error: "Source not found" }); return true; }
+				if (await store.stat(wsId, relNew)) { json(res, 409, { error: "Target already exists" }); return true; }
+				await store.move(wsId, relOld, relNew);
+				mirrorMove(wsId, relOld, relNew);
+				const entry = await store.stat(wsId, relNew);
+				json(res, 200, {
+					name: entry?.name ?? basename(relNew), path: relNew,
+					type: entry?.kind === "directory" ? "directory" : "file",
+					size: entry?.size ?? 0,
+					updatedAt: entry ? new Date(entry.mtimeMs).toISOString() : new Date().toISOString(),
+				});
+			} catch (error) {
+				json(res, storeStatus(error), { error: error instanceof Error ? error.message : String(error) });
+			}
+			return true;
+		}
 		const workspace = await resolveWorkspace(requestedWsId);
 		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
 		const wsId = workspace.id;
 		const root = workspaceRegistry.resolveWorkspaceDir(wsId);
 		if (!root) { json(res, 404, { error: "Workspace not found" }); return true; }
-		const oldPath = typeof body.oldPath === "string" ? body.oldPath.trim() : "";
-		const newPath = typeof body.newPath === "string" ? body.newPath.trim() : "";
-		if (!oldPath || !newPath) { json(res, 400, { error: "Missing oldPath or newPath" }); return true; }
-		if (oldPath === newPath) { json(res, 400, { error: "Paths are identical" }); return true; }
 		const fullOld = safeWorkspacePath(wsId, oldPath);
 		const fullNew = safeWorkspacePath(wsId, newPath);
 		if (!fullOld || !fullNew) { json(res, 400, { error: "Invalid path" }); return true; }
@@ -906,11 +1049,26 @@ export async function handleWorkspacesRoutes(
 	if (method === "POST" && url === "/api/workspace/delete") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const requestedWsId = workspaceIdFromBody(body);
+		const itemPath = typeof body.path === "string" ? body.path.trim() : "";
+		if (!itemPath) { json(res, 400, { error: "Cannot delete workspace root" }); return true; }
+		if (storeBacked) {
+			const workspace = await resolveWriteWorkspace(requestedWsId);
+			if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
+			const wsId = workspace.id;
+			try {
+				const rel = normalizeWorkspacePath(itemPath);
+				if (!await store.stat(wsId, rel)) { json(res, 404, { error: "Not found" }); return true; }
+				await store.remove(wsId, rel, { recursive: true });
+				mirrorRemove(wsId, rel);
+				json(res, 200, { deleted: true, path: itemPath });
+			} catch (error) {
+				json(res, storeStatus(error), { error: error instanceof Error ? error.message : String(error) });
+			}
+			return true;
+		}
 		const workspace = await resolveWorkspace(requestedWsId);
 		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
 		const wsId = workspace.id;
-		const itemPath = typeof body.path === "string" ? body.path.trim() : "";
-		if (!itemPath) { json(res, 400, { error: "Cannot delete workspace root" }); return true; }
 		const fullPath = safeWorkspacePath(wsId, itemPath);
 		if (!fullPath) { json(res, 400, { error: "Invalid path" }); return true; }
 		if (!existsSync(fullPath)) { json(res, 404, { error: "Not found" }); return true; }
@@ -923,14 +1081,38 @@ export async function handleWorkspacesRoutes(
 	if (method === "POST" && url === "/api/workspace/move") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const requestedWsId = workspaceIdFromBody(body);
+		const sourcePath = typeof body.sourcePath === "string" ? body.sourcePath.trim() : "";
+		const targetDir = typeof body.targetDir === "string" ? body.targetDir.trim() : "";
+		if (!sourcePath) { json(res, 400, { error: "Missing sourcePath" }); return true; }
+		if (storeBacked) {
+			const workspace = await resolveWriteWorkspace(requestedWsId);
+			if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
+			const wsId = workspace.id;
+			try {
+				const relSource = normalizeWorkspacePath(sourcePath);
+				if (!await store.stat(wsId, relSource)) { json(res, 404, { error: "Source not found" }); return true; }
+				const relDir = targetDir ? normalizeWorkspacePath(targetDir) : "";
+				const relDest = relDir ? `${relDir}/${basename(relSource)}` : basename(relSource);
+				if (await store.stat(wsId, relDest)) { json(res, 409, { error: "Target already exists" }); return true; }
+				await store.move(wsId, relSource, relDest);
+				mirrorMove(wsId, relSource, relDest);
+				const entry = await store.stat(wsId, relDest);
+				json(res, 200, {
+					name: entry?.name ?? basename(relDest), path: relDest,
+					type: entry?.kind === "directory" ? "directory" : "file",
+					size: entry?.size ?? 0,
+					updatedAt: entry ? new Date(entry.mtimeMs).toISOString() : new Date().toISOString(),
+				});
+			} catch (error) {
+				json(res, storeStatus(error), { error: error instanceof Error ? error.message : String(error) });
+			}
+			return true;
+		}
 		const workspace = await resolveWorkspace(requestedWsId);
 		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
 		const wsId = workspace.id;
 		const root = workspaceRegistry.resolveWorkspaceDir(wsId);
 		if (!root) { json(res, 404, { error: "Workspace not found" }); return true; }
-		const sourcePath = typeof body.sourcePath === "string" ? body.sourcePath.trim() : "";
-		const targetDir = typeof body.targetDir === "string" ? body.targetDir.trim() : "";
-		if (!sourcePath) { json(res, 400, { error: "Missing sourcePath" }); return true; }
 		const fullSource = safeWorkspacePath(wsId, sourcePath);
 		const fullTargetDir = targetDir ? safeWorkspacePath(wsId, targetDir) : root;
 		if (!fullSource || !fullTargetDir) { json(res, 400, { error: "Invalid path" }); return true; }
@@ -954,15 +1136,58 @@ export async function handleWorkspacesRoutes(
 	if (method === "POST" && url === "/api/workspace/upload") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const requestedWsId = workspaceIdFromBody(body);
+		const files = Array.isArray(body.files) ? body.files : [];
+		if (!files.length) { json(res, 400, { error: "No files provided" }); return true; }
+		const uploaded: Array<{ name: string; path: string; type: string; size: number; updatedAt: string }> = [];
+		let installedSkill = false;
+		if (storeBacked) {
+			const workspace = await resolveWriteWorkspace(requestedWsId);
+			if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
+			const wsId = workspace.id;
+			for (const entry of files) {
+				const filePath = typeof entry.path === "string" ? entry.path.trim() : "";
+				const dataBase64 = typeof entry.dataBase64 === "string" ? entry.dataBase64 : "";
+				if (!filePath || !dataBase64) continue;
+				const data = Buffer.from(dataBase64, "base64");
+				const ext = extname(filePath).toLowerCase();
+				let rel: string;
+				try {
+					rel = normalizeWorkspacePath(filePath);
+				} catch {
+					continue; // same as the fs path: unusable names are skipped
+				}
+				if (filePath.split("/").includes(WORKSPACE_PRIVATE_SKILLS_DIR) && (ext === ".zip" || ext === ".md")) {
+					try {
+						uploaded.push(await installWorkspaceSkill(wsId, basename(filePath), data));
+						installedSkill = true;
+					} catch (err) {
+						logger.error({ err }, "failed to install skill package during upload");
+						json(res, 400, { error: err instanceof Error ? err.message : "Failed to install skill package" });
+						return true;
+					}
+					continue;
+				}
+				try {
+					const written = await store.write(wsId, rel, data);
+					mirrorWrite(wsId, rel, data);
+					uploaded.push({
+						name: written.name, path: rel, type: "file", size: written.size,
+						updatedAt: new Date(written.mtimeMs).toISOString(),
+					});
+				} catch (error) {
+					json(res, storeStatus(error), { error: error instanceof Error ? error.message : String(error) });
+					return true;
+				}
+			}
+			if (installedSkill) scheduleSkillsReload();
+			json(res, 201, { uploaded });
+			return true;
+		}
 		const workspace = await resolveWorkspace(requestedWsId);
 		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
 		const wsId = workspace.id;
 		const root = workspaceRegistry.resolveWorkspaceDir(wsId);
 		if (!root) { json(res, 404, { error: "Workspace not found" }); return true; }
-		const files = Array.isArray(body.files) ? body.files : [];
-		if (!files.length) { json(res, 400, { error: "No files provided" }); return true; }
-		const uploaded: Array<{ name: string; path: string; type: string; size: number; updatedAt: string }> = [];
-		let installedSkill = false;
 		for (const entry of files) {
 			const filePath = typeof entry.path === "string" ? entry.path.trim() : "";
 			const dataBase64 = typeof entry.dataBase64 === "string" ? entry.dataBase64 : "";
@@ -1015,17 +1240,31 @@ export async function handleWorkspacesRoutes(
 	if (method === "POST" && url === "/api/workspace/skills/upload") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const requestedWsId = workspaceIdFromBody(body);
-		const workspace = await resolveWorkspace(requestedWsId);
-		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
-		const wsId = workspace.id;
-		const root = workspaceRegistry.resolveWorkspaceDir(wsId);
-		if (!root) { json(res, 404, { error: "Workspace not found" }); return true; }
 		const fileName = typeof body.fileName === "string" ? body.fileName : "";
 		const dataBase64 = typeof body.dataBase64 === "string" ? body.dataBase64 : "";
 		if (!fileName || !dataBase64) { json(res, 400, { error: "Missing fileName or dataBase64" }); return true; }
 		const ext = extname(fileName).toLowerCase();
 		if (ext !== ".zip" && ext !== ".md") { json(res, 400, { error: "Only .zip or .md skill packages are supported" }); return true; }
 		const data = Buffer.from(dataBase64, "base64");
+		if (storeBacked) {
+			const workspace = await resolveWriteWorkspace(requestedWsId);
+			if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
+			const wsId = workspace.id;
+			try {
+				const node = await installWorkspaceSkill(wsId, fileName, data);
+				scheduleSkillsReload();
+				json(res, 201, node);
+			} catch (err) {
+				logger.error({ err }, "failed to install workspace skill package");
+				json(res, 400, { error: err instanceof Error ? err.message : "Failed to install skill package" });
+			}
+			return true;
+		}
+		const workspace = await resolveWorkspace(requestedWsId);
+		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
+		const wsId = workspace.id;
+		const root = workspaceRegistry.resolveWorkspaceDir(wsId);
+		if (!root) { json(res, 404, { error: "Workspace not found" }); return true; }
 		// Guard the install target: a symlink planted at `.skills` would make the
 		// installer delete/overwrite a directory outside the workspace.
 		const skillsRoot = safeWorkspacePath(wsId, WORKSPACE_PRIVATE_SKILLS_DIR);

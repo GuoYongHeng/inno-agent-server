@@ -449,7 +449,8 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - S3 核心已完成（T3.0/T3.1/T3.2 的本地一期）：`INNO_EXEC_BACKEND=local` 时 `LocalExecManager`（`sandbox/local-exec-manager.ts`）经 `SandboxRuntimeBinding` 把会话工作目录挂成 `LocalDirSandbox`，`bash` 随绑定自动注册，本地与认证模式都生效；env 走 `SandboxExecutionEnv`，路径语义与真实沙箱一致。`beforeTurn` 增量 `replica.pull`（面板经对象存储的写、其他 worker 的写在下一轮前可见），`pullToHost`（每轮 settle 后）与 `release` 增量 `replica.push`。远程沙箱开启时 E2B 优先，开关默认 `persistent`（不启用本地 bash）。`LocalDirSandbox` 已生产化：文件操作做 realpath containment（逃逸符号链接报 permission_denied 而非跟随），shell 本身不隔离（第一期已知并接受）。集成测试证明：`INNO_EXEC_BACKEND=local` + fs 对象存储下 bash 写文件 → 字节进对象存储 → 删本地目录后面板照常读。
 - S3 的取舍（与阶段 3 原方案的偏差）：没有做"每任务一个临时目录"——工作目录仍是 `resolveWorkspaceDir` 的稳定路径，但作为可随时丢弃的工作副本存在（pull 可重建，push 只删除自身状态文件里已知的文件，所以从未拉取的 worker 上写路由+push 是安全的）。写路由与附件上传因此不需要改动，对象存储直写面板仍留待 T1.4。T3.5/T4 的孤儿目录清理、遗留临时目录清扫仍未做。
 - S3 剩余已完成（T3.0/T3.1 的懒激活与并发上限、T4.2、T5.1）：`GatedLocalBackend` 包住 `LocalDirSandbox`，第一次文件/命令操作才占并发位（纯推理会话不占位），`INNO_EXEC_LOCAL_MAX_CONCURRENT`（默认 0 不限）超限返回 `SandboxRunError("unavailable")` 的可重试拒绝，`release` 归还；包装方法全部 async，超限是 rejected promise 而非同步抛错。指标：`inno_workspace_replica_push_ms`/`pull_ms`、`inno_workspace_replica_uploaded_bytes`/`downloaded_bytes`、`inno_local_exec_pull_ms`/`push_ms`、`inno_local_exec_pull_errors_total`/`push_errors_total`/`busy_total`/`activations_total`。T5.1 集成测试（`server.integration.test.ts`）：`INNO_EXEC_BACKEND=local` + fs 对象存储下 bash 写文件 → SIGKILL → 删本地工作区目录 → 新进程重启后打开会话经 pull 从对象存储重建本地副本并完成新一轮。测试证实一个既有恢复行为：SIGKILL 发生在 done 事件 fire-and-forget 落盘前后时，journal 里的 turn 恢复为 active，新 prompt 按设计返回 409，需先走 `/api/chat/events` 重放让孤儿 projection 收尾（真实客户端的 SSE 重连路径），此后一切正常。
-- T2.6 已完成：全局技能随后端镜像分发（见任务表）。- 未开始：T1.4 附件/写路由走对象存储（可选）、T1.5、T3.3 到 T3.6、阶段 4 的 T4.1、阶段 5 的 T5.2/T5.3、阶段 6。
+- T2.6 已完成：全局技能随后端镜像分发（见任务表）。
+- T1.4、T3.3、T3.4、T4.1、T5.2、T5.3 均已完成（见任务表）。第一期剩余：T1.5（预签名直连，可选叠加项）、T3.5/T3.6（写工具与提示词路径改写——本地 provider 下 `read`/`write`/`edit` 仍走 `WorkspaceFileEnv`，与阶段 6 的真实沙箱切换强相关）、阶段 6。
 - 守卫：对象存储未配置（默认 `memory`）时，认证模式仍读本地磁盘并在启动时告警。原因：内存对象存储进程重启后字节丢失而清单仍在，面板会列出打不开的文件，且复制器的本地状态认为已推送，不会重传。
 
 **S1 实施中的发现**：
@@ -494,7 +495,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 | T1.1 | **（接口已定，见 `workspace/workspace-store.ts`；清单表加 `kind` 列的迁移 v12 表示目录，空目录是一行 `kind='directory'` 的清单行，没有对应对象；改名/移动目录为"逐个复制字节 → 单事务改清单 → 删旧对象"，清单晚于字节、删除时清单先于字节）** 定义 `WorkspaceStore` 接口（列表/读/写/删/改名/移动/stat）并实现对象存储版：数据来自 `ObjectStore` 与 PG 的 `workspace_files`；复用 `tenantObjectKey`；使用虚拟路径并沿用现有路径遍历防护规则；大目录分页。`ObjectStore` 接口保持现状（底层为 `@aws-sdk/client-s3`） | L |
 | T1.2 | 本地文件版实现（本地模式仍为文件存储），与对象存储版共用同一接口；由"认证模式且已配置对象存储"选择实现 | M |
 | T1.3 | `routes/workspaces.ts`（约 1100 行）迁移到 `WorkspaceStore`，**分两步**：先迁读路由（目录树、文件内容、raw、下载文件夹、office/pptx 预览——后两者调用 LibreOffice/Python，需把对象取到系统临时文件，转换后删除），此时执行仍在本地持久目录、H4 复制负责把数据推进对象存储；写路由（保存、新建、重命名、删除、移动、上传、技能上传、导入）在执行环境切到临时目录（阶段 3）时一并迁移，避免面板写对象存储而 agent 仍读本地目录的不一致；认证模式下 `resolveRequestWorkspace` 不再创建本地目录；重写相关测试 | L |
-| T1.4 | 聊天附件与内联图片的上传路径改写到 `WorkspaceStore` | M |
+| T1.4 | ~~聊天附件与内联图片的上传路径改写到 `WorkspaceStore`~~ **已完成**：`workspaces.ts` 全部写路由（file/create/rename/delete/move/upload/技能上传）在 manifest 存储模式下直写 `WorkspaceStore` 并镜像到本地目录（保持 `replica.push` 增量与 exec 工作副本温热）；技能包装到临时目录后整棵子树写回 store 并镜像本地安装；附件校验走 `validateChatAttachmentsInStore`（以清单为准）、内联图片持久化后镜像进 store；`workspaceStoreFor` 提取为 server.ts 顶层 `workspaceStoreForRequest` 供路由与 service 共用 | M |
 | T1.5 | 预签名直连（叠加项，第一期可先用后端代理跑通再做，依赖 T1.1）：`ObjectStore` 增加可选 `presign`（引入 `@aws-sdk/s3-request-presigner`，与已用的 `@aws-sdk/client-s3` 同一套 SDK）；上传流程为"后端按租户前缀生成 key 并写 `pending` 清单行 → 返回短有效期预签名 PUT → 浏览器直传 → 完成回调后端 `HeadObject` 校验大小与校验和 → 改为 `ready`"，回调按 key 幂等 upsert；下载与二进制预览按需签发短有效期 GET；大于 100 MB 用分片上传；桶保持私有并配置 CORS；清单只存 key，不存 URL | M |
 
 阶段 2：按路径读文件的工具改道（第 2 批，依赖 T1.1，可与阶段 3 并行）
@@ -515,8 +516,8 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 | T3.0 | ~~本地 `SandboxProvider`（第一期实现）~~ **部分完成**：`LocalExecManager` + `LocalDirSandbox`（realpath containment 已生产化，通过 `SandboxExecutionEnv` 一致性套件与端到端 bash 用例）；按任务临时目录与启动清扫未做——S3 偏差决定：工作目录是可丢弃工作副本而非每任务临时目录，故无遗留目录可清扫；`INNO_EXEC_LOCAL_MAX_CONCURRENT` 并发上限已实现 | M |
 | T3.1 | ~~懒激活~~ **已完成**：`GatedLocalBackend` 在第一次文件/命令操作时才占并发位（`inno_local_exec_activations_total`），纯推理会话不占位；超限返回 `unavailable` 可重试拒绝 | M |
 | T3.2 | 同步层：`WorkspaceSync` 的宿主侧换成 `WorkspaceStore`；激活时按清单拉取，之后增量推送且幂等；保留忽略目录与 20 MiB/5000 个文件/深度 24 的上限；定义删除的传播规则 | L |
-| T3.3 | 推送时机：写文件类工具调用完成且无命令在运行时增量推送，避免推到写了一半的文件 | M |
-| T3.4 | 生命周期：任务结束或 runtime 关闭时最终推送并销毁执行环境；更新孤儿清理（`sandbox:fsck`，另需覆盖本地临时目录），环境 ID 只用于进行中任务 | M |
+| T3.3 | ~~推送时机~~ **已完成**：`GatedLocalBackend` 在 write/mkdir/remove/rename 落盘后触发 `replica.push`（经 `createReplicaPushGate` 按工作区合并），命令在跑期间的变更延迟到命令退出时一次推送，不会推到写了一半的文件 | M |
+| T3.4 | ~~生命周期~~ **已完成/不适用**：runtime 关闭时的最终推送由 `LocalExecManager.release` 承担；`sandbox:fsck` 无需覆盖本地执行——没有每任务临时目录（S3 偏差），工作目录是可重建的工作副本，无孤儿对象；环境 ID 仅绑定期存在 | M |
 | T3.5 | 工具集：认证模式下 `read`/`write`/`edit`/`bash` 全部经 provider 执行，去掉写 worker 持久目录的 `WorkspaceFileEnv`；由配置选择 provider（本地/E2B 协议） | M |
 | T3.6 | 提示词里的路径改写（`rebasePaths`、`promptSection`）适配新流程，同时覆盖全局技能与工作区技能的路径 | S |
 
@@ -524,7 +525,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 | 任务 | 内容 | 规模 |
 |---|---|---|
-| T4.1 | 删除认证模式下已无用的本地目录复制路径（本地模式保留）；该处代码是 H4 刚做的，需谨慎 | M |
+| T4.1 | ~~删除认证模式下已无用的本地目录复制路径~~ **已完成**：`SandboxBindingProvider.syncsWorkspaceReplica` 标记（`LocalExecManager` 有 replica 时置真）让 service 跳过关闭时的重复 push；打开时的 pull 保留——`agent.md`/`.skills` 在打开时从本地目录读进提示词 | M |
 | T4.2 | ~~增加指标~~ **已完成**：replica push/pull 耗时与上传/下载字节、local exec pull/push 耗时与错误、激活与 busy 计数；`CLAUDE.md`、roadmap、`.env.example` 已更新 | S |
 
 阶段 5：验证（本地 provider）
@@ -532,8 +533,8 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 | 任务 | 内容 | 规模 |
 |---|---|---|
 | T5.1 | ~~集成测试~~ **已完成**（`server.integration.test.ts` 的 "local exec session survives SIGKILL"）：bash 产物已推送完整、删本地目录后重启 worker 经 pull 重建并完成新一轮；无每任务临时目录，故无遗留目录清理项 | L |
-| T5.2 | 多租户隔离：存储键、清单、下载接口的跨租户拒绝测试 | M |
-| T5.3 | 性能基线：拉取耗时随文件数的变化，据此决定是否做按需拉取 | M |
+| T5.2 | ~~多租户隔离~~ **已完成**：`object-workspace-store.integration.test.ts` 新增"同名 workspace id 在两租户下完全隔离"（清单行与对象字节都按租户分键），此前已有存储键/清单/下载接口的跨租户拒绝覆盖 | M |
+| T5.3 | ~~性能基线~~ **已完成**：`workspace-replica-benchmark.integration.test.ts`（fs 对象存储 + ParadeDB）：100 文件冷拉 18ms / 无变更 3ms / 10% 变更 3ms；500 → 71/7/11ms；2000 → 257/17/37ms。增量拉取很便宜、冷拉线性增长——S3 每对象往返会放大冷拉，按需拉取仍是可选项但非瓶颈 | M |
 
 阶段 6：接入真实沙箱（后期，抽象层不变）
 

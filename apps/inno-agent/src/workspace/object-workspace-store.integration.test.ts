@@ -80,6 +80,25 @@ describe("ObjectWorkspaceStore cross-tenant isolation", () => {
 			expect((error as WorkspaceStoreError).code).toBe("not_found");
 		}
 	});
+
+	it("identical workspace ids in two tenants stay fully isolated", async () => {
+		const ctxA = await contextFor("iso-user-a");
+		const ctxB = await contextFor("iso-user-b");
+		const wsA = new ObjectWorkspaceStore({ objects, store, context: ctxA });
+		const wsB = new ObjectWorkspaceStore({ objects, store, context: ctxB });
+		await wsA.write("shared-ws", "note.txt", new Uint8Array([65]));
+		await wsB.write("shared-ws", "note.txt", new Uint8Array([66]));
+
+		// Manifest rows and object bytes are keyed by tenant, so each side sees
+		// exactly its own content under the same workspace id and path.
+		expect([...(await wsA.read("shared-ws", "note.txt"))!.body]).toEqual([65]);
+		expect([...(await wsB.read("shared-ws", "note.txt"))!.body]).toEqual([66]);
+		expect((await wsA.list("shared-ws", "")).entries.map((entry) => entry.name)).toEqual(["note.txt"]);
+		expect((await wsB.list("shared-ws", "")).entries.map((entry) => entry.name)).toEqual(["note.txt"]);
+		await wsA.remove("shared-ws", "note.txt");
+		expect(await wsA.read("shared-ws", "note.txt")).toBeNull();
+		expect([...(await wsB.read("shared-ws", "note.txt"))!.body]).toEqual([66]);
+	});
 });
 
 describe("ObjectWorkspaceStore move failure", () => {

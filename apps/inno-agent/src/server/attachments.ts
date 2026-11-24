@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
 import { logger } from "../logger.js";
 import { resolveContainedPath } from "../utils/path-safety.js";
+import { normalizeWorkspacePath, type WorkspaceStore } from "../workspace/workspace-store.js";
 import { normalizeWorkspaceRelativePath } from "./file-helpers.js";
 
 /**
@@ -137,6 +138,48 @@ export function validateChatAttachments(
 		})
 		.filter((file): file is AttachmentRef => file !== null);
 
+	return { bindings, loose };
+}
+
+/**
+ * Store-backed variant for authenticated mode (T1.4): the manifest is the
+ * source of truth, so a file uploaded on another worker validates even before
+ * the local mirror pulls it down.
+ */
+export async function validateChatAttachmentsInStore(
+	attachments: ChatAttachments,
+	store: Pick<WorkspaceStore, "stat">,
+	workspaceId: string,
+): Promise<ChatAttachments> {
+	const usable = async (path: string): Promise<string | null> => {
+		let rel: string;
+		try {
+			rel = normalizeWorkspacePath(path);
+		} catch {
+			return null;
+		}
+		try {
+			return (await store.stat(workspaceId, rel))?.kind === "file" ? rel : null;
+		} catch {
+			return null;
+		}
+	};
+	const bindings: AttachmentBinding[] = [];
+	for (const binding of attachments.bindings) {
+		const files: AttachmentRef[] = [];
+		for (const file of binding.files) {
+			const path = await usable(file.path);
+			if (path) files.push({ ...file, path });
+			else logger.warn({ path: file.path, word: binding.word }, "chat attachment binding dropped: file missing or outside workspace");
+		}
+		if (files.length > 0) bindings.push({ ...binding, files });
+	}
+	const loose: AttachmentRef[] = [];
+	for (const file of attachments.loose) {
+		const path = await usable(file.path);
+		if (path) loose.push({ ...file, path });
+		else logger.warn({ path: file.path }, "chat loose attachment dropped: file missing or outside workspace");
+	}
 	return { bindings, loose };
 }
 
