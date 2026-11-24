@@ -119,7 +119,7 @@ function AccessControl({ personalOnly, onPersonalOnlyChange, userIds, onUserIdsC
 
 /* ---------- Feishu channel ---------- */
 
-function FeishuChannel({ settings, state, onStateChange }: {
+function FeishuChannel({ settings, state, onStateChange, credsManaged }: {
 	settings: InnoSettings;
 	state: {
 		enabled: boolean;
@@ -129,6 +129,7 @@ function FeishuChannel({ settings, state, onStateChange }: {
 		allowedUsers: string;
 	};
 	onStateChange: (patch: Partial<{ enabled: boolean; appId: string; appSecret: string; personalOnly: boolean; allowedUsers: string }>) => void;
+	credsManaged?: boolean;
 }) {
 	const { t } = useTranslation();
 
@@ -224,16 +225,18 @@ function FeishuChannel({ settings, state, onStateChange }: {
 
 			{state.enabled && (
 				<>
-					<div className="grid grid-cols-2 gap-2">
-						<div>
-							<label className={labelCls}>{t("settings.channels.feishu.appId")}</label>
-							<input className={inputCls} value={state.appId} onChange={(e) => onStateChange({ appId: e.target.value })} />
+					{!credsManaged && (
+						<div className="grid grid-cols-2 gap-2">
+							<div>
+								<label className={labelCls}>{t("settings.channels.feishu.appId")}</label>
+								<input className={inputCls} value={state.appId} onChange={(e) => onStateChange({ appId: e.target.value })} />
+							</div>
+							<div>
+								<label className={labelCls}>{t("settings.channels.feishu.appSecret")} {settings.feishu?.appSecret && <span className="text-[var(--inno-text-subtle)]">(••••)</span>}</label>
+								<input className={inputCls} type="password" placeholder={t("settings.channels.feishu.appSecretHint") ?? ""} value={state.appSecret} onChange={(e) => onStateChange({ appSecret: e.target.value })} />
+							</div>
 						</div>
-						<div>
-							<label className={labelCls}>{t("settings.channels.feishu.appSecret")} {settings.feishu?.appSecret && <span className="text-[var(--inno-text-subtle)]">(••••)</span>}</label>
-							<input className={inputCls} type="password" placeholder={t("settings.channels.feishu.appSecretHint") ?? ""} value={state.appSecret} onChange={(e) => onStateChange({ appSecret: e.target.value })} />
-						</div>
-					</div>
+					)}
 					<AccessControl
 						personalOnly={state.personalOnly}
 						onPersonalOnlyChange={(v) => onStateChange({ personalOnly: v })}
@@ -372,6 +375,7 @@ function WechatChannel({ state, onStateChange }: {
 
 export function ChannelsSettings({ settings }: { settings: InnoSettings }) {
 	const { t } = useTranslation();
+	const credsManaged = settings.serverManaged?.channelCredentials ?? false;
 	const [saving, setSaving] = useState(false);
 	const [saveMsg, setSaveMsg] = useState<string | null>(null);
 	const [formError, setFormError] = useState<string | null>(null);
@@ -426,26 +430,25 @@ export function ChannelsSettings({ settings }: { settings: InnoSettings }) {
 					},
 					qq: {
 						enabled: qqEnabled,
-						mode: "bridge",
 						personalOnly: qqPersonalOnly,
 						allowedUserIds: parseUserIds(qqAllowedUsers),
-						sidecarBaseUrl: qqSidecarUrl.trim(),
 					},
 					wechat: {
 						enabled: wechat.enabled,
-						mode: "ilink",
 						allowedUserIds: parseUserIds(wechat.allowedUsers),
 					},
 				},
 			};
-			if (feishu.appId.trim()) {
-				payload.feishu = {
-					appId: feishu.appId.trim(),
-					...(feishu.appSecret.trim() ? { appSecret: feishu.appSecret.trim() } : {}),
-				};
-			}
-			if (bridgeToken.trim()) {
-				payload.bridge = { token: bridgeToken.trim() };
+			if (!credsManaged) {
+				if (feishu.appId.trim()) {
+					payload.feishu = {
+						appId: feishu.appId.trim(),
+						...(feishu.appSecret.trim() ? { appSecret: feishu.appSecret.trim() } : {}),
+					};
+				}
+				if (bridgeToken.trim()) {
+					payload.bridge = { token: bridgeToken.trim() };
+				}
 			}
 			await settingsStore.saveChannels(payload);
 			setSaveMsg(t("settings.channels.saved"));
@@ -459,7 +462,7 @@ export function ChannelsSettings({ settings }: { settings: InnoSettings }) {
 
 	return (
 		<SettingsSection title={t("settings.tabs.channels")} description={t("settings.sections.channels.desc", "飞书、微信等消息渠道接入")}>
-			<FeishuChannel settings={settings} state={feishu} onStateChange={patchFeishu} />
+			<FeishuChannel settings={settings} state={feishu} onStateChange={patchFeishu} credsManaged={credsManaged} />
 
 			{/* QQ (hidden: channel not yet implemented) */}
 			{QQ_CHANNEL_READY && (
@@ -476,10 +479,12 @@ export function ChannelsSettings({ settings }: { settings: InnoSettings }) {
 					</div>
 					{qqEnabled && (
 						<div className="grid grid-cols-2 gap-2">
-							<div className="col-span-2">
-								<label className={labelCls}>{t("settings.channels.sidecarBaseUrl")}</label>
-								<input className={inputCls} value={qqSidecarUrl} onChange={(e) => setQqSidecarUrl(e.target.value)} />
-							</div>
+							{!credsManaged && (
+								<div className="col-span-2">
+									<label className={labelCls}>{t("settings.channels.sidecarBaseUrl")}</label>
+									<input className={inputCls} value={qqSidecarUrl} onChange={(e) => setQqSidecarUrl(e.target.value)} />
+								</div>
+							)}
 							<div className="col-span-2">
 								<AccessControl
 									personalOnly={qqPersonalOnly}
@@ -495,8 +500,8 @@ export function ChannelsSettings({ settings }: { settings: InnoSettings }) {
 
 			<WechatChannel state={wechat} onStateChange={patchWechat} />
 
-			{/* Bridge Token (used by QQ sidecar) */}
-			{QQ_CHANNEL_READY && qqEnabled && (
+			{/* Bridge Token (used by QQ sidecar) — operator-managed when credsManaged */}
+			{QQ_CHANNEL_READY && qqEnabled && !credsManaged && (
 				<div className="rounded-lg bg-[var(--inno-surface)] p-4">
 					<div className="text-xs font-medium text-[var(--inno-text)] mb-1">{t("settings.channels.bridgeToken")}</div>
 					<div className="text-xs text-[var(--inno-text-subtle)] mb-2">{t("settings.channels.bridgeTokenHint")}</div>

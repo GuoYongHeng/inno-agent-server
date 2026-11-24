@@ -135,6 +135,7 @@ function ContentHubSettings({ settings }: { settings: InnoSettings }) {
 
 function TavilySettings({ settings }: { settings: InnoSettings }) {
 	const { t } = useTranslation();
+	const managed = settings.serverManaged?.tavily ?? false;
 	const tavily = settings.tavily;
 	const [open, setOpen] = useState(false);
 	const [apiKey, setApiKey] = useState("");
@@ -204,6 +205,14 @@ function TavilySettings({ settings }: { settings: InnoSettings }) {
 
 			{open ? (
 				<div className="mt-3 grid gap-2.5">
+					{managed ? (
+						<p className="text-xs text-[var(--inno-text-muted)]">
+							{hasExistingKey
+								? t("settings.tavily.managed", "由服务端统一管理")
+								: t("settings.tavily.notConfigured", "未配置")}
+						</p>
+					) : (
+					<>
 					<input
 						className={inputCls}
 						type="password"
@@ -230,6 +239,8 @@ function TavilySettings({ settings }: { settings: InnoSettings }) {
 							</button>
 						)}
 					</div>
+					</>
+					)}
 				</div>
 			) : null}
 		</div>

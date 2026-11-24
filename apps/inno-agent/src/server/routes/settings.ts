@@ -1,15 +1,10 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
-import { probeProviderModels } from "../../agent/model-probe.js";
 import {
-	deleteModel,
-	deleteProvider,
-		normalizeSmartInputConfig,
+	normalizeSmartInputConfig,
 	normalizeUiConfig,
-		setDefaultModel,
-	upsertProvider,
-		type InnoConfig,
+	setDefaultModel,
+	type InnoConfig,
 	type InnoModelConfig,
-	type InnoProviderConfig,
 	type InnoSmartInputConfig,
 } from "../../config.js";
 import { logger } from "../../logger.js";
@@ -18,6 +13,7 @@ import { requireRequestTenant } from "../../tenants/http.js";
 import { getCurrentTenantStore } from "../../tenants/current.js";
 import {
 	loadTenantConfig,
+	mergeTenantConfig,
 	persistTenantConfig,
 } from "../../tenants/config.js";
 import { json, readBody } from "../http-helpers.js";
@@ -108,68 +104,7 @@ function buildSafeSettings(config: InnoConfig) {
 	};
 }
 
-function parseModelConfig(value: unknown): InnoModelConfig {
-	if (!value || typeof value !== "object") throw new Error("Invalid model");
-	const record = value as Record<string, unknown>;
-	const id = typeof record.id === "string" ? record.id.trim() : "";
-	if (!id) throw new Error("Model id is required");
-	return {
-		id,
-		name: typeof record.name === "string" && record.name.trim() ? record.name.trim() : id,
-		reasoning: Boolean(record.reasoning),
-		input: ("input" in record)
-			? (Array.isArray(record.input) && record.input.includes("image") ? ["text", "image"] : ["text"])
-			: ["text", "image"],
-		contextWindow: typeof record.contextWindow === "number" ? record.contextWindow : Number(record.contextWindow ?? 128000),
-		maxTokens: typeof record.maxTokens === "number" ? record.maxTokens : Number(record.maxTokens ?? 8192),
-	};
-}
 
-function parseStringHeaders(value: unknown): Record<string, string> | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const headers: Record<string, string> = {};
-	for (const [key, headerValue] of Object.entries(value as Record<string, unknown>)) {
-		const normalizedKey = key.trim();
-		if (normalizedKey && typeof headerValue === "string") {
-			headers[normalizedKey] = headerValue;
-		}
-	}
-	return Object.keys(headers).length > 0 ? headers : undefined;
-}
-
-function parseProviderPayload(body: Record<string, unknown>): {
-	providerId: string;
-	provider: InnoProviderConfig;
-	makeDefault: boolean;
-	preserveApiKey: boolean;
-	preserveHeaders: boolean;
-} {
-	const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
-	if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(providerId)) {
-		throw new Error("Provider id must use letters, numbers, dot, underscore, or dash");
-	}
-	const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl.trim() : "";
-	const apiKey = typeof body.apiKey === "string" ? body.apiKey : "";
-	const api = typeof body.api === "string" ? body.api.trim() : "openai-completions";
-	const headers = parseStringHeaders(body.headers);
-	const rawModels = Array.isArray(body.models) ? body.models : [];
-	const models = rawModels.map(parseModelConfig);
-	return {
-		providerId,
-		provider: {
-			baseUrl,
-			apiKey,
-			api,
-			...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
-			...(body.authHeader === true ? { authHeader: true } : {}),
-			...(body.bypassProxy === true ? { bypassProxy: true } : {}),
-			models,
-		},
-		makeDefault: Boolean(body.makeDefault),
-		preserveApiKey: Boolean(body.preserveApiKey),
-		preserveHeaders: !Object.prototype.hasOwnProperty.call(body, "headers"),
-	};
-}
 
 /**
  * /api/settings* and /api/mcp* route domain. Returns true when the request
@@ -195,11 +130,19 @@ export async function handleSettingsRoutes(
 	// Durable runtimes read the config when a session is opened, so there is no
 	// live process-wide registry to synchronise after a settings change.
 	const sync = (): void => {};
-	const refreshProviders = async (): Promise<void> => {};
+	// The read surface shows the effective config: server-managed providers,
+	// search and channel endpoints from the deployment config merged with this
+	// tenant's selections. Writes below still persist the tenant record only.
+	const effective = () => mergeTenantConfig(ctx.getConfig(), config);
 	const safeSettings = () => {
-		const view = buildSafeSettings(config);
+		const view = buildSafeSettings(effective());
 		// The sandbox is platform-level: a tenant neither sees nor edits it.
-		return { ...view, sandbox: undefined, sandboxEditable: false };
+		// Providers, web-search and channel credentials are server-managed in
+		// this deployment; tenants only pick a default model and flip
+		// channel/memory toggles, so the payload tells the UI to hide those
+		// edit affordances.
+		return { ...view, sandbox: undefined, sandboxEditable: false,
+			serverManaged: { providers: true, tavily: true, channelCredentials: true } };
 	};
 	const rejectSharedRuntime = (feature: string): true => {
 		json(res, 409, { error: `${feature} is unavailable until its runtime is tenant-scoped` });
@@ -220,111 +163,25 @@ export async function handleSettingsRoutes(
 			return true;
 		}
 
-		await save(setDefaultModel(config, provider, model));
+		setDefaultModel(effective(), provider, model);
+		config.defaultProvider = provider;
+		config.defaultModel = model;
+		await save(config);
 		json(res, 200, { defaultProvider: provider, defaultModel: model });
 		return true;
 	}
 
-	if ((method === "PUT" || method === "POST" || method === "PATCH") && url === "/api/settings/providers") {
-		const body = (await readBody(req)) as Record<string, unknown>;
-		const payload = parseProviderPayload(body);
-		if (payload.provider.bypassProxy) {
-			json(res, 400, { error: "bypassProxy is process-global and unavailable for tenant providers" });
-			return true;
-		}
-		await save(upsertProvider(config, payload.providerId, payload.provider, {
-			makeDefault: payload.makeDefault,
-			preserveApiKey: payload.preserveApiKey,
-			preserveHeaders: payload.preserveHeaders,
-		}));
-
-		await refreshProviders();
-		if (payload.makeDefault) {
-			await save(setDefaultModel(config, config.defaultProvider, config.defaultModel));
-		}
-		json(res, 200, safeSettings());
-		return true;
-	}
-
-	// Probe a provider's model list server-side (the browser can't call
-	// provider APIs directly due to CORS + API key exposure). If apiKey is
-	// omitted, fall back to the stored key of an existing provider.
-	if (method === "POST" && url === "/api/settings/providers/probe-models") {
-		const body = (await readBody(req)) as Record<string, unknown>;
-		const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl.trim() : "";
-		const api = typeof body.api === "string" ? body.api : undefined;
-		let apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
-		const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
-		if ((!apiKey || apiKey.startsWith("****")) && providerId) {
-			apiKey = config.providers?.[providerId]?.apiKey ?? "";
-		}
-		try {
-			const result = await probeProviderModels({ baseUrl, apiKey, api });
-			json(res, 200, result);
-		} catch (err) {
-			json(res, 400, { error: err instanceof Error ? err.message : String(err) });
-		}
-		return true;
-	}
-
-	// Delete a single model from a provider. Must be matched before the
-	// provider-delete route below (which uses startsWith on the same prefix).
-	if (method === "DELETE" && /^\/api\/settings\/providers\/[^/]+\/models\/[^/]+$/.test(url)) {
-		const rest = url.slice("/api/settings/providers/".length);
-		const [providerPart, modelPart] = rest.split("/models/");
-		const providerId = decodeURIComponent(providerPart);
-		const modelId = decodeURIComponent(modelPart);
-		if (!providerId || !modelId) {
-			json(res, 400, { error: "Missing provider or model id" });
-			return true;
-		}
-		try {
-			await save(deleteModel(config, providerId, modelId));
-			await refreshProviders();
-		} catch (err) {
-			logger.error({ err, providerId, modelId }, "failed to delete model");
-			json(res, 400, { error: err instanceof Error ? err.message : String(err) });
-			return true;
-		}
-		json(res, 200, safeSettings());
-		return true;
-	}
-
-	if (method === "DELETE" && url.startsWith("/api/settings/providers/")) {
-		const providerId = decodeURIComponent(url.slice("/api/settings/providers/".length));
-		if (!providerId) {
-			json(res, 400, { error: "Missing provider id" });
-			return true;
-		}
-		try {
-			await save(deleteProvider(config, providerId));
-			await refreshProviders();
-		} catch (err) {
-			logger.error({ err }, "failed to update channel settings");
-			json(res, 400, { error: err instanceof Error ? err.message : String(err) });
-			return true;
-		}
-		json(res, 200, safeSettings());
-		return true;
-	}
-
-	// --- Channels Settings ---
 	if (method === "PUT" && url === "/api/settings/channels") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const previous = structuredClone(config);
+		// Channel credentials (feishu appId/appSecret, bridge token, sidecar
+		// endpoints, mode) are server-managed — reject them outright so a
+		// stale client cannot silently shadow the operator config.
+		if (body.feishu !== undefined || body.bridge !== undefined) {
+			json(res, 403, { error: "Channel credentials are managed by the server operator" });
+			return true;
+		}
 		try {
-			// Update feishu config
-			if (body.feishu && typeof body.feishu === "object") {
-				const feishuBody = body.feishu as Record<string, unknown>;
-				const appId = typeof feishuBody.appId === "string" ? feishuBody.appId.trim() : "";
-				const appSecret = typeof feishuBody.appSecret === "string" ? feishuBody.appSecret.trim() : "";
-				if (appId) {
-					config.feishu = {
-						appId,
-						appSecret: (appSecret.startsWith("****") ? "" : appSecret) || config.feishu?.appSecret || "",
-					};
-				}
-			}
 			// Update channels config
 			if (body.channels && typeof body.channels === "object") {
 				const channels = body.channels as Record<string, unknown>;
@@ -338,20 +195,11 @@ export async function handleSettingsRoutes(
 							enabled: typeof chObj.enabled === "boolean" ? chObj.enabled : false,
 							...(typeof chObj.personalOnly === "boolean" ? { personalOnly: chObj.personalOnly } : {}),
 							...(Array.isArray(chObj.allowedUserIds) ? { allowedUserIds: chObj.allowedUserIds.filter((v: unknown) => typeof v === "string") } : {}),
-							...(typeof chObj.mode === "string" ? { mode: chObj.mode } : {}),
-							...(typeof chObj.sidecarBaseUrl === "string" ? { sidecarBaseUrl: chObj.sidecarBaseUrl.trim() } : {}),
 						};
+						if (chObj.mode !== undefined || chObj.sidecarBaseUrl !== undefined) {
+							throw new Error("Channel endpoints are managed by the server operator");
+						}
 					}
-				}
-			}
-			// Update bridge config
-			if (body.bridge && typeof body.bridge === "object") {
-				const bridgeBody = body.bridge as Record<string, unknown>;
-				const token = typeof bridgeBody.token === "string" ? bridgeBody.token.trim() : "";
-				if (token && !token.startsWith("****")) {
-					config.bridge = { token };
-				} else if (!config.bridge && token) {
-					// preserve existing
 				}
 			}
 			if (tenant && ctx.syncChannelOwnership) await ctx.syncChannelOwnership(previous, config);
@@ -429,27 +277,6 @@ export async function handleSettingsRoutes(
 	// --- Sandbox settings (platform-level): tenants neither see nor edit them. ---
 	if (method === "PUT" && url === "/api/settings/sandbox") {
 		json(res, 403, { error: "Sandbox settings are managed by the server operator" });
-		return true;
-	}
-
-	// --- Tavily settings (web_search tool API key) ---
-	if (method === "PUT" && url === "/api/settings/tavily") {
-		const body = (await readBody(req)) as Record<string, unknown>;
-		if (typeof body.apiKey !== "string") {
-			json(res, 400, { error: "Missing apiKey (string)" });
-			return true;
-		}
-		const incoming = body.apiKey.trim();
-		// A masked value (e.g. "****abcd") means "keep the existing key".
-		const apiKey = incoming.startsWith("****") ? (config.tavily?.apiKey ?? "") : incoming;
-		if (!apiKey) {
-			config.tavily = undefined;
-		} else {
-			config.tavily = { apiKey };
-		}
-		await save(config);
-		sync();
-		json(res, 200, safeSettings());
 		return true;
 	}
 

@@ -166,7 +166,7 @@ function sessionIdFromBody(body: Buffer): string | null {
 
 /** Rebuild a request-like stream around a buffered body so downstream handlers
  * can still read it when the request is served locally. */
-function replayBodyRequest(req: IncomingMessage, body: Buffer): IncomingMessage {
+export function replayBodyRequest(req: IncomingMessage, body: Buffer): IncomingMessage {
 	const stream = new PassThrough();
 	const replay = stream as unknown as IncomingMessage;
 	replay.method = req.method;
@@ -185,7 +185,7 @@ function replayBodyRequest(req: IncomingMessage, body: Buffer): IncomingMessage 
 	return replay;
 }
 
-function bufferBody(req: IncomingMessage): Promise<Buffer> {
+export function bufferBody(req: IncomingMessage): Promise<Buffer> {
 	return new Promise((resolveBuffer, reject) => {
 		const chunks: Buffer[] = [];
 		let received = 0;

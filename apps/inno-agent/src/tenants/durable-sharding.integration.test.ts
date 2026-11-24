@@ -180,9 +180,20 @@ beforeAll(async () => {
 		worker.home = await mkdtemp(join(tmpdir(), `inno-${worker.id}-`));
 		await mkdir(join(worker.home, "config"), { recursive: true });
 		await writeFile(join(worker.home, "config", "config.json"), JSON.stringify({
-			defaultProvider: "dummy",
-			defaultModel: "dummy-model",
-			providers: { dummy: { baseUrl: "http://127.0.0.1:9", apiKey: "unused", api: "openai-completions", models: [{ id: "dummy-model" }] } },
+			defaultProvider: "shared",
+			defaultModel: "tenant-model",
+			providers: {
+				dummy: { baseUrl: "http://127.0.0.1:9", apiKey: "unused", api: "openai-completions", models: [{ id: "dummy-model" }] },
+				// Server-managed catalog: the tenant selects, never writes.
+				shared: {
+					baseUrl: providerOrigin, apiKey: "durable-shard-secret", api: "openai-completions",
+					models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
+				},
+			},
+			// Shared, operator-managed bridge: token and sidecar are global;
+			// tenants only enable the channel and bind chat identities.
+			bridge: { token: "durable-shard-bridge-token" },
+			channels: { qq: { enabled: false, mode: "bridge", sidecarBaseUrl: sidecarOrigin } },
 		}));
 	}
 	await migrateAuthDatabase(readAuthRuntimeConfig({
@@ -245,13 +256,9 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 	const owner = workers[ownerId];
 	const nonOwner = workers[nonOwnerId];
 
-	const configured = await api(nonOwner, cookie, "/api/settings/providers", {
-		method: "PUT",
-		body: JSON.stringify({
-			providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-shard-secret",
-			api: "openai-completions", makeDefault: true,
-			models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-		}),
+	const configured = await api(nonOwner, cookie, "/api/settings/model", {
+		method: "POST",
+		body: JSON.stringify({ provider: "shared", model: "tenant-model" }),
 	});
 	expect(configured.status, await configured.text()).toBe(200);
 	expect(configured.headers.get("x-inno-durable-shard")).toBe(ownerId);
@@ -302,12 +309,25 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 	const channels = await api(nonOwner, cookie, "/api/settings/channels", {
 		method: "PUT",
 		body: JSON.stringify({
-			bridge: { token: bridgeToken },
-			channels: { qq: { enabled: true, mode: "bridge", sidecarBaseUrl: sidecarOrigin } },
+			// Managed fields are rejected; tenants only flip the enabled toggle.
+			bridge: { token: "not-the-operator-token" },
+			channels: { qq: { enabled: true, mode: "bridge", sidecarBaseUrl: "http://127.0.0.1:9" } },
 		}),
 	});
-	expect(channels.status).toBe(200);
-	expect(channels.headers.get("x-inno-durable-shard")).toBe(ownerId);
+	expect(channels.status).toBe(403);
+	const channelsOk = await api(nonOwner, cookie, "/api/settings/channels", {
+		method: "PUT",
+		body: JSON.stringify({ channels: { qq: { enabled: true } } }),
+	});
+	expect(channelsOk.status).toBe(200);
+	expect(channelsOk.headers.get("x-inno-durable-shard")).toBe(ownerId);
+	// Inbound routing resolves the tenant from the claimed chat identity —
+	// bind shard-chat to this tenant on the owning worker.
+	const target = await api(nonOwner, cookie, "/api/channels/qq/default-target", {
+		method: "POST", body: JSON.stringify({ chatId: "shard-chat" }),
+	});
+	expect(target.status).toBe(200);
+	expect(target.headers.get("x-inno-durable-shard")).toBe(ownerId);
 	const callback = await fetch(`${nonOwner.origin}/api/bridge/messages`, {
 		method: "POST",
 		headers: { Authorization: `Bearer ${bridgeToken}`, "Content-Type": "application/json" },
@@ -434,13 +454,9 @@ it("takes over from a SIGSTOP zombie owner once its lease expires", async () => 
 	const nonOwnerId: WorkerId = ownerId === "worker-a" ? "worker-b" : "worker-a";
 	const owner = workers[ownerId];
 	const nonOwner = workers[nonOwnerId];
-	const configured = await api(owner, cookie, "/api/settings/providers", {
-		method: "PUT",
-		body: JSON.stringify({
-			providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-shard-secret",
-			api: "openai-completions", makeDefault: true,
-			models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-		}),
+	const configured = await api(owner, cookie, "/api/settings/model", {
+		method: "POST",
+		body: JSON.stringify({ provider: "shared", model: "tenant-model" }),
 	});
 	expect(configured.status, await configured.text()).toBe(200);
 	const created = await api(nonOwner, cookie, "/api/sessions", {
@@ -576,13 +592,9 @@ it("restores a session's workspace files on the takeover worker", async () => {
 	const owner = workers[ownerId];
 	const nonOwner = workers[nonOwnerId];
 
-	const configured = await api(nonOwner, cookie, "/api/settings/providers", {
-		method: "PUT",
-		body: JSON.stringify({
-			providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-shard-secret",
-			api: "openai-completions", makeDefault: true,
-			models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-		}),
+	const configured = await api(nonOwner, cookie, "/api/settings/model", {
+		method: "POST",
+		body: JSON.stringify({ provider: "shared", model: "tenant-model" }),
 	});
 	expect(configured.status).toBe(200);
 	const created = await api(nonOwner, cookie, "/api/sessions", {
@@ -680,13 +692,9 @@ it("serves internal durable prompts on the worker-token endpoint", async () => {
 	expect(registered.status).toBe(200);
 	const cookie = registered.headers.get("set-cookie")?.split(";", 1)[0]!;
 	expect((await api(workers["worker-a"], cookie, "/api/sessions")).status).toBe(200);
-	const configured = await api(workers["worker-a"], cookie, "/api/settings/providers", {
-		method: "PUT",
-		body: JSON.stringify({
-			providerId: "shared", baseUrl: providerOrigin, apiKey: "internal-prompt-secret",
-			api: "openai-completions", makeDefault: true,
-			models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-		}),
+	const configured = await api(workers["worker-a"], cookie, "/api/settings/model", {
+		method: "POST",
+		body: JSON.stringify({ provider: "shared", model: "tenant-model" }),
 	});
 	expect(configured.status, await configured.text()).toBe(200);
 	const created = await api(workers["worker-a"], cookie, "/api/sessions", {

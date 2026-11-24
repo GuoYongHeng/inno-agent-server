@@ -29,7 +29,7 @@ import { ChannelRegistry } from "./channels/channel.js";
 import { FeishuChannel } from "./channels/feishu/feishu-channel.js";
 import type { PersonalChannelDispatcherOptions, StreamEventCallback } from "./channels/personal-dispatcher.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import { bridgeChannelResourceId, TenantChannelManager } from "./channels/tenant-channel-manager.js";
+import { channelChatResourceId, channelUserResourceId, TenantChannelManager } from "./channels/tenant-channel-manager.js";
 import { bridgeBearerToken, handleBridgeMessage } from "./channels/bridge/bridge-server.js";
 import { BridgeChannel } from "./channels/bridge/bridge-channel.js";
 import { WeChatChannel } from "./channels/wechat/wechat-channel.js";
@@ -80,7 +80,7 @@ import { createAuthRuntime } from "./auth/runtime.js";
 import { createBackgroundRequest, requireRequestTenant, setRequestTenant } from "./tenants/http.js";
 import type { TenantContext } from "./tenants/store.js";
 import { syncTenantConfigFromStore } from "./tenants/config.js";
-import { forwardDurableTenantRequest, readDurableShardConfig } from "./tenants/durable-tenant-router.js";
+import { bufferBody, forwardDurableTenantRequest, readDurableShardConfig, replayBodyRequest } from "./tenants/durable-tenant-router.js";
 import { getCurrentTenant, getCurrentTenantStore, runWithoutTenantContext } from "./tenants/current.js";
 
 // ---------------------------------------------------------------------------
@@ -305,6 +305,7 @@ async function ensureBootstrapped(): Promise<void> {
 			tenantChannelManager = new TenantChannelManager({
 				dataDir,
 				tenantStore: auth.tenantStore,
+				getLocalConfig: () => config,
 				dispatcher: dispatcherOptions,
 				createChannels: ({ config: tenantConfig, channelsDataDir: tenantChannelsDir, registry, dispatch, wechatTokenPersistence }) => {
 					const tenantDataDir = dirname(tenantChannelsDir);
@@ -1160,13 +1161,29 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		handleBridge: async (authHeader, body) => {
 			const manager = tenantChannelManager!;
 			const token = bridgeBearerToken(authHeader);
-			const result = await manager.runWithBridgeToken(token, () => handleBridgeMessage({
+			const msg = body as { channel?: string; chatId?: string; userId?: string };
+			const result = await manager.runWithBridgeMessage(token, msg,
+				() => handleBridgeMessage({
+					token,
+					channelRegistry: manager,
+					dispatcher: manager,
+					requireChatId: true,
+				}, authHeader, body));
+			if (result !== null) return result;
+			if (!manager.hasBridgeToken(token)) {
+				return { status: 401, body: { ok: false as const, error: "Unauthorized" } };
+			}
+			// Valid sidecar token but no tenant claims this chat/user identity:
+			// still run the body validation so malformed messages get their 400,
+			// then reject the unroutable (well-formed) message.
+			const validated = handleBridgeMessage({
 				token,
 				channelRegistry: manager,
-				dispatcher: manager,
+				dispatcher: { handle: async () => {} },
 				requireChatId: true,
-			}, authHeader, body));
-			return result ?? { status: 401, body: { ok: false as const, error: "Unauthorized" } };
+			}, authHeader, body);
+			if (validated.status !== 200) return validated;
+			return { status: 401, body: { ok: false as const, error: "No tenant claims this channel identity" } };
 		},
 		reloadFeishuChannel,
 		getWechatChannel: () => tenantChannelManager!.getWechatChannel(),
@@ -1345,10 +1362,22 @@ const server = createServer(async (req, response) => {
 		// durable owner before bootstrapping any local channel runtime. The owner
 		// repeats the bearer-token and ownership checks in the normal bridge route.
 		if (durableShardConfig && method === "POST" && path === "/api/bridge/messages") {
-			const token = bridgeBearerToken(req.headers.authorization);
-			const tenant = token
-				? await auth.tenantStore.findResourceOwner("channel", bridgeChannelResourceId(token))
-				: null;
+			// The bridge token is shared; the owning tenant is resolved from the
+			// claimed chat/user identity inside the buffered message body.
+			const buffered = await bufferBody(req);
+			let msg: { channel?: string; chatId?: string; userId?: string } = {};
+			try { msg = JSON.parse(buffered.toString("utf8")) as typeof msg; } catch { /* handled downstream */ }
+			const channel = typeof msg.channel === "string" ? msg.channel : "";
+			const ids = [
+				typeof msg.chatId === "string" && msg.chatId ? channelChatResourceId(channel, msg.chatId) : null,
+				typeof msg.userId === "string" && msg.userId ? channelUserResourceId(channel, msg.userId) : null,
+			].filter((id): id is string => Boolean(id));
+			let tenant: Awaited<ReturnType<typeof auth.tenantStore.findResourceOwner>> = null;
+			for (const id of ids) {
+				tenant = await auth.tenantStore.findResourceOwner("channel", id);
+				if (tenant) break;
+			}
+			req = replayBodyRequest(req, buffered);
 			if (tenant && !(await forwardDurableTenantRequest(req, res, tenant, durableShardConfig))) return;
 		}
 

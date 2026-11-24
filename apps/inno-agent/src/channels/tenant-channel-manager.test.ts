@@ -7,7 +7,7 @@ import { getCurrentTenant, runInTenantContext } from "../tenants/current.js";
 import { ResourceOwnershipError, type TenantContext, type TenantStore } from "../tenants/store.js";
 import type { ChatChannel } from "./channel.js";
 import type { PersonalChannelDispatcherOptions } from "./personal-dispatcher.js";
-import { bridgeChannelResourceId, TenantChannelManager } from "./tenant-channel-manager.js";
+import { channelUserResourceId, TenantChannelManager } from "./tenant-channel-manager.js";
 import type { IncomingMessage } from "./types.js";
 import type { WeChatChannel } from "./wechat/wechat-channel.js";
 
@@ -88,6 +88,10 @@ function setup() {
 	const manager = new TenantChannelManager({
 		dataDir,
 		tenantStore: store,
+		getLocalConfig: () => createEmptyTenantConfig() && Object.assign(createEmptyTenantConfig(), {
+			bridge: { token: "shared-token" },
+			channels: { qq: { enabled: false, mode: "bridge", sidecarBaseUrl: "http://sidecar" } },
+		}),
 		createStateStore: (tenant) => {
 			let map = stateData.get(tenant.context.tenantId);
 			if (!map) stateData.set(tenant.context.tenantId, map = new Map());
@@ -145,21 +149,23 @@ describe("TenantChannelManager", () => {
 		configure(dataDir, "tenant-b", "shared-token", "shared-app");
 		const previous = createEmptyTenantConfig();
 		const next = createEmptyTenantConfig();
-		next.bridge = { token: "shared-token" };
 		next.feishu = { appId: "shared-app", appSecret: "secret" };
+		next.channels = { qq: { enabled: true, allowedUserIds: ["user-1"] } as never };
 		await run("tenant-a", () => manager.syncOwnership(previous, next));
 		await expect(run("tenant-b", () => manager.syncOwnership(previous, next))).rejects.toBeInstanceOf(ResourceOwnershipError);
-		expect(owners.get(bridgeChannelResourceId("shared-token"))?.tenantId).toBe("tenant-a");
+		expect(owners.get(channelUserResourceId("qq", "user-1"))?.tenantId).toBe("tenant-a");
 		expect(owners.has("feishu:shared-app")).toBe(true);
 
-		const resolved = await manager.runWithBridgeToken("shared-token", () => manager.get("feishu")?.name);
-		expect(resolved).toBe("feishu");
-		await manager.runWithBridgeToken("shared-token", () => manager.handle(manager.get("feishu")!, message("bridge-1", "bridge-message")));
-		expect(prompts.at(-1)?.tenantId).toBe("tenant-a");
-		expect(replies.at(-1)?.tenantId).toBe("tenant-a");
-		expect(await manager.runWithBridgeToken("missing", () => "not-found")).toBeNull();
+		// Shared token only authenticates the sidecar; tenant resolves by claim.
+		const resolved = await manager.runWithBridgeMessage("shared-token",
+			{ channel: "qq", userId: "user-1" }, () => "tenant-a-inbound");
+		expect(resolved).toBe("tenant-a-inbound");
+		expect(await manager.runWithBridgeMessage("wrong-token",
+			{ channel: "qq", userId: "user-1" }, () => "not-found")).toBeNull();
+		expect(await manager.runWithBridgeMessage("shared-token",
+			{ channel: "qq", userId: "nobody" }, () => "not-found")).toBeNull();
 		await run("tenant-a", () => manager.syncOwnership(next, previous));
-		expect(await store.findResourceOwner("channel", bridgeChannelResourceId("shared-token"))).toBeNull();
+		expect(await store.findResourceOwner("channel", channelUserResourceId("qq", "user-1"))).toBeNull();
 		await run("tenant-b", () => manager.syncOwnership(previous, next));
 		expect(owners.get("feishu:shared-app")?.tenantId).toBe("tenant-b");
 	});

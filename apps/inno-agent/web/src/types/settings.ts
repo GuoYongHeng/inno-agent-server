@@ -63,8 +63,8 @@ export interface ChannelsSettingsPayload {
 	};
 	channels?: {
 		feishu?: PersonalChannelConfig;
-		qq?: PersonalBridgeChannelConfig;
-		wechat?: PersonalILinkChannelConfig | PersonalBridgeChannelConfig;
+		qq?: PersonalChannelConfig;
+		wechat?: PersonalChannelConfig;
 	};
 	bridge?: {
 		token: string;
@@ -108,6 +108,8 @@ export interface InnoSettings {
 	sandbox?: SandboxSettings;
 	/** False in authenticated mode: the operator manages the sandbox, tenants cannot. */
 	sandboxEditable?: boolean;
+	/** Server-managed surfaces: hide tenant edit affordances for these. */
+	serverManaged?: { providers?: boolean; tavily?: boolean; channelCredentials?: boolean };
 	/** True when the server has E2B_API_KEY in its environment. */
 	sandboxEnvKey?: boolean;
 	contentHub?: {

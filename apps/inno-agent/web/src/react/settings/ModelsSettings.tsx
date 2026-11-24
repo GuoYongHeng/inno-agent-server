@@ -179,6 +179,7 @@ function ModelEditForm({ model, settings, onClose }: {
 
 export function ModelsSettings({ settings }: { settings: InnoSettings }) {
 	const { t } = useTranslation();
+	const managed = settings.serverManaged?.providers ?? false;
 	const [editingModel, setEditingModel] = useState<string | null>(null);
 	const { isSavingModel, storeError } = useStoreSnapshot(settingsStore, () => ({
 		isSavingModel: settingsStore.isSavingModel,
@@ -286,8 +287,8 @@ export function ModelsSettings({ settings }: { settings: InnoSettings }) {
 				</div>
 			</SettingsCard>
 
-			{/* New Provider */}
-			<AddProviderWizard providers={settings.providers} />
+			{/* New Provider — hidden when the operator manages the catalog */}
+			{!managed && <AddProviderWizard providers={settings.providers} />}
 		</SettingsSection>
 	);
 }

@@ -11,7 +11,7 @@ import { WeChatChannel } from "../../channels/wechat/wechat-channel.js";
 import type { WechatTokenPersistence } from "../../channels/wechat/ilink-client.js";
 import type { InnoConfig } from "../../config.js";
 import { logger } from "../../logger.js";
-import { loadTenantConfig, persistTenantConfig } from "../../tenants/config.js";
+import { loadTenantConfig, persistTenantConfig, resolveTenantConfig } from "../../tenants/config.js";
 import { getCurrentTenantStore } from "../../tenants/current.js";
 import { requireRequestTenant } from "../../tenants/http.js";
 import { json, matchRoute, readBody } from "../http-helpers.js";
@@ -93,7 +93,10 @@ export async function handleChannelsRoutes(
 	// Tenant-authenticated channel management below — the bridge webhook above
 	// resolves its tenant from the bearer token, not the request session.
 	const tenant = requireRequestTenant(req);
+	// Writes persist the tenant record (user fields only); reads that feed
+	// channel construction resolve the merged view (server endpoints + toggles).
 	const getConfig = () => loadTenantConfig(ctx.dataDir, tenant.tenantId);
+	const getEffectiveConfig = () => resolveTenantConfig(ctx.dataDir, tenant.tenantId, ctx.getConfig());
 	const persistConfig = async (previous: InnoConfig, next: InnoConfig): Promise<void> => {
 		if (ctx.syncChannelOwnership) await ctx.syncChannelOwnership(previous, next);
 		try {
@@ -237,7 +240,7 @@ export async function handleChannelsRoutes(
 		if (!wechatChannel) {
 			const persistence = ctx.wechatTokenPersistence?.()
 				?? join(ctx.dataDir, "tenants", tenant.tenantId);
-			wechatChannel = new WeChatChannel(persistence, getConfig().channels?.wechat);
+			wechatChannel = new WeChatChannel(persistence, getEffectiveConfig().channels?.wechat);
 			channelRegistry.register(wechatChannel);
 			ctx.setWechatChannel(wechatChannel);
 		}

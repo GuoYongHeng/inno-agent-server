@@ -1,8 +1,8 @@
-import { createHash } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 import type { InnoConfig } from "../config.js";
 import { logger } from "../logger.js";
-import { loadTenantConfig } from "../tenants/config.js";
+import { resolveTenantConfig } from "../tenants/config.js";
 import { getCurrentTenant, getCurrentTenantStore, runInTenantContext } from "../tenants/current.js";
 import type { TenantContext, TenantStore } from "../tenants/store.js";
 import { feishuRegistrationBegin, feishuRegistrationPoll } from "./feishu/feishu-registration.js";
@@ -41,14 +41,20 @@ interface TenantChannelRuntime {
 export interface TenantChannelManagerOptions {
 	dataDir: string;
 	tenantStore: TenantStore;
+	/** Deployment config: providers, shared bridge token and channel endpoints. */
+	getLocalConfig: () => InnoConfig;
 	dispatcher: Omit<PersonalChannelDispatcherOptions, "channelRegistry" | "channelsDataDir">;
 	createChannels: (options: TenantChannelFactoryOptions) => TenantChannelRegistration;
 	/** Test seam: override the tenant_state KV (defaults to PostgreSQL). */
 	createStateStore?: (tenant: { context: TenantContext; store: TenantStore }) => TenantStateKv;
 }
 
-export function bridgeChannelResourceId(token: string): string {
-	return `bridge:${createHash("sha256").update(token).digest("hex")}`;
+export function channelUserResourceId(channel: string, userId: string): string {
+	return `channel-user:${channel}:${userId}`;
+}
+
+export function channelChatResourceId(channel: string, chatId: string): string {
+	return `channel-chat:${channel}:${chatId}`;
 }
 
 export function feishuChannelResourceId(appId: string): string {
@@ -59,10 +65,20 @@ export function wechatChannelResourceId(botId: string): string {
 	return `wechat:${botId}`;
 }
 
-function configuredChannelResourceIds(config: InnoConfig): Set<string> {
+// Ownership claims derive from the tenant record only: the personal Feishu
+// app bound via QR registration and the external user ids whitelisted on
+// shared (bridge-mode) channels. The server-managed bridge token itself is
+// not claimable — inbound routing resolves by channel-user/channel-chat.
+function configuredChannelResourceIds(config: InnoConfig, localConfig: InnoConfig): Set<string> {
 	const ids = new Set<string>();
 	if (config.feishu?.appId) ids.add(feishuChannelResourceId(config.feishu.appId));
-	if (config.bridge?.token) ids.add(bridgeChannelResourceId(config.bridge.token));
+	for (const name of ["qq", "wechat"] as const) {
+		const endpoint = localConfig.channels?.[name] as { mode?: string } | undefined;
+		if (endpoint?.mode !== "bridge") continue;
+		for (const userId of config.channels?.[name]?.allowedUserIds ?? []) {
+			ids.add(channelUserResourceId(name, userId));
+		}
+	}
 	return ids;
 }
 
@@ -98,6 +114,14 @@ export class TenantChannelManager extends ChannelRegistry {
 	override async setDefaultTarget(target: Parameters<ChannelRegistry["setDefaultTarget"]>[0]): Promise<void> {
 		const runtime = this.runtime();
 		await runtime.hydrated;
+		const tenant = this.tenant();
+		const previous = await runtime.registry.getDefaultTarget(target.channel);
+		if (previous?.chatId && previous.chatId !== target.chatId) {
+			await tenant.store.releaseResource(tenant.context, "channel",
+				channelChatResourceId(target.channel, previous.chatId));
+		}
+		await tenant.store.claimResource(tenant.context, "channel",
+			channelChatResourceId(target.channel, target.chatId));
 		await runtime.registry.setDefaultTarget(target);
 	}
 
@@ -134,8 +158,9 @@ export class TenantChannelManager extends ChannelRegistry {
 	/** Claim newly configured external identities before their config becomes active. */
 	async syncOwnership(previous: InnoConfig, next: InnoConfig): Promise<void> {
 		const tenant = this.tenant();
-		const before = configuredChannelResourceIds(previous);
-		const after = configuredChannelResourceIds(next);
+		const localConfig = this.options.getLocalConfig();
+		const before = configuredChannelResourceIds(previous, localConfig);
+		const after = configuredChannelResourceIds(next, localConfig);
 		const added = [...after].filter((id) => !before.has(id));
 		const claimed: string[] = [];
 		try {
@@ -193,12 +218,37 @@ export class TenantChannelManager extends ChannelRegistry {
 		this.wechatQrs.delete(qrId);
 	}
 
-	/** Public bridge callbacks recover tenant context from persisted token ownership. */
-	async runWithBridgeToken<T>(token: string, operation: () => T): Promise<T | null> {
-		if (!token) return null;
-		const context = await this.options.tenantStore.findResourceOwner("channel", bridgeChannelResourceId(token));
-		if (!context) return null;
-		return runInTenantContext(context, this.options.tenantStore, operation);
+	/** Constant-time check of the shared, operator-managed bridge token. */
+	hasBridgeToken(token: string): boolean {
+		const expected = this.options.getLocalConfig().bridge?.token;
+		return Boolean(token && expected && token.length === expected.length
+			&& timingSafeEqual(Buffer.from(token), Buffer.from(expected)));
+	}
+
+	/**
+	 * Bridge inbound: the token is server-managed and shared across tenants, so
+	 * it only authenticates the sidecar. The owning tenant is resolved from the
+	 * claimed external identity — the bound chat, else the whitelisted user.
+	 */
+	async runWithBridgeMessage<T>(
+		token: string,
+		msg: { channel?: string; chatId?: string; userId?: string },
+		operation: () => T,
+	): Promise<T | null> {
+		const expected = this.options.getLocalConfig().bridge?.token;
+		if (!token || !expected || token.length !== expected.length
+			|| !timingSafeEqual(Buffer.from(token), Buffer.from(expected))) return null;
+		const channel = typeof msg.channel === "string" ? msg.channel : "";
+		const candidates = [
+			typeof msg.chatId === "string" && msg.chatId ? channelChatResourceId(channel, msg.chatId) : null,
+			typeof msg.userId === "string" && msg.userId ? channelUserResourceId(channel, msg.userId) : null,
+		];
+		for (const id of candidates) {
+			if (!id) continue;
+			const context = await this.options.tenantStore.findResourceOwner("channel", id);
+			if (context) return runInTenantContext(context, this.options.tenantStore, operation);
+		}
+		return null;
 	}
 
 	async beginFeishuRegistration(): ReturnType<typeof feishuRegistrationBegin> {
@@ -307,7 +357,7 @@ export class TenantChannelManager extends ChannelRegistry {
 			},
 		};
 		const registration = this.options.createChannels({
-			config: loadTenantConfig(this.options.dataDir, tenant.context.tenantId),
+			config: resolveTenantConfig(this.options.dataDir, tenant.context.tenantId, this.options.getLocalConfig()),
 			channelsDataDir,
 			registry,
 			dispatch,

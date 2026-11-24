@@ -25,7 +25,6 @@ const providerRequests: Array<{ authorization: string; body: string }> = [];
 const sidecarServers: HttpServer[] = [];
 const sidecarRequests: Array<{ sidecar: string; method: string; path: string; authorization: string; body: string }> = [];
 let sidecarOriginA = "";
-let sidecarOriginB = "";
 
 async function freePort(): Promise<number> {
 	const listener = createServer();
@@ -61,14 +60,12 @@ async function api(cookie: string, path: string, init: RequestInit = {}): Promis
 	});
 }
 
-async function configureTestProvider(cookie: string, apiKey = "integration-test-secret"): Promise<void> {
-	const response = await api(cookie, "/api/settings/providers", {
-		method: "PUT",
-		body: JSON.stringify({
-			providerId: "shared", baseUrl: providerOrigin, apiKey,
-			api: "openai-completions", makeDefault: true,
-			models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-		}),
+// Providers are server-managed; the tenant only picks a model from the
+// server catalog (this is the real user-facing selection path).
+async function configureTestProvider(cookie: string): Promise<void> {
+	const response = await api(cookie, "/api/settings/model", {
+		method: "POST",
+		body: JSON.stringify({ provider: "shared", model: "tenant-model" }),
 	});
 	expect(response.status).toBe(200);
 }
@@ -188,7 +185,7 @@ beforeAll(async () => {
 			}
 			providerRequests.push({ authorization: req.headers.authorization ?? "", body });
 			if (body.includes("请用一句简短的中文短语概括")) {
-				const topic = req.headers.authorization === "Bearer durable-topic-a-secret"
+				const topic = body.includes("durable-topic-first-a") || body.includes("durable-topic-third-a")
 					? "租户 A 学习目标"
 					: "租户 B 学习目标";
 				res.writeHead(200, { "Content-Type": "text/event-stream" });
@@ -391,13 +388,13 @@ beforeAll(async () => {
 	});
 	await new Promise<void>((resolveListen) => providerServer.listen(0, "127.0.0.1", resolveListen));
 	providerOrigin = `http://127.0.0.1:${(providerServer.address() as AddressInfo).port}`;
-	[sidecarOriginA, sidecarOriginB] = await Promise.all([startSidecar("a"), startSidecar("b")]);
+	sidecarOriginA = await startSidecar("a");
 	const port = await freePort();
 	origin = `http://127.0.0.1:${port}`;
 	await mkdir(join(home, "config"), { recursive: true });
 	await writeFile(join(home, "config", "config.json"), JSON.stringify({
-		defaultProvider: "dummy",
-		defaultModel: "dummy-model",
+		defaultProvider: "shared",
+		defaultModel: "tenant-model",
 		providers: {
 			dummy: {
 				baseUrl: "http://127.0.0.1:9",
@@ -405,6 +402,26 @@ beforeAll(async () => {
 				api: "openai-completions",
 				models: [{ id: "dummy-model" }],
 			},
+			// Server-managed catalog: tenants can only select, never edit.
+			shared: {
+				baseUrl: providerOrigin,
+				apiKey: "integration-test-secret",
+				api: "openai-completions",
+				models: [
+					{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 },
+					{ id: "other-model", name: "Other model", contextWindow: 32_000, maxTokens: 2_000 },
+				],
+			},
+			"text-only": {
+				baseUrl: providerOrigin,
+				apiKey: "integration-test-secret",
+				api: "openai-completions",
+				models: [{ id: "text-model", name: "Text model", input: ["text"], contextWindow: 32_000, maxTokens: 2_000 }],
+			},
+		},
+		bridge: { token: "channel-token" },
+		channels: {
+			qq: { enabled: false, mode: "bridge", sidecarBaseUrl: sidecarOriginA },
 		},
 		contentHub: { type: "bundle", baseUrl: providerOrigin },
 	}));
@@ -450,7 +467,7 @@ describe("server authentication boundary", () => {
 		const cookie = registered.headers.get("set-cookie")?.split(";", 1)[0]!;
 		expect(cookie).toContain("session_token");
 		expect((await fetch(`${origin}/api/sessions`, { headers: { Cookie: cookie } })).status).toBe(200);
-		await configureTestProvider(cookie, "server-boundary-secret");
+		await configureTestProvider(cookie);
 		// Bridge has its own bearer-token/tenant-ownership check; it must not
 		// become a cookie-auth route or fall back to the legacy global channel.
 		expect((await fetch(`${origin}/api/bridge/messages`, { method: "POST" })).status).toBe(401);
@@ -462,7 +479,7 @@ describe("multi-user durable execution boundary", () => {
 	it("defaults new work to durable and never executes a legacy-style session", async () => {
 		const cookie = await registerUser("durable-required@example.com");
 		expect((await api(cookie, "/api/sessions")).status).toBe(200);
-		await configureTestProvider(cookie, "durable-required-secret");
+		await configureTestProvider(cookie);
 		const created = await api(cookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ newWorkspace: { isTemp: true } }),
 		});
@@ -526,7 +543,7 @@ describe("session sidecar tenant isolation", () => {
 			expect(response.status, await response.clone().text()).toBe(201);
 			return (await response.json() as { id: string }).id;
 		};
-		await Promise.all([configureTestProvider(cookieA, "sidecar-a-secret"), configureTestProvider(cookieB, "sidecar-b-secret")]);
+		await Promise.all([configureTestProvider(cookieA), configureTestProvider(cookieB)]);
 		const sessionA = await createSession(cookieA);
 		const sessionB = await createSession(cookieB);
 		const pool = new Pool({ connectionString: postgres.databaseUrl });
@@ -574,8 +591,8 @@ describe("session and workspace tenant isolation", () => {
 			registerUser("tenant-b@example.com"),
 		]);
 		await Promise.all([
-			configureTestProvider(cookieA, "tenant-a-secret"),
-			configureTestProvider(cookieB, "tenant-b-secret"),
+			configureTestProvider(cookieA),
+			configureTestProvider(cookieB),
 		]);
 		const workspaceResponse = await api(cookieA, "/api/workspaces", {
 			method: "POST", body: JSON.stringify({ name: "Tenant A private" }),
@@ -672,7 +689,7 @@ describe("job and check-in tenant isolation", () => {
 			registerUser("jobs-a@example.com"),
 			registerUser("jobs-b@example.com"),
 		]);
-		await configureTestProvider(cookieB, "jobs-b-secret");
+		await configureTestProvider(cookieB);
 		await mkdir(join(home, "data", "jobs"), { recursive: true });
 		await writeFile(join(home, "data", "jobs", "jobs.json"), JSON.stringify([{
 			id: "job_legacy", name: "legacy global", cron: "0 9 * * *", timezone: "UTC", enabled: true,
@@ -776,35 +793,36 @@ describe("settings and model credential isolation", () => {
 		]);
 		const globalConfigBefore = await readFile(join(home, "config", "config.json"), "utf-8");
 
+		// The catalog is server-managed: a fresh tenant already sees the shared
+		// providers (keys masked) and the deployment default model.
 		const initial = await (await api(cookieA, "/api/settings")).json() as {
-			providers: Record<string, unknown>;
+			providers: Record<string, { apiKey?: string }>;
 			defaultProvider: string;
+			defaultModel: string;
 			availableModels: unknown[];
 		};
-		expect(initial.providers).toEqual({});
-		expect(initial.defaultProvider).toBe("");
-		expect(initial.availableModels).toEqual([]);
+		expect(initial.providers.shared.apiKey).toBe("****cret");
+		expect(initial.defaultProvider).toBe("shared");
+		expect(initial.defaultModel).toBe("tenant-model");
+		expect(initial.availableModels.length).toBeGreaterThan(0);
 
-		const configureProvider = async (cookie: string, apiKey: string, providerId = "shared", modelId = "tenant-model") => {
-			const response = await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId,
-					baseUrl: providerOrigin,
-					apiKey,
-					api: "openai-completions",
-					makeDefault: true,
-					models: [{ id: modelId, name: "Tenant stub" }],
-				}),
+		// Provider write endpoints are gone: tenants can only select a model.
+		expect((await api(cookieA, "/api/settings/providers", {
+			method: "PUT", body: JSON.stringify({ providerId: "shared", baseUrl: providerOrigin, apiKey: "x" }),
+		})).status).toBe(404);
+
+		const selectModel = async (cookie: string, modelId: string) => {
+			const response = await api(cookie, "/api/settings/model", {
+				method: "POST", body: JSON.stringify({ provider: "shared", model: modelId }),
 			});
 			expect(response.status).toBe(200);
-			return response.json() as Promise<{ providers: Record<string, { apiKey: string }> }>;
 		};
-		const settingsA = await configureProvider(cookieA, "tenant-a-secret");
-		expect(settingsA.providers.shared.apiKey).toBe("****cret");
-		expect((await (await api(cookieB, "/api/settings")).json() as { providers: Record<string, unknown> }).providers).toEqual({});
-		const settingsB = await configureProvider(cookieB, "tenant-b-secret");
-		expect(settingsB.providers.shared.apiKey).toBe("****cret");
+		await selectModel(cookieA, "tenant-model");
+		await selectModel(cookieB, "other-model");
+		// Tenant B's selection does not leak into A's view — the shared catalog
+		// stays identical but the default model differs per tenant.
+		expect((await (await api(cookieA, "/api/settings")).json() as { defaultModel: string }).defaultModel).toBe("tenant-model");
+		expect((await (await api(cookieB, "/api/settings")).json() as { defaultModel: string }).defaultModel).toBe("other-model");
 
 		expect((await api(cookieB, "/api/settings/memory", {
 			method: "PUT", body: JSON.stringify({ l2Enabled: false }),
@@ -831,11 +849,10 @@ describe("settings and model credential isolation", () => {
 		};
 		const [sessionA, sessionB] = await Promise.all([createSession(cookieA), createSession(cookieB)]);
 		const unconfiguredCookie = await registerUser("settings-unconfigured@example.com");
-		const requestsBeforeUnconfigured = providerRequests.length;
+		// No explicit selection needed: the server-managed default model applies.
 		expect((await api(unconfiguredCookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ newWorkspace: { isTemp: true } }),
-		})).status).toBe(500);
-		expect(providerRequests).toHaveLength(requestsBeforeUnconfigured);
+		})).status).toBe(201);
 
 		for (const [cookie, sessionId, prompt] of [
 			[cookieA, sessionA, "tenant-a-main-prompt"],
@@ -848,8 +865,8 @@ describe("settings and model credential isolation", () => {
 			expect(response.status, JSON.stringify({ responseBody, serverLog: output.slice(-12_000) })).toBe(200);
 			expect(responseBody).toMatchObject({ response: "tenant stub response" });
 		}
-		expect(providerRequests.find((request) => request.body.includes("tenant-a-main-prompt"))?.authorization).toBe("Bearer tenant-a-secret");
-		expect(providerRequests.find((request) => request.body.includes("tenant-b-main-prompt"))?.authorization).toBe("Bearer tenant-b-secret");
+		expect(providerRequests.find((request) => request.body.includes("tenant-a-main-prompt"))?.authorization).toBe("Bearer integration-test-secret");
+		expect(providerRequests.find((request) => request.body.includes("tenant-b-main-prompt"))?.authorization).toBe("Bearer integration-test-secret");
 
 		const sideQuestions = await Promise.all([
 			api(cookieA, "/api/btw/ask", {
@@ -863,8 +880,8 @@ describe("settings and model credential isolation", () => {
 			expect(response.status).toBe(200);
 			expect(await response.json()).toMatchObject({ answer: "tenant stub response" });
 		}
-		expect(providerRequests.find((request) => request.body.includes("tenant-a-side-question"))?.authorization).toBe("Bearer tenant-a-secret");
-		expect(providerRequests.find((request) => request.body.includes("tenant-b-side-question"))?.authorization).toBe("Bearer tenant-b-secret");
+		expect(providerRequests.find((request) => request.body.includes("tenant-a-side-question"))?.authorization).toBe("Bearer integration-test-secret");
+		expect(providerRequests.find((request) => request.body.includes("tenant-b-side-question"))?.authorization).toBe("Bearer integration-test-secret");
 
 		for (const [path, body] of [
 			["/api/settings/content-hub", { token: "must-not-be-shared" }],
@@ -879,8 +896,7 @@ describe("settings and model credential isolation", () => {
 			method: "POST", body: JSON.stringify({ fileName: "tenant.md", dataBase64: Buffer.from("---\nname: tenant\n---\n").toString("base64") }),
 		})).status).toBe(409);
 
-		await configureProvider(cookieB, "tenant-b-secondary", "extra", "extra-model");
-		expect((await api(cookieB, "/api/settings/providers/shared", { method: "DELETE" })).status).toBe(200);
+		expect((await api(cookieB, "/api/settings/providers/shared", { method: "DELETE" })).status).toBe(404);
 		expect((await (await api(cookieA, "/api/settings")).json() as { defaultModel: string }).defaultModel).toBe("tenant-model");
 		expect(await readFile(join(home, "config", "config.json"), "utf-8")).toBe(globalConfigBefore);
 	}, 90_000);
@@ -893,36 +909,25 @@ describe("channel runtime isolation", () => {
 			registerUser("channels-b@example.com"),
 		]);
 		const globalConfigBefore = await readFile(join(home, "config", "config.json"), "utf-8");
-		const configureProvider = async (cookie: string, apiKey: string) => {
-			const response = await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared",
-					baseUrl: providerOrigin,
-					apiKey,
-					api: "openai-completions",
-					makeDefault: true,
-					models: [{ id: "tenant-model", name: "Tenant stub", input: ["text", "image"] }],
-				}),
-			});
+		const configureProvider = async (cookie: string) => {
+			const response = await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) });
 			expect(response.status).toBe(200);
 		};
-		await Promise.all([
-			configureProvider(cookieA, "channel-a-secret"),
-			configureProvider(cookieB, "channel-b-secret"),
-		]);
-		const configureChannels = (cookie: string, token: string, sidecarBaseUrl: string) => api(cookie, "/api/settings/channels", {
+		await Promise.all([configureProvider(cookieA), configureProvider(cookieB)]);
+		// Channel credentials and endpoints are server-managed: the tenant only
+		// enables the preset channel. Credential fields are rejected outright.
+		const configureChannels = (cookie: string) => api(cookie, "/api/settings/channels", {
 			method: "PUT",
-			body: JSON.stringify({
-				bridge: { token },
-				channels: { qq: { enabled: true, mode: "bridge", sidecarBaseUrl } },
-			}),
+			body: JSON.stringify({ channels: { qq: { enabled: true } } }),
 		});
+		expect((await api(cookieA, "/api/settings/channels", {
+			method: "PUT",
+			body: JSON.stringify({ bridge: { token: "x" }, channels: { qq: { enabled: true } } }),
+		})).status).toBe(403);
 
-		expect((await configureChannels(cookieA, "channel-token-a", sidecarOriginA)).status).toBe(200);
-		expect((await configureChannels(cookieB, "channel-token-a", sidecarOriginB)).status).toBe(404);
-		expect(await (await api(cookieB, "/api/settings")).json() as { bridge?: unknown }).not.toHaveProperty("bridge");
-		expect((await configureChannels(cookieB, "channel-token-b", sidecarOriginB)).status).toBe(200);
+		expect((await configureChannels(cookieA)).status).toBe(200);
+		expect((await configureChannels(cookieB)).status).toBe(200);
+		expect((await (await api(cookieB, "/api/settings")).json() as { bridge?: { token: string } }).bridge?.token).toBe("****oken");
 		for (const cookie of [cookieA, cookieB]) {
 			const channels = await (await api(cookie, "/api/channels")).json() as Array<{ name: string; mode: string }>;
 			expect(channels).toEqual([{ name: "qq", mode: "bridge", enabled: true, hasDefaultTarget: false }]);
@@ -938,7 +943,7 @@ describe("channel runtime isolation", () => {
 		})).status).toBe(200);
 		await waitFor(() => sidecarRequests.some((request) => request.path === "/push" && request.body.includes("push-only-a")), "tenant A test push");
 		const pushA = sidecarRequests.find((request) => request.path === "/push" && request.body.includes("push-only-a"));
-		expect(pushA).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token-a" });
+		expect(pushA).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token" });
 		expect(pushA?.body).toContain("chat-a");
 		expect(sidecarRequests.some((request) => request.sidecar === "b" && request.body.includes("push-only-a"))).toBe(false);
 
@@ -948,7 +953,7 @@ describe("channel runtime isolation", () => {
 			body: JSON.stringify(body),
 		});
 		const providerCountBeforeRejected = providerRequests.length;
-		expect((await bridgeMessage("channel-token-a", {
+		expect((await bridgeMessage("channel-token", {
 			channel: "qq", messageId: "missing-chat", text: "must-not-run",
 		})).status).toBe(400);
 		expect((await bridgeMessage("wrong-token", {
@@ -957,11 +962,11 @@ describe("channel runtime isolation", () => {
 		expect(providerRequests).toHaveLength(providerCountBeforeRejected);
 
 		const inboundResponses = await Promise.all([
-			bridgeMessage("channel-token-a", {
+			bridgeMessage("channel-token", {
 				channel: "qq", messageId: "inbound-a", chatId: "chat-a", text: "channel-a-inbound",
 				attachments: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
 			}),
-			bridgeMessage("channel-token-b", {
+			bridgeMessage("channel-token", {
 				channel: "qq", messageId: "inbound-b", chatId: "chat-b", text: "channel-b-inbound",
 			}),
 		]);
@@ -975,12 +980,12 @@ describe("channel runtime isolation", () => {
 		const channelProviderBodyA = providerRequests.find((request) => request.body.includes("channel-a-inbound"))?.body ?? "";
 		expect(channelProviderBodyA).toContain("image_url");
 		expect(channelProviderBodyA).toContain("aW1hZ2U=");
-		expect(providerRequests.find((request) => request.body.includes("channel-a-inbound"))?.authorization).toBe("Bearer channel-a-secret");
-		expect(providerRequests.find((request) => request.body.includes("channel-b-inbound"))?.authorization).toBe("Bearer channel-b-secret");
+		expect(providerRequests.find((request) => request.body.includes("channel-a-inbound"))?.authorization).toBe("Bearer integration-test-secret");
+		expect(providerRequests.find((request) => request.body.includes("channel-b-inbound"))?.authorization).toBe("Bearer integration-test-secret");
 		const replyA = sidecarRequests.find((request) => request.path === "/reply" && request.body.includes("inbound-a"));
 		const replyB = sidecarRequests.find((request) => request.path === "/reply" && request.body.includes("inbound-b"));
-		expect(replyA).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token-a" });
-		expect(replyB).toMatchObject({ sidecar: "b", authorization: "Bearer channel-token-b" });
+		expect(replyA).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token" });
+		expect(replyB).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token" });
 		expect(replyA?.body).toContain("chat-a");
 		expect(replyB?.body).toContain("chat-b");
 		const runsA = await (await api(cookieA, "/api/channels/runs")).json() as Array<{ messageId: string; status: string }>;
@@ -1053,7 +1058,7 @@ describe("channel runtime isolation", () => {
 			runtime: "durable", origin: "scheduler",
 		});
 		await waitFor(() => sidecarRequests.some((request) => request.path === "/push" && request.body.includes("tenant stub response") && request.body.includes("chat-a")), "manual tenant job push");
-		expect(providerRequests.find((request) => request.body.includes("channel-job-a"))?.authorization).toBe("Bearer channel-a-secret");
+		expect(providerRequests.find((request) => request.body.includes("channel-job-a"))?.authorization).toBe("Bearer integration-test-secret");
 		expect(sidecarRequests.some((request) => request.sidecar === "b" && request.body.includes("channel-job-a"))).toBe(false);
 		expect(await readFile(join(home, "config", "config.json"), "utf-8")).toBe(globalConfigBefore);
 	}, 90_000);
@@ -1066,28 +1071,19 @@ describe("tenant background execution", () => {
 			registerUser("background-b@example.com"),
 		]);
 		const globalConfigBefore = await readFile(join(home, "config", "config.json"), "utf-8");
-		const configure = async (cookie: string, apiKey: string, token: string, sidecarBaseUrl: string, chatId: string) => {
-			expect((await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared", baseUrl: providerOrigin, apiKey, api: "openai-completions",
-					makeDefault: true, models: [{ id: "tenant-model", name: "Tenant stub" }],
-				}),
-			})).status).toBe(200);
+		const configure = async (cookie: string, chatId: string) => {
+			expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 			expect((await api(cookie, "/api/settings/channels", {
 				method: "PUT",
-				body: JSON.stringify({
-					bridge: { token },
-					channels: { qq: { enabled: true, mode: "bridge", sidecarBaseUrl } },
-				}),
+				body: JSON.stringify({ channels: { qq: { enabled: true } } }),
 			})).status).toBe(200);
 			expect((await api(cookie, "/api/channels/qq/default-target", {
 				method: "POST", body: JSON.stringify({ chatId }),
 			})).status).toBe(200);
 		};
 		await Promise.all([
-			configure(cookieA, "background-a-secret", "background-token-a", sidecarOriginA, "background-chat-a"),
-			configure(cookieB, "background-b-secret", "background-token-b", sidecarOriginB, "background-chat-b"),
+			configure(cookieA, "background-chat-a"),
+			configure(cookieB, "background-chat-b"),
 		]);
 		const createJob = async (cookie: string, name: string, prompt: string, runtime?: "durable") => {
 			// Use the next UTC minute, not every minute. The test still exercises the
@@ -1110,8 +1106,8 @@ describe("tenant background execution", () => {
 		await waitFor(() => ["background-a-prompt", "background-b-prompt"].every((prompt) =>
 			providerRequests.some((request) => request.body.includes(prompt)),
 		), "deferred tenant model executions", 75_000);
-		expect(providerRequests.find((request) => request.body.includes("background-a-prompt"))?.authorization).toBe("Bearer background-a-secret");
-		expect(providerRequests.find((request) => request.body.includes("background-b-prompt"))?.authorization).toBe("Bearer background-b-secret");
+		expect(providerRequests.find((request) => request.body.includes("background-a-prompt"))?.authorization).toBe("Bearer integration-test-secret");
+		expect(providerRequests.find((request) => request.body.includes("background-b-prompt"))?.authorization).toBe("Bearer integration-test-secret");
 		expect((await api(cookieA, `/api/jobs/${jobA.id}`, {
 			method: "PATCH", body: JSON.stringify({ enabled: false }),
 		})).status).toBe(200);
@@ -1130,8 +1126,8 @@ describe("tenant background execution", () => {
 		), "tenant background channel delivery");
 		const pushA = sidecarRequests.find((request) => request.path === "/push" && request.body.includes("background-chat-a") && request.body.includes("tenant stub response"));
 		const pushB = sidecarRequests.find((request) => request.path === "/push" && request.body.includes("background-chat-b") && request.body.includes("tenant stub response"));
-		expect(pushA).toMatchObject({ sidecar: "a", authorization: "Bearer background-token-a" });
-		expect(pushB).toMatchObject({ sidecar: "b", authorization: "Bearer background-token-b" });
+		expect(pushA).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token" });
+		expect(pushB).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token" });
 
 		const sessionsA = await (await api(cookieA, "/api/sessions")).json() as Array<{ id: string; runtime?: string; origin?: string }>;
 		const sessionsB = await (await api(cookieB, "/api/sessions")).json() as Array<{ id: string; runtime?: string; origin?: string }>;
@@ -1185,7 +1181,7 @@ describe("tenant background execution", () => {
 describe("durable session HTTP boundary", () => {
 	it("persists BTW bring-back once without a synthetic user or model turn", async () => {
 		const cookie = await registerUser("durable-btw-bring-back@example.com");
-		await configureTestProvider(cookie, "durable-btw-secret");
+		await configureTestProvider(cookie);
 		const created = await api(cookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ newWorkspace: { isTemp: true } }),
 		});
@@ -1220,20 +1216,11 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-a@example.com"),
 			registerUser("durable-b@example.com"),
 		]);
-		const configure = async (cookie: string, apiKey: string) => {
-			const response = await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared",
-					baseUrl: providerOrigin,
-					apiKey,
-					api: "openai-completions",
-					models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-				}),
-			});
+		const configure = async (cookie: string) => {
+			const response = await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) });
 			expect(response.status).toBe(200);
 		};
-		await Promise.all([configure(cookieA, "durable-a-secret"), configure(cookieB, "durable-b-secret")]);
+		await Promise.all([configure(cookieA), configure(cookieB)]);
 		const createDurable = async (cookie: string) => {
 			const response = await api(cookie, "/api/sessions", {
 				method: "POST",
@@ -1267,8 +1254,8 @@ describe("durable session HTTP boundary", () => {
 			stream(cookieA, sessionA.id, "durable-a-main-prompt", "durable-a-request"),
 			stream(cookieB, sessionB.id, "durable-b-main-prompt", "durable-b-request"),
 		]);
-		expect(providerRequests.find((request) => request.body.includes("durable-a-main-prompt"))?.authorization).toBe("Bearer durable-a-secret");
-		expect(providerRequests.find((request) => request.body.includes("durable-b-main-prompt"))?.authorization).toBe("Bearer durable-b-secret");
+		expect(providerRequests.find((request) => request.body.includes("durable-a-main-prompt"))?.authorization).toBe("Bearer integration-test-secret");
+		expect(providerRequests.find((request) => request.body.includes("durable-b-main-prompt"))?.authorization).toBe("Bearer integration-test-secret");
 		const countA = providerRequests.filter((request) => request.body.includes("durable-a-main-prompt")).length;
 		await stream(cookieA, sessionA.id, "durable-a-main-prompt", "durable-a-request");
 		expect(providerRequests.filter((request) => request.body.includes("durable-a-main-prompt"))).toHaveLength(countA);
@@ -1319,14 +1306,7 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-workspace-write@example.com"),
 			registerUser("durable-workspace-write-other@example.com"),
 		]);
-		expect((await api(cookie, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-workspace-write-secret",
-				api: "openai-completions", makeDefault: true,
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		const created = await api(cookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
 		});
@@ -1418,14 +1398,7 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-preset-a@example.com"),
 			registerUser("durable-preset-b@example.com"),
 		]);
-		expect((await api(cookieA, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-preset-secret",
-				api: "openai-completions", makeDefault: true,
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookieA, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		const createPreset = () => api(cookieA, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable", presetId: "durable-preset" }),
 		});
@@ -1446,14 +1419,7 @@ describe("durable session HTTP boundary", () => {
 
 	it("streams manual durable jobs and validates explicit runtime selection", async () => {
 		const cookie = await registerUser("durable-job-stream@example.com");
-		expect((await api(cookie, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-job-stream-secret",
-				api: "openai-completions", makeDefault: true,
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		expect((await api(cookie, "/api/jobs", {
 			method: "POST",
 			body: JSON.stringify({ name: "bad runtime", cron: "0 9 * * *", taskType: "custom_prompt", prompt: "no", runtime: "other" }),
@@ -1486,7 +1452,7 @@ describe("durable session HTTP boundary", () => {
 		expect(streamText).toContain("job_result");
 		expect(streamText).toContain('"success":true');
 		expect(providerRequests.find((request) => request.body.includes("durable-job-stream-prompt"))?.authorization)
-			.toBe("Bearer durable-job-stream-secret");
+			.toBe("Bearer integration-test-secret");
 		const detail = await (await api(cookie, `/api/sessions/${session.id}`)).json() as {
 			runtime: string; origin: string; messages: Array<{ role: string; content: string }>;
 		};
@@ -1504,22 +1470,10 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-topic-a@example.com"),
 			registerUser("durable-topic-b@example.com"),
 		]);
-		const configure = async (cookie: string, apiKey: string) => {
-			expect((await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared",
-					baseUrl: providerOrigin,
-					apiKey,
-					api: "openai-completions",
-					models: [
-						{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 },
-						{ id: "other-model", name: "Other model", contextWindow: 32_000, maxTokens: 2_000 },
-					],
-				}),
-			})).status).toBe(200);
+		const configure = async (cookie: string) => {
+			expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		};
-		await Promise.all([configure(cookieA, "durable-topic-a-secret"), configure(cookieB, "durable-topic-b-secret")]);
+		await Promise.all([configure(cookieA), configure(cookieB)]);
 		const createDurable = async (cookie: string) => {
 			const response = await api(cookie, "/api/sessions", {
 				method: "POST", body: JSON.stringify({ runtime: "durable" }),
@@ -1551,8 +1505,8 @@ describe("durable session HTTP boundary", () => {
 		await waitFor(async () => await topicName(cookieA, sessionA.id) === "租户 A 学习目标"
 			&& await topicName(cookieB, sessionB.id) === "租户 B 学习目标", "durable automatic topics");
 		const automaticTopics = providerRequests.filter((request) => request.body.includes("请用一句简短的中文短语概括"));
-		const topicA = automaticTopics.filter((request) => request.authorization === "Bearer durable-topic-a-secret");
-		const topicB = automaticTopics.filter((request) => request.authorization === "Bearer durable-topic-b-secret");
+		const topicA = automaticTopics.filter((request) => request.body.includes("durable-topic-first-a"));
+		const topicB = automaticTopics.filter((request) => request.body.includes("durable-topic-first-b"));
 		expect(topicA).toHaveLength(1);
 		expect(topicB).toHaveLength(1);
 		expect((JSON.parse(topicA[0]!.body) as { model: string }).model).toBe("tenant-model");
@@ -1565,7 +1519,7 @@ describe("durable session HTTP boundary", () => {
 		const regenerated = await api(cookieA, `/api/sessions/${sessionA.id}/generate-topic`, { method: "POST" });
 		expect(regenerated.status).toBe(200);
 		expect(await regenerated.json()).toMatchObject({ name: "租户 A 学习目标", runtime: "durable", topicPendingUpgrade: false });
-		expect(providerRequests.filter((request) => request.authorization === "Bearer durable-topic-a-secret"
+		expect(providerRequests.filter((request) => request.body.includes("durable-topic-first-a")
 			&& request.body.includes("请用一句简短的中文短语概括"))).toHaveLength(2);
 	}, 60_000);
 
@@ -1574,16 +1528,10 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-l3-index-a@example.com"),
 			registerUser("durable-l3-index-b@example.com"),
 		]);
-		const configure = async (cookie: string, apiKey: string) => {
-			expect((await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared", baseUrl: providerOrigin, apiKey, api: "openai-completions",
-					models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-				}),
-			})).status).toBe(200);
+		const configure = async (cookie: string) => {
+			expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		};
-		await Promise.all([configure(cookieA, "durable-l3-index-a-secret"), configure(cookieB, "durable-l3-index-b-secret")]);
+		await Promise.all([configure(cookieA), configure(cookieB)]);
 		const createDurable = async (cookie: string) => {
 			const response = await api(cookie, "/api/sessions", { method: "POST", body: JSON.stringify({ runtime: "durable" }) });
 			expect(response.status).toBe(201);
@@ -1606,18 +1554,17 @@ describe("durable session HTTP boundary", () => {
 			chat(cookieA, recallA.id, "durable-l3-history-a", "durable-l3-history-request-a"),
 			chat(cookieB, recallB.id, "durable-l3-history-b", "durable-l3-history-request-b"),
 		]);
-		const finalA = providerRequests.find((request) => request.authorization === "Bearer durable-l3-index-a-secret"
-			&& request.body.includes("durable-l3-history-a") && request.body.includes("durable-topic-first-a"));
-		const finalB = providerRequests.find((request) => request.authorization === "Bearer durable-l3-index-b-secret"
-			&& request.body.includes("durable-l3-history-b") && request.body.includes("durable-topic-first-b"));
+		const finalA = providerRequests.find((request) => request.body.includes("durable-l3-history-a")
+			&& request.body.includes("durable-topic-first-a"));
+		const finalB = providerRequests.find((request) => request.body.includes("durable-l3-history-b")
+			&& request.body.includes("durable-topic-first-b"));
 		expect(finalA).toBeDefined();
 		expect(finalB).toBeDefined();
 		expect(finalA?.body).not.toContain("durable-topic-first-b");
 		expect(finalB?.body).not.toContain("durable-topic-first-a");
 
 		await chat(cookieA, autoA.id, "durable-topic-first followup", "durable-l3-auto-request");
-		const autoRequest = providerRequests.find((request) => request.authorization === "Bearer durable-l3-index-a-secret"
-			&& request.body.includes("durable-topic-first followup"));
+		const autoRequest = providerRequests.find((request) => request.body.includes("durable-topic-first followup"));
 		expect(autoRequest?.body).toContain("# 相关历史对话");
 		expect(autoRequest?.body).toContain("durable-topic-first-a");
 		expect(autoRequest?.body).not.toContain("durable-topic-first-b");
@@ -1630,16 +1577,7 @@ describe("durable session HTTP boundary", () => {
 
 	it("passes validated attachments and inline images without exposing model-only context as user text", async () => {
 		const cookieA = await registerUser("durable-attachments@example.com");
-		expect((await api(cookieA, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared",
-				baseUrl: providerOrigin,
-				apiKey: "durable-attachments-secret",
-				api: "openai-completions",
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookieA, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		const workspace = await (await api(cookieA, "/api/workspaces", {
 			method: "POST", body: JSON.stringify({ name: "Durable attachments" }),
 		})).json() as { id: string };
@@ -1753,16 +1691,7 @@ describe("durable session HTTP boundary", () => {
 		expect(rejectionRequests).toHaveLength(1);
 		expect(rejectionRequests[0].body).toContain("image_url");
 
-		expect((await api(cookieA, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "text-only",
-				baseUrl: providerOrigin,
-				apiKey: "durable-text-only-secret",
-				api: "openai-completions",
-				models: [{ id: "text-model", name: "Text model", input: ["text"], contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookieA, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		expect((await api(cookieA, "/api/settings/model", {
 			method: "POST", body: JSON.stringify({ provider: "text-only", model: "text-model" }),
 		})).status).toBe(200);
@@ -1796,16 +1725,7 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-question-a@example.com"),
 			registerUser("durable-question-b@example.com"),
 		]);
-		const configured = await api(cookieA, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared",
-				baseUrl: providerOrigin,
-				apiKey: "durable-question-secret",
-				api: "openai-completions",
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		});
+		const configured = await api(cookieA, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) });
 		expect(configured.status).toBe(200);
 		const created = await api(cookieA, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable" }),
@@ -1886,16 +1806,7 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-abort-a@example.com"),
 			registerUser("durable-abort-b@example.com"),
 		]);
-		expect((await api(cookieA, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared",
-				baseUrl: providerOrigin,
-				apiKey: "durable-abort-secret",
-				api: "openai-completions",
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookieA, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		const session = await (await api(cookieA, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable" }),
 		})).json() as { id: string };
@@ -1942,16 +1853,7 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-memory-b@example.com"),
 		]);
 		const configure = async (cookie: string, tenant: string) => {
-			const response = await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared",
-					baseUrl: providerOrigin,
-					apiKey: "durable-memory-secret",
-					api: "openai-completions",
-					models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-				}),
-			});
+			const response = await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) });
 			expect(response.status).toBe(200);
 		};
 		await Promise.all([configure(cookieA, "a"), configure(cookieB, "b")]);
@@ -2013,16 +1915,7 @@ describe("durable session HTTP boundary", () => {
 
 	it("replays and completes an admitted durable SSE turn after SIGKILL and restart", async () => {
 		const cookie = await registerUser("durable-restart@example.com");
-		expect((await api(cookie, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared",
-				baseUrl: providerOrigin,
-				apiKey: "durable-restart-secret",
-				api: "openai-completions",
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		const session = await (await api(cookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable" }),
 		})).json() as { id: string };
@@ -2080,13 +1973,21 @@ describe("workspace read routes in authenticated mode", () => {
 		if (!existingHome) {
 			await mkdir(join(providerHome, "config"), { recursive: true });
 			await writeFile(join(providerHome, "config", "config.json"), JSON.stringify({
-				defaultProvider: "dummy",
-				defaultModel: "dummy-model",
-				providers: { dummy: { baseUrl: "http://127.0.0.1:9", apiKey: "x", api: "openai-completions", models: [{ id: "dummy-model" }] } },
+				defaultProvider: "shared",
+				defaultModel: "tenant-model",
+				providers: {
+					dummy: { baseUrl: "http://127.0.0.1:9", apiKey: "x", api: "openai-completions", models: [{ id: "dummy-model" }] },
+					shared: {
+						baseUrl: providerOrigin,
+						apiKey: "integration-test-secret",
+						api: "openai-completions",
+						models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
+					},
+				},
 			}));
 		}
 		const port = await freePort();
-		const providerOrigin = `http://127.0.0.1:${port}`;
+		const childOrigin = `http://127.0.0.1:${port}`;
 		const providerChild = spawn(process.execPath, ["--import", "tsx", resolve(root, "apps/inno-agent/src/server.ts")], {
 			cwd: root,
 			env: {
@@ -2100,7 +2001,7 @@ describe("workspace read routes in authenticated mode", () => {
 				INNO_HOST: "127.0.0.1",
 				DATABASE_URL: postgres.databaseUrl,
 				BETTER_AUTH_SECRET: SECRET,
-				BETTER_AUTH_URL: providerOrigin,
+				BETTER_AUTH_URL: childOrigin,
 				...env,
 			},
 			stdio: ["ignore", "pipe", "pipe"],
@@ -2112,12 +2013,12 @@ describe("workspace read routes in authenticated mode", () => {
 		while (true) {
 			if (providerChild.exitCode !== null) throw new Error(`Provider server exited: ${providerOutput}`);
 			try {
-				if ((await fetch(`${providerOrigin}/health`)).ok) break;
+				if ((await fetch(`${childOrigin}/health`)).ok) break;
 			} catch {}
 			if (Date.now() > deadline) throw new Error(`Provider server startup timed out: ${providerOutput}`);
 			await new Promise((resolveWait) => setTimeout(resolveWait, 100));
 		}
-		return { child: providerChild, origin: providerOrigin, home: providerHome };
+		return { child: providerChild, origin: childOrigin, home: providerHome };
 	};
 
 	const stopServer = async (providerChild: ChildProcess, providerHome: string) => {
@@ -2294,14 +2195,7 @@ describe("workspace read routes in authenticated mode", () => {
 		});
 		try {
 			const cookie = await providerRegister(providerOriginChild, "local-exec@example.com");
-			expect((await providerApi(providerOriginChild, cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-bash-write-secret",
-					api: "openai-completions", makeDefault: true,
-					models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-				}),
-			})).status).toBe(200);
+			expect((await providerApi(providerOriginChild, cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 			const created = await providerApi(providerOriginChild, cookie, "/api/sessions", {
 				method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
 			});
@@ -2370,14 +2264,7 @@ describe("workspace read routes in authenticated mode", () => {
 		let second: Awaited<ReturnType<typeof startProviderServer>> | null = null;
 		try {
 			const cookie = await providerRegister(first.origin, "local-exec-kill@example.com");
-			expect((await providerApi(first.origin, cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-bash-write-secret",
-					api: "openai-completions", makeDefault: true,
-					models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-				}),
-			})).status).toBe(200);
+			expect((await providerApi(first.origin, cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 			const created = await providerApi(first.origin, cookie, "/api/sessions", {
 				method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
 			});

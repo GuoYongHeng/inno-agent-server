@@ -513,10 +513,14 @@ export function normalizeConfig(
 	const defaultModel = config.defaultModel?.trim() || fallback?.model || "";
 	const defaultProviderConfig = providers[defaultProvider];
 	const hasDefaultModel = defaultProviderConfig?.models.some((model) => model.id === defaultModel);
+	// A tenant record carries no providers — the catalog lives in the
+	// deployment config, so the stored selection cannot be validated here and
+	// must be kept verbatim instead of being reset to the empty fallback.
+	const unverifiable = Object.keys(providers).length === 0;
 
 	return {
-		defaultProvider: hasDefaultModel ? defaultProvider : fallback?.provider || "",
-		defaultModel: hasDefaultModel ? defaultModel : fallback?.model || "",
+		defaultProvider: hasDefaultModel || unverifiable ? defaultProvider : fallback?.provider || "",
+		defaultModel: hasDefaultModel || unverifiable ? defaultModel : fallback?.model || "",
 		providers,
 		server: config.server,
 		feishu: config.feishu,

@@ -179,19 +179,12 @@ ServerResponse.prototype.end = function (...args) {
 		throw new Error(`server did not become ready within 90s\n--- child log ---\n${childLog}`);
 	}
 	cookie = await registerUser("smoke@example.com");
-	// Tenant configs start empty — seed the dummy provider through the
-	// tenant settings API so sessions can open a model.
-	const providerSetup = await api("/api/settings/providers", {
-		method: "PUT",
+	// The dummy provider is server-managed via the global config; the tenant
+	// only selects it (the real user-facing selection path).
+	const providerSetup = await api("/api/settings/model", {
+		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			providerId: "dummy",
-			baseUrl: `http://127.0.0.1:${providerPort}`,
-			apiKey: DUMMY_API_KEY,
-			api: "openai-completions",
-			makeDefault: true,
-			models: [{ id: "dummy-model", name: "Dummy model", contextWindow: 32_000, maxTokens: 2_000 }],
-		}),
+		body: JSON.stringify({ provider: "dummy", model: "dummy-model" }),
 	});
 	expect(providerSetup.status).toBe(200);
 }, 120_000);

@@ -43,10 +43,53 @@ export function saveTenantConfig(dataDir: string, tenantId: string, config: Inno
 	return saveConfig(tenantConfigPath(dataDir, tenantId), config, TENANT_CONFIG_OPTIONS);
 }
 
+const TENANT_CHANNEL_NAMES = ["feishu", "qq", "wechat", "wecom"] as const;
+
+/**
+ * Effective config = server-managed fields from the deployment config plus
+ * user selections from the tenant config. Providers, search keys, channel
+ * endpoints/mode and the bridge token are operator-owned; the tenant record
+ * only carries default model, channel enable/whitelist toggles, personal
+ * QR-bound credentials (feishu app), memory/smart-input/ui and scheduler.
+ */
+export function mergeTenantConfig(localConfig: InnoConfig, tenantConfig: InnoConfig): InnoConfig {
+	const channels: NonNullable<InnoConfig["channels"]> = {};
+	for (const name of TENANT_CHANNEL_NAMES) {
+		const global = localConfig.channels?.[name] as Record<string, unknown> | undefined;
+		const tenant = tenantConfig.channels?.[name] as Record<string, unknown> | undefined;
+		if (!global && !tenant) continue;
+		(channels as Record<string, unknown>)[name] = {
+			...(global ?? {}),
+			...(tenant ? {
+				enabled: Boolean(tenant.enabled),
+				...(tenant.personalOnly !== undefined ? { personalOnly: tenant.personalOnly } : {}),
+				...(tenant.allowedUserIds !== undefined ? { allowedUserIds: tenant.allowedUserIds } : {}),
+			} : {}),
+		};
+	}
+	return {
+		...localConfig,
+		defaultProvider: tenantConfig.defaultProvider || localConfig.defaultProvider,
+		defaultModel: tenantConfig.defaultModel || localConfig.defaultModel,
+		providers: localConfig.providers,
+		feishu: tenantConfig.feishu ?? localConfig.feishu,
+		channels,
+		memory: tenantConfig.memory ?? localConfig.memory,
+		smartInput: tenantConfig.smartInput ?? localConfig.smartInput,
+		ui: tenantConfig.ui ?? localConfig.ui,
+		scheduler: tenantConfig.scheduler ?? localConfig.scheduler,
+	};
+}
+
 /** Resolve configuration at execution time, inside the verified ALS tenant scope. */
 export function resolveCurrentTenantConfig(dataDir: string, localConfig: InnoConfig): InnoConfig {
 	const tenant = getCurrentTenant();
-	return tenant ? loadTenantConfig(dataDir, tenant.tenantId) : localConfig;
+	return tenant ? mergeTenantConfig(localConfig, loadTenantConfig(dataDir, tenant.tenantId)) : localConfig;
+}
+
+/** Effective config for a specific tenant id (channel manager, webhook routing). */
+export function resolveTenantConfig(dataDir: string, tenantId: string, localConfig: InnoConfig): InnoConfig {
+	return mergeTenantConfig(localConfig, loadTenantConfig(dataDir, tenantId));
 }
 
 function tenantConfigSyncPath(dataDir: string, tenantId: string): string {

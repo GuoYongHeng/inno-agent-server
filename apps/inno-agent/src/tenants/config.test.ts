@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,7 +9,6 @@ import {
 	loadTenantConfig,
 	resolveCurrentTenantConfig,
 	saveTenantConfig,
-	tenantConfigPath,
 } from "./config.js";
 import type { TenantContext, TenantStore } from "./store.js";
 
@@ -55,10 +54,12 @@ describe("tenant configuration", () => {
 		expect(config.tavily).toBeUndefined();
 	});
 
-	it("persists providers independently and resolves them from tenant context", () => {
+	it("merges server-managed fields from global config with tenant selections", () => {
 		const dataDir = tempDir();
 		const local = localConfig();
 		const tenantA = createEmptyTenantConfig();
+		// Stale tenant-side provider entries are ignored — the shared catalog
+		// always comes from the deployment config.
 		tenantA.providers.shared = {
 			baseUrl: "http://tenant-a.invalid",
 			apiKey: "tenant-a-secret",
@@ -66,15 +67,20 @@ describe("tenant configuration", () => {
 		};
 		tenantA.defaultProvider = "shared";
 		tenantA.defaultModel = "model-a";
+		tenantA.channels = { qq: { enabled: true, allowedUserIds: ["u1"] } as never };
 		saveTenantConfig(dataDir, "tenant-a", tenantA);
 
-		expect(loadTenantConfig(dataDir, "tenant-b").providers).toEqual({});
-		expect(JSON.parse(readFileSync(tenantConfigPath(dataDir, "tenant-a"), "utf-8")).providers.shared.apiKey).toBe("tenant-a-secret");
 		runInTenantContext(context("tenant-a"), tenantStore, () => {
-			expect(resolveCurrentTenantConfig(dataDir, local).providers.shared.apiKey).toBe("tenant-a-secret");
+			const resolved = resolveCurrentTenantConfig(dataDir, local);
+			expect(resolved.providers.legacy.apiKey).toBe("legacy-secret");
+			expect(resolved.defaultProvider).toBe("shared");
+			expect(resolved.defaultModel).toBe("model-a");
+			expect(resolved.channels?.qq).toMatchObject({ enabled: true, allowedUserIds: ["u1"] });
 		});
 		runInTenantContext(context("tenant-b"), tenantStore, () => {
-			expect(resolveCurrentTenantConfig(dataDir, local).providers).toEqual({});
+			const resolved = resolveCurrentTenantConfig(dataDir, local);
+			expect(resolved.providers.legacy.apiKey).toBe("legacy-secret");
+			expect(resolved.defaultProvider).toBe(local.defaultProvider);
 		});
 		expect(resolveCurrentTenantConfig(dataDir, local)).toBe(local);
 	});
