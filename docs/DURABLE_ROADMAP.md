@@ -448,7 +448,8 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - S2 已完成（T2.1 到 T2.5，行为不变的重构）：新增 `WorkspaceFileAccess` 接口（`workspace/workspace-files.ts`：`toRelative`/`stat`/`read`/`withLocalFile`/`withLocalDir`）与两个实现——`LocalWorkspaceFileAccess`（真实目录，沿用 `checkWorkspaceMutationPath` 的判定，不复制文件）和 `StoreWorkspaceFileAccess`（任意 `WorkspaceStore`，需要真实路径时物化到 0700 临时目录并保证清理）。`parse_document`、`ocr_image`、`send_file_to_channel`（发件箱快照在临时文件清理前完成）、`l2_archive` 的文件分支、工作区上下文（`agent.md`、`.skills`）都改走该接口；`durable-session-service` 每次打开运行时创建一个 `LocalWorkspaceFileAccess`，所以当前行为与改造前一致。三个实现共用契约测试，五类工具有 Local 与 Store(对象存储) 的结果一致性测试。阶段 3 换执行目录时只需改 `durable-session-service` 里的接线。
 - S3 核心已完成（T3.0/T3.1/T3.2 的本地一期）：`INNO_EXEC_BACKEND=local` 时 `LocalExecManager`（`sandbox/local-exec-manager.ts`）经 `SandboxRuntimeBinding` 把会话工作目录挂成 `LocalDirSandbox`，`bash` 随绑定自动注册，本地与认证模式都生效；env 走 `SandboxExecutionEnv`，路径语义与真实沙箱一致。`beforeTurn` 增量 `replica.pull`（面板经对象存储的写、其他 worker 的写在下一轮前可见），`pullToHost`（每轮 settle 后）与 `release` 增量 `replica.push`。远程沙箱开启时 E2B 优先，开关默认 `persistent`（不启用本地 bash）。`LocalDirSandbox` 已生产化：文件操作做 realpath containment（逃逸符号链接报 permission_denied 而非跟随），shell 本身不隔离（第一期已知并接受）。集成测试证明：`INNO_EXEC_BACKEND=local` + fs 对象存储下 bash 写文件 → 字节进对象存储 → 删本地目录后面板照常读。
 - S3 的取舍（与阶段 3 原方案的偏差）：没有做"每任务一个临时目录"——工作目录仍是 `resolveWorkspaceDir` 的稳定路径，但作为可随时丢弃的工作副本存在（pull 可重建，push 只删除自身状态文件里已知的文件，所以从未拉取的 worker 上写路由+push 是安全的）。写路由与附件上传因此不需要改动，对象存储直写面板仍留待 T1.4。T3.5/T4 的孤儿目录清理、遗留临时目录清扫仍未做。
-- T2.6 已完成：全局技能随后端镜像分发（见任务表）。- 未开始：T1.4 附件/写路由走对象存储（可选）、T1.5、T3.3 到 T3.6、阶段 4 到 6。
+- S3 剩余已完成（T3.0/T3.1 的懒激活与并发上限、T4.2、T5.1）：`GatedLocalBackend` 包住 `LocalDirSandbox`，第一次文件/命令操作才占并发位（纯推理会话不占位），`INNO_EXEC_LOCAL_MAX_CONCURRENT`（默认 0 不限）超限返回 `SandboxRunError("unavailable")` 的可重试拒绝，`release` 归还；包装方法全部 async，超限是 rejected promise 而非同步抛错。指标：`inno_workspace_replica_push_ms`/`pull_ms`、`inno_workspace_replica_uploaded_bytes`/`downloaded_bytes`、`inno_local_exec_pull_ms`/`push_ms`、`inno_local_exec_pull_errors_total`/`push_errors_total`/`busy_total`/`activations_total`。T5.1 集成测试（`server.integration.test.ts`）：`INNO_EXEC_BACKEND=local` + fs 对象存储下 bash 写文件 → SIGKILL → 删本地工作区目录 → 新进程重启后打开会话经 pull 从对象存储重建本地副本并完成新一轮。测试证实一个既有恢复行为：SIGKILL 发生在 done 事件 fire-and-forget 落盘前后时，journal 里的 turn 恢复为 active，新 prompt 按设计返回 409，需先走 `/api/chat/events` 重放让孤儿 projection 收尾（真实客户端的 SSE 重连路径），此后一切正常。
+- T2.6 已完成：全局技能随后端镜像分发（见任务表）。- 未开始：T1.4 附件/写路由走对象存储（可选）、T1.5、T3.3 到 T3.6、阶段 4 的 T4.1、阶段 5 的 T5.2/T5.3、阶段 6。
 - 守卫：对象存储未配置（默认 `memory`）时，认证模式仍读本地磁盘并在启动时告警。原因：内存对象存储进程重启后字节丢失而清单仍在，面板会列出打不开的文件，且复制器的本地状态认为已推送，不会重传。
 
 **S1 实施中的发现**：
@@ -511,8 +512,8 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 | 任务 | 内容 | 规模 |
 |---|---|---|
-| T3.0 | 本地 `SandboxProvider`（第一期实现）：每任务一个临时目录，`create` 建目录、`destroy` 删目录；全部工具含 `bash` 在其中本地执行；worker 启动时清理崩溃遗留的临时目录；并发任务数上限。在 `LocalDirSandbox` 基础上改造，并通过现有 `SandboxExecutionEnv` 一致性套件 | M |
-| T3.1 | 懒激活：把 `beforeTurn` 里的急切激活改为"文件/命令工具被调用时才激活"；配额与并发改为按任务计 | M |
+| T3.0 | ~~本地 `SandboxProvider`（第一期实现）~~ **部分完成**：`LocalExecManager` + `LocalDirSandbox`（realpath containment 已生产化，通过 `SandboxExecutionEnv` 一致性套件与端到端 bash 用例）；按任务临时目录与启动清扫未做——S3 偏差决定：工作目录是可丢弃工作副本而非每任务临时目录，故无遗留目录可清扫；`INNO_EXEC_LOCAL_MAX_CONCURRENT` 并发上限已实现 | M |
+| T3.1 | ~~懒激活~~ **已完成**：`GatedLocalBackend` 在第一次文件/命令操作时才占并发位（`inno_local_exec_activations_total`），纯推理会话不占位；超限返回 `unavailable` 可重试拒绝 | M |
 | T3.2 | 同步层：`WorkspaceSync` 的宿主侧换成 `WorkspaceStore`；激活时按清单拉取，之后增量推送且幂等；保留忽略目录与 20 MiB/5000 个文件/深度 24 的上限；定义删除的传播规则 | L |
 | T3.3 | 推送时机：写文件类工具调用完成且无命令在运行时增量推送，避免推到写了一半的文件 | M |
 | T3.4 | 生命周期：任务结束或 runtime 关闭时最终推送并销毁执行环境；更新孤儿清理（`sandbox:fsck`，另需覆盖本地临时目录），环境 ID 只用于进行中任务 | M |
@@ -524,13 +525,13 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 | 任务 | 内容 | 规模 |
 |---|---|---|
 | T4.1 | 删除认证模式下已无用的本地目录复制路径（本地模式保留）；该处代码是 H4 刚做的，需谨慎 | M |
-| T4.2 | 增加指标（同步字节数/耗时、激活延迟）；更新 `CLAUDE.md`、roadmap、`.env.example` | S |
+| T4.2 | ~~增加指标~~ **已完成**：replica push/pull 耗时与上传/下载字节、local exec pull/push 耗时与错误、激活与 busy 计数；`CLAUDE.md`、roadmap、`.env.example` 已更新 | S |
 
 阶段 5：验证（本地 provider）
 
 | 任务 | 内容 | 规模 |
 |---|---|---|
-| T5.1 | 集成测试：任务进行中 SIGKILL worker，另一 worker 接管，已推送的产物完整，遗留临时目录被清理 | L |
+| T5.1 | ~~集成测试~~ **已完成**（`server.integration.test.ts` 的 "local exec session survives SIGKILL"）：bash 产物已推送完整、删本地目录后重启 worker 经 pull 重建并完成新一轮；无每任务临时目录，故无遗留目录清理项 | L |
 | T5.2 | 多租户隔离：存储键、清单、下载接口的跨租户拒绝测试 | M |
 | T5.3 | 性能基线：拉取耗时随文件数的变化，据此决定是否做按需拉取 | M |
 

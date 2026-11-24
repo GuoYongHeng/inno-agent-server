@@ -1059,7 +1059,10 @@ function getSandboxManager(): SandboxBindingProvider | undefined {
 		sandboxManager = sandboxConfig.enabled
 			? createSandboxManager(sandboxConfig, auth.tenantStore ? new PgSandboxQuotaStore(auth.tenantStore.database) : undefined)
 			: process.env.INNO_EXEC_BACKEND === "local"
-				? new LocalExecManager({ ...(workspaceReplica ? { replica: workspaceReplica } : {}) })
+				? new LocalExecManager({
+					...(workspaceReplica ? { replica: workspaceReplica } : {}),
+					maxConcurrent: Math.max(0, Number(process.env.INNO_EXEC_LOCAL_MAX_CONCURRENT) || 0),
+				})
 				: null;
 		if (sandboxManager) console.log(`[inno-server] ${sandboxConfig.enabled ? `sandbox enabled (${sandboxConfig.provider}, approval: ${sandboxConfig.requireApproval})` : "local execution backend enabled (bash runs on this worker)"}`);
 	}

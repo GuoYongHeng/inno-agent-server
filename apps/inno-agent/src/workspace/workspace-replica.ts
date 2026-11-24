@@ -4,7 +4,7 @@ import { logger } from "../logger.js";
 import type { ObjectStore } from "../object-store/object-store.js";
 import { readJson, writeJson } from "../storage/file-store.js";
 import type { TenantContext, TenantStore } from "../tenants/store.js";
-import { incCounter } from "../utils/metrics.js";
+import { incCounter, observeMs } from "../utils/metrics.js";
 import { isWithin } from "../utils/path-safety.js";
 import { workspaceObjectKey, workspaceObjectPrefix } from "./workspace-object-key.js";
 import { TEMP_WORKSPACE_ID, type WorkspaceMeta, type WorkspaceRegistry } from "./workspace-registry.js";
@@ -177,6 +177,15 @@ export class WorkspaceReplica {
 
 	/** Local workspace → objects + listing rows. Local deletions propagate. */
 	async push(context: TenantContext, workspaceId: string, dir: string): Promise<ReplicaReport> {
+		const started = performance.now();
+		try {
+			return await this.pushInner(context, workspaceId, dir);
+		} finally {
+			observeMs("inno_workspace_replica_push_ms", performance.now() - started);
+		}
+	}
+
+	private async pushInner(context: TenantContext, workspaceId: string, dir: string): Promise<ReplicaReport> {
 		const report: ReplicaReport = { uploaded: 0, downloaded: 0, deleted: 0, skipped: 0 };
 		const state = this.loadState(context, workspaceId);
 		const upserts: Array<{ relPath: string; size: number; mtimeMs: number }> = [];
@@ -191,7 +200,9 @@ export class WorkspaceReplica {
 				upserts.push({ relPath: rel, ...stamp });
 				continue; // directories upload no object, so `uploaded` stays object-count
 			}
-			await this.objects.put(this.objectKey(context, workspaceId, rel), new Uint8Array(readFileSync(join(dir, ...rel.split("/")))));
+			const bytes = new Uint8Array(readFileSync(join(dir, ...rel.split("/"))));
+			await this.objects.put(this.objectKey(context, workspaceId, rel), bytes);
+			incCounter("inno_workspace_replica_uploaded_bytes", bytes.length);
 			state.files[rel] = stamp;
 			upserts.push({ relPath: rel, ...stamp });
 			report.uploaded++;
@@ -222,6 +233,15 @@ export class WorkspaceReplica {
 	 * (local extras are kept). Returns early when the workspace has no replica.
 	 */
 	async pull(context: TenantContext, workspaceId: string, dir: string): Promise<ReplicaReport> {
+		const started = performance.now();
+		try {
+			return await this.pullInner(context, workspaceId, dir);
+		} finally {
+			observeMs("inno_workspace_replica_pull_ms", performance.now() - started);
+		}
+	}
+
+	private async pullInner(context: TenantContext, workspaceId: string, dir: string): Promise<ReplicaReport> {
 		const report: ReplicaReport = { uploaded: 0, downloaded: 0, deleted: 0, skipped: 0 };
 		const rows = await this.store.listWorkspaceFiles(context, workspaceId);
 		if (rows.length === 0) return report;
@@ -253,6 +273,7 @@ export class WorkspaceReplica {
 			}
 			const body = await this.objects.get(this.objectKey(context, workspaceId, row.relPath));
 			if (!body) { report.skipped++; logger.warn({ workspaceId, rel: row.relPath }, "workspace replica object missing"); continue; }
+			incCounter("inno_workspace_replica_downloaded_bytes", body.length);
 			mkdirSync(dirname(target), { recursive: true });
 			writeFileSync(target, body);
 			const mtimeSec = row.mtimeMs / 1000;

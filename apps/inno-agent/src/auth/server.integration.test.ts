@@ -2161,14 +2161,17 @@ describe("durable session HTTP boundary", () => {
 describe("workspace read routes in authenticated mode", () => {
 	const startProviderServer = async (
 		env: Record<string, string>,
+		existingHome?: string,
 	): Promise<{ child: ChildProcess; origin: string; home: string }> => {
-		const providerHome = await mkdtemp(join(tmpdir(), "inno-server-wsread-"));
-		await mkdir(join(providerHome, "config"), { recursive: true });
-		await writeFile(join(providerHome, "config", "config.json"), JSON.stringify({
-			defaultProvider: "dummy",
-			defaultModel: "dummy-model",
-			providers: { dummy: { baseUrl: "http://127.0.0.1:9", apiKey: "x", api: "openai-completions", models: [{ id: "dummy-model" }] } },
-		}));
+		const providerHome = existingHome ?? await mkdtemp(join(tmpdir(), "inno-server-wsread-"));
+		if (!existingHome) {
+			await mkdir(join(providerHome, "config"), { recursive: true });
+			await writeFile(join(providerHome, "config", "config.json"), JSON.stringify({
+				defaultProvider: "dummy",
+				defaultModel: "dummy-model",
+				providers: { dummy: { baseUrl: "http://127.0.0.1:9", apiKey: "x", api: "openai-completions", models: [{ id: "dummy-model" }] } },
+			}));
+		}
 		const port = await freePort();
 		const providerOrigin = `http://127.0.0.1:${port}`;
 		const providerChild = spawn(process.execPath, ["--import", "tsx", resolve(root, "apps/inno-agent/src/server.ts")], {
@@ -2429,4 +2432,127 @@ describe("workspace read routes in authenticated mode", () => {
 			await rm(objectStoreDir, { recursive: true, force: true });
 		}
 	}, 60_000);
+
+	it("local exec session survives SIGKILL: a restarted worker restores and reuses the workspace", async () => {
+		const objectStoreDir = await mkdtemp(join(tmpdir(), "inno-localexec-kill-"));
+		const env = {
+			INNO_OBJECT_STORAGE_PROVIDER: "fs",
+			INNO_OBJECT_STORAGE_DIR: objectStoreDir,
+			INNO_EXEC_BACKEND: "local",
+			INNO_DURABLE_STORAGE_LEASE_MS: "2000",
+		};
+		const first = await startProviderServer(env);
+		const providerHome = first.home;
+		let second: Awaited<ReturnType<typeof startProviderServer>> | null = null;
+		try {
+			const cookie = await providerRegister(first.origin, "local-exec-kill@example.com");
+			expect((await providerApi(first.origin, cookie, "/api/settings/providers", {
+				method: "PUT",
+				body: JSON.stringify({
+					providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-bash-write-secret",
+					api: "openai-completions", makeDefault: true,
+					models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
+				}),
+			})).status).toBe(200);
+			const created = await providerApi(first.origin, cookie, "/api/sessions", {
+				method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
+			});
+			expect(created.status).toBe(201);
+			const session = await created.json() as { id: string; workspaceId: string };
+
+			const response = await providerApi(first.origin, cookie, "/api/chat/stream", {
+				method: "POST",
+				body: JSON.stringify({
+					sessionId: session.id,
+					prompt: "durable-bash-write",
+					clientRequestId: "durable-bash-kill-request",
+				}),
+			});
+			expect(response.status).toBe(200);
+			const streamed = await readDurableStream(response);
+			expect(streamed).toContain('"type":"done"');
+			const turnId = /"turnId":"([^"]+)"/.exec(streamed)?.[1];
+			expect(turnId).toBeTruthy();
+
+			// The bash-written file was pushed into durable storage before the crash.
+			const objectDeadline = Date.now() + 15_000;
+			let replicated = false;
+			while (Date.now() < objectDeadline) {
+				const objectPaths: string[] = [];
+				const walk = async (dir: string) => {
+					for (const entry of await readdir(dir, { withFileTypes: true })) {
+						const full = join(dir, entry.name);
+						if (entry.isDirectory()) await walk(full);
+						else objectPaths.push(full);
+					}
+				};
+				await walk(objectStoreDir);
+				for (const path of objectPaths) {
+					if ((await readFile(path)).includes("bash-content")) { replicated = true; break; }
+				}
+				if (replicated) break;
+				await new Promise((resolveWait) => setTimeout(resolveWait, 200));
+			}
+			expect(replicated).toBe(true);
+
+			// Kill the worker mid-life and delete its local workspace copy: the
+			// restarted worker must rebuild it from the replica.
+			first.child.kill("SIGKILL");
+			await new Promise<void>((resolveExit) => first.child.once("exit", () => resolveExit()));
+			const metaPool = new Pool({ connectionString: postgres.databaseUrl });
+			let relPath: string;
+			try {
+				const result = await metaPool.query<{ rel_path: string }>(
+					"SELECT rel_path FROM tenant_workspaces WHERE workspace_id = $1", [session.workspaceId],
+				);
+				relPath = result.rows[0]!.rel_path;
+			} finally {
+				await metaPool.end();
+			}
+			const localFile = join(providerHome, "workspace", relPath, "bash-made.txt");
+			expect(existsSync(localFile)).toBe(true);
+			await rm(join(providerHome, "workspace", relPath), { recursive: true, force: true });
+			expect(existsSync(localFile)).toBe(false);
+
+			second = await startProviderServer(env, providerHome);
+			// The crashed worker's last terminal append may not have reached the
+			// journal, so the previous turn restores as active: the events
+			// endpoint is the intended recovery path — it resumes the orphaned
+			// projection and lets the turn finish before new prompts are allowed.
+			const replay = await providerApi(second.origin, cookie,
+				`/api/chat/events/${session.id}?turnId=${turnId}&after=0`);
+			expect(replay.status).toBe(200);
+			const replayed = await readDurableStream(replay);
+			expect(replayed).toContain('"type":"done"');
+
+			let response2: Response | null = null;
+			const takeoverDeadline = Date.now() + 15_000;
+			let attemptIndex = 0;
+			while (Date.now() < takeoverDeadline) {
+				const attempt = await providerApi(second.origin, cookie, "/api/chat/stream", {
+					method: "POST",
+					body: JSON.stringify({
+						sessionId: session.id,
+						prompt: "durable-bash-write",
+						clientRequestId: `durable-bash-kill-request-2-${++attemptIndex}`,
+					}),
+				});
+				if (attempt.status === 200) { response2 = attempt; break; }
+				expect(attempt.status).toBe(409);
+				await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+			}
+			expect(response2).not.toBeNull();
+			const streamed2 = await readDurableStream(response2!);
+			expect(streamed2).toContain('"type":"done"');
+
+			// The pull on open rebuilt the local copy from object storage.
+			expect(existsSync(localFile)).toBe(true);
+			expect(await readFile(localFile, "utf8")).toBe("bash-content\n");
+		} finally {
+			if (second) await stopServer(second.child, providerHome);
+			else if (first.child.exitCode === null) await stopServer(first.child, providerHome);
+			else await rm(providerHome, { recursive: true, force: true });
+			await rm(objectStoreDir, { recursive: true, force: true });
+		}
+	}, 90_000);
 });

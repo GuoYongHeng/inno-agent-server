@@ -83,6 +83,23 @@ describe("LocalExecManager", () => {
 		expect(calls).toEqual([]);
 	});
 
+	it("enforces maxConcurrent lazily and frees the slot on release", async () => {
+		const { workspace } = setup();
+		const manager = new LocalExecManager({ maxConcurrent: 1 });
+		const first = await manager.bind(input({ sessionId: "s1", hostWorkspaceDir: workspace }));
+		const second = await manager.bind(input({ sessionId: "s2", hostWorkspaceDir: workspace }));
+
+		// A session that never touches files holds no slot.
+		await first.backend.stat("/").catch(() => undefined);
+		const denial = await second.backend.stat("/").then(() => null, (error: unknown) => error);
+		expect(denial).toMatchObject({ name: "SandboxRunError", code: "unavailable" });
+
+		// After release, the next binding can activate again.
+		await first.release();
+		await expect(second.backend.stat("/")).resolves.toBeDefined();
+		await second.release();
+	});
+
 	it("never fails the turn on replica errors", async () => {
 		const { workspace } = setup();
 		const replica = {
