@@ -610,7 +610,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 ## 11. 待决问题
 
 1. S1 缺口清单里，哪些缺口"必须补齐才能发布"，哪些可接受为已知丢失（需按产品优先级判断）。
-2. `@earendil-works/pi-web-ui` 在 web 端的实际使用范围。
+2. ~~`@earendil-works/pi-web-ui` 在 web 端的实际使用范围~~ 已查明，暂保留：`<markdown-artifact>` Lit 元素承担 markdown 渲染（`WorkspaceBrowser` 流式快照、`notebook/PageView`、`SkillsPanel` 预览），`app.css` 引入其基础排版样式，`utils/markdown-math.ts` 的数学公式规范化专为它的渲染器服务；`useDefineForClassFields: false` 亦为这些 Lit 组件保留。若要摘除：换自研 markdown 渲染 + 替换其 `app.css`，注意流式渲染行为差异。
 3. ~~发布形态：移除前是否先发一个带"legacy 即将移除"提示的过渡版本~~ 已过时：legacy 已移除上线。
 4. ~~pi-durable 升级时 `Storage` 与 `ExecutionEnv` 接口的稳定性~~ 已定：升级时手动验证兼容性，不依赖上游承诺。
 5. ~~沙箱技术选型和部署形态~~ 第一期不接入沙箱，暂不考虑；真实沙箱（E2B 协议服务）接入时再定自建/托管。
