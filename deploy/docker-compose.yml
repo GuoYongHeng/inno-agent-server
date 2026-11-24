@@ -1,3 +1,7 @@
+# Fix the project name so containers are inno-agent-* regardless of the
+# directory this file is launched from (otherwise it takes the dir name).
+name: inno-agent
+
 services:
   # File-backed runtime: keep exactly one replica and stop it before replacement.
   # PostgreSQL metadata does not make the data/workspace volumes shareable.
