@@ -56,7 +56,7 @@ import { PgDurableStorage } from "./pg-durable-storage.js";
 import type { PersistedQuestion, QuestionBridgeResult, QuestionResponseStatus } from "./question-types.js";
 import type { PermissionDecision, PermissionResponseStatus } from "./permission-types.js";
 import { INNO_SYSTEM_PROMPT } from "./system-prompt.js";
-import { buildWorkspaceContextSectionsFrom } from "./workspace-context.js";
+import { buildWorkspaceContextSectionsFrom, WORKSPACE_AGENT_FILE, WORKSPACE_SKILLS_DIR } from "./workspace-context.js";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { buildDurableContextUsage, unavailableContextUsage, type UsageMessage } from "./context-usage.js";
 import type { SessionContextUsage } from "../shared/context-usage.js";
@@ -153,9 +153,12 @@ export interface DurableSessionServiceOptions {
 	 * storage lease still names this worker the single writer.
 	 */
 	workspaceReplica?: {
-		materializeSession: (tenant: TenantContext, sessionId: string, catalogWorkspaceId: string | null) => Promise<string>;
-		pull: (tenant: TenantContext, workspaceId: string, dir: string) => Promise<void>;
+		materializeSession: (tenant: TenantContext, sessionId: string, catalogWorkspaceId: string | null,
+			options?: { download?: (relPath: string) => boolean }) => Promise<string>;
+		pull: (tenant: TenantContext, workspaceId: string, dir: string,
+			options?: { download?: (relPath: string) => boolean }) => Promise<void>;
 		push: (tenant: TenantContext, workspaceId: string, dir: string) => Promise<void>;
+		materializeFile: (tenant: TenantContext, workspaceId: string, dir: string, relPath: string) => Promise<boolean>;
 	};
 	/**
 	 * Per-request workspace store (T1.4): when it is manifest-backed,
@@ -986,8 +989,10 @@ export class DurableSessionService {
 							modelId: record.modelId,
 						});
 						let workspaceId = record.workspaceId;
+						const promptPaths = { download: (rel: string) =>
+							rel === WORKSPACE_AGENT_FILE || rel === WORKSPACE_SKILLS_DIR || rel.startsWith(`${WORKSPACE_SKILLS_DIR}/`) };
 						if (tenant && this.options.workspaceReplica) {
-							workspaceId = await this.options.workspaceReplica.materializeSession(tenant, id, record.workspaceId);
+							workspaceId = await this.options.workspaceReplica.materializeSession(tenant, id, record.workspaceId, promptPaths);
 						}
 						const workspaceDir = this.options.resolveWorkspaceDir(id, workspaceId);
 						if (!workspaceDir) throw new Error(`Durable session workspace not found: ${record.workspaceId}`);
@@ -997,13 +1002,15 @@ export class DurableSessionService {
 						// nothing else syncs the directory.
 						const bindingSyncs = this.options.getSandboxManager?.()?.syncsWorkspaceReplica === true;
 						if (tenant && this.options.workspaceReplica) {
-							// The pull seeds the dir for prompt building
-							// (agent.md/.skills are read during open) — keep it
-							// even when the binding syncs. The close-time push is
-							// skipped then: the binding already pushes on every
-							// settle and on release.
+							// Lazy pull (T-按需拉取): only the files prompt building
+							// needs — agent.md and .skills/ — download bodies at
+							// open; every other file materializes on first tool
+							// read via workspaceMaterialize. Directory rows still
+							// materialize so listings/bash see the tree shape. The
+							// close-time push is skipped when the binding syncs
+							// (it already pushes on every settle and on release).
 							if (!bindingSyncs) replicaDir = { tenant, workspaceId, dir: workspaceDir };
-							await this.options.workspaceReplica.pull(tenant, workspaceId, workspaceDir);
+							await this.options.workspaceReplica.pull(tenant, workspaceId, workspaceDir, promptPaths);
 						}
 						const tenantDataRoot = resolveRequestTenantDataRoot(req, this.options.dataDir);
 						const scopedL3 = new ScopedL3Memory(this.options.dataDir, this.options.recoveryPool);
@@ -1075,6 +1082,10 @@ export class DurableSessionService {
 							].filter((section): section is string => Boolean(section)).join("\n\n"),
 							...(sandbox ? { sandbox } : {}),
 							workspaceDir,
+							...(tenant && this.options.workspaceReplica ? {
+								workspaceMaterialize: (relPath: string) =>
+									this.options.workspaceReplica!.materializeFile(tenant, workspaceId, workspaceDir, relPath),
+							} : {}),
 							workspaceTools: true,
 							permissions: this.permissionStore(req, id),
 							memory,

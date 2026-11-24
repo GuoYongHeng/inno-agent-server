@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MemoryObjectStore } from "../object-store/object-store.js";
 import type { TenantContext } from "../tenants/store.js";
 import { WorkspaceRegistry } from "./workspace-registry.js";
+import { workspaceObjectKey } from "./workspace-object-key.js";
 import { WorkspaceReplica } from "./workspace-replica.js";
 
 /** In-memory stand-in for the TenantStore methods the replica uses. */
@@ -32,6 +33,9 @@ class FakeStore {
 	}
 	async deleteSessionWorkspace(_ctx: TenantContext, sessionId: string) {
 		this.bindings.delete(sessionId);
+	}
+	async getWorkspaceFile(_ctx: TenantContext, workspaceId: string, relPath: string) {
+		return this.files.get(`${workspaceId}/${relPath}`) ?? null;
 	}
 	async listWorkspaceFiles(_ctx: TenantContext, workspaceId: string) {
 		const prefix = `${workspaceId}/`;
@@ -180,6 +184,70 @@ describe("WorkspaceReplica", () => {
 			const wsId = await replicaB.materializeSessionWorkspace(ctx, "sess-1", null);
 			expect(wsId).toBe(ws.id);
 			expect(registryB.getSessionWorkspaceId("sess-1")).toBe(ws.id);
+		} finally {
+			rmSync(freshRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("pull with a download filter defers bodies but still materializes directories", async () => {
+		const { ws, dir } = makeWorkspace({ "agent.md": "agent", "big/data.bin": "blob", "docs/note.txt": "note" });
+		await replica.replicateWorkspace(ctx, ws);
+		await replica.push(ctx, ws.id, dir);
+
+		const freshRoot = mkdtempSync(join(tmpdir(), "inno-replica-lazy-"));
+		try {
+			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"), join(freshRoot, "data"));
+			registryB.ensureBootstrapped();
+			const replicaB = new WorkspaceReplica(objects, store as never, registryB, join(freshRoot, "state"));
+			const dirB = join(freshRoot, "out");
+			const report = await replicaB.pull(ctx, ws.id, dirB, { download: (rel) => rel === "agent.md" });
+			expect(report.downloaded).toBe(1);
+			expect(readFileSync(join(dirB, "agent.md"), "utf8")).toBe("agent");
+			expect(existsSync(join(dirB, "big", "data.bin"))).toBe(false);
+			expect(existsSync(join(dirB, "docs", "note.txt"))).toBe(false);
+			// Directory rows still materialize — the tree shape is visible.
+			expect(existsSync(join(dirB, "big"))).toBe(true);
+			expect(existsSync(join(dirB, "docs"))).toBe(true);
+
+			// A push on this worker must NOT delete deferred manifest rows:
+			// they were never recorded as local state, so their absence on
+			// disk cannot be read back as a local deletion.
+			await replicaB.push(ctx, ws.id, dirB);
+			const rows = (await store.listWorkspaceFiles(ctx, ws.id)).map((row) => row.relPath).sort();
+			expect(rows).toContain("big/data.bin");
+			expect(rows).toContain("docs/note.txt");
+			expect(await objects.head(workspaceObjectKey(ctx.tenantId, ws.id, "big/data.bin"))).not.toBeNull();
+		} finally {
+			rmSync(freshRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("materializeFile downloads on miss, refreshes on drift, and reports unknown paths", async () => {
+		const { ws, dir } = makeWorkspace({ "notes/a.txt": "v1" });
+		await replica.replicateWorkspace(ctx, ws);
+		await replica.push(ctx, ws.id, dir);
+
+		const freshRoot = mkdtempSync(join(tmpdir(), "inno-replica-mat-"));
+		try {
+			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"), join(freshRoot, "data"));
+			registryB.ensureBootstrapped();
+			const replicaB = new WorkspaceReplica(objects, store as never, registryB, join(freshRoot, "state"));
+			const dirB = join(freshRoot, "out");
+
+			expect(await replicaB.materializeFile(ctx, ws.id, dirB, "missing.txt")).toBe(false);
+			expect(await replicaB.materializeFile(ctx, ws.id, dirB, "notes/a.txt")).toBe(true);
+			expect(readFileSync(join(dirB, "notes", "a.txt"), "utf8")).toBe("v1");
+
+			// Remote drift: manifest bump → re-download replaces local bytes.
+			const objectsKey = workspaceObjectKey(ctx.tenantId, ws.id, "notes/a.txt");
+			await objects.put(objectsKey, new Uint8Array(Buffer.from("v2-remote")));
+			store.files.set(`${ws.id}/notes/a.txt`, { relPath: "notes/a.txt", size: 9, mtimeMs: Date.now() + 5_000, kind: "file" });
+			expect(await replicaB.materializeFile(ctx, ws.id, dirB, "notes/a.txt")).toBe(true);
+			expect(readFileSync(join(dirB, "notes", "a.txt"), "utf8")).toBe("v2-remote");
+
+			// The materialized file is recorded in pull state like a pull.
+			const pushReport = await replicaB.push(ctx, ws.id, dirB);
+			expect(pushReport.deleted).toBe(0);
 		} finally {
 			rmSync(freshRoot, { recursive: true, force: true });
 		}

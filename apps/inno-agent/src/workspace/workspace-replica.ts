@@ -105,7 +105,8 @@ export class WorkspaceReplica {
 	 * row when the workspace was created on another worker. Returns the local
 	 * meta or null when the workspace is unknown everywhere.
 	 */
-	async materializeWorkspace(context: TenantContext, workspaceId: string): Promise<WorkspaceMeta | null> {
+	async materializeWorkspace(context: TenantContext, workspaceId: string,
+		options?: { download?: (relPath: string) => boolean }): Promise<WorkspaceMeta | null> {
 		const local = this.registry.getWorkspace(workspaceId);
 		if (local) return local;
 		const row = await this.store.getWorkspaceRow(context, workspaceId);
@@ -118,7 +119,7 @@ export class WorkspaceReplica {
 		mkdirSync(dir, { recursive: true });
 		// A freshly adopted workspace is empty locally — pull its replica before
 		// callers write, so remote files aren't "missing" from the next push.
-		await this.pull(context, workspaceId, dir);
+		await this.pull(context, workspaceId, dir, options);
 		return meta;
 	}
 
@@ -128,16 +129,17 @@ export class WorkspaceReplica {
 	 * then the shared tmp fallback. Adopted bindings are written into the local
 	 * session map so `getSessionWorkspaceId` resolves correctly afterwards.
 	 */
-	async materializeSessionWorkspace(context: TenantContext, sessionId: string, catalogWorkspaceId?: string | null): Promise<string> {
+	async materializeSessionWorkspace(context: TenantContext, sessionId: string, catalogWorkspaceId?: string | null,
+		options?: { download?: (relPath: string) => boolean }): Promise<string> {
 		if (this.registry.isSessionBound(sessionId)) {
 			const id = this.registry.getSessionWorkspaceId(sessionId);
-			await this.materializeWorkspace(context, id);
+			await this.materializeWorkspace(context, id, options);
 			return id;
 		}
 		const candidates = [await this.store.getSessionWorkspace(context, sessionId), catalogWorkspaceId ?? null];
 		for (const id of candidates) {
 			if (!id || id === TEMP_WORKSPACE_ID) continue;
-			if (await this.materializeWorkspace(context, id)) {
+			if (await this.materializeWorkspace(context, id, options)) {
 				this.registry.bindSession(sessionId, id);
 				return id;
 			}
@@ -231,17 +233,62 @@ export class WorkspaceReplica {
 	 * Remote replica → local workspace: downloads rows whose local file is
 	 * missing or has drifted, and never deletes files the replica doesn't know
 	 * (local extras are kept). Returns early when the workspace has no replica.
+	 * `options.download` defers bodies the filter rejects (lazy pull): deferred
+	 * rows are NOT recorded in pull state — recording them would let the next
+	 * push treat the never-materialized file as a local deletion and remove
+	 * the manifest row + object.
 	 */
-	async pull(context: TenantContext, workspaceId: string, dir: string): Promise<ReplicaReport> {
+	async pull(context: TenantContext, workspaceId: string, dir: string,
+		options?: { download?: (relPath: string) => boolean }): Promise<ReplicaReport> {
 		const started = performance.now();
 		try {
-			return await this.pullInner(context, workspaceId, dir);
+			return await this.pullInner(context, workspaceId, dir, options);
 		} finally {
 			observeMs("inno_workspace_replica_pull_ms", performance.now() - started);
 		}
 	}
 
-	private async pullInner(context: TenantContext, workspaceId: string, dir: string): Promise<ReplicaReport> {
+	/**
+	 * Pull ONE manifest file into the local copy on demand (lazy pull): the
+	 * object is downloaded only when the local file is missing or has drifted
+	 * from the manifest row. Returns whether the manifest knows the file.
+	 */
+	async materializeFile(context: TenantContext, workspaceId: string, dir: string, relPath: string): Promise<boolean> {
+		const started = performance.now();
+		try {
+			const row = await this.store.getWorkspaceFile(context, workspaceId, relPath);
+			if (!row || row.kind !== "file" || ignored(row.relPath)) return false;
+			const target = join(dir, ...row.relPath.split("/"));
+			if (!isWithin(dir, target)) return false;
+			let local: ReplicaStamp | null = null;
+			try {
+				const stats = lstatSync(target);
+				if (stats.isFile()) local = { size: stats.size, mtimeMs: stats.mtimeMs };
+			} catch { /* missing */ }
+			const state = this.loadState(context, workspaceId);
+			if (!local || local.size !== row.size || local.mtimeMs !== row.mtimeMs) {
+				const body = await this.objects.get(this.objectKey(context, workspaceId, row.relPath));
+				if (!body) {
+					incCounter("inno_workspace_replica_materialize_errors_total");
+					return false;
+				}
+				incCounter("inno_workspace_replica_downloaded_bytes", body.length);
+				mkdirSync(dirname(target), { recursive: true });
+				writeFileSync(target, body);
+				const mtimeSec = row.mtimeMs / 1000;
+				try { utimesSync(target, mtimeSec, mtimeSec); } catch { /* mtime best-effort */ }
+				incCounter("inno_workspace_replica_materialized_total");
+			}
+			state.files[row.relPath] = { size: row.size, mtimeMs: row.mtimeMs, kind: "file" };
+			this.saveState(context, workspaceId, state);
+			return true;
+		} finally {
+			observeMs("inno_workspace_replica_materialize_ms", performance.now() - started);
+		}
+	}
+
+	private async pullInner(context: TenantContext, workspaceId: string, dir: string,
+		options?: { download?: (relPath: string) => boolean }): Promise<ReplicaReport> {
 		const report: ReplicaReport = { uploaded: 0, downloaded: 0, deleted: 0, skipped: 0 };
 		const rows = await this.store.listWorkspaceFiles(context, workspaceId);
 		if (rows.length === 0) return report;
@@ -269,6 +316,13 @@ export class WorkspaceReplica {
 			} catch { /* missing */ }
 			if (local && local.size === row.size && local.mtimeMs === row.mtimeMs) {
 				state.files[row.relPath] = row;
+				continue;
+			}
+			if (options?.download && !options.download(row.relPath)) {
+				// Lazy pull: leave the body for materializeFile. Not recording
+				// state keeps the entry pending for the next pull AND safe from
+				// push's local-deletion propagation.
+				report.skipped++;
 				continue;
 			}
 			const body = await this.objects.get(this.objectKey(context, workspaceId, row.relPath));

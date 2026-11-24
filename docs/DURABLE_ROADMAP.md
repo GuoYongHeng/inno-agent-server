@@ -433,7 +433,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 - ~~channel/job 内部调用方仍锚定租户哈希 worker，会话 owner 漂移后内部 prompt 被 fencing 拒绝~~ **已解决**：内部 prompt 先经 `lease({ busyWaitMs })` 有界等待远端活跃 turn 结束；超时仍 busy 时按 routeHint 转交给 owner worker——`POST /api/internal/durable-prompt`（`x-inno-worker-token` 共享密钥认证，未配置 `INNO_WORKER_TOKEN` 时端点 404），接收端从 `durable_sessions` 行解析租户与 `tenants.owner_user_id`（`tenant_memberships` join 需要真实 userId）、同步租户配置后本地执行。分片部署应为所有 worker 配置同一 token；未配置时退化为 busy 失败（同旧行为）。
 - ~~空闲会话无 owner，owner-follow 只覆盖活跃 turn 期间~~ **已实现会话亲和**：迁移 v10 给 `ds_metadata` 加 `last_worker`（每次认领写入、释放时保留），`durableSessionRouteHint` 一次查询返回 `{owner, affinity}`；路由目标顺序 live owner → last_worker → 租户哈希，目标不可达照旧本地回退认领（亲和自动自愈迁移）。sharding 集成测试端到端验证：SIGKILL 接管后，重启的哈希 owner 收到的空闲会话请求被转发到最后认领 worker。
-- ~~workspace 目录与 registry 仍是 worker 本地、未复制~~ **已实现 workspace→对象存储复制**（`workspace/workspace-replica.ts` + 迁移 v11）：registry 行复制到 `tenant_workspaces`、会话绑定复制到 `session_workspaces`（FK 级联）、文件清单复制到 `workspace_files`，文件字节进 `tenants/<t>/workspaces/<ws>/<path>` 对象（base64url 编码路径段）。同步点：会话打开（`lease()`，持租约后）物化 registry 行+绑定并 `pull` 缺失文件；runtime 关闭（持租约内）`push` 增量；workspace 文件写路由（file/create/rename/delete/move/upload/skills）与 workspace/绑定变更端点同步复制。**已知限制**：文件级 last-writer-wins——两个 worker 同时写同一共享 workspace 会互相覆盖（无 OT/合并）；push 在 runtime 关闭与路由写时触发，worker 在 turn 中途死亡丢当轮写入；pull 只在物化/会话打开时发生，远端 push 不会主动推给另一 worker 的本地副本；`memory` 对象存储是进程内的，跨 worker 部署需 `INNO_OBJECT_STORAGE_PROVIDER=s3` 或 `fs`（`fs` 供单机多进程/测试，`INNO_OBJECT_STORAGE_DIR`）。新增 `FsObjectStore` 与跨 worker 集成测试：owner 上传文件→SIGKILL→存活 worker 认领打开会话→文件内容恢复验证。
+- ~~workspace 目录与 registry 仍是 worker 本地、未复制~~ **已实现 workspace→对象存储复制**（`workspace/workspace-replica.ts` + 迁移 v11）：registry 行复制到 `tenant_workspaces`、会话绑定复制到 `session_workspaces`（FK 级联）、文件清单复制到 `workspace_files`，文件字节进 `tenants/<t>/workspaces/<ws>/<path>` 对象（base64url 编码路径段）。同步点：会话打开（`lease()`，持租约后）物化 registry 行+绑定并 `pull`——按需拉取只下载提示词路径（`agent.md`、`.skills/`）与目录骨架，其余文件经 `materializeFile` 在读取 miss/漂移时单文件物化，local exec 的 bash 在每次 `run` 前做全量增量同步；runtime 关闭（持租约内）`push` 增量；workspace 文件写路由（file/create/rename/delete/move/upload/skills）与 workspace/绑定变更端点同步复制。**已知限制**：文件级 last-writer-wins——两个 worker 同时写同一共享 workspace 会互相覆盖（无 OT/合并）；push 在 runtime 关闭与路由写时触发，worker 在 turn 中途死亡丢当轮写入；pull 只在物化/会话打开时发生，远端 push 不会主动推给另一 worker 的本地副本；`memory` 对象存储是进程内的，跨 worker 部署需 `INNO_OBJECT_STORAGE_PROVIDER=s3` 或 `fs`（`fs` 供单机多进程/测试，`INNO_OBJECT_STORAGE_DIR`）。新增 `FsObjectStore` 与跨 worker 集成测试：owner 上传文件→SIGKILL→存活 worker 认领打开会话→文件内容恢复验证。
 - ~~H1 未做项：目录分页、回滚导出命令、`durable_sessions` 专用指标~~ **已全部补齐**：`SessionCatalog.listPage` 提供 `(updated_at, id)` 游标分页，`GET /api/sessions?limit=&cursor=` 返回 `{sessions, nextCursor}`（无参数保持旧数组响应，前端未改）；`npm run durable:export-catalog -- --data-dir <dir> [--tenant <id>]` 把 PG 目录导出回每租户的 `durable/sessions.json`（`sessions.json.migrated` 只是导入时快照，回滚需先导出）；指标改专用名 `inno_durable_sessions_{get,list,insert,update,remove}_ms` + `inno_durable_sessions` gauge（list 时刷新）。
 - ~~缺"旧会话重开后能看到新工具"的验证测试~~ **已覆盖**：`durable-tools-reopen.test.ts` 验证重开后 `configure()` 重放 agent 配置使新注册工具可见，含 fork 后会话变体。
 - E2B 沙箱仅 mock 验证；真实验收针对自部署的 E2B 兼容服务：设置 `E2B_API_KEY` 与 `E2B_DOMAIN`（可选 `E2B_TEMPLATE`）后运行 `e2b-live.integration.test.ts`，上线前必跑并实测暂停/恢复/冷启动与延迟。
@@ -455,7 +455,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 **S1 实施中的发现**：
 - 复制器上限（5000 个文件、单文件 20 MiB、深度 24）远低于 `WorkspaceStore` 的 192 MiB 单文件上限与无限深度：本地创建的超限文件不会复制，两种实现在边界处行为不一致，需在写路由迁移时统一。
-- 对象删除、移动、`deleteAll` 在清单提交后尽力删除对象，失败只记日志，没有清理孤儿对象的任务；需要一个按 `list(prefix)` 对比清单的清扫器。
+- 对象删除、移动、`deleteAll` 在清单提交后尽力删除对象，失败只记日志；孤儿对象由 `npm run workspace:fsck`（`workspace-object-audit.ts`，`list(prefix)` 对照清单、宽限期保护在途上传、`--repair` 才删）离线清扫，尚无自动周期调度。
 - `starts_with(rel_path, prefix)` 在 `(tenant_id, workspace_id)` 主键前缀范围内做顺序扫描，随工作区文件数线性增长；存在性与最大 mtime 检查已改为单条聚合查询（`summarizeWorkspacePrefix`），列表与遍历仍取回子树全部行（上限 10 万行）。
 - 行为差异：`normalizeWorkspacePath` 比旧的 `normalizeWorkspaceRelativePath` 严格，反斜杠输入现在返回 404（原先改写为 `/`）；指向工作区外的符号链接不再列出（原先作为无子节点显示）；认证模式下目录树的 `root` 为空字符串（前端不使用）。
 - S2 中仅 Store 实现才有的差异：`parse_document` 的 `details.filePath` 是临时物化路径；`l2_archive` 经接口找不到文件时返回 `outside_workspace`（原为解析错误）；工作区技能的 `<location>` 指向物化出的 `.skills` 目录；`toRelative` 对 `a\b` 这类 POSIX 合法但不可寻址的名字返回 null。遗留在 `node:fs` 上的只有 `restrictToWorkspace === false` 的本地模式分支和未传 `files` 的旧调用方，工具层之外 `ChannelToolsDeps.workspaceDir` 与 `workspaceRegistry` 回退仍为非 durable 调用方保留。
@@ -572,7 +572,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - 技能脚本依赖 `bash` 与运行环境：技能需要的 Python 包、命令行工具必须预装在后端镜像（第一期）或沙箱模板（后期），否则每个任务都要重装；技能访问外网时，迁移到沙箱后需在出口白名单里放行对应域名。
 - 只在结束时同步会丢中途产物，故需增量推送；环境在两次推送之间死亡仍会丢这一小段。
 - 每次任务都是冷启动：依赖、虚拟环境和缓存不保留（`WorkspaceSync` 本就忽略 `.venv`、`node_modules`）；本地 provider 依赖 worker 镜像里预装的工具，沙箱阶段依赖模板预装。
-- 新环境是空盘，工作区文件多时首次拉取较慢；沿用单文件 20 MiB、5000 个文件、深度 24 的上限，并考虑按需拉取。
+- 新环境是空盘，工作区文件多时首次全量拉取较慢——已按需拉取：打开只取提示词路径，文件工具按需物化，bash 每次 `run` 前全量增量同步；沿用单文件 20 MiB、5000 个文件、深度 24 的上限。
 - 预览与文件树改读对象存储后延迟升高，大目录需分页。
 - 对象存储文件级"后写覆盖"，并行任务写同一路径会互相覆盖；预签名 URL 在有效期内可重复使用，同样是后写覆盖。
 - 预签名 URL 本身相当于公开资源：必须短有效期、限定单个对象与方法，桶保持私有；key 一律由服务端生成，不接受客户端指定。

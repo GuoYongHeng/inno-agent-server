@@ -127,6 +127,32 @@ beforeAll(async () => {
 					"",
 				].join("\n"));
 			};
+			if (body.includes("workspace-takeover-read")) {
+				const request = JSON.parse(body) as { messages?: Array<{ role?: string }> };
+				const toolResults = request.messages?.filter((message) => message.role === "tool").length ?? 0;
+				if (toolResults === 0) {
+					res.writeHead(200, { "Content-Type": "text/event-stream" });
+					res.end([
+						`data: ${JSON.stringify({
+							id: "shard-stub", object: "chat.completion.chunk", created: 0, model: "tenant-model",
+							choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{
+								index: 0, id: "takeover-read-call", type: "function",
+								function: { name: "read", arguments: JSON.stringify({ path: "notes/research.txt" }) },
+							}] }, finish_reason: null }],
+						})}`,
+						"",
+						`data: ${JSON.stringify({
+							id: "shard-stub", object: "chat.completion.chunk", created: 0, model: "tenant-model",
+							choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+						})}`,
+						"",
+						"data: [DONE]",
+						"",
+						"",
+					].join("\n"));
+					return;
+				}
+			}
 			if (body.includes("shard-slow")) setTimeout(respond, 4_000);
 			else respond();
 		});
@@ -614,8 +640,19 @@ it("restores a session's workspace files on the takeover worker", async () => {
 	const takeoverText = await takenOver.text();
 	expect(takeoverText).toContain('"type":"done"');
 
-	// Opening the session materialized the replicated workspace and its files.
-	const restored = join(nonOwner.home, "workspace", ".tmp", `tmp-${tenantId}`, "notes", "research.txt");
+	// Lazy pull: opening materialized the directory skeleton and prompt files,
+	// but not the file body — it downloads on first tool access.
+	const wsDir = join(nonOwner.home, "workspace", ".tmp", `tmp-${tenantId}`);
+	const restored = join(wsDir, "notes", "research.txt");
+	expect(existsSync(join(wsDir, "notes"))).toBe(true);
+	expect(existsSync(restored)).toBe(false);
+
+	const readTurn = await api(nonOwner, cookie, "/api/chat/stream", {
+		method: "POST",
+		body: JSON.stringify({ sessionId: session.id, prompt: "workspace-takeover-read", clientRequestId: "workspace-takeover-read" }),
+	});
+	expect(readTurn.status).toBe(200);
+	expect(await readTurn.text()).toContain('"type":"done"');
 	expect(existsSync(restored)).toBe(true);
 	expect(readFileSync(restored, "utf8")).toBe("workspace replica content");
 }, 60_000);

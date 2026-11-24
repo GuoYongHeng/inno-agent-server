@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { posix } from "node:path";
 import { logger } from "../logger.js";
 import { incCounter, observeMs } from "../utils/metrics.js";
 import type { WorkspaceReplica } from "../workspace/workspace-replica.js";
@@ -38,7 +39,19 @@ class GatedLocalBackend implements SandboxBackend {
 		private readonly acquire: () => boolean,
 		private readonly busyMessage: string,
 		private readonly onMutated?: () => void,
+		/** Lazy-pull hook: fetch one manifest file (miss or drift) before a read. */
+		private readonly materialize?: (relPath: string) => Promise<boolean>,
+		/** Runs before every command — lazy pull's full-sync trigger for bash. */
+		private readonly beforeRun?: () => Promise<void>,
 	) {}
+
+	/** Materialize `path` when a replica backs this dir; failures are logged-only
+	 * upstream and the delegate then serves whatever the local copy has. */
+	private async syncPath(path: string): Promise<void> {
+		if (!this.materialize) return;
+		const rel = posix.normalize(path).replace(/^\/+/, "");
+		if (rel && rel !== "." && !rel.startsWith("..")) await this.materialize(rel);
+	}
 
 	private delegate(): LocalDirSandbox {
 		if (!this.inner) {
@@ -55,7 +68,10 @@ class GatedLocalBackend implements SandboxBackend {
 
 	// All methods are async so an over-cap denial rejects like a normal
 	// backend failure instead of throwing synchronously at the call site.
-	readFile = async (path: string) => this.delegate().readFile(path);
+	readFile = async (path: string) => {
+		await this.syncPath(path);
+		return this.delegate().readFile(path);
+	};
 	writeFile = async (path: string, data: Uint8Array | string) => {
 		const result = await this.delegate().writeFile(path, data);
 		this.mutated();
@@ -63,7 +79,10 @@ class GatedLocalBackend implements SandboxBackend {
 	};
 	list = async (path: string) => this.delegate().list(path);
 	listTree = async (path: string, maxDepth: number) => this.delegate().listTree(path, maxDepth);
-	stat = async (path: string) => this.delegate().stat(path);
+	stat = async (path: string) => {
+		await this.syncPath(path);
+		return this.delegate().stat(path);
+	};
 	makeDir = async (path: string) => {
 		const result = await this.delegate().makeDir(path);
 		this.mutated();
@@ -82,6 +101,9 @@ class GatedLocalBackend implements SandboxBackend {
 	run = async (command: string, options?: Parameters<LocalDirSandbox["run"]>[1]) => {
 		this.inflightRuns++;
 		try {
+			// Bash cannot be intercepted per-file: sync the whole workspace
+			// before every command (incremental — only drifted bodies download).
+			await this.beforeRun?.();
 			return await this.delegate().run(command, options);
 		} finally {
 			this.inflightRuns--;
@@ -135,11 +157,11 @@ export class LocalExecManager implements SandboxBindingProvider {
 		const tenant = input.tenantContext;
 		const workspaceId = input.workspaceId;
 
-		const pull = async () => {
+		const pull = async (options?: { download?: (relPath: string) => boolean }) => {
 			if (!replica || !tenant || !workspaceId) return;
 			const started = performance.now();
 			try {
-				await replica.pull(tenant, workspaceId, dir);
+				await replica.pull(tenant, workspaceId, dir, options);
 			} catch (error) {
 				incCounter("inno_local_exec_pull_errors_total");
 				logger.warn({ err: error, sessionId: input.sessionId, workspaceId }, "failed to pull workspace replica before turn");
@@ -147,6 +169,17 @@ export class LocalExecManager implements SandboxBindingProvider {
 				observeMs("inno_local_exec_pull_ms", performance.now() - started);
 			}
 		};
+		// beforeTurn syncs only the manifest shape (dirs + drift detection, no
+		// bodies): file tools materialize single files on read and bash syncs
+		// fully per command — a session that never touches files never pulls.
+		const pullIndex = async () => pull({ download: () => false });
+		const materialize = replica && tenant && workspaceId && typeof replica.materializeFile === "function"
+			? (relPath: string) => replica.materializeFile(tenant, workspaceId, dir, relPath)
+				.catch((error) => {
+					logger.warn({ err: error, sessionId: input.sessionId, workspaceId, relPath }, "lazy workspace materialize failed");
+					return false;
+				})
+			: undefined;
 		const push = async () => {
 			if (!replica || !tenant || !workspaceId) return;
 			const started = performance.now();
@@ -184,11 +217,11 @@ export class LocalExecManager implements SandboxBindingProvider {
 				slotHeld = true;
 				incCounter("inno_local_exec_activations_total");
 				return true;
-			}, "本地执行并发已满，请稍后重试", onMutated),
+			}, "本地执行并发已满，请稍后重试", onMutated, materialize, () => pull()),
 			remoteRoot: "/",
 			requireApproval: this.options.requireApproval ?? false,
 			commandTimeoutSeconds: this.options.commandTimeoutSeconds ?? 600,
-			beforeTurn: pull,
+			beforeTurn: pullIndex,
 			pullToHost: push,
 			release,
 			rebasePaths: (text) => text.split(`${dir}/`).join("/").split(dir).join("/"),

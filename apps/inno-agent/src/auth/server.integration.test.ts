@@ -254,8 +254,8 @@ beforeAll(async () => {
 			}
 			if (body.includes("durable-bash-write")) {
 				const request = JSON.parse(body) as { messages?: Array<{ role?: string }> };
-				const toolResults = request.messages?.filter((message) => message.role === "tool").length ?? 0;
-				if (toolResults === 0) {
+				const lastRole = request.messages?.[request.messages.length - 1]?.role;
+				if (lastRole === "user") {
 					res.writeHead(200, { "Content-Type": "text/event-stream" });
 					res.end([
 						`data: ${JSON.stringify({
@@ -2559,7 +2559,9 @@ describe("workspace read routes in authenticated mode", () => {
 			const streamed2 = await readDurableStream(response2!);
 			expect(streamed2).toContain('"type":"done"');
 
-			// The pull on open rebuilt the local copy from object storage.
+			// The second turn's bash call ran the binding's full pull first, and
+			// the command itself rewrote the file — either way the local copy is
+			// back from durable storage.
 			expect(existsSync(localFile)).toBe(true);
 			expect(await readFile(localFile, "utf8")).toBe("bash-content\n");
 		} finally {

@@ -68,4 +68,30 @@ describe("WorkspaceFileEnv", () => {
 		expect(exec.ok).toBe(false);
 		if (!exec.ok) expect(exec.error.code).toBe("shell_unavailable");
 	});
+it("materializes a missing file on first read via the lazy-pull hook", async () => {
+		const base = root();
+		const workspace = join(base, "workspace");
+		mkdirSync(workspace);
+		const calls: string[] = [];
+		const env = new WorkspaceFileEnv(workspace, async (relPath) => {
+			calls.push(relPath);
+			if (relPath !== "notes/research.txt") return false;
+			mkdirSync(join(workspace, "notes"), { recursive: true });
+			writeFileSync(join(workspace, "notes", "research.txt"), "remote body");
+			return true;
+		});
+
+		const miss = await env.readTextFile("not-in-manifest.txt", BACKGROUND_CONTEXT);
+		expect(miss.ok).toBe(false);
+		expect(calls).toEqual(["not-in-manifest.txt"]);
+
+		const hit = await env.readTextFile("notes/research.txt", BACKGROUND_CONTEXT);
+		expect(hit).toMatchObject({ ok: true, value: "remote body" });
+
+		// stat-style reads materialize too; existing files never re-call the hook.
+		expect((await env.exists("notes/research.txt", BACKGROUND_CONTEXT))).toMatchObject({ ok: true, value: true });
+		expect(calls).toHaveLength(2);
+	});
 });
+
+

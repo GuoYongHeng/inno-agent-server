@@ -1118,11 +1118,13 @@ const durableSessions = new DurableSessionService({
 		pgCatalog: new PgSessionCatalog(auth.tenantStore.database, (req) => join(resolveRequestTenantDataRoot(req, dataDir), "durable", "sessions.json")),
 	} : {}),
 	workspaceReplica: {
-		materializeSession: (tenant, sessionId, catalogWorkspaceId) =>
+		materializeSession: (tenant, sessionId, catalogWorkspaceId, options) =>
 			workspaceReplica
-				? workspaceReplica.materializeSessionWorkspace(tenant, sessionId, catalogWorkspaceId)
+				? workspaceReplica.materializeSessionWorkspace(tenant, sessionId, catalogWorkspaceId, options)
 				: Promise.resolve(catalogWorkspaceId || TEMP_WORKSPACE_ID),
-		pull: async (tenant, workspaceId, dir) => { await workspaceReplica?.pull(tenant, workspaceId, dir); },
+		pull: async (tenant, workspaceId, dir, options) => { await workspaceReplica?.pull(tenant, workspaceId, dir, options); },
+		materializeFile: async (tenant, workspaceId, dir, relPath) =>
+			workspaceReplica ? workspaceReplica.materializeFile(tenant, workspaceId, dir, relPath) : false,
 		push: async (tenant, workspaceId, dir) => { await workspaceReplica?.push(tenant, workspaceId, dir); },
 	},
 });

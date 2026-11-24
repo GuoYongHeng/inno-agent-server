@@ -4,8 +4,8 @@ import { logger } from "../logger.js";
 import { formatSkillsForPrompt, loadSkillsFromDir } from "./skills.js";
 import type { WorkspaceFileAccess } from "../workspace/workspace-files.js";
 
-const WORKSPACE_AGENT_FILE = "agent.md";
-const WORKSPACE_SKILLS_DIR = ".skills";
+export const WORKSPACE_AGENT_FILE = "agent.md";
+export const WORKSPACE_SKILLS_DIR = ".skills";
 
 /** Build the same workspace prompt sections for legacy and durable sessions.
  * Private skills are prompt resources only; this does not install process-global

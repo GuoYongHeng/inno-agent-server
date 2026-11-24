@@ -116,7 +116,7 @@ execute(params, api, context)
 配置了持久对象存储（`INNO_OBJECT_STORAGE_PROVIDER=s3|fs`）时，租户工作区文件的真源是**对象存储字节 + PostgreSQL `workspace_files` 清单**（`ObjectWorkspaceStore`），worker 本地目录只是可随时丢弃的工作副本：
 
 - 面板读（目录树、文件内容、raw、下载、office 预览）与写（保存、新建、重命名、删除、移动、上传、技能包）全部走 `WorkspaceStore`；写先落清单再镜像本地副本，保证执行中会话立刻可见。
-- `workspace/workspace-replica.ts` 在会话打开与每轮开始前置增量 pull、文件变更/每轮 settle/关闭时增量 push；push 只删除自身状态文件里已知的键，未拉取过的 worker 不会误删。
+- `workspace/workspace-replica.ts` 按增量 pull/push 同步；push 只删除自身状态文件里已知的键，未拉取过的 worker 不会误删。pull 是**按需**的：会话打开只下载提示词必需路径（`agent.md`、`.skills/`）与目录骨架，其余文件行登记为待物化；文件工具/stat 读 miss 或漂移时经 `materializeFile` 单文件拉取，local exec 的 bash 无法逐文件拦截、每次 `run` 前做一次全量增量同步（无变更时只花一轮清单对比）。文件变更/每轮 settle/关闭时增量 push 不变。
 - `INNO_EXEC_BACKEND=local` 时 bash/read/write/edit 经 `SandboxExecutionEnv` → `LocalDirSandbox` 在 worker 上执行（realpath 防逃逸，`INNO_EXEC_LOCAL_MAX_CONCURRENT` 限并发）；默认 `persistent` 不提供 bash。
 - `S3ObjectStore` 支持预签名：`/api/workspace/upload-url` + `/api/workspace/upload/complete` 让浏览器字节直传，`raw?download=1` 302 到短效 GET；其它 provider 返回 404 由前端回退代理。桶需配 CORS 允许浏览器 PUT。
 - 对象存储未配置（`memory`）时字节随进程死亡，面板回退读本地磁盘并在启动告警——此时多 worker 接管会丢工作区。

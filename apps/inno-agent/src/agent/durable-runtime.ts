@@ -95,6 +95,8 @@ export interface DurableSessionRuntimeOptions {
 	model: ModelRef;
 	instructions?: string;
 	workspaceDir?: string;
+	/** Lazy-pull hook for `WorkspaceFileEnv` reads (replica-backed workspaces). */
+	workspaceMaterialize?: (relPath: string) => Promise<boolean>;
 	/** Workspace-contained read/write/edit tools. Shell and other mutations stay disabled. */
 	workspaceTools?: boolean;
 	/** Tenant-local, replay-safe L2/L3 memory tools. */
@@ -275,7 +277,7 @@ export class DurableSessionRuntime {
 					env: options.sandbox
 						? () => new SandboxExecutionEnv(options.sandbox!.backend, options.sandbox!.remoteRoot)
 						: options.workspaceDir
-							? () => new WorkspaceFileEnv(options.workspaceDir!)
+							? () => new WorkspaceFileEnv(options.workspaceDir!, options.workspaceMaterialize)
 							: undefined,
 				},
 				BACKGROUND_CONTEXT,
