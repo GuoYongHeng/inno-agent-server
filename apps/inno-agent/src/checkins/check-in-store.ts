@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import type { Pool } from "pg";
 import { readJson, writeJson, ensureDir } from "../storage/file-store.js";
 import type { JobStore } from "../scheduler/job-store.js";
 import type { JobRunStatus, ScheduledJob } from "../scheduler/types.js";
@@ -94,52 +95,41 @@ export function isLearningJob(job: ScheduledJob): boolean {
 }
 
 /**
- * File-backed daily progress for the scheduler-driven learning check-in.
- * The check-in record is derived from today's live job configuration and the
- * occurrence ledger; a client cannot mark a day complete on its own.
+ * Daily progress ledger for the scheduler-driven learning check-in
+ * (checkins.json / occurrences.json → `tenant_checkins` +
+ * `tenant_checkin_occurrences`). The check-in record is derived from today's
+ * live job configuration and the occurrence ledger; a client cannot mark a
+ * day complete on its own.
  */
-export class CheckInStore {
+export abstract class CheckInStore {
 	readonly timezone: string;
+	private claimedOccurrences = new Set<string>();
 
 	constructor(
-		private readonly dataDir: string | (() => string),
 		timezone: string = DEFAULT_SCHEDULER_TIMEZONE,
 		private readonly jobStore: JobStore | (() => JobStore),
 	) {
 		this.timezone = timezone || DEFAULT_SCHEDULER_TIMEZONE;
-		if (typeof dataDir === "string") ensureDir(join(dataDir, "checkins"));
 	}
 
-	private filePath(): string {
-		const dataDir = typeof this.dataDir === "function" ? this.dataDir() : this.dataDir;
-		const checkinsDir = join(dataDir, "checkins");
-		ensureDir(checkinsDir);
-		return join(checkinsDir, CHECKINS_FILE);
-	}
+	protected abstract readCheckInRecords(): Promise<CheckInRecord[]>;
+	protected abstract upsertCheckInRecord(record: CheckInRecord): Promise<void>;
+	protected abstract listOccurrenceRecords(): Promise<OccurrenceRecord[]>;
+	protected abstract getOccurrenceRecord(occurrenceId: string): Promise<OccurrenceRecord | undefined>;
+	protected abstract upsertOccurrenceRecord(record: OccurrenceRecord): Promise<void>;
 
-	private occurrencesFilePath(): string {
-		const dataDir = typeof this.dataDir === "function" ? this.dataDir() : this.dataDir;
-		const checkinsDir = join(dataDir, "checkins");
-		ensureDir(checkinsDir);
-		return join(checkinsDir, OCCURRENCES_FILE);
-	}
-
-	private jobs(): ScheduledJob[] {
+	protected jobs(): Promise<ScheduledJob[]> {
 		return (typeof this.jobStore === "function" ? this.jobStore() : this.jobStore).list();
 	}
 
-	list(): CheckInRecord[] {
-		const records = readJson<unknown>(this.filePath(), []);
-		if (!Array.isArray(records)) return [];
-		return records
-			.map(parseCheckInRecord)
-			.filter((record): record is CheckInRecord => record !== undefined);
+	async list(): Promise<CheckInRecord[]> {
+		return this.readCheckInRecords();
 	}
 
-	getTodayPlan(now: Date = new Date()): TodayLearningPlan {
+	async getTodayPlan(now: Date = new Date()): Promise<TodayLearningPlan> {
 		const today = dateKeyForTimeZone(now, this.timezone);
-		const occurrenceRecords = new Map(this.listOccurrenceRecords().map((record) => [record.occurrenceId, record]));
-		const jobs = this.jobs()
+		const occurrenceRecords = new Map((await this.listOccurrenceRecords()).map((record) => [record.occurrenceId, record]));
+		const jobs = (await this.jobs())
 			.filter((job) => job.enabled && isLearningJob(job))
 			.map((job): CheckInJobStatus | null => {
 				const scheduledAt = getCronOccurrencesForDate(job.cron, job.timezone, today, this.timezone);
@@ -168,8 +158,8 @@ export class CheckInStore {
 		return { today, timezone: this.timezone, jobs };
 	}
 
-	status(now: Date = new Date()): CheckInStatus {
-		const plan = this.getTodayPlan(now);
+	async status(now: Date = new Date()): Promise<CheckInStatus> {
+		const plan = await this.getTodayPlan(now);
 		const occurrences = plan.jobs.flatMap((job) => job.occurrences);
 		const completedCount = occurrences.filter((occurrence) => occurrence.status === "success").length;
 		const skippedCount = occurrences.filter((occurrence) => occurrence.status === "skipped").length;
@@ -181,7 +171,7 @@ export class CheckInStore {
 				? "completed"
 				: "pending";
 
-		let records = this.list();
+		const records = await this.readCheckInRecords();
 		let todayRecord = records.find((record) => record.date === plan.today);
 		if (dayStatus === "completed") {
 			const completedOccurrenceIds = occurrences
@@ -197,12 +187,11 @@ export class CheckInStore {
 					checkedInAt: sameCompletionSet ? todayRecord!.checkedInAt : now.toISOString(),
 					completedOccurrenceIds,
 				};
-				records = [...records.filter((record) => record.date !== plan.today), todayRecord];
-				writeJson(this.filePath(), records);
+				await this.upsertCheckInRecord(todayRecord);
 			}
 		}
 
-		const validDates = records
+		const validDates = [...records, ...(todayRecord && !records.some((record) => record.date === plan.today) ? [todayRecord] : [])]
 			.filter((record) => record.date <= plan.today)
 			.filter((record) => record.date !== plan.today || dayStatus === "completed")
 			.map((record) => record.date)
@@ -227,11 +216,9 @@ export class CheckInStore {
 		};
 	}
 
-	isCheckedInToday(now: Date = new Date()): boolean {
-		return this.status(now).todayCheckedIn;
+	async isCheckedInToday(now: Date = new Date()): Promise<boolean> {
+		return (await this.status(now)).todayCheckedIn;
 	}
-
-	private claimedOccurrences = new Set<string>();
 
 	/**
 	 * Reserve a slot for execution so cron re-fires, the deferred
@@ -264,8 +251,8 @@ export class CheckInStore {
 	 * for the legacy generic "Run now" action. Skipped and successful slots are
 	 * never selected again.
 	 */
-	resolveOccurrence(jobId: string, occurrenceId?: string, now: Date = new Date()): CheckInOccurrence | undefined {
-		const candidates = this.getTodayPlan(now).jobs
+	async resolveOccurrence(jobId: string, occurrenceId?: string, now: Date = new Date()): Promise<CheckInOccurrence | undefined> {
+		const candidates = (await this.getTodayPlan(now)).jobs
 			.find((job) => job.jobId === jobId)
 			?.occurrences ?? [];
 		if (occurrenceId) {
@@ -276,15 +263,15 @@ export class CheckInStore {
 	}
 
 	/** Find any live occurrence, including one that was already completed. */
-	getOccurrence(jobId: string, occurrenceId: string, now: Date = new Date()): CheckInOccurrence | undefined {
-		return this.getTodayPlan(now).jobs
+	async getOccurrence(jobId: string, occurrenceId: string, now: Date = new Date()): Promise<CheckInOccurrence | undefined> {
+		return (await this.getTodayPlan(now)).jobs
 			.find((job) => job.jobId === jobId)
 			?.occurrences.find((occurrence) => occurrence.occurrenceId === occurrenceId);
 	}
 
 	/** Find a live occurrence by its stable id, including settled slots. */
-	getOccurrenceById(occurrenceId: string, now: Date = new Date()): CheckInOccurrence | undefined {
-		return this.getTodayPlan(now).jobs
+	async getOccurrenceById(occurrenceId: string, now: Date = new Date()): Promise<CheckInOccurrence | undefined> {
+		return (await this.getTodayPlan(now)).jobs
 			.flatMap((job) => job.occurrences)
 			.find((occurrence) => occurrence.occurrenceId === occurrenceId);
 	}
@@ -294,36 +281,149 @@ export class CheckInStore {
 	 * A successful attempt is sticky: a later failed retry cannot undo a slot
 	 * that already succeeded.
 	 */
-	recordOccurrence(input: RecordCheckInOccurrenceInput): CheckInOccurrenceResult {
+	async recordOccurrence(input: RecordCheckInOccurrenceInput): Promise<CheckInOccurrenceResult> {
 		const finishedAt = new Date(input.finishedAt);
-		const before = this.status(finishedAt);
-		const records = this.listOccurrenceRecords();
-		const index = records.findIndex((record) => record.occurrenceId === input.occurrenceId);
-		const current = index >= 0 ? records[index] : undefined;
+		const before = await this.status(finishedAt);
+		const current = await this.getOccurrenceRecord(input.occurrenceId);
 		const status = current?.status === "success" || input.status === "success"
 			? "success"
 			: input.status;
-		const next: OccurrenceRecord = {
+		await this.upsertOccurrenceRecord({
 			...input,
 			status,
 			date: dateKeyForTimeZone(new Date(input.scheduledAt), this.timezone),
 			updatedAt: finishedAt.toISOString(),
-		};
-		if (index >= 0) records[index] = next;
-		else records.push(next);
-		writeJson(this.occurrencesFilePath(), records);
+		});
 
-		const after = this.status(finishedAt);
+		const after = await this.status(finishedAt);
 		return {
 			status: after,
 			justCompleted: !before.todayCheckedIn && after.todayCheckedIn,
 		};
 	}
+}
 
-	private listOccurrenceRecords(): OccurrenceRecord[] {
+/** File-backed CheckInStore for unit tests; production uses PgCheckInStore. */
+export class FileCheckInStore extends CheckInStore {
+	constructor(
+		private readonly dataDir: string | (() => string),
+		timezone: string = DEFAULT_SCHEDULER_TIMEZONE,
+		jobStore: JobStore | (() => JobStore),
+	) {
+		super(timezone, jobStore);
+		if (typeof dataDir === "string") ensureDir(join(dataDir, "checkins"));
+	}
+
+	private checkinsDir(): string {
+		const dataDir = typeof this.dataDir === "function" ? this.dataDir() : this.dataDir;
+		const checkinsDir = join(dataDir, "checkins");
+		ensureDir(checkinsDir);
+		return checkinsDir;
+	}
+
+	private filePath(): string {
+		return join(this.checkinsDir(), CHECKINS_FILE);
+	}
+
+	private occurrencesFilePath(): string {
+		return join(this.checkinsDir(), OCCURRENCES_FILE);
+	}
+
+	protected async readCheckInRecords(): Promise<CheckInRecord[]> {
+		const records = readJson<unknown>(this.filePath(), []);
+		if (!Array.isArray(records)) return [];
+		return records
+			.map(parseCheckInRecord)
+			.filter((record): record is CheckInRecord => record !== undefined);
+	}
+
+	protected async upsertCheckInRecord(record: CheckInRecord): Promise<void> {
+		const records = (await this.readCheckInRecords())
+			.filter((existing) => existing.date !== record.date);
+		writeJson(this.filePath(), [...records, record]);
+	}
+
+	protected async listOccurrenceRecords(): Promise<OccurrenceRecord[]> {
 		const records = readJson<unknown>(this.occurrencesFilePath(), []);
 		if (!Array.isArray(records)) return [];
 		return records.filter(isOccurrenceRecord);
+	}
+
+	protected async getOccurrenceRecord(occurrenceId: string): Promise<OccurrenceRecord | undefined> {
+		return (await this.listOccurrenceRecords()).find((record) => record.occurrenceId === occurrenceId);
+	}
+
+	protected async upsertOccurrenceRecord(record: OccurrenceRecord): Promise<void> {
+		const records = await this.listOccurrenceRecords();
+		const index = records.findIndex((existing) => existing.occurrenceId === record.occurrenceId);
+		if (index >= 0) records[index] = record;
+		else records.push(record);
+		writeJson(this.occurrencesFilePath(), records);
+	}
+}
+
+/** PostgreSQL check-in ledger scoped to the ambient tenant. */
+export class PgCheckInStore extends CheckInStore {
+	constructor(
+		private readonly pool: Pool,
+		timezone: string = DEFAULT_SCHEDULER_TIMEZONE,
+		jobStore: JobStore | (() => JobStore),
+	) {
+		super(timezone, jobStore);
+	}
+
+	private tenantId(): string {
+		const tenant = getCurrentTenant();
+		if (!tenant) throw new Error("PgCheckInStore requires a verified tenant context");
+		return tenant.tenantId;
+	}
+
+	protected async readCheckInRecords(): Promise<CheckInRecord[]> {
+		const result = await this.pool.query<{ date: string; checked_in_at: Date; completed_occurrence_ids: string[] }>(
+			"SELECT date, checked_in_at, completed_occurrence_ids FROM tenant_checkins WHERE tenant_id = $1",
+			[this.tenantId()],
+		);
+		return result.rows.map((row) => ({
+			date: row.date,
+			checkedInAt: row.checked_in_at instanceof Date ? row.checked_in_at.toISOString() : String(row.checked_in_at),
+			completedOccurrenceIds: Array.isArray(row.completed_occurrence_ids) ? row.completed_occurrence_ids : [],
+		}));
+	}
+
+	protected async upsertCheckInRecord(record: CheckInRecord): Promise<void> {
+		await this.pool.query(
+			`INSERT INTO tenant_checkins (tenant_id, date, checked_in_at, completed_occurrence_ids)
+			 VALUES ($1, $2, $3, $4::jsonb)
+			 ON CONFLICT (tenant_id, date) DO UPDATE
+			 SET checked_in_at = $3, completed_occurrence_ids = $4::jsonb, updated_at = CURRENT_TIMESTAMP`,
+			[this.tenantId(), record.date, record.checkedInAt, JSON.stringify(record.completedOccurrenceIds)],
+		);
+	}
+
+	protected async listOccurrenceRecords(): Promise<OccurrenceRecord[]> {
+		const result = await this.pool.query<{ data: OccurrenceRecord }>(
+			"SELECT data FROM tenant_checkin_occurrences WHERE tenant_id = $1",
+			[this.tenantId()],
+		);
+		return result.rows.map((row) => row.data);
+	}
+
+	protected async getOccurrenceRecord(occurrenceId: string): Promise<OccurrenceRecord | undefined> {
+		const result = await this.pool.query<{ data: OccurrenceRecord }>(
+			"SELECT data FROM tenant_checkin_occurrences WHERE tenant_id = $1 AND occurrence_id = $2",
+			[this.tenantId(), occurrenceId],
+		);
+		return result.rows[0]?.data;
+	}
+
+	protected async upsertOccurrenceRecord(record: OccurrenceRecord): Promise<void> {
+		await this.pool.query(
+			`INSERT INTO tenant_checkin_occurrences (tenant_id, occurrence_id, job_id, data)
+			 VALUES ($1, $2, $3, $4::jsonb)
+			 ON CONFLICT (tenant_id, occurrence_id) DO UPDATE
+			 SET data = $4::jsonb, updated_at = CURRENT_TIMESTAMP`,
+			[this.tenantId(), record.occurrenceId, record.jobId, JSON.stringify(record)],
+		);
 	}
 }
 

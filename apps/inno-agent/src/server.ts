@@ -33,8 +33,8 @@ import { bridgeChannelResourceId, TenantChannelManager } from "./channels/tenant
 import { bridgeBearerToken, handleBridgeMessage } from "./channels/bridge/bridge-server.js";
 import { BridgeChannel } from "./channels/bridge/bridge-channel.js";
 import { WeChatChannel } from "./channels/wechat/wechat-channel.js";
-import { ScopedJobStore } from "./scheduler/scoped-job-store.js";
-import { CheckInStore } from "./checkins/check-in-store.js";
+import { PgJobStore, type JobStore } from "./scheduler/job-store.js";
+import { PgCheckInStore, type CheckInStore } from "./checkins/check-in-store.js";
 import { TenantCronScheduler } from "./scheduler/tenant-cron-scheduler.js";
 import { HttpError, json, readBody } from "./server/http-helpers.js";
 import { serveStatic } from "./server/static-serve.js";
@@ -187,7 +187,7 @@ const contentHubCatalog = new ContentHubCatalog({
 // All stateful services are declared with !: — they are guaranteed to be
 // initialised before any API handler that uses them runs, because the HTTP
 // handler calls ensureBootstrapped() before dispatching.
-let jobStore!: ScopedJobStore;
+let jobStore!: JobStore;
 let checkInStore!: CheckInStore;
 let channelRegistry!: ChannelRegistry;
 let workspaceRegistry!: WorkspaceRegistry;
@@ -221,11 +221,11 @@ async function ensureBootstrapped(): Promise<void> {
 		ensureDir(paths.workspaceDir);
 
 		// ---- stores ----
-		jobStore = new ScopedJobStore(dataDir, paths.jobsDir, config.scheduler?.timezone);
-		jobStore.normalizePersistedJobs();
-		checkInStore = new CheckInStore(() => resolveCurrentTenantDataRoot(dataDir), config.scheduler?.timezone, jobStore);
+		jobStore = new PgJobStore(auth.tenantStore.database, config.scheduler?.timezone);
+		await jobStore.normalizePersistedJobs();
+		checkInStore = new PgCheckInStore(auth.tenantStore.database, config.scheduler?.timezone, jobStore);
 
-		channelRegistry = new ChannelRegistry(join(dataDir, "channels", "default-targets.json"));
+		channelRegistry = new ChannelRegistry();
 
 		workspaceRegistry = new WorkspaceRegistry(paths.workspaceDir, dataDir);
 		workspaceRegistry.ensureBootstrapped();
@@ -403,7 +403,7 @@ async function ensureBootstrapped(): Promise<void> {
 		scheduler.start();
 
 		logger.info("[inno-server] tenant-scoped channels");
-		logger.info({ jobCount: jobStore.list().length }, "[inno-server] jobs loaded");
+		logger.info({ jobCount: (await jobStore.normalizePersistedJobs()).length }, "[inno-server] jobs loaded");
 
 		bootstrapped = true;
 		logger.info("[inno-server] bootstrap complete");

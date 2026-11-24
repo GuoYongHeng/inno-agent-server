@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { CheckInStore } from "../../checkins/check-in-store.js";
-import { JobStore } from "../../scheduler/job-store.js";
+import { CheckInStore, FileCheckInStore } from "../../checkins/check-in-store.js";
+import { FileJobStore, JobStore } from "../../scheduler/job-store.js";
 import { FakeTenantStore, ctxA } from "../../workspace/fake-tenant-store.js";
 import { setRequestTenant } from "../../tenants/http.js";
 import type { TenantStore } from "../../tenants/store.js";
@@ -18,8 +18,8 @@ let tenantStore: FakeTenantStore;
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "inno-checkins-route-"));
-	jobStore = new JobStore(join(dir, "jobs"), "Asia/Shanghai");
-	checkInStore = new CheckInStore(join(dir, "data"), "Asia/Shanghai", jobStore);
+	jobStore = new FileJobStore(join(dir, "jobs"), "Asia/Shanghai");
+	checkInStore = new FileCheckInStore(join(dir, "data"), "Asia/Shanghai", jobStore);
 	tenantStore = new FakeTenantStore();
 });
 
@@ -51,8 +51,8 @@ function fakeRes(): ServerResponse & { statusCode: number; payload: unknown } {
 }
 
 /** Create an enabled daily learning job and return today's planned slot. */
-function plannedOccurrence() {
-	const job = jobStore.create({
+async function plannedOccurrence() {
+	const job = await jobStore.create({
 		name: "daily review",
 		cron: "0 9 * * *",
 		timezone: "Asia/Shanghai",
@@ -60,14 +60,14 @@ function plannedOccurrence() {
 		taskType: "daily_review",
 		prompt: "review my notes",
 	});
-	const occurrence = checkInStore.getTodayPlan().jobs
+	const occurrence = (await checkInStore.getTodayPlan()).jobs
 		.find((candidate) => candidate.jobId === job.id)?.occurrences[0];
 	if (!occurrence) throw new Error("expected a planned occurrence for today");
 	return { job, occurrence };
 }
 
-function skipOccurrence(occurrenceId: string) {
-	checkInStore.recordOccurrence({
+async function skipOccurrence(occurrenceId: string) {
+	await checkInStore.recordOccurrence({
 		occurrenceId,
 		jobId: "job",
 		scheduledAt: new Date().toISOString(),
@@ -79,8 +79,8 @@ function skipOccurrence(occurrenceId: string) {
 
 describe("check-ins skip/claim idempotency", () => {
 	it("treats a repeated skip of an already-skipped slot as success", async () => {
-		const { occurrence } = plannedOccurrence();
-		skipOccurrence(occurrence.occurrenceId);
+		const { occurrence } = await plannedOccurrence();
+		await skipOccurrence(occurrence.occurrenceId);
 		// No deferred run is registered, so the cancel misses and the route
 		// falls back to the persisted slot state.
 
@@ -96,7 +96,7 @@ describe("check-ins skip/claim idempotency", () => {
 	});
 
 	it("returns 409 for a repeated skip of a slot that is still pending", async () => {
-		const { occurrence } = plannedOccurrence();
+		const { occurrence } = await plannedOccurrence();
 
 		const res = fakeRes();
 		await handleCheckInsRoutes(
@@ -118,8 +118,8 @@ describe("check-ins skip/claim idempotency", () => {
 	});
 
 	it("lets a late claim of an already-skipped slot stand down quietly", async () => {
-		const { occurrence } = plannedOccurrence();
-		skipOccurrence(occurrence.occurrenceId);
+		const { occurrence } = await plannedOccurrence();
+		await skipOccurrence(occurrence.occurrenceId);
 
 		const res = fakeRes();
 		await handleCheckInsRoutes(

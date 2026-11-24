@@ -157,7 +157,7 @@ async function autoExecute(run: PendingDeferredRun): Promise<void> {
 	const key = `${scopeKey}:${occurrenceId}`;
 	try {
 		if (cfg.checkInStore) {
-			const occurrence = cfg.checkInStore.getOccurrence(job.id, occurrenceId);
+			const occurrence = await cfg.checkInStore.getOccurrence(job.id, occurrenceId);
 			if (occurrence && (occurrence.status === "success" || occurrence.status === "skipped")) {
 				logger.info({ jobId: job.id, occurrenceId, status: occurrence.status }, "Deferred run obsolete: slot already settled");
 				return;

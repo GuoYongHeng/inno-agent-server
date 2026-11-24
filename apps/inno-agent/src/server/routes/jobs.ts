@@ -209,17 +209,17 @@ export async function handleJobsRoutes(
 	};
 
 	if (method === "GET" && url === "/api/jobs") {
-		json(res, 200, jobStore.list());
+		json(res, 200, await jobStore.list());
 		return true;
 	}
 
 	if (method === "GET" && url === "/api/jobs/status") {
-		json(res, 200, jobStore.getStatus());
+		json(res, 200, await jobStore.getStatus());
 		return true;
 	}
 
 	if (method === "GET" && url === "/api/jobs/runs") {
-		json(res, 200, jobStore.listRuns());
+		json(res, 200, await jobStore.listRuns());
 		return true;
 	}
 
@@ -252,11 +252,11 @@ export async function handleJobsRoutes(
 			json(res, 400, { error: "Durable jobs support agent tasks, not reminder tasks" });
 			return true;
 		}
-		const job = jobStore.create(body);
+		const job = await jobStore.create(body);
 		try {
 			await claimRequestResource(req, tenantStore, "job", job.id);
 		} catch (err) {
-			jobStore.delete(job.id);
+			await jobStore.delete(job.id);
 			throw err;
 		}
 		json(res, 201, job);
@@ -265,11 +265,11 @@ export async function handleJobsRoutes(
 
 	const runsMatch = matchRoute("GET", method, url, "/api/jobs/:id/runs");
 	if (runsMatch) {
-		if (requireRequestTenant(req) && !jobStore.get(runsMatch.id)) {
+		if (requireRequestTenant(req) && !(await jobStore.get(runsMatch.id))) {
 			json(res, 404, { error: "Job not found" });
 			return true;
 		}
-		json(res, 200, jobStore.listRuns(runsMatch.id));
+		json(res, 200, await jobStore.listRuns(runsMatch.id));
 		return true;
 	}
 
@@ -291,7 +291,7 @@ export async function handleJobsRoutes(
 
 	const runStreamMatch = matchRoute("POST", method, url, "/api/jobs/:id/run/stream");
 	if (runStreamMatch) {
-		const job = jobStore.get(runStreamMatch.id);
+		const job = await jobStore.get(runStreamMatch.id);
 		if (!job) {
 			json(res, 404, { error: "Job not found" });
 			return true;
@@ -322,7 +322,7 @@ export async function handleJobsRoutes(
 				return true;
 			}
 			if (isLearningJob(job) && ctx.checkInStore) {
-				const occurrence = ctx.checkInStore.resolveOccurrence(job.id, occurrenceId);
+				const occurrence = await ctx.checkInStore.resolveOccurrence(job.id, occurrenceId);
 				if (!occurrence) {
 					json(res, 409, { error: "Learning schedule slot is no longer pending." });
 					return true;
@@ -410,7 +410,7 @@ export async function handleJobsRoutes(
 
 	const runMatch = matchRoute("POST", method, url, "/api/jobs/:id/run");
 	if (runMatch) {
-		const job = jobStore.get(runMatch.id);
+		const job = await jobStore.get(runMatch.id);
 		if (!job) {
 			json(res, 404, { error: "Job not found" });
 			return true;
@@ -450,7 +450,7 @@ export async function handleJobsRoutes(
 			}
 		}
 		if (occurrenceId && isLearningJob(job) && ctx.checkInStore) {
-			const occurrence = ctx.checkInStore.resolveOccurrence(job.id, occurrenceId);
+			const occurrence = await ctx.checkInStore.resolveOccurrence(job.id, occurrenceId);
 			if (!occurrence) {
 				json(res, 409, { error: "Learning schedule slot is no longer pending." });
 				return true;
@@ -506,7 +506,7 @@ export async function handleJobsRoutes(
 			json(res, 400, { error: "The legacy runtime has been removed; jobs run in durable sessions" });
 			return true;
 		}
-		const current = jobStore.get(patchMatch.id);
+		const current = await jobStore.get(patchMatch.id);
 		const effectiveTaskType = body.taskType ?? current?.taskType;
 		if (body.runtime === undefined && effectiveTaskType !== "push_reminder" && effectiveTaskType !== "check_in_reminder") {
 			body.runtime = "durable";
@@ -519,7 +519,7 @@ export async function handleJobsRoutes(
 			json(res, 400, { error: "Durable jobs support agent tasks, not reminder tasks" });
 			return true;
 		}
-		const updated = jobStore.update(patchMatch.id, body);
+		const updated = await jobStore.update(patchMatch.id, body);
 		if (!updated) {
 			json(res, 404, { error: "Job not found" });
 			return true;
@@ -530,7 +530,7 @@ export async function handleJobsRoutes(
 
 	const deleteMatch = matchRoute("DELETE", method, url, "/api/jobs/:id");
 	if (deleteMatch) {
-		const deleted = jobStore.delete(deleteMatch.id);
+		const deleted = await jobStore.delete(deleteMatch.id);
 		if (!deleted) {
 			json(res, 404, { error: "Job not found" });
 			return true;

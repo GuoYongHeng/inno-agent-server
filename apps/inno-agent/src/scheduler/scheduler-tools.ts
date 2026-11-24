@@ -71,7 +71,7 @@ export function createSchedulerTools(
 				};
 			}
 			const defaultTarget = params.channel ? channelRegistry?.getDefaultTarget(params.channel) : undefined;
-			const job = jobStore.create({
+			const job = await jobStore.create({
 				name: params.name,
 				cron: params.cron,
 				timezone: jobStore.defaultTimezone,
@@ -87,13 +87,13 @@ export function createSchedulerTools(
 			if (tenant) {
 				const tenantStore = getCurrentTenantStore();
 				if (!tenantStore) {
-					jobStore.delete(job.id);
+					await jobStore.delete(job.id);
 					throw new Error("Tenant store is required to create a scheduled job");
 				}
 				try {
 					await tenantStore.claimResource(tenant, "job", job.id);
 				} catch (err) {
-					jobStore.delete(job.id);
+					await jobStore.delete(job.id);
 					throw err;
 				}
 			}
@@ -114,7 +114,7 @@ export function createSchedulerTools(
 		description: "列出所有定时任务。用户问「我有哪些定时任务」或「查看定时任务」时调用。",
 		parameters: Type.Object({}),
 		async execute() {
-			const jobs = jobStore.list();
+			const jobs = await jobStore.list();
 			if (jobs.length === 0) {
 				return {
 					content: [{ type: "text" as const, text: "当前没有定时任务。" }],
@@ -158,7 +158,7 @@ export function createSchedulerTools(
 					};
 				}
 			}
-			const updated = jobStore.update(id, patch);
+			const updated = await jobStore.update(id, patch);
 			if (!updated) {
 				return {
 					content: [{ type: "text" as const, text: `未找到任务 ${id}` }],
@@ -180,7 +180,7 @@ export function createSchedulerTools(
 			id: Type.String({ description: "要删除的任务 ID" }),
 		}),
 		async execute(params) {
-			const deleted = jobStore.delete(params.id);
+			const deleted = await jobStore.delete(params.id);
 			const tenant = getCurrentTenant();
 			const tenantStore = getCurrentTenantStore();
 			if (deleted && tenant) {
@@ -206,7 +206,7 @@ export function createSchedulerTools(
 			id: Type.String({ description: "要执行的任务 ID" }),
 		}),
 		async execute(params) {
-			const job = jobStore.get(params.id);
+			const job = await jobStore.get(params.id);
 			if (!job) {
 				return {
 					content: [{ type: "text" as const, text: `未找到任务 ${params.id}` }],

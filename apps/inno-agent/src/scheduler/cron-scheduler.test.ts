@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChannelRegistry } from "../channels/channel.js";
 import { CronScheduler } from "./cron-scheduler.js";
 import { executeJob } from "./job-runner.js";
-import { JobStore } from "./job-store.js";
+import { FileJobStore } from "./job-store.js";
 import type { ScheduledJob } from "./types.js";
 
 vi.mock("./job-runner.js", () => ({
@@ -26,12 +26,12 @@ describe("CronScheduler runtime targets", () => {
 	it("gives every run a durable session and passes the executor", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "inno-cron-runtime-"));
 		dirs.push(dir);
-		const store = new JobStore(dir, "UTC");
-		const first = store.create({
+		const store = new FileJobStore(dir, "UTC");
+		const first = await store.create({
 			name: "first", cron: "* * * * *", timezone: "UTC", enabled: true,
 			taskType: "custom_prompt", prompt: "first prompt",
 		});
-		const second = store.create({
+		const second = await store.create({
 			name: "second", cron: "* * * * *", timezone: "UTC", enabled: true,
 			taskType: "custom_prompt", prompt: "second prompt", runtime: "durable",
 		});

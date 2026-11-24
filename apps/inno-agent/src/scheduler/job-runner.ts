@@ -121,10 +121,10 @@ export async function executeJob(
 	const requestedOccurrenceId = options?.occurrenceId
 		?? (options?.scheduledAt ? occurrenceIdFor(job.id, options.scheduledAt) : undefined);
 	const requestedOccurrence = !isReminderJob && checkInStore && requestedOccurrenceId
-		? checkInStore.getOccurrence(job.id, requestedOccurrenceId, startedAt)
+		? await checkInStore.getOccurrence(job.id, requestedOccurrenceId, startedAt)
 		: undefined;
 	const checkInOccurrence = !isReminderJob && checkInStore
-		? checkInStore.resolveOccurrence(job.id, requestedOccurrenceId, startedAt)
+		? await checkInStore.resolveOccurrence(job.id, requestedOccurrenceId, startedAt)
 		: undefined;
 	// A selected slot must still belong to today's live plan. The route also
 	// validates this before execution, but keeping the guard here prevents an
@@ -161,7 +161,7 @@ export async function executeJob(
 	const useDurable = !(job.taskType === "push_reminder" || job.taskType === "check_in_reminder");
 
 	try {
-		if (isCheckInReminder && checkInStore?.isCheckedInToday()) {
+		if (isCheckInReminder && await checkInStore?.isCheckedInToday()) {
 			const finishedAt = new Date();
 			const output = "今天已经完成学习打卡，跳过提醒。";
 			jobStore.appendRun({
@@ -411,7 +411,7 @@ async function reconcileCheckIn(
 	error: string | undefined,
 ): Promise<CheckInStatus | undefined> {
 	if (!checkInStore || !occurrence) return undefined;
-	const result = checkInStore.recordOccurrence({
+	const result = await checkInStore.recordOccurrence({
 		occurrenceId: occurrence.occurrenceId,
 		jobId: occurrence.jobId,
 		scheduledAt: occurrence.scheduledAt,

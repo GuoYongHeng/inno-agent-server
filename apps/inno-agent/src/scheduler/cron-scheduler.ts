@@ -48,7 +48,7 @@ export class CronScheduler {
 		if (this.ticking) return;
 		this.ticking = true;
 		try {
-			const jobs = this.jobStore.list();
+			const jobs = await this.jobStore.list();
 			const now = new Date();
 			for (const job of jobs) {
 				if (!job.enabled || this.running.has(job.id)) continue;
@@ -57,7 +57,7 @@ export class CronScheduler {
 				const occurrenceId = occurrenceIdFor(job.id, scheduledAt);
 				try {
 					if (this.checkInStore && isLearningJob(job)) {
-						const slot = this.checkInStore.getOccurrence(job.id, occurrenceId, now);
+						const slot = await this.checkInStore.getOccurrence(job.id, occurrenceId, now);
 						if (slot && (slot.status === "success" || slot.status === "skipped")) {
 							this.runJob(job, scheduledAt, occurrenceId, false);
 							continue;

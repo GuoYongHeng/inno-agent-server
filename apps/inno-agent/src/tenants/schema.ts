@@ -457,6 +457,73 @@ ALTER TABLE workspace_files
 	CHECK (kind IN ('file','directory'));
 `;
 
+
+/**
+ * Per-tenant scheduler ledgers (jobs.json / runs.jsonl replacement): the job
+ * row stores the full normalized ScheduledJob JSON; run history is one row per
+ * run so recent-history queries read a bounded tail by job or tenant.
+ */
+const TENANT_JOBS_SQL = `
+CREATE TABLE IF NOT EXISTS tenant_jobs (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	job_id text NOT NULL,
+	data jsonb NOT NULL,
+	created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, job_id)
+);
+
+CREATE TABLE IF NOT EXISTS tenant_job_runs (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	run_id text NOT NULL,
+	job_id text,
+	data jsonb NOT NULL,
+	recorded_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, run_id)
+);
+CREATE INDEX IF NOT EXISTS tenant_job_runs_job_idx
+	ON tenant_job_runs (tenant_id, job_id, recorded_at DESC);
+`;
+
+/**
+ * Per-tenant check-in ledger (checkins.json / occurrences.json replacement).
+ */
+const TENANT_CHECKINS_SQL = `
+CREATE TABLE IF NOT EXISTS tenant_checkins (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	date text NOT NULL,
+	checked_in_at timestamptz NOT NULL,
+	completed_occurrence_ids jsonb NOT NULL DEFAULT '[]',
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS tenant_checkin_occurrences (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	occurrence_id text NOT NULL,
+	job_id text NOT NULL,
+	data jsonb NOT NULL,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, occurrence_id)
+);
+CREATE INDEX IF NOT EXISTS tenant_checkin_occurrences_job_idx
+	ON tenant_checkin_occurrences (tenant_id, job_id);
+`;
+
+/**
+ * Small per-tenant key-value state (channel default targets, chat-session
+ * bindings, session-channel metadata, wechat login token). Values are stored
+ * as JSON text so jsonb's key reordering / U+0000 restriction never applies.
+ */
+const TENANT_STATE_SQL = `
+CREATE TABLE IF NOT EXISTS tenant_state (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	key text NOT NULL,
+	value jsonb NOT NULL,
+	updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, key)
+);
+`;
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
@@ -470,6 +537,9 @@ export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 10, name: "session_affinity", sql: SESSION_AFFINITY_SQL },
 	{ version: 11, name: "workspace_replica", sql: WORKSPACE_REPLICA_SQL },
 	{ version: 12, name: "workspace_file_kind", sql: WORKSPACE_FILE_KIND_SQL },
+	{ version: 13, name: "tenant_jobs", sql: TENANT_JOBS_SQL },
+	{ version: 14, name: "tenant_checkins", sql: TENANT_CHECKINS_SQL },
+	{ version: 15, name: "tenant_state", sql: TENANT_STATE_SQL },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

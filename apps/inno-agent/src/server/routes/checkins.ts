@@ -20,7 +20,7 @@ export async function handleCheckInsRoutes(
 	ctx: CheckInsRouteContext,
 ): Promise<boolean> {
 	const getOwnedOccurrence = async (occurrenceId: string) => {
-		const occurrence = ctx.checkInStore.getOccurrenceById(occurrenceId);
+		const occurrence = await ctx.checkInStore.getOccurrenceById(occurrenceId);
 		return occurrence && await ownsRequestResource(req, ctx.tenantStore, "job", occurrence.jobId)
 			? occurrence
 			: undefined;
@@ -28,7 +28,7 @@ export async function handleCheckInsRoutes(
 	// Read-only by design: check-in state is derived server-side from job runs;
 	// clients cannot create or forge a check-in.
 	if (method === "GET" && (url === "/api/checkins" || url === "/api/checkins/today")) {
-		json(res, 200, ctx.checkInStore.status());
+		json(res, 200, await ctx.checkInStore.status());
 		return true;
 	}
 
@@ -37,7 +37,7 @@ export async function handleCheckInsRoutes(
 	// completed task even if a stale deferred entry is still armed.
 	if (method === "GET" && url === "/api/checkins/pending-runs") {
 		const runs = await Promise.all(listDeferredRuns().map(async (run) => {
-			const occurrence = ctx.checkInStore.getOccurrence(run.jobId, run.occurrenceId);
+			const occurrence = await ctx.checkInStore.getOccurrence(run.jobId, run.occurrenceId);
 			requireRequestTenant(req);
 			if (!occurrence || !await ownsRequestResource(req, ctx.tenantStore, "job", run.jobId)) return null;
 			return !occurrence || (occurrence.status !== "success" && occurrence.status !== "skipped") ? run : null;
@@ -65,7 +65,7 @@ export async function handleCheckInsRoutes(
 			// another tab). The slot is already settled, so report success and
 			// let the client's settled-slot pre-check quietly stand down instead
 			// of surfacing a spurious failure.
-			const occurrence = ctx.checkInStore.getOccurrenceById(occurrenceId);
+			const occurrence = await ctx.checkInStore.getOccurrenceById(occurrenceId);
 			if (occurrence?.status === "skipped") {
 				json(res, 200, { skipped: true, alreadySkipped: true });
 				return true;
@@ -95,7 +95,7 @@ export async function handleCheckInsRoutes(
 			// already persisted the slot. Treat a repeated skip for that same
 			// slot as success so the client cannot resurrect the banner by
 			// retrying (a plain 409 would look like "auto-execution won").
-			const occurrence = ctx.checkInStore.getOccurrenceById(occurrenceId);
+			const occurrence = await ctx.checkInStore.getOccurrenceById(occurrenceId);
 			if (occurrence?.status === "skipped") {
 				json(res, 200, { skipped: true, alreadySkipped: true });
 				return true;
@@ -104,7 +104,7 @@ export async function handleCheckInsRoutes(
 			return true;
 		}
 		ctx.checkInStore.releaseOccurrenceClaim(occurrenceId);
-		ctx.checkInStore.recordOccurrence({
+		await ctx.checkInStore.recordOccurrence({
 			occurrenceId,
 			jobId: cancelled.jobId,
 			scheduledAt: cancelled.scheduledAt,
