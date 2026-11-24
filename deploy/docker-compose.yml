@@ -20,11 +20,11 @@ services:
     env_file:
       - path: ../.env
         required: false
+    # INNO_DATA_DIR / INNO_SKILLS_DIR / INNO_WORKSPACE_DIR come from the image
+    # (Dockerfile.backend ENV): /var/lib/inno-agent/data, /app/skills,
+    # /srv/inno-workspace — all pure scratch on the container writable layer.
     environment:
       INNO_CONFIG_DIR: /etc/inno-agent
-      INNO_DATA_DIR: /var/lib/inno-agent/data
-      INNO_SKILLS_DIR: /app/skills
-      INNO_WORKSPACE_DIR: /srv/inno-workspace
       INNO_PORT: 3000
       INNO_HOST: 0.0.0.0
       # local exec: bash/file tools run inside this container (the container
@@ -62,19 +62,16 @@ services:
       # /etc/inno-agent/config.json is the OPERATOR-MANAGED catalog: providers
       # and apiKeys, tavily key, channel endpoints/bridge token. Tenants only
       # pick a model and flip channel/memory toggles — their choices live in
-      # PostgreSQL. Seed this file once (see config.example.json); keep the
-      # volume persistent because it holds real credentials.
+      # the tenant_configs row, read async per request, never on disk. Seed
+      # this file once (see config.example.json); keep the volume persistent
+      # because it holds real credentials.
       - inno-agent-config:/etc/inno-agent
-      # Scratch: session workspaces are materialised here, config is mirrored
-      # from PostgreSQL, downloads/cache are transient. Losing this volume
-      # only loses un-pushed workspace deltas — the source of truth is
-      # postgres-data + minio-data. A tmpfs/anonymous volume also works.
-      - inno-agent-data:/var/lib/inno-agent/data
-      # Same scratch semantics as inno-agent-data: a local materialisation of
-      # workspace objects whose truth is the S3 replica.
-      # Global skills come from the image (/app/skills). For skill development,
-      # mount a live dir instead, e.g. ../runtime/skills:/app/skills
-      - inno-agent-workspace:/srv/inno-workspace
+      # Everything else the agent writes — workspace copies in
+      # INNO_WORKSPACE_DIR, downloads/caches/logs in INNO_DATA_DIR — is
+      # scratch on the container writable layer by design: the source of
+      # truth is postgres-data + minio-data. For skill development, mount a
+      # live dir over the image's /app/skills, e.g.
+      #   ../runtime/skills:/app/skills
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s
@@ -167,5 +164,3 @@ volumes:
   postgres-data:
   minio-data:
   inno-agent-config:
-  inno-agent-data:
-  inno-agent-workspace:
