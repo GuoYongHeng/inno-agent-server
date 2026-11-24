@@ -611,8 +611,8 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 
 1. S1 缺口清单里，哪些缺口"必须补齐才能发布"，哪些可接受为已知丢失（需按产品优先级判断）。
 2. `@earendil-works/pi-web-ui` 在 web 端的实际使用范围。
-3. 发布形态：移除前是否先发一个带"legacy 即将移除"提示的过渡版本。
-4. pi-durable 升级时 `Storage` 与 `ExecutionEnv` 接口的稳定性，需要与上游确认兼容性承诺。
-5. 沙箱技术选型和部署形态（自建 Kubernetes 与托管服务）。
-6. 对象存储选型，以及 L2 正文是否需要租户级加密。
-7. 目标规模（租户数、单租户会话数、并发 turn 数）：决定是否需要 H4 的完整动态路由，还是固定分片加人工迁移即可。
+3. ~~发布形态：移除前是否先发一个带"legacy 即将移除"提示的过渡版本~~ 已过时：legacy 已移除上线。
+4. ~~pi-durable 升级时 `Storage` 与 `ExecutionEnv` 接口的稳定性~~ 已定：升级时手动验证兼容性，不依赖上游承诺。
+5. ~~沙箱技术选型和部署形态~~ 第一期不接入沙箱，暂不考虑；真实沙箱（E2B 协议服务）接入时再定自建/托管。
+6. ~~对象存储选型，以及 L2 正文是否需要租户级加密~~ 已定：对象存储用 AWS S3 SDK（`S3ObjectStore`），部署方自选 S3 兼容服务（MinIO/OSS 等）；L2 正文不做租户级加密。
+7. ~~目标规模（租户数、单租户会话数、并发 turn 数）~~ 已定：先自托管、目标服务化，并发 turn >50。静态分片 + PG 租约懒接管的架构保留，H4 完整动态路由不做。服务发现按部署形态分两路：k8s 用 StatefulSet + headless service（Pod 名即 shard id、Pod DNS 即 shard URL，可让 shard id 缺省回退 `HOSTNAME`）；docker compose 用显式 worker + `INNO_DURABLE_SHARD_URLS` 静态 map。PG worker 注册表仅在 compose 需要动态副本时再做（小工作项）。
