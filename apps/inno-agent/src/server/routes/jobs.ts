@@ -11,7 +11,7 @@ import { logger } from "../../logger.js";
 import { cancelDeferredRun, isDeferredExecuting } from "../../scheduler/deferred-runs.js";
 import { claimOccurrenceForExecution } from "../../scheduler/execution-claims.js";
 import type { JobRunClaim, TenantStore } from "../../tenants/store.js";
-import { claimRequestResource, getRequestTenant, ownsRequestResource, releaseRequestResource } from "../../tenants/http.js";
+import { claimRequestResource, ownsRequestResource, releaseRequestResource, requireRequestTenant } from "../../tenants/http.js";
 
 type JobRunStreamEvent =
 	| { type: "job_state"; status: "queued" | "running" }
@@ -179,7 +179,7 @@ export interface JobsRouteContext {
 	abortJobRun?: (sessionId: string) => Promise<boolean>;
 	/** Release a durable question waiter when its only live view disconnects. */
 	disconnectJobRun?: (sessionId: string, turnId: string) => void;
-	tenantStore: TenantStore | null;
+	tenantStore: TenantStore;
 }
 
 /**
@@ -265,7 +265,7 @@ export async function handleJobsRoutes(
 
 	const runsMatch = matchRoute("GET", method, url, "/api/jobs/:id/runs");
 	if (runsMatch) {
-		if (getRequestTenant(req) && !jobStore.get(runsMatch.id)) {
+		if (requireRequestTenant(req) && !jobStore.get(runsMatch.id)) {
 			json(res, 404, { error: "Job not found" });
 			return true;
 		}
@@ -394,7 +394,7 @@ export async function handleJobsRoutes(
 			);
 			logger.info({ jobId: job.id, sessionId, runId: result.runId, success: result.success }, "Manual job run stream finished");
 			// Tenant leases end with the attempt; local success retains its legacy claim.
-			if (occurrenceId && (!result.success || getRequestTenant(req))) await occurrenceClaim?.release();
+			if (occurrenceId && (!result.success || requireRequestTenant(req))) await occurrenceClaim?.release();
 			if (!disconnected) writeJobStreamEvent(res, { type: "job_result", result });
 		} catch (err) {
 			logger.error({ err, jobId: job.id, sessionId }, "Manual job run stream failed");
@@ -418,7 +418,7 @@ export async function handleJobsRoutes(
 		const body = await readBody(req) as Record<string, unknown>;
 		const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
 		const occurrenceId = typeof body.occurrenceId === "string" ? body.occurrenceId.trim() : "";
-		if (getRequestTenant(req) && !sessionId) {
+		if (requireRequestTenant(req) && !sessionId) {
 			json(res, 400, { error: "sessionId is required for authenticated manual job runs" });
 			return true;
 		}
@@ -475,7 +475,7 @@ export async function handleJobsRoutes(
 					occurrenceId: occurrenceId || undefined,
 				} : undefined,
 			);
-			if (occurrenceId && (!result.success || getRequestTenant(req))) await occurrenceClaim?.release();
+			if (occurrenceId && (!result.success || requireRequestTenant(req))) await occurrenceClaim?.release();
 			json(res, 200, result);
 		} catch (error) {
 			if (occurrenceId) await occurrenceClaim?.release();

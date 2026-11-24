@@ -24,7 +24,7 @@ import { ensureDir } from "../../storage/file-store.js";
 import { isWithin } from "../../utils/path-safety.js";
 import { TEMP_WORKSPACE_ID, type WorkspaceMeta, type WorkspaceRegistry } from "../../workspace/workspace-registry.js";
 import type { TenantStore } from "../../tenants/store.js";
-import { claimRequestResource, getRequestTenant, ownsRequestResource, releaseRequestResource } from "../../tenants/http.js";
+import { claimRequestResource, ownsRequestResource, releaseRequestResource, requireRequestTenant } from "../../tenants/http.js";
 import { resolveRequestWorkspace, resolveRequestWorkspaceForRead } from "../../tenants/workspaces.js";
 import type { WorkspaceReplica } from "../../workspace/workspace-replica.js";
 import { LocalFsWorkspaceStore } from "../../workspace/local-fs-workspace-store.js";
@@ -67,7 +67,7 @@ export interface WorkspacesRouteContext {
 	workspaceRegistry: WorkspaceRegistry;
 	dataDir: string;
 	paths: RuntimePaths;
-	tenantStore?: TenantStore | null;
+	tenantStore: TenantStore;
 	installSkillZip: (fileName: string, data: Buffer, targetRoot?: string) => { name: string; filePath: string };
 	installSkillMarkdown: (fileName: string, data: Buffer, targetRoot?: string) => { name: string; filePath: string };
 	importWorkspaceZip: (fileName: string, data: Buffer, name?: string) => WorkspaceMeta;
@@ -418,7 +418,7 @@ export async function handleWorkspacesRoutes(
 	const resolveWorkspace = (workspaceId?: string | null) =>
 		resolveRequestWorkspace(req, workspaceRegistry, tenantStore, workspaceId, ctx.workspaceReplica);
 	const replica = ctx.workspaceReplica ?? null;
-	const requestTenant = getRequestTenant(req);
+	const requestTenant = requireRequestTenant(req);
 	/** Upload a workspace's file mirror after a route mutation (authenticated mode). */
 	const pushReplica = async (workspaceId: string) => {
 		if (!replica || !requestTenant) return;
@@ -1404,7 +1404,7 @@ export async function handleWorkspacesRoutes(
 
 	// --- Workspaces registry API ---
 	if (method === "GET" && url === "/api/workspaces") {
-		const tenant = getRequestTenant(req);
+		const tenant = requireRequestTenant(req);
 		if (tenant && !tenantStore) throw new Error("Tenant store is required for an authenticated request");
 		if (tenant) await resolveWorkspace(TEMP_WORKSPACE_ID);
 		const [ownedWorkspaceIds, ownedSessionIds] = tenant

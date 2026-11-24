@@ -14,13 +14,8 @@ function authEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 }
 
 describe("auth runtime config", () => {
-	it("defaults to local mode without PostgreSQL configuration", () => {
-		expect(readAuthRuntimeConfig({})).toEqual({
-			mode: "local",
-			trustedOrigins: [],
-			allowSignUp: false,
-			multiUserEnabled: false,
-		});
+	it("requires the full better-auth environment", () => {
+		expect(() => readAuthRuntimeConfig({})).toThrow("DATABASE_URL");
 	});
 
 	it("loads Better Auth and normalizes origins", () => {
@@ -28,7 +23,6 @@ describe("auth runtime config", () => {
 			BETTER_AUTH_URL: "https://agent.example.com/login",
 			INNO_TRUSTED_ORIGINS: "https://app.example.com/path, http://localhost:5173",
 		}))).toMatchObject({
-			mode: "better-auth",
 			baseUrl: "https://agent.example.com",
 			trustedOrigins: ["https://app.example.com", "http://localhost:5173"],
 			allowSignUp: true,
@@ -46,14 +40,8 @@ describe("auth runtime config", () => {
 		expect(() => readAuthRuntimeConfig(authEnv({ BETTER_AUTH_SECRET: "short" }))).toThrow("at least 32");
 	});
 
-	it("allows the explicit multi-user gate only with Better Auth and durable execution", () => {
-		expect(readAuthRuntimeConfig(authEnv({ INNO_MULTI_USER_ENABLED: "true", INNO_DURABLE_ENABLED: "true" }))).toMatchObject({
-			mode: "better-auth",
-			multiUserEnabled: true,
-		});
-		expect(() => readAuthRuntimeConfig({ INNO_MULTI_USER_ENABLED: "true" })).toThrow("requires INNO_AUTH_MODE=better-auth");
-		// Durable is the only runtime, so multi-user mode needs no separate durable switch.
-		expect(readAuthRuntimeConfig(authEnv({ INNO_MULTI_USER_ENABLED: "true" }))).toMatchObject({ multiUserEnabled: true });
+	it("rejects the obsolete multi-user gate", () => {
+		expect(() => readAuthRuntimeConfig(authEnv({ INNO_MULTI_USER_ENABLED: "true" }))).toThrow("INNO_MULTI_USER_ENABLED is obsolete");
 	});
 
 	it("rejects invalid mode and boolean values", () => {
@@ -64,21 +52,10 @@ describe("auth runtime config", () => {
 
 describe("listen config", () => {
 	it("defaults to loopback", () => {
-		expect(readListenConfig({}, "local").host).toBe("127.0.0.1");
+		expect(readListenConfig({}).host).toBe("127.0.0.1");
 	});
 
-	it("rejects unauthenticated non-loopback listeners by default", () => {
-		expect(() => readListenConfig({ INNO_HOST: "0.0.0.0" }, "local")).toThrow("INNO_ALLOW_UNAUTHENTICATED_NETWORK");
-	});
-
-	it("allows an explicit insecure network override", () => {
-		expect(readListenConfig({
-			INNO_HOST: "0.0.0.0",
-			INNO_ALLOW_UNAUTHENTICATED_NETWORK: "true",
-		}, "local").host).toBe("0.0.0.0");
-	});
-
-	it("allows non-loopback listeners in authenticated mode", () => {
-		expect(readListenConfig({ INNO_HOST: "0.0.0.0" }, "better-auth").host).toBe("0.0.0.0");
+	it("allows non-loopback listeners", () => {
+		expect(readListenConfig({ INNO_HOST: "0.0.0.0" }).host).toBe("0.0.0.0");
 	});
 });

@@ -27,7 +27,7 @@ import {
 
 export interface BtwRouteContext {
 	dataDir: string;
-	tenantStore?: TenantStore | null;
+	tenantStore: TenantStore;
 	durableSessions: DurableHttpContext["service"];
 }
 

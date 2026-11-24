@@ -4,11 +4,11 @@ import type { CheckInStore } from "../../checkins/check-in-store.js";
 import { cancelDeferredRun, listDeferredRuns } from "../../scheduler/deferred-runs.js";
 import { json, readBody } from "../http-helpers.js";
 import type { TenantStore } from "../../tenants/store.js";
-import { getRequestTenant, ownsRequestResource } from "../../tenants/http.js";
+import { ownsRequestResource, requireRequestTenant } from "../../tenants/http.js";
 
 export interface CheckInsRouteContext {
 	checkInStore: CheckInStore;
-	tenantStore?: TenantStore | null;
+	tenantStore: TenantStore;
 }
 
 /** /api/checkins* route domain for the personal learning check-in MVP. */
@@ -38,11 +38,8 @@ export async function handleCheckInsRoutes(
 	if (method === "GET" && url === "/api/checkins/pending-runs") {
 		const runs = await Promise.all(listDeferredRuns().map(async (run) => {
 			const occurrence = ctx.checkInStore.getOccurrence(run.jobId, run.occurrenceId);
-			if (getRequestTenant(req)) {
-				if (!occurrence || !await ownsRequestResource(req, ctx.tenantStore, "job", run.jobId)) return null;
-			} else if (!ctx.checkInStore) {
-				return run;
-			}
+			requireRequestTenant(req);
+			if (!occurrence || !await ownsRequestResource(req, ctx.tenantStore, "job", run.jobId)) return null;
 			return !occurrence || (occurrence.status !== "success" && occurrence.status !== "skipped") ? run : null;
 		}));
 		json(res, 200, runs.filter((run) => run !== null));
@@ -58,7 +55,7 @@ export async function handleCheckInsRoutes(
 			json(res, 400, { error: "occurrenceId is required" });
 			return true;
 		}
-		if (getRequestTenant(req) && !await getOwnedOccurrence(occurrenceId)) {
+		if (!await getOwnedOccurrence(occurrenceId)) {
 			json(res, 404, { error: "Occurrence not found" });
 			return true;
 		}
@@ -88,7 +85,7 @@ export async function handleCheckInsRoutes(
 			json(res, 400, { error: "occurrenceId is required" });
 			return true;
 		}
-		if (getRequestTenant(req) && !await getOwnedOccurrence(occurrenceId)) {
+		if (!await getOwnedOccurrence(occurrenceId)) {
 			json(res, 404, { error: "Occurrence not found" });
 			return true;
 		}

@@ -6,15 +6,32 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { afterEach, describe, expect, it } from "vitest";
 import { normalizeConfig, normalizeSandboxConfig } from "../config.js";
+import { saveTenantConfig } from "../tenants/config.js";
 import { LocalDirSandboxProvider } from "../sandbox/local-backend.js";
 import { SandboxManager, SANDBOX_WORKSPACE_ROOT } from "../sandbox/sandbox-session.js";
 import { runWithoutTenantContext } from "../tenants/current.js";
+import { setRequestTenant } from "../tenants/http.js";
+import type { TenantContext, TenantStore } from "../tenants/store.js";
+import type { Pool } from "pg";
+import { resolveRequestTenantDataRoot } from "../tenants/paths.js";
 import { DurableSessionService } from "./durable-session-service.js";
+import { FileSessionCatalog } from "./session-catalog.js";
 import { DurableSessionRuntime } from "./durable-runtime.js";
 
 const roots: string[] = [];
 const services: DurableSessionService[] = [];
 const providers: LocalDirSandboxProvider[] = [];
+const ctxT = { tenantId: "t", userId: "u", role: "owner" } as TenantContext;
+const tenantStore = {
+	acquireDurableStorageLock: async () => undefined,
+	claimDurableStorage: async () => 1,
+	renewDurableStorage: async () => true,
+	releaseDurableStorage: async () => {},
+} as unknown as TenantStore;
+const fakePool = {
+	query: async () => ({ rows: [], rowCount: 0 }),
+	connect: async () => ({ query: async () => ({ rows: [], rowCount: 0 }), release: () => {} }),
+} as unknown as Pool;
 
 afterEach(async () => {
 	await Promise.all(services.splice(0).map((service) => service.close()));
@@ -37,17 +54,22 @@ function setup(approval: "always" | "never", responses: ReturnType<typeof fauxAs
 	const faux = fauxProvider();
 	faux.setResponses(responses);
 	const instructions: string[] = [];
+	const cfg = normalizeConfig({
+		defaultProvider: "p", defaultModel: "m",
+		providers: { p: { baseUrl: "http://x.invalid/v1", apiKey: "k", models: [{ id: "m", name: "M", reasoning: false, input: ["text"], contextWindow: 8000, maxTokens: 1000 }] } },
+	});
+	saveTenantConfig(base, ctxT.tenantId, cfg);
 	const service = new DurableSessionService({
 		dataDir: base,
-		getLocalConfig: () => normalizeConfig({
-			defaultProvider: "p", defaultModel: "m",
-			providers: { p: { baseUrl: "http://x.invalid/v1", apiKey: "k", models: [{ id: "m", name: "M", reasoning: false, input: ["text"], contextWindow: 8000, maxTokens: 1000 }] } },
-		}),
+		getLocalConfig: () => cfg,
 		enabled: true,
 		resolveWorkspaceDir: () => workspace,
 		skillsDir: skills,
 		getSandboxManager: () => manager,
-		openRuntime: async (options) => {
+		pgCatalog: new FileSessionCatalog((r) => join(resolveRequestTenantDataRoot(r, base), "durable", "sessions.json")),
+		recoveryPool: fakePool,
+		tenantStore,
+		openRuntime: async ({ openStorage: _pg, ...options }) => {
 			instructions.push(options.instructions ?? "");
 			const models = createModels();
 			models.setProvider(faux.provider);
@@ -56,6 +78,7 @@ function setup(approval: "always" | "never", responses: ReturnType<typeof fauxAs
 	});
 	services.push(service);
 	const req = { headers: {} } as IncomingMessage;
+	setRequestTenant(req, ctxT, tenantStore);
 	const turn = async (sessionId: string, prompt: string, requestId: string, noUi = false) => {
 		const lease = await service.lease(req, sessionId);
 		try {

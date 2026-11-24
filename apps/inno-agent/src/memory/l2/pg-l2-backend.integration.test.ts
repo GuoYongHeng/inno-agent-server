@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Pool } from "pg";
@@ -180,33 +180,4 @@ describe("PgL2Backend", () => {
 		await expect(backend.putBinary("raw/../x.bin", new Uint8Array([1]))).rejects.toThrow();
 	});
 
-	it("imports a legacy file-backed L2 directory once and rebuilds the index", async () => {
-		const legacy = join(dataDir, "legacy-l2");
-		mkdirSync(join(legacy, "wiki", "concepts"), { recursive: true });
-		mkdirSync(join(legacy, "raw", "uploads"), { recursive: true });
-		writeFileSync(join(legacy, "manifest.jsonl"), `${JSON.stringify(entry("l2src_legacy"))}\n`);
-		writeFileSync(join(legacy, "wiki", "concepts", "legacy.md"), "---\ntitle: 旧概念\n---\n# 旧概念\n\n旧系统的迁移内容\n");
-		writeFileSync(join(legacy, "wiki", "index.md"), "# Index\n");
-		writeFileSync(join(legacy, "raw", "uploads", "old.pdf"), "%PDF-1.4 old");
-		writeFileSync(join(legacy, "index.db-wal"), "sqlite-junk");
-
-		await pool.query(
-			`INSERT INTO "user" (id, name, email, "emailVerified", "createdAt", "updatedAt") VALUES ('l2-user-c', 'c', 'c@example.com', false, NOW(), NOW())`,
-		);
-		const tenantC = await new TenantStore(pool).ensurePersonalTenant("l2-user-c");
-		const backend = new PgL2Backend(pool, tenantC.tenantId, objects, legacy);
-		// First access triggers the one-time import.
-		expect(await backend.readText("wiki/concepts/legacy.md")).toContain("旧系统的迁移内容");
-		expect(existsSync(`${legacy}.migrated`)).toBe(true);
-		expect(existsSync(legacy)).toBe(false);
-
-		expect((await backend.readManifest()).map((e) => e.id)).toEqual(["l2src_legacy"]);
-		expect(new TextDecoder().decode((await backend.readBinary("raw/uploads/old.pdf"))!)).toBe("%PDF-1.4 old");
-		// The sqlite index file was skipped and the index rebuilt from pages.
-		expect(await backend.exists("index.db-wal")).toBe(false);
-		expect((await backend.searchLexical("旧概念", 5)).map((hit) => hit.path)).toEqual(["wiki/concepts/legacy.md"]);
-		// Second backend does not re-import (dir is gone).
-		const again = new PgL2Backend(pool, tenantC.tenantId, objects, `${legacy}.migrated`);
-		expect((await again.readManifest()).map((e) => e.id)).toEqual(["l2src_legacy"]);
-	});
 });

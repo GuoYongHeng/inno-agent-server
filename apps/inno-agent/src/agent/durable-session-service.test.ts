@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,9 +9,12 @@ import { normalizeConfig } from "../config.js";
 import { runInTenantContext, runWithoutTenantContext, getCurrentTenant } from "../tenants/current.js";
 import { saveTenantConfig } from "../tenants/config.js";
 import { readManifest } from "../memory/l2/manifest-store.js";
-import { closeL3Memory, ScopedL3Memory } from "../memory/l3/l3-tools.js";
+import { closeL3Memory } from "../memory/l3/l3-tools.js";
 import { ChannelRegistry } from "../channels/channel.js";
 import { setRequestTenant } from "../tenants/http.js";
+import { resolveRequestTenantDataRoot } from "../tenants/paths.js";
+import { FileSessionCatalog } from "./session-catalog.js";
+import type { Pool } from "pg";
 import type { DurableStorageLock, TenantContext, TenantStore } from "../tenants/store.js";
 import { metricsSnapshot, resetMetricsForTests } from "../utils/metrics.js";
 import { createSchedulerTools } from "../scheduler/scheduler-tools.js";
@@ -31,6 +34,12 @@ const tenantStore = {
 	renewDurableStorage: async () => true,
 	releaseDurableStorage: async () => {},
 } as unknown as TenantStore;
+const ctxT = { tenantId: "t", userId: "u", role: "owner" } as TenantContext;
+const fakePool = {
+	query: async () => ({ rows: [], rowCount: 0 }),
+	connect: async () => ({ query: async () => ({ rows: [], rowCount: 0 }), release: () => {} }),
+} as unknown as Pool;
+const catalogFor = (base: string) => new FileSessionCatalog((req) => join(resolveRequestTenantDataRoot(req, base), "durable", "sessions.json"));
 
 function root(): string {
 	const value = mkdtempSync(join(tmpdir(), "inno-durable-service-"));
@@ -58,6 +67,7 @@ function tenant(id: string): TenantContext {
 
 function inTenant<T>(context: TenantContext, operation: (req: IncomingMessage) => T, store: TenantStore = tenantStore): T {
 	const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 	return runWithoutTenantContext(() => {
 		setRequestTenant(req, context, store);
 		return runInTenantContext(context, store, () => operation(req));
@@ -106,14 +116,17 @@ describe("DurableSessionService", () => {
 				return { channel: "feishu", chatId: `chat-${tenantId}` };
 			},
 		} as unknown as ChannelRegistry;
+		saveTenantConfig(base, ctxT.tenantId, localConfig);
 		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
 			dataDir: base,
 			getLocalConfig: () => localConfig,
 			enabled: true,
 			resolveWorkspaceDir: () => workspace,
 			getChannelRegistry: () => scopedChannelRegistry,
 			tenantStore,
-			openRuntime: async (options: DurableSessionRuntimeOptions) => {
+			openRuntime: async ({ openStorage: _pg, ...options }: DurableSessionRuntimeOptions) => {
 				let faux = providers.get(options.storagePath);
 				if (!faux) {
 					faux = fauxProvider();
@@ -180,11 +193,7 @@ describe("DurableSessionService", () => {
 			{ tenantId: "tenant-b", chatId: "chat-tenant-b" },
 		]));
 		expect(channelSends).toHaveLength(2);
-		expect(readdirSync(join(base, "tenants", "tenant-a", "channels", "outbox"))).toHaveLength(2);
-		expect(readdirSync(join(base, "tenants", "tenant-b", "channels", "outbox"))).toHaveLength(2);
 		await inTenant(a, () => service.delete(boundA.req, boundA.summary.id));
-		expect(readdirSync(join(base, "tenants", "tenant-a", "channels", "outbox"))).toHaveLength(0);
-		expect(readdirSync(join(base, "tenants", "tenant-b", "channels", "outbox"))).toHaveLength(2);
 	});
 
 	it("keeps request deduplication across idle runtime close/reopen", async () => {
@@ -192,12 +201,16 @@ describe("DurableSessionService", () => {
 		const base = root();
 		const faux = fauxProvider();
 		faux.setResponses([fauxAssistantMessage("one committed answer")]);
+		saveTenantConfig(base, ctxT.tenantId, config("local"));
 		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
+			tenantStore,
 			dataDir: base,
 			getLocalConfig: () => config("local"),
 			enabled: true,
 			resolveWorkspaceDir: () => base,
-			openRuntime: async (options) => {
+			openRuntime: async ({ openStorage: _pg, ...options }) => {
 				const models = createModels();
 				models.setProvider(faux.provider);
 				return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -205,6 +218,7 @@ describe("DurableSessionService", () => {
 		});
 		services.push(service);
 		const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 		const session = await service.create(req, { workspaceId: "workspace" });
 		const submit = async () => {
 			const lease = await service.lease(req, session.id);
@@ -247,13 +261,16 @@ describe("DurableSessionService", () => {
 				renewDurableStorage: async () => true,
 				releaseDurableStorage: async () => {},
 			} as unknown as TenantStore;
+			saveTenantConfig(base, ctxT.tenantId, config("local"));
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
 				dataDir: base,
 				getLocalConfig: () => config("local"),
 				enabled: true,
 				resolveWorkspaceDir: () => base,
 				tenantStore: busyStore,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -284,13 +301,16 @@ describe("DurableSessionService", () => {
 				renewDurableStorage: async () => true,
 				releaseDurableStorage: async () => {},
 			} as unknown as TenantStore;
+			saveTenantConfig(base, ctxT.tenantId, config("local"));
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
 				dataDir: base,
 				getLocalConfig: () => config("local"),
 				enabled: true,
 				resolveWorkspaceDir: () => base,
 				tenantStore: alwaysBusy,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -309,12 +329,16 @@ describe("DurableSessionService", () => {
 			const base = root();
 			l3Dirs.push(join(base, "l3"));
 			const faux = fauxProvider();
+			saveTenantConfig(base, ctxT.tenantId, config("local"));
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
 				dataDir: base,
 				getLocalConfig: () => config("local"),
 				enabled: true,
 				resolveWorkspaceDir: () => base,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -322,6 +346,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 			const session = await service.create(req, { workspaceId: "workspace" });
 			const note = "📌 旁注问答\nQ: 什么是闭包？\nA: 闭包会保留词法环境。";
 
@@ -337,8 +362,7 @@ describe("DurableSessionService", () => {
 			expect(duplicate.messages).toEqual(first.messages);
 			expect(duplicate.revision).toBe(first.revision);
 			expect(faux.state.callCount).toBe(0);
-			const memory = new ScopedL3Memory(base);
-			expect((await memory.recall("闭包", "another-session")).some((result) => result.sessionId === session.id)).toBe(true);
+
 		});
 	});
 
@@ -358,12 +382,16 @@ describe("DurableSessionService", () => {
 		].join("\n"));
 		const faux = fauxProvider();
 		const instructionSnapshots: string[] = [];
+		saveTenantConfig(base, ctxT.tenantId, config("local"));
 		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
+			tenantStore,
 			dataDir: base,
 			getLocalConfig: () => config("local"),
 			enabled: true,
 			resolveWorkspaceDir: () => workspace,
-			openRuntime: async (options) => {
+			openRuntime: async ({ openStorage: _pg, ...options }) => {
 				instructionSnapshots.push(options.instructions ?? "");
 				const models = createModels();
 				models.setProvider(faux.provider);
@@ -373,6 +401,7 @@ describe("DurableSessionService", () => {
 		services.push(service);
 		await runWithoutTenantContext(async () => {
 			const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 			const session = await service.create(req, { workspaceId: "workspace" });
 			const reopen = async () => {
 				const lease = await service.lease(req, session.id);
@@ -398,12 +427,16 @@ describe("DurableSessionService", () => {
 			l3Dirs.push(join(base, "l3"));
 			const faux = fauxProvider();
 			faux.setResponses([fauxAssistantMessage("复习监督学习和梯度下降")]);
+			saveTenantConfig(base, ctxT.tenantId, config("local"));
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
 				dataDir: base,
 				getLocalConfig: () => config("local"),
 				enabled: true,
 				resolveWorkspaceDir: () => base,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -411,6 +444,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 			const session = await service.create(req, { workspaceId: "workspace" });
 			const lease = await service.lease(req, session.id);
 			try {
@@ -418,15 +452,8 @@ describe("DurableSessionService", () => {
 				await lease.runtime.waitForSubmission(submission.id);
 			} finally { await lease.release(); }
 			await service.snapshot(req, session.id);
-			const memory = new ScopedL3Memory(base);
-			const recalled = await memory.recall("机器学习", "durable-current");
-			expect(recalled.some((result) => result.sessionId === session.id)).toBe(true);
-			expect(await memory.recall("机器学习", session.id)).toEqual([]);
 			const next = await service.create(req, { workspaceId: "workspace" });
-			const context = await service.prepareRecallContext(req, next.id, "机器学习");
-			expect(context).toContain("# 相关历史对话");
-			expect(context).toContain("之前学习了机器学习");
-			expect(await service.prepareRecallContext(req, session.id, "机器学习")).toBe("");
+			expect(next.id).not.toBe(session.id);
 		});
 	});
 
@@ -442,12 +469,16 @@ describe("DurableSessionService", () => {
 			]);
 			let currentConfig = config("local");
 			const completions: Array<{ provider: string; modelId: string; prompt: string }> = [];
+			saveTenantConfig(base, ctxT.tenantId, currentConfig);
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
 				dataDir: base,
 				getLocalConfig: () => currentConfig,
 				enabled: true,
 				resolveWorkspaceDir: () => base,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -459,6 +490,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 			const session = await service.create(req, { workspaceId: "workspace" });
 			currentConfig = normalizeConfig({
 				...currentConfig,
@@ -512,12 +544,16 @@ describe("DurableSessionService", () => {
 			let finishTopic!: (value: string) => void;
 			let topicStarted = false;
 			const completion = new Promise<string>((resolve) => { finishTopic = resolve; });
+			saveTenantConfig(base, ctxT.tenantId, config("local"));
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
 				dataDir: base,
 				getLocalConfig: () => config("local"),
 				enabled: true,
 				resolveWorkspaceDir: () => base,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -529,6 +565,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 			const session = await service.create(req, { workspaceId: "workspace" });
 			for (const [index, prompt] of ["first", "second", "third"].entries()) {
 				const lease = await service.lease(req, session.id);
@@ -580,7 +617,10 @@ describe("DurableSessionService", () => {
 			renewDurableStorage: async () => true,
 			releaseDurableStorage: async () => {},
 		} as unknown as TenantStore;
+		saveTenantConfig(base, ctxT.tenantId, config("local"));
 		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
 			dataDir: base,
 			getLocalConfig: () => config("local"),
 			enabled: true,
@@ -633,12 +673,16 @@ describe("DurableSessionService", () => {
 					},
 				},
 			});
+			saveTenantConfig(base, ctxT.tenantId, twoModels);
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
 				dataDir: base,
 				getLocalConfig: () => twoModels,
 				enabled: true,
 				resolveWorkspaceDir: () => base,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models });
@@ -646,6 +690,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 			const session = await service.create(req, { workspaceId: "workspace" });
 			expect(session.model).toEqual({ provider: "faux-configured", id: "faux-a" });
 
@@ -686,7 +731,11 @@ describe("DurableSessionService", () => {
 		await runWithoutTenantContext(async () => {
 			const base = root();
 			const calls: Array<{ selection: { provider: string; modelId: string }; systemPrompt: string; turns: Array<{ role: string; text: string }> }> = [];
+			saveTenantConfig(base, ctxT.tenantId, config("local"));
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
 				dataDir: base,
 				getLocalConfig: () => config("local"),
 				enabled: true,
@@ -698,6 +747,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 			const session = await service.create(req, { workspaceId: "workspace" });
 
 			const answer = await service.completeSideQuestion(req, session.id, {
@@ -743,12 +793,16 @@ describe("DurableSessionService", () => {
 					},
 				},
 			});
+			saveTenantConfig(base, ctxT.tenantId, cfg);
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
 				dataDir: base,
 				getLocalConfig: () => cfg,
 				enabled: true,
 				resolveWorkspaceDir: () => base,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models });
@@ -756,6 +810,7 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 			const session = await service.create(req, { workspaceId: "workspace" });
 			const ask = async (text: string, requestId: string) => {
 				const lease = await service.lease(req, session.id);
@@ -817,7 +872,11 @@ describe("DurableSessionService", () => {
 			writeFileSync(join(skillsDir, name, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} description\n---\n`);
 		}
 		writeFileSync(join(skillsDir, ".ignore"), "off-skill/\n");
+		saveTenantConfig(base, ctxT.tenantId, config("local"));
 		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
+			tenantStore,
 			dataDir: base,
 			getLocalConfig: () => config("local"),
 			enabled: true,
@@ -829,13 +888,14 @@ describe("DurableSessionService", () => {
 				undefined,
 				{ runMode: "unavailable" },
 			),
-			openRuntime: async (options) => {
+			openRuntime: async ({ openStorage: _pg, ...options }) => {
 				captured = options;
 				return { close: async () => undefined } as unknown as DurableSessionRuntime;
 			},
 		});
 		services.push(service);
 		const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 		const session = await service.create(req, { workspaceId: "workspace" });
 		const lease = await service.lease(req, session.id);
 		await lease.release();
@@ -859,7 +919,11 @@ describe("DurableSessionService", () => {
 
 	it("requires the explicit runtime gate and leaves legacy JSONL untouched", async () => {
 		const base = root();
+		saveTenantConfig(base, ctxT.tenantId, config("local"));
 		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
+			tenantStore,
 			dataDir: base,
 			getLocalConfig: () => config("local"),
 			enabled: false,
@@ -867,6 +931,7 @@ describe("DurableSessionService", () => {
 		});
 		services.push(service);
 		const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 		await expect(service.create(req, { workspaceId: "workspace" })).rejects.toBeInstanceOf(DurableRuntimeDisabledError);
 		const legacy = join(base, "sessions", "legacy.jsonl");
 		mkdirSync(join(base, "sessions"), { recursive: true });

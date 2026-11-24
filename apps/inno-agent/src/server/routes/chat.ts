@@ -19,7 +19,7 @@ import { json, matchRoute, readBody } from "../http-helpers.js";
  */
 export interface ChatRouteContext {
 	workspaceRegistry: WorkspaceRegistry;
-	tenantStore?: TenantStore | null;
+	tenantStore: TenantStore;
 	durableSessions: DurableHttpContext["service"];
 	workspaceReplica?: DurableHttpContext["workspaceReplica"];
 	objectStorageDurable?: boolean;

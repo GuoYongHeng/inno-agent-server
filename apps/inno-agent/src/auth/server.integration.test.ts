@@ -135,9 +135,6 @@ async function startServer(): Promise<void> {
 			INNO_WORKSPACE_DIR: join(home, "workspace"),
 			INNO_PORT: port,
 			INNO_HOST: "127.0.0.1",
-			INNO_AUTH_MODE: "better-auth",
-			INNO_MULTI_USER_ENABLED: "true",
-			INNO_DURABLE_ENABLED: "true",
 			DATABASE_URL: postgres.databaseUrl,
 			BETTER_AUTH_SECRET: SECRET,
 			BETTER_AUTH_URL: origin,
@@ -453,7 +450,6 @@ beforeAll(async () => {
 		contentHub: { type: "bundle", baseUrl: providerOrigin },
 	}));
 	await migrateAuthDatabase(readAuthRuntimeConfig({
-		INNO_AUTH_MODE: "better-auth",
 		DATABASE_URL: postgres.databaseUrl,
 		BETTER_AUTH_SECRET: SECRET,
 		BETTER_AUTH_URL: origin,
@@ -2185,9 +2181,6 @@ describe("workspace read routes in authenticated mode", () => {
 				INNO_WORKSPACE_DIR: join(providerHome, "workspace"),
 				INNO_PORT: String(port),
 				INNO_HOST: "127.0.0.1",
-				INNO_AUTH_MODE: "better-auth",
-				INNO_MULTI_USER_ENABLED: "true",
-				INNO_DURABLE_ENABLED: "true",
 				DATABASE_URL: postgres.databaseUrl,
 				BETTER_AUTH_SECRET: SECRET,
 				BETTER_AUTH_URL: providerOrigin,

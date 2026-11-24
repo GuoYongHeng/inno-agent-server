@@ -2,7 +2,6 @@ import { incCounter, observeMs } from "../utils/metrics.js";
 import type { SandboxBindingProvider, SandboxRuntimeBinding } from "../sandbox/sandbox-session.js";
 import {
 	DURABLE_ID_PATTERN,
-	FileSessionCatalog,
 	type DurableSessionPatch,
 	type DurableSessionRecord,
 	type SessionCatalog,
@@ -15,12 +14,12 @@ import type { IncomingMessage } from "node:http";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { join } from "node:path";
 import type { InnoConfig } from "../config.js";
-import { FileChannelOutbox, type ChannelOutbox } from "../channels/channel-outbox.js";
+import type { ChannelOutbox } from "../channels/channel-outbox.js";
 import { PgChannelOutbox } from "../channels/pg-channel-outbox.js";
 import type { ChannelRegistry } from "../channels/channel.js";
 import { resolveCurrentTenantConfig } from "../tenants/config.js";
-import { runInTenantContext, runWithoutTenantContext } from "../tenants/current.js";
-import { getRequestTenant } from "../tenants/http.js";
+import { runInTenantContext } from "../tenants/current.js";
+import { requireRequestTenant } from "../tenants/http.js";
 import { resolveRequestTenantDataRoot } from "../tenants/paths.js";
 import { DURABLE_STORAGE_LEASE_MS, durableWorkerId, type DurableStorageLock, type TenantContext, type TenantStore } from "../tenants/store.js";
 import { TOPIC_UPGRADE_MESSAGE_THRESHOLD, type SessionMessageSummary, type SessionSummary } from "../server/session-model.js";
@@ -48,9 +47,9 @@ import {
 import { durableEntriesToMessages } from "./durable-projection.js";
 import { DurablePermissionStore, type PendingDurablePermission } from "./durable-permissions.js";
 import { DurableQuestionStore } from "./durable-questions.js";
-import { DurableStreamStore, FileStreamJournal, type StreamJournal } from "./durable-stream-store.js";
+import type { StreamJournal } from "./durable-stream-store.js";
 import { PgStreamJournal } from "./pg-stream-journal.js";
-import { FileRecoveryStore, PgRecoveryStore, type RecoveryKind, type RecoveryRecordStore } from "./recovery-store.js";
+import { PgRecoveryStore, type RecoveryKind, type RecoveryRecordStore } from "./recovery-store.js";
 import { DurableSessionRuntime } from "./durable-runtime.js";
 import { PgDurableStorage } from "./pg-durable-storage.js";
 import type { PersistedQuestion, QuestionBridgeResult, QuestionResponseStatus } from "./question-types.js";
@@ -135,11 +134,11 @@ export interface DurableSessionServiceOptions {
 	skillsDir?: string;
 	/** Lazy for the same reason: job stores are created during server bootstrap. */
 	getSchedulerTools?: () => ToolRegistration[];
-	tenantStore?: TenantStore | null;
-	/** PostgreSQL catalog for authenticated tenants; without it every scope uses `sessions.json`. */
-	pgCatalog?: SessionCatalog;
-	/** PostgreSQL pool for authenticated tenants' recovery records; without it every scope keeps JSON files. */
-	recoveryPool?: Pool;
+	tenantStore: TenantStore;
+	/** PostgreSQL catalog — the only catalog; sessions.json is gone. */
+	pgCatalog: SessionCatalog;
+	/** PostgreSQL pool for recovery records — the only store; JSON files are gone. */
+	recoveryPool: Pool;
 	/** When set, every session runs its shell and file tools in a remote sandbox. */
 	getSandboxManager?: () => SandboxBindingProvider | undefined;
 	openRuntime?: typeof DurableSessionRuntime.open;
@@ -172,11 +171,9 @@ export interface DurableSessionServiceOptions {
  * pi-durable may resume a tool outside the original HTTP request's async context. */
 function bindToolsToTenant(
 	tools: ToolRegistration[],
-	tenant: ReturnType<typeof getRequestTenant>,
-	tenantStore: TenantStore | null | undefined,
+	tenant: TenantContext,
+	tenantStore: TenantStore,
 ): ToolRegistration[] {
-	if (!tenant) return tools;
-	if (!tenantStore) throw new Error("Authenticated durable tools require a tenant store");
 	return tools.map((tool) => ({
 		...tool,
 		execute: (params, api, context) => runInTenantContext(tenant, tenantStore, () => tool.execute(params, api, context)),
@@ -186,11 +183,9 @@ function bindToolsToTenant(
 function bindChannelRegistry(
 	req: IncomingMessage,
 	registry: ChannelRegistry,
-	tenantStore: TenantStore | null | undefined,
+	tenantStore: TenantStore,
 ): ChannelRegistry {
-	const tenant = getRequestTenant(req);
-	if (!tenant) return registry;
-	if (!tenantStore) throw new Error("Authenticated durable channels require a tenant store");
+	const tenant = requireRequestTenant(req);
 	const run = <T>(operation: () => T): T => runInTenantContext(tenant, tenantStore, operation);
 	// Channel tool lookups re-enter the verified tenant even when pi-durable
 	// resumes outside the original HTTP request's async context.
@@ -253,7 +248,6 @@ function toSummary(record: DurableSessionRecord): DurableSessionSummary {
  * tenant-rooted metadata; committed conversation history stays in pi-durable
  * SQLite and is never represented as a legacy SessionManager JSONL file. */
 export class DurableSessionService {
-	private readonly fileCatalog = new FileSessionCatalog((req) => this.catalogPath(req));
 	private readonly runtimes = new Map<string, RuntimeEntry>();
 	private readonly openings = new Map<string, Promise<OpenedRuntime>>();
 	private readonly questionStores = new Map<string, DurableQuestionStore>();
@@ -273,14 +267,6 @@ export class DurableSessionService {
 		return join(resolveRequestTenantDataRoot(req, this.options.dataDir), "durable");
 	}
 
-	private catalogPath(req: IncomingMessage): string {
-		return join(this.root(req), "sessions.json");
-	}
-
-	private storagePath(req: IncomingMessage, id: string): string {
-		return join(this.root(req), "storage", id, "session.sqlite");
-	}
-
 	private runtimeKey(req: IncomingMessage, id: string): string {
 		return join(this.root(req), "storage", id);
 	}
@@ -294,30 +280,16 @@ export class DurableSessionService {
 	}
 
 	private recoveryStore(req: IncomingMessage, kind: RecoveryKind): RecoveryRecordStore {
-		const dir = (id: string) => kind === "question" ? this.questionDir(req, id) : this.permissionDir(req, id);
-		const tenant = getRequestTenant(req);
-		return tenant && this.options.recoveryPool
-			? new PgRecoveryStore(this.options.recoveryPool, tenant.tenantId, kind, { dir })
-			: new FileRecoveryStore(dir);
+		return new PgRecoveryStore(this.options.recoveryPool, requireRequestTenant(req).tenantId, kind);
 	}
 
 	/** OCR checkpoints. Files are tenant-wide in one directory; rows are per session. */
 	private ocrStore(req: IncomingMessage, tenantDataRoot: string): RecoveryRecordStore {
-		const dir = join(tenantDataRoot, "ocr");
-		// A checkpoint's operation ID is `ocr_image:<sessionId>:<callId>`.
-		const belongsTo = (value: unknown, sessionId: string) =>
-			(value as { operationId?: unknown })?.operationId?.toString().startsWith(`ocr_image:${sessionId}:`) === true;
-		const tenant = getRequestTenant(req);
-		if (!(tenant && this.options.recoveryPool)) return new FileRecoveryStore(() => dir, belongsTo);
-		return new PgRecoveryStore(this.options.recoveryPool, tenant.tenantId, "ocr", { dir: () => dir, flat: true, belongsTo });
+		return new PgRecoveryStore(this.options.recoveryPool, requireRequestTenant(req).tenantId, "ocr");
 	}
 
 	private channelOutbox(req: IncomingMessage, tenantDataRoot: string): ChannelOutbox {
-		const dir = join(tenantDataRoot, "channels", "outbox");
-		const tenant = getRequestTenant(req);
-		return tenant && this.options.recoveryPool
-			? new PgChannelOutbox(this.options.recoveryPool, tenant.tenantId, dir)
-			: new FileChannelOutbox(dir);
+		return new PgChannelOutbox(this.options.recoveryPool, requireRequestTenant(req).tenantId);
 	}
 
 	private permissionStore(req: IncomingMessage, id: string): DurablePermissionStore {
@@ -341,9 +313,8 @@ export class DurableSessionService {
 	}
 
 	streamStore(req: IncomingMessage): StreamJournal {
-		const tenant = getRequestTenant(req);
-		const key = `${tenant?.tenantId ?? "local"}`;
-		if (!(tenant && this.options.recoveryPool)) return new FileStreamJournal(new DurableStreamStore(join(this.root(req), "streams")));
+		const tenant = requireRequestTenant(req);
+		const key = tenant.tenantId;
 		// One journal per tenant so buffered appends keep their order across requests.
 		let journal = this.streamJournals.get(key);
 		if (!journal) {
@@ -418,8 +389,8 @@ export class DurableSessionService {
 		}
 	}
 
-	private catalogFor(req: IncomingMessage): SessionCatalog {
-		return getRequestTenant(req) && this.options.pgCatalog ? this.options.pgCatalog : this.fileCatalog;
+	private catalogFor(_req: IncomingMessage): SessionCatalog {
+		return this.options.pgCatalog;
 	}
 
 	async get(req: IncomingMessage, id: string): Promise<DurableSessionRecord | undefined> {
@@ -808,12 +779,8 @@ export class DurableSessionService {
 			const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
 			if (config.memory?.l3Enabled === false || !prompt.trim()) return "";
 			const scoped = new ScopedL3Memory(this.options.dataDir, this.options.recoveryPool);
-			const tenant = getRequestTenant(req);
-			if (tenant && !this.options.tenantStore) throw new Error("Authenticated durable L3 recall requires a tenant store");
 			const recall = () => scoped.recall(prompt, id);
-			const results = tenant
-				? await runInTenantContext(tenant, this.options.tenantStore!, recall)
-				: await runWithoutTenantContext(recall);
+			const results = await runInTenantContext(requireRequestTenant(req), this.options.tenantStore, recall);
 			return formatRecallForPrompt(results);
 		} catch (error) {
 			logger.warn({ err: error, sessionId: id }, "durable L3 recall failed (non-fatal)");
@@ -829,14 +796,8 @@ export class DurableSessionService {
 	): Promise<void> {
 		// Indexing continues while recall is disabled so re-enabling L3 has no gap.
 		const scoped = new ScopedL3Memory(this.options.dataDir, this.options.recoveryPool);
-		const tenant = getRequestTenant(req);
 		try {
-			if (tenant) {
-				if (!this.options.tenantStore) throw new Error("Authenticated durable L3 indexing requires a tenant store");
-				await runInTenantContext(tenant, this.options.tenantStore, () => scoped.indexMessages(id, messages, revision));
-			} else {
-				await runWithoutTenantContext(() => scoped.indexMessages(id, messages, revision));
-			}
+			await runInTenantContext(requireRequestTenant(req), this.options.tenantStore, () => scoped.indexMessages(id, messages, revision));
 		} catch (error) {
 			// L3 is derived, best-effort state; committed history remains authoritative.
 			logger.warn({ err: error, sessionId: id }, "failed to index durable history for L3");
@@ -945,12 +906,11 @@ export class DurableSessionService {
 			let opening = this.openings.get(key);
 			if (!opening) {
 				opening = (async () => {
-					const tenant = getRequestTenant(req);
+					const tenant = requireRequestTenant(req);
 					let storageLock: DurableStorageLock | undefined;
 					let storageLease: StorageLease | undefined;
 					let replicaDir: { tenant: TenantContext; workspaceId: string; dir: string } | undefined;
-					if (tenant) {
-						if (!this.options.tenantStore) throw new Error("Authenticated durable storage requires a tenant store");
+					{
 						const lockStarted = performance.now();
 						const workerId = durableWorkerId();
 						storageLock = await this.options.tenantStore.acquireDurableStorageLock(tenant, id) ?? undefined;
@@ -991,7 +951,7 @@ export class DurableSessionService {
 						let workspaceId = record.workspaceId;
 						const promptPaths = { download: (rel: string) =>
 							rel === WORKSPACE_AGENT_FILE || rel === WORKSPACE_SKILLS_DIR || rel.startsWith(`${WORKSPACE_SKILLS_DIR}/`) };
-						if (tenant && this.options.workspaceReplica) {
+						if (this.options.workspaceReplica) {
 							workspaceId = await this.options.workspaceReplica.materializeSession(tenant, id, record.workspaceId, promptPaths);
 						}
 						const workspaceDir = this.options.resolveWorkspaceDir(id, workspaceId);
@@ -1001,7 +961,7 @@ export class DurableSessionService {
 						// release — the close-time mirror push is only needed when
 						// nothing else syncs the directory.
 						const bindingSyncs = this.options.getSandboxManager?.()?.syncsWorkspaceReplica === true;
-						if (tenant && this.options.workspaceReplica) {
+						if (this.options.workspaceReplica) {
 							// Lazy pull (T-按需拉取): only the files prompt building
 							// needs — agent.md and .skills/ — download bodies at
 							// open; every other file materializes on first tool
@@ -1014,15 +974,13 @@ export class DurableSessionService {
 						}
 						const tenantDataRoot = resolveRequestTenantDataRoot(req, this.options.dataDir);
 						const scopedL3 = new ScopedL3Memory(this.options.dataDir, this.options.recoveryPool);
-						const l3Memory = tenant
-							? {
-								recall: (query: string, excludeSessionId?: string) => runInTenantContext(
-									tenant,
-									this.options.tenantStore!,
-									() => scopedL3.recall(query, excludeSessionId),
-								),
-							}
-							: scopedL3;
+						const l3Memory = {
+							recall: (query: string, excludeSessionId?: string) => runInTenantContext(
+								tenant,
+								this.options.tenantStore,
+								() => scopedL3.recall(query, excludeSessionId),
+							),
+						};
 						const memory = {
 							sessionId: id,
 							l2DataDir: join(tenantDataRoot, "l2"),
@@ -1050,26 +1008,22 @@ export class DurableSessionService {
 						const sandbox: SandboxRuntimeBinding | undefined = sandboxManager
 							? await sandboxManager.bind({
 								sessionId: id,
-								...(tenant ? { tenantId: tenant.tenantId } : {}),
+								tenantId: tenant.tenantId,
 								...(record.sandboxId ? { sandboxId: record.sandboxId } : {}),
 								hostWorkspaceDir: workspaceDir,
 								workspaceId,
-								...(tenant ? { tenantContext: tenant } : {}),
+								tenantContext: tenant,
 								countTenantSandboxes: async () => (await this.catalogFor(req).list(req)).filter((entry) => entry.sandboxId).length,
 								...(this.options.skillsDir ? { hostSkillsDir: this.options.skillsDir } : {}),
 								stateDir: join(this.root(req), "storage", id),
 								persistSandboxId: async (sandboxId) => { await this.update(req, id, { sandboxId }); },
 							})
 							: undefined;
-						const legacyStoragePath = this.storagePath(req, id);
 						const runtime = await this.openRuntime({
-							storagePath: legacyStoragePath,
-							...(storageLease && this.options.recoveryPool ? {
-								openStorage: () => PgDurableStorage.open(this.options.recoveryPool!, id, {
-									leaseEpoch: storageLease!.epoch,
-									legacySqlitePath: legacyStoragePath,
-								}),
-							} : {}),
+							storagePath: join(this.root(req), "storage", id, "session.sqlite"),
+							openStorage: () => PgDurableStorage.open(this.options.recoveryPool, id, {
+								leaseEpoch: storageLease!.epoch,
+							}),
 							...selection,
 							...(record.conversationId ? { conversationId: record.conversationId } : {}),
 							instructions: [
@@ -1082,7 +1036,7 @@ export class DurableSessionService {
 							].filter((section): section is string => Boolean(section)).join("\n\n"),
 							...(sandbox ? { sandbox } : {}),
 							workspaceDir,
-							...(tenant && this.options.workspaceReplica ? {
+							...(this.options.workspaceReplica ? {
 								workspaceMaterialize: (relPath: string) =>
 									this.options.workspaceReplica!.materializeFile(tenant, workspaceId, workspaceDir, relPath),
 							} : {}),
@@ -1113,7 +1067,7 @@ export class DurableSessionService {
 						};
 					} catch (error) {
 						if (storageLease) {
-							await this.options.tenantStore?.releaseDurableStorage(storageLease.sessionId, storageLease.epoch)
+							await this.options.tenantStore.releaseDurableStorage(storageLease.sessionId, storageLease.epoch)
 								.catch((releaseError) => logger.error({ err: releaseError, sessionId: id }, "failed to release durable storage lease after open failure"));
 						}
 						await storageLock?.release().catch((releaseError) => {
@@ -1143,7 +1097,7 @@ export class DurableSessionService {
 				if (openedEntry.storageLease && !openedEntry.storageLease.heartbeat) {
 					const lease = openedEntry.storageLease;
 					lease.heartbeat = setInterval(() => {
-						void this.options.tenantStore?.renewDurableStorage(lease.sessionId, lease.workerId, lease.epoch)
+						void this.options.tenantStore.renewDurableStorage(lease.sessionId, lease.workerId, lease.epoch)
 							.then((renewed) => {
 								if (renewed) return;
 								incCounter("inno_durable_lease_lost_total");
@@ -1227,10 +1181,8 @@ export class DurableSessionService {
 	/** The L3 index is derived data; a failed cleanup only leaves chunks that recall already hides (the session is no longer owned). */
 	private async deleteL3Session(req: IncomingMessage, id: string): Promise<void> {
 		const scoped = new ScopedL3Memory(this.options.dataDir, this.options.recoveryPool);
-		const tenant = getRequestTenant(req);
 		try {
-			if (tenant && this.options.tenantStore) await runInTenantContext(tenant, this.options.tenantStore, () => scoped.deleteSession(id));
-			else if (!tenant) await runWithoutTenantContext(() => scoped.deleteSession(id));
+			await runInTenantContext(requireRequestTenant(req), this.options.tenantStore, () => scoped.deleteSession(id));
 		} catch (error) {
 			logger.warn({ err: error, sessionId: id }, "failed to remove deleted session from the L3 index");
 		}

@@ -46,7 +46,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
 		);
 	}
 	if (!session) return <main className="h-full bg-[var(--inno-chat-bg)]" aria-label={t("auth.loading")} />;
-	if (session.mode === "local" || session.user) {
+	if (session.user) {
 		sessionsStore.durableEnabled = session.durableEnabled === true;
 		sessionsStore.durableRequired = session.durableRequired === true;
 		return children;

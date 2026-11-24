@@ -5,15 +5,19 @@ import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { readAuthRuntimeConfig } from "./auth/config.js";
+import { migrateAuthDatabase } from "./auth/migration.js";
+import { startTemporaryPostgres, type TemporaryPostgres } from "./db/test-postgres.js";
 
 /**
  * HTTP smoke tests for server.ts — the safety net for the route-domain
  * extraction in docs/quality-remediation-plan.md (P2).
  *
  * server.ts is a side-effect-only entry point (no exports), so these tests
- * spawn it as a child process against a throwaway --home with a dummy
- * provider, then assert status codes / redaction on a handful of endpoints.
- * No external LLM calls are made; streaming tests use a local provider stub.
+ * spawn it as a child process against a throwaway --home plus a temporary
+ * PostgreSQL, sign one tenant up through better-auth, then replay every
+ * request with that tenant's session cookie. No external LLM calls are made;
+ * streaming tests use a local provider stub.
  */
 
 const SERVER_ENTRY = resolve(import.meta.dirname, "server.ts");
@@ -26,6 +30,7 @@ let workspace: string;
 let port: number;
 let child: ChildProcess;
 let childLog = "";
+let postgres: TemporaryPostgres | undefined;
 let providerServer: Server;
 let providerRequests = 0;
 
@@ -50,8 +55,30 @@ async function getFreePort(): Promise<number> {
 	});
 }
 
-function api(path: string): Promise<Response> {
-	return fetch(`http://127.0.0.1:${port}${path}`);
+let cookie = "";
+const origin = () => `http://127.0.0.1:${port}`;
+
+function api(path: string, init: RequestInit = {}): Promise<Response> {
+	return fetch(`${origin()}${path}`, {
+		...init,
+		headers: {
+			...(cookie ? { Cookie: cookie } : {}),
+			Origin: origin(),
+			...init.headers,
+		},
+	});
+}
+
+async function registerUser(email: string): Promise<string> {
+	const response = await fetch(`${origin()}/api/auth/sign-up/email`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Origin: origin() },
+		body: JSON.stringify({ name: email, email, password: "smoke-test-password-123" }),
+	});
+	expect(response.status).toBe(200);
+	const c = response.headers.get("set-cookie")?.split(";", 1)[0];
+	expect(c).toContain("session_token");
+	return c!;
 }
 
 beforeAll(async () => {
@@ -101,10 +128,27 @@ ServerResponse.prototype.end = function (...args) {
 };
 `);
 	port = await getFreePort();
+	postgres = await startTemporaryPostgres();
+	await migrateAuthDatabase(readAuthRuntimeConfig({
+		DATABASE_URL: postgres.databaseUrl,
+		BETTER_AUTH_SECRET: "smoke-test-secret-at-least-32-chars!!",
+		BETTER_AUTH_URL: `http://127.0.0.1:${port}`,
+	}));
 	child = spawn(
 		process.execPath,
 		["--import", errorHook, "--import", "tsx", SERVER_ENTRY, "--home", home, "--data-dir", join(home, "data"), "--workspace", workspace, "--port", String(port)],
-		{ cwd: REPO_ROOT, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, LOG_LEVEL: "debug" } },
+		{
+			cwd: REPO_ROOT,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: {
+				...process.env,
+				LOG_LEVEL: "debug",
+				DATABASE_URL: postgres.databaseUrl,
+				BETTER_AUTH_SECRET: "smoke-test-secret-at-least-32-chars!!",
+				BETTER_AUTH_URL: `http://127.0.0.1:${port}`,
+				INNO_AUTH_ALLOW_SIGNUP: "true",
+			},
+		},
 	);
 	child.stdout?.on("data", (chunk) => (childLog += chunk));
 	child.stderr?.on("data", (chunk) => (childLog += chunk));
@@ -134,9 +178,26 @@ ServerResponse.prototype.end = function (...args) {
 	if (!ready) {
 		throw new Error(`server did not become ready within 90s\n--- child log ---\n${childLog}`);
 	}
+	cookie = await registerUser("smoke@example.com");
+	// Tenant configs start empty — seed the dummy provider through the
+	// tenant settings API so sessions can open a model.
+	const providerSetup = await api("/api/settings/providers", {
+		method: "PUT",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			providerId: "dummy",
+			baseUrl: `http://127.0.0.1:${providerPort}`,
+			apiKey: DUMMY_API_KEY,
+			api: "openai-completions",
+			makeDefault: true,
+			models: [{ id: "dummy-model", name: "Dummy model", contextWindow: 32_000, maxTokens: 2_000 }],
+		}),
+	});
+	expect(providerSetup.status).toBe(200);
 }, 120_000);
 
 afterAll(async () => {
+	await postgres?.close();
 	if (child && !child.killed) {
 		child.kill("SIGTERM");
 		await new Promise<void>((resolveDone) => {
@@ -168,7 +229,7 @@ describe("server smoke", () => {
 	it("GET /api/session reports that durable is always enabled and required", async () => {
 		const res = await api("/api/session");
 		expect(res.status).toBe(200);
-		expect(await res.json()).toMatchObject({ mode: "local", durableEnabled: true, durableRequired: true });
+		expect(await res.json()).toMatchObject({ mode: "better-auth", durableEnabled: true, durableRequired: true });
 	});
 
 	it("GET /api/settings returns 200 with provider API keys redacted", async () => {
@@ -194,7 +255,7 @@ describe("server smoke", () => {
 	});
 
 	it("branch-before-message validates its input on a durable session", async () => {
-		const created = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+		const created = await api(`/api/sessions`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({}),
@@ -203,7 +264,7 @@ describe("server smoke", () => {
 		const { id: sessionId } = (await created.json()) as { id: string };
 		expect(sessionId.startsWith("durable-")).toBe(true);
 
-		const branch = (body: unknown) => fetch(`http://127.0.0.1:${port}/api/sessions/${sessionId}/branch-before-message`, {
+		const branch = (body: unknown) => api(`/api/sessions/${sessionId}/branch-before-message`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
@@ -215,20 +276,20 @@ describe("server smoke", () => {
 	}, 60_000);
 
 	it("POST /api/sessions/:id/archive + unarchive round-trips on a durable session", async () => {
-		const created = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+		const created = await api(`/api/sessions`, {
 			method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}),
 		});
 		const { id } = (await created.json()) as { id: string };
-		const archive = await fetch(`http://127.0.0.1:${port}/api/sessions/${id}/archive`, { method: "POST" });
+		const archive = await api(`/api/sessions/${id}/archive`, { method: "POST" });
 		expect(archive.status).toBe(200);
 		expect((await archive.json()) as { archived: boolean }).toMatchObject({ id, archived: true });
-		const unarchive = await fetch(`http://127.0.0.1:${port}/api/sessions/${id}/unarchive`, { method: "POST" });
+		const unarchive = await api(`/api/sessions/${id}/unarchive`, { method: "POST" });
 		expect(unarchive.status).toBe(200);
 		expect((await unarchive.json()) as { archived: boolean }).toMatchObject({ id, archived: false });
 	}, 60_000);
 
 	it("archiving an unknown session returns 404", async () => {
-		const res = await fetch(`http://127.0.0.1:${port}/api/sessions/some-session.jsonl/archive`, { method: "POST" });
+		const res = await api(`/api/sessions/some-session.jsonl/archive`, { method: "POST" });
 		expect(res.status).toBe(404);
 	});
 
@@ -246,7 +307,7 @@ describe("server smoke", () => {
 	});
 
 	it("POST /api/jobs with an invalid cron returns 400 (route-domain extraction guard)", async () => {
-		const res = await fetch(`http://127.0.0.1:${port}/api/jobs`, {
+		const res = await api(`/api/jobs`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ name: "bad", cron: "not a cron", prompt: "x", taskType: "custom_prompt" }),
@@ -257,7 +318,7 @@ describe("server smoke", () => {
 	});
 
 	it("PUT /api/settings/theme accepts a valid theme and rejects an invalid one", async () => {
-		const ok = await fetch(`http://127.0.0.1:${port}/api/settings/theme`, {
+		const ok = await api(`/api/settings/theme`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ theme: "ocean" }),
@@ -267,7 +328,7 @@ describe("server smoke", () => {
 		expect(body.ui.theme).toBe("ocean");
 
 		// dark is the second supported theme in the redesigned UI
-		const dark = await fetch(`http://127.0.0.1:${port}/api/settings/theme`, {
+		const dark = await api(`/api/settings/theme`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ theme: "dark" }),
@@ -276,7 +337,7 @@ describe("server smoke", () => {
 		const darkBody = (await dark.json()) as { ui: { theme: string } };
 		expect(darkBody.ui.theme).toBe("dark");
 
-		const bad = await fetch(`http://127.0.0.1:${port}/api/settings/theme`, {
+		const bad = await api(`/api/settings/theme`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ theme: "neon" }),
@@ -285,7 +346,7 @@ describe("server smoke", () => {
 	});
 
 	it("PUT /api/settings/markdown persists the single-dollar math preference", async () => {
-		const ok = await fetch(`http://127.0.0.1:${port}/api/settings/markdown`, {
+		const ok = await api(`/api/settings/markdown`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ mathSingleDollar: true }),
@@ -294,7 +355,7 @@ describe("server smoke", () => {
 		const body = (await ok.json()) as { ui: { mathSingleDollar: boolean } };
 		expect(body.ui.mathSingleDollar).toBe(true);
 
-		const bad = await fetch(`http://127.0.0.1:${port}/api/settings/markdown`, {
+		const bad = await api(`/api/settings/markdown`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ mathSingleDollar: "yes" }),
@@ -303,7 +364,7 @@ describe("server smoke", () => {
 	});
 
 	it("PUT /api/settings/memory validates boolean fields", async () => {
-		const res = await fetch(`http://127.0.0.1:${port}/api/settings/memory`, {
+		const res = await api(`/api/settings/memory`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ l2Enabled: "yes" }),
@@ -325,13 +386,13 @@ describe("server smoke", () => {
 		expect(body.length).toBeGreaterThan(0);
 	});
 
-	it("POST /api/bridge/messages returns 404 when no bridge is configured", async () => {
-		const res = await fetch(`http://127.0.0.1:${port}/api/bridge/messages`, {
+	it("POST /api/bridge/messages returns 401 without a bridge bearer token", async () => {
+		const res = await api(`/api/bridge/messages`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({}),
 		});
-		expect(res.status).toBe(404);
+		expect(res.status).toBe(401);
 	});
 
 	it("GET /api/skills returns 200 with a list", async () => {
@@ -339,13 +400,13 @@ describe("server smoke", () => {
 		expect(res.status).toBe(200);
 		expect(Array.isArray(await res.json())).toBe(true);
 	});
-	it("POST /api/skills/upload validates required fields", async () => {
-		const res = await fetch(`http://127.0.0.1:${port}/api/skills/upload`, {
+	it("POST /api/skills/upload is read-only for tenants (shared catalog)", async () => {
+		const res = await api(`/api/skills/upload`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ fileName: "x.zip" }),
+			body: JSON.stringify({ fileName: "x.zip", dataBase64: "eA==" }),
 		});
-		expect(res.status).toBe(400);
+		expect(res.status).toBe(409);
 	});
 
 	it("GET /api/skills/:name/content returns 404 for a missing skill", async () => {
@@ -353,10 +414,9 @@ describe("server smoke", () => {
 		expect(res.status).toBe(404);
 	});
 
-	it("GET /api/jobs/:id/runs returns 200 for any id shape", async () => {
+	it("GET /api/jobs/:id/runs returns 404 for a missing job", async () => {
 		const res = await api("/api/jobs/job_missing/runs");
-		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual([]);
+		expect(res.status).toBe(404);
 	});
 
 	it("wiki: pages/graph/stats return 200, missing page 404, traversal 400", async () => {
@@ -386,7 +446,7 @@ describe("server smoke", () => {
 			"# Index Sync Smoke",
 		].join("\n");
 
-		const saved = await fetch(`http://127.0.0.1:${port}/api/wiki/page`, {
+		const saved = await api(`/api/wiki/page`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ path, content }),
@@ -396,7 +456,7 @@ describe("server smoke", () => {
 		expect(indexAfterSave.status).toBe(200);
 		expect(((await indexAfterSave.json()) as { content: string }).content).toContain("[[concepts/index-sync-smoke]]");
 
-		const removed = await fetch(`http://127.0.0.1:${port}/api/wiki/page?path=${encodeURIComponent(path)}`, {
+		const removed = await api(`/api/wiki/page?path=${encodeURIComponent(path)}`, {
 			method: "DELETE",
 		});
 		expect(removed.status).toBe(200);
@@ -406,14 +466,14 @@ describe("server smoke", () => {
 	});
 
 	it("POST /api/l2/raw/upload stores a file and rejects empty payloads", async () => {
-		const bad = await fetch(`http://127.0.0.1:${port}/api/l2/raw/upload`, {
+		const bad = await api(`/api/l2/raw/upload`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ fileName: "x.md" }),
 		});
 		expect(bad.status).toBe(400);
 
-		const ok = await fetch(`http://127.0.0.1:${port}/api/l2/raw/upload`, {
+		const ok = await api(`/api/l2/raw/upload`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ fileName: "notes.md", mimeType: "text/markdown", dataBase64: Buffer.from("# hi").toString("base64") }),
@@ -443,7 +503,17 @@ describe("server smoke", () => {
 	});
 
 	it("GET /api/workspace/file rejects symlinks escaping the workspace (issue #162)", async () => {
-		const tree = await api("/api/workspace/tree");
+		// The shared tmp workspace is unowned under auth, so create a
+		// tenant-owned workspace and exercise the same boundary there.
+		const created = await api("/api/workspaces", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name: "symlink-boundary" }),
+		});
+		expect(created.status).toBe(201);
+		const wsId = ((await created.json()) as { id: string }).id;
+		const wsQuery = `workspaceId=${encodeURIComponent(wsId)}`;
+		const tree = await api(`/api/workspace/tree?${wsQuery}`);
 		const { root } = (await tree.json()) as { root: string };
 
 		// A symlink planted inside the workspace (trivial via the agent's bash
@@ -469,10 +539,10 @@ describe("server smoke", () => {
 				}
 			}
 
-			const viaDir = await api("/api/workspace/file?path=escape-link/secret.txt");
+			const viaDir = await api(`/api/workspace/file?path=escape-link/secret.txt&${wsQuery}`);
 			expect(viaDir.status).toBe(404);
 			if (directLinkPlanted) {
-				const viaFile = await api("/api/workspace/file?path=direct-link.txt");
+				const viaFile = await api(`/api/workspace/file?path=direct-link.txt&${wsQuery}`);
 				expect(viaFile.status).toBe(404);
 			}
 
@@ -490,10 +560,10 @@ describe("server smoke", () => {
 				}
 			}
 			if (danglingLinkPlanted) {
-				const writeViaDangling = await fetch(`http://127.0.0.1:${port}/api/workspace/upload`, {
+				const writeViaDangling = await api(`/api/workspace/upload`, {
 					method: "POST",
 					headers: { "content-type": "application/json" },
-					body: JSON.stringify({ files: [{ path: "dangling-link.txt", dataBase64: Buffer.from("pwned").toString("base64") }] }),
+					body: JSON.stringify({ workspaceId: wsId, files: [{ path: "dangling-link.txt", dataBase64: Buffer.from("pwned").toString("base64") }] }),
 				});
 				expect(writeViaDangling.status).toBe(201);
 				const writeBody = (await writeViaDangling.json()) as { uploaded: unknown[] };
@@ -503,9 +573,9 @@ describe("server smoke", () => {
 
 			// Positive control: a genuine file inside the root stays readable.
 			writeFileSync(join(root, "hello.txt"), "hello");
-			const ok = await api("/api/workspace/file?path=hello.txt");
+			const ok = await api(`/api/workspace/file?path=hello.txt&${wsQuery}`);
 			expect(ok.status).toBe(200);
-			const prefixed = await api("/api/workspace/file?path=.%2Fhello.txt");
+			const prefixed = await api(`/api/workspace/file?path=.%2Fhello.txt&${wsQuery}`);
 			expect(prefixed.status).toBe(200);
 			expect((await prefixed.json() as { path: string }).path).toBe("hello.txt");
 		} finally {
@@ -516,9 +586,9 @@ describe("server smoke", () => {
 		}
 	});
 
-	it("DELETE /api/workspaces/tmp is rejected with 400", async () => {
-		const res = await fetch(`http://127.0.0.1:${port}/api/workspaces/tmp`, { method: "DELETE" });
-		expect(res.status).toBe(400);
+	it("DELETE /api/workspaces/tmp is rejected (unowned shared workspace)", async () => {
+		const res = await api(`/api/workspaces/tmp`, { method: "DELETE" });
+		expect(res.status).toBe(404);
 	});
 
 	it.each([
@@ -532,10 +602,10 @@ describe("server smoke", () => {
 		["GET", "/api/jobs?query=1"],
 		["GET", "/api"],
 	])("unknown %s %s returns a JSON 404 (not the SPA index.html)", async (method, path) => {
-		const res = await fetch(`http://127.0.0.1:${port}${path}`, { method });
+		const res = await api(`${path}`, { method });
 		expect(res.status).toBe(404);
 		expect(res.headers.get("content-type")).toContain("application/json");
-		if (method !== "HEAD") expect(await res.json()).toEqual({ error: "Not found" });
+		if (method !== "HEAD") expect(typeof ((await res.json()) as { error?: unknown }).error).toBe("string");
 	});
 
 	it.each([
@@ -546,7 +616,7 @@ describe("server smoke", () => {
 		["GET", "/api/sessions/%/workspace"],
 		["DELETE", "/api/workspaces/%F4%90%80%80"],
 	])("%s %s returns the matchRoute HttpError as JSON 400", async (method, path) => {
-		const res = await fetch(`http://127.0.0.1:${port}${path}`, { method });
+		const res = await api(`${path}`, { method });
 		expect(res.status).toBe(400);
 		expect(await res.json()).toEqual({ error: "Malformed URL encoding" });
 		expect((await api("/health")).status).toBe(200);
@@ -558,15 +628,15 @@ describe("server smoke", () => {
 		expect(res.headers.get("content-type")).toContain("application/json");
 	});
 
-	it("chat: POST /api/chat 400 without prompt, stream 400 without fields, status 200 found:false", async () => {
-		const noPrompt = await fetch(`http://127.0.0.1:${port}/api/chat`, {
+	it("chat: POST /api/chat 400 without prompt, stream 400 without fields, status 404 for unknown session", async () => {
+		const noPrompt = await api(`/api/chat`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({}),
 		});
 		expect(noPrompt.status).toBe(400);
 
-		const noFields = await fetch(`http://127.0.0.1:${port}/api/chat/stream`, {
+		const noFields = await api(`/api/chat/stream`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ prompt: "hi" }),
@@ -574,15 +644,14 @@ describe("server smoke", () => {
 		expect(noFields.status).toBe(400);
 
 		const status = await api("/api/chat/status/no-such-session");
-		expect(status.status).toBe(200);
-		expect(await status.json()).toEqual({ found: false });
+		expect(status.status).toBe(404);
 
-		const abort = await fetch(`http://127.0.0.1:${port}/api/chat/sess/turn/abort`, { method: "POST" });
+		const abort = await api(`/api/chat/sess/turn/abort`, { method: "POST" });
 		expect(abort.status).toBe(404);
 	});
 
 	it("POST with a malformed JSON body returns 400 (not 500)", async () => {
-		const res = await fetch(`http://127.0.0.1:${port}/api/chat`, {
+		const res = await api(`/api/chat`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: "not json{",
@@ -605,6 +674,8 @@ describe("server smoke", () => {
 						headers: {
 							"Content-Type": "application/json",
 							"Content-Length": String(33 * 1024 * 1024),
+							Cookie: cookie,
+							Origin: origin(),
 						},
 					},
 					(res) => {
@@ -630,7 +701,7 @@ describe("server smoke", () => {
 		// 33 MB exceeds the default 32 MB cap but is under the upload cap, so
 		// the body is consumed and fails JSON parsing (400) rather than size
 		// rejection (413).
-		const accepted = await fetch(`http://127.0.0.1:${port}/api/skills/upload`, {
+		const accepted = await api(`/api/l2/raw/upload`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: "a".repeat(33 * 1024 * 1024),
@@ -643,11 +714,13 @@ describe("server smoke", () => {
 				{
 					host: "127.0.0.1",
 					port,
-					path: "/api/skills/upload",
+					path: "/api/l2/raw/upload",
 					method: "POST",
 					headers: {
 						"Content-Type": "application/json",
 						"Content-Length": String(193 * 1024 * 1024),
+						Cookie: cookie,
+						Origin: origin(),
 					},
 				},
 				(res) => {
@@ -670,7 +743,7 @@ describe("server smoke", () => {
 		["/assets/request-logging-missing.js", 404, 20],
 		["/%ZZ", 500, 20],
 	] as const)("correlates %s with exactly one access log at the expected level", async (path, statusCode, level) => {
-		const res = await fetch(`http://127.0.0.1:${port}${path}`, { headers: { "x-request-id": "client-supplied-id" } });
+		const res = await api(`${path}`, { headers: { "x-request-id": "client-supplied-id" } });
 		expect(res.status).toBe(statusCode);
 		const requestId = res.headers.get("x-request-id") ?? "";
 		expect(requestId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
@@ -695,7 +768,7 @@ describe("server smoke", () => {
 	});
 
 	it("logs a synthetic response error at debug and still completes the response", async () => {
-		const res = await fetch(`http://127.0.0.1:${port}/health`, { headers: { "x-test-response-error": "1" } });
+		const res = await api(`/health`, { headers: { "x-test-response-error": "1" } });
 		expect(res.status).toBe(200);
 		expect(await res.json()).toEqual({ status: "ok" });
 		const requestId = res.headers.get("x-request-id") ?? "";
@@ -707,14 +780,14 @@ describe("server smoke", () => {
 	});
 
 	it("logs a disconnected SSE once, including after the server finishes the turn", async () => {
-		const created = await fetch(`http://127.0.0.1:${port}/api/sessions`, { method: "POST", body: "{}" });
+		const created = await api(`/api/sessions`, { method: "POST", body: "{}" });
 		expect(created.status).toBe(201);
 		const { id: sessionId } = await created.json() as { id: string };
 		const controller = new AbortController();
 		const previousProviderRequests = providerRequests;
 		let turnId: string | undefined;
 		try {
-			const res = await fetch(`http://127.0.0.1:${port}/api/chat/stream`, {
+			const res = await api(`/api/chat/stream`, {
 				method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
 				body: JSON.stringify({ sessionId, clientRequestId: "request-logging-smoke", prompt: "Stay pending for the SSE disconnect test." }),
 			});
@@ -733,13 +806,13 @@ describe("server smoke", () => {
 				level: 30, method: "POST", path: "/api/chat/stream", statusCode: 200, requestId,
 				durationMs: expect.any(Number), outcome: "disconnected", msg: "HTTP request",
 			});
-			const stopped = await fetch(`http://127.0.0.1:${port}/api/chat/${sessionId}/${turnId}/abort`, { method: "POST" });
+			const stopped = await api(`/api/chat/${sessionId}/${turnId}/abort`, { method: "POST" });
 			expect(stopped.status).toBe(202);
 			await stopped.arrayBuffer();
 			expect(requestLogs(requestId)).toHaveLength(1);
 		} finally {
 			controller.abort();
-			if (turnId) await fetch(`http://127.0.0.1:${port}/api/chat/${sessionId}/${turnId}/abort`, { method: "POST" });
+			if (turnId) await api(`/api/chat/${sessionId}/${turnId}/abort`, { method: "POST" });
 		}
 	}, 30_000);
 });

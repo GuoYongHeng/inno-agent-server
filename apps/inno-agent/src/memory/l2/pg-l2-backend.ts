@@ -15,10 +15,7 @@
  * rebuilt from the imported pages instead of being imported.
  */
 
-import { readdirSync, readFileSync, renameSync, statSync } from "node:fs";
-import { extname, join, sep } from "node:path";
 import type { Pool } from "pg";
-import { logger } from "../../logger.js";
 import type { ObjectStore } from "../../object-store/index.js";
 import { sha256Hex, tenantObjectKey } from "../../object-store/index.js";
 import { segmentForFts } from "../l3/sqlite-store.js";
@@ -29,11 +26,7 @@ import type { ManifestEntry } from "./types.js";
 /** `text`/`jsonb` cannot hold U+0000 in PostgreSQL. */
 const clean = (text: string) => text.replaceAll("\0", "�");
 
-const TEXT_EXTENSIONS = new Set([".md", ".txt", ".json", ".jsonl", ".log"]);
 
-function isTextPath(path: string): boolean {
-	return TEXT_EXTENSIONS.has(extname(path).toLowerCase());
-}
 
 /** Object-key name segment: hash-prefixed so CJK filenames stay valid. */
 function objectKeyFor(tenantId: string, sha256: string, path: string): string {
@@ -46,96 +39,19 @@ function objectKeyFor(tenantId: string, sha256: string, path: string): string {
 	return tenantObjectKey(tenantId, "l2-raw", `${sha256.slice(0, 16)}-${base || "object"}`);
 }
 
-interface FileEntry {
-	rel: string;
-	bytes: Uint8Array;
-}
-
-/** List every file under `dir` as { rel, bytes }, skipping derived sqlite state. */
-function readLegacyFiles(dir: string): FileEntry[] {
-	const files: FileEntry[] = [];
-	const visit = (absoluteDir: string, relativeDir: string): void => {
-		let entries;
-		try {
-			entries = readdirSync(absoluteDir, { withFileTypes: true });
-		} catch {
-			return;
-		}
-		for (const entry of entries) {
-			const abs = join(absoluteDir, entry.name);
-			const rel = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
-			if (entry.isDirectory()) {
-				// ingest-progress holds transient crash checkpoints; dead by definition.
-				if (rel === "ingest-progress") continue;
-				visit(abs, rel);
-			} else if (entry.isFile() && !entry.name.startsWith("index.db")) {
-				files.push({ rel: rel.replaceAll(sep, "/"), bytes: readFileSync(abs) });
-			}
-		}
-	};
-	visit(dir, "");
-	return files;
-}
 
 export class PgL2Backend implements L2Backend {
-	private initPromise: Promise<void> | null = null;
-
 	constructor(
 		private readonly pool: Pool,
 		private readonly tenantId: string,
 		private readonly objects: ObjectStore,
-		private readonly legacyDir?: string,
 	) {}
 
-	/** One-time legacy import before the first real operation. */
+	/** Kept for symmetry with the previous lazy-init contract; a no-op now. */
 	private init(): Promise<void> {
-		if (!this.initPromise) this.initPromise = this.importLegacy();
-		return this.initPromise;
+		return Promise.resolve();
 	}
 
-	private async importLegacy(): Promise<void> {
-		const dir = this.legacyDir;
-		if (!dir) return;
-		let files: FileEntry[];
-		try {
-			if (!statSync(dir).isDirectory()) return;
-			files = readLegacyFiles(dir);
-		} catch {
-			return; // No legacy dir — nothing to import.
-		}
-		try {
-			for (const file of files) {
-				if (file.rel === "manifest.jsonl") {
-					const manifestText = new TextDecoder().decode(file.bytes);
-					await this.storeText(file.rel, manifestText);
-					for (const line of manifestText.split("\n")) {
-						const trimmed = line.trim();
-						if (!trimmed) continue;
-						try {
-							const entry = JSON.parse(trimmed) as ManifestEntry;
-							if (entry && typeof entry.id === "string") await this.insertManifestEntry(entry);
-						} catch {
-							// Malformed lines are skipped like the JSONL file reader does.
-						}
-					}
-				} else if (isTextPath(file.rel)) {
-					await this.storeText(file.rel, new TextDecoder().decode(file.bytes));
-				} else {
-					await this.storeBinary(file.rel, file.bytes);
-				}
-			}
-			// The index is derived state — rebuild it from the imported pages.
-			// A helper backend without a legacy dir is used so its public methods
-			// resolve init() immediately; indexing through `this` would deadlock on
-			// the still-pending init promise.
-			const { indexAllPages } = await import("./l2-indexer.js");
-			await indexAllPages(new PgL2Backend(this.pool, this.tenantId, this.objects));
-			renameSync(dir, `${dir}.migrated`);
-			logger.info(`[L2] imported legacy ${dir} into PostgreSQL for tenant ${this.tenantId}`);
-		} catch (err) {
-			logger.warn({ err }, `[L2] legacy import from ${dir} failed; will retry on next access`);
-		}
-	}
 
 	async indexAvailable(): Promise<boolean> {
 		return true;

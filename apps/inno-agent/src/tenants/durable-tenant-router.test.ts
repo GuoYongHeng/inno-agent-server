@@ -28,20 +28,17 @@ function shardConfig(localShardId: string, workerA: string, workerB: string): Du
 }
 
 describe("durable tenant router", () => {
-	it("is disabled without explicit shard configuration and validates the multi-user gate", () => {
+	it("is disabled without explicit shard configuration and requires id plus url", () => {
 		expect(readDurableShardConfig({})).toBeNull();
-		expect(() => readDurableShardConfig({ INNO_DURABLE_SHARD_ID: "worker-a" })).toThrow(/must be configured together|requires Better Auth/);
+		expect(() => readDurableShardConfig({ INNO_DURABLE_SHARD_ID: "worker-a" })).toThrow(/must be configured together/);
 		expect(() => readDurableShardConfig({
-			INNO_AUTH_MODE: "better-auth",
-			INNO_MULTI_USER_ENABLED: "true",
-			INNO_DURABLE_ENABLED: "true",
 			INNO_DURABLE_SHARD_ID: "worker-a",
 			INNO_DURABLE_SHARD_URLS: JSON.stringify({ "worker-a": "http://127.0.0.1:3000" }),
 		})).not.toThrow();
 	});
 
 	it("derives the local shard id from HOSTNAME when sharding is configured", () => {
-		const authEnv = { INNO_AUTH_MODE: "better-auth", INNO_MULTI_USER_ENABLED: "true" };
+		const authEnv = {};
 		const config = readDurableShardConfig({
 			...authEnv,
 			HOSTNAME: "inno-agent-1",
@@ -61,7 +58,7 @@ describe("durable tenant router", () => {
 	});
 
 	it("expands a shard URL template over a peer list or StatefulSet ordinals", () => {
-		const authEnv = { INNO_AUTH_MODE: "better-auth", INNO_MULTI_USER_ENABLED: "true", HOSTNAME: "inno-0" };
+		const authEnv = { HOSTNAME: "inno-0" };
 		const byIds = readDurableShardConfig({
 			...authEnv,
 			INNO_DURABLE_SHARD_URL_TEMPLATE: "http://{id}.inno-headless:3000",

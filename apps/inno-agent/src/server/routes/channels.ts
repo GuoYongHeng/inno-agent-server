@@ -8,11 +8,11 @@ import { feishuRegistrationBegin, feishuRegistrationPoll } from "../../channels/
 import type { PersonalChannelDispatcher } from "../../channels/personal-dispatcher.js";
 import type { ChannelName } from "../../channels/types.js";
 import { WeChatChannel } from "../../channels/wechat/wechat-channel.js";
-import { saveConfig, type InnoConfig } from "../../config.js";
+import type { InnoConfig } from "../../config.js";
 import { logger } from "../../logger.js";
 import { loadTenantConfig, persistTenantConfig } from "../../tenants/config.js";
 import { getCurrentTenantStore } from "../../tenants/current.js";
-import { getRequestTenant } from "../../tenants/http.js";
+import { requireRequestTenant } from "../../tenants/http.js";
 import { json, matchRoute, readBody } from "../http-helpers.js";
 
 /**
@@ -62,15 +62,41 @@ export async function handleChannelsRoutes(
 	ctx: ChannelsRouteContext,
 ): Promise<boolean> {
 	const { channelRegistry } = ctx;
-	const tenant = getRequestTenant(req);
-	const getConfig = () => tenant ? loadTenantConfig(ctx.dataDir, tenant.tenantId) : ctx.getConfig();
+
+	// Bridge message endpoint
+	if (method === "POST" && url === "/api/bridge/messages") {
+		const body = await readBody(req);
+		const authHeader = req.headers.authorization;
+		if (ctx.handleBridge) {
+			const result = await ctx.handleBridge(authHeader, body);
+			json(res, result.status, result.body);
+			return true;
+		}
+		const bridgeToken = ctx.getBridgeToken();
+		const dispatcher = ctx.getDispatcher();
+		if (!bridgeToken || !dispatcher) {
+			json(res, 404, { error: "Bridge not configured" });
+			return true;
+		}
+		const result = handleBridgeMessage(
+			{ token: bridgeToken, channelRegistry, dispatcher },
+			authHeader,
+			body,
+		);
+		json(res, result.status, result.body);
+		return true;
+	}
+
+	// Tenant-authenticated channel management below — the bridge webhook above
+	// resolves its tenant from the bearer token, not the request session.
+	const tenant = requireRequestTenant(req);
+	const getConfig = () => loadTenantConfig(ctx.dataDir, tenant.tenantId);
 	const persistConfig = async (previous: InnoConfig, next: InnoConfig): Promise<void> => {
-		if (tenant && ctx.syncChannelOwnership) await ctx.syncChannelOwnership(previous, next);
+		if (ctx.syncChannelOwnership) await ctx.syncChannelOwnership(previous, next);
 		try {
-			if (tenant) await persistTenantConfig(getCurrentTenantStore(), ctx.dataDir, tenant.tenantId, next);
-			else ctx.setConfig(saveConfig(ctx.configPath, next));
+			await persistTenantConfig(getCurrentTenantStore(), ctx.dataDir, tenant.tenantId, next);
 		} catch (error) {
-			if (tenant && ctx.syncChannelOwnership) {
+			if (ctx.syncChannelOwnership) {
 				try { await ctx.syncChannelOwnership(next, previous); }
 				catch (rollbackError) { logger.error({ err: rollbackError }, "failed to roll back channel ownership after config save failure"); }
 			}
@@ -130,30 +156,6 @@ export async function handleChannelsRoutes(
 		}
 		await channel.push(target, text);
 		json(res, 200, { channel: channelTestMatch.name, chatId: target.chatId, pushed: true });
-		return true;
-	}
-
-	// Bridge message endpoint
-	if (method === "POST" && url === "/api/bridge/messages") {
-		const body = await readBody(req);
-		const authHeader = req.headers.authorization;
-		if (ctx.handleBridge) {
-			const result = await ctx.handleBridge(authHeader, body);
-			json(res, result.status, result.body);
-			return true;
-		}
-		const bridgeToken = ctx.getBridgeToken();
-		const dispatcher = ctx.getDispatcher();
-		if (!bridgeToken || !dispatcher) {
-			json(res, 404, { error: "Bridge not configured" });
-			return true;
-		}
-		const result = handleBridgeMessage(
-			{ token: bridgeToken, channelRegistry, dispatcher },
-			authHeader,
-			body,
-		);
-		json(res, result.status, result.body);
 		return true;
 	}
 

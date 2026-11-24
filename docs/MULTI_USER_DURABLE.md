@@ -28,7 +28,7 @@
 | 工具 | PI coding-agent 扩展；共享原生工具经反向适配器 | pi-durable 原生三参数 ABI |
 | 多用户执行 | 禁止；历史资源只读 | 强制使用 |
 
-local/authenticated compatibility mode 可通过 `INNO_DURABLE_ENABLED=true` 和 `POST /api/sessions` 的 `{ "runtime": "durable" }` 显式选择 Durable。`INNO_MULTI_USER_ENABLED=true` 时，省略 runtime 也只会创建 Durable；显式 legacy 执行返回 `409 durable_required`。已有 legacy 历史不会自动迁移或改写。
+本分支已删除未认证本地模式：服务器总是要求 Better Auth + PostgreSQL，每个 API 请求都绑定租户。`INNO_AUTH_MODE` / `INNO_MULTI_USER_ENABLED` / `INNO_ALLOW_UNAUTHENTICATED_NETWORK` / `INNO_DURABLE_ENABLED` 均已废弃——设置了会直接启动报错。文件态目录（sessions.json、session.sqlite、文件版 L2/L3）与 import-once 迁移机器已删除；文件实现仅保留为单测 fake。`POST /api/sessions` 仍接受 `runtime` 字段兼容旧客户端（除 `"durable"` 外一律拒绝）。
 
 ## 3. 请求与并发架构
 
@@ -151,8 +151,6 @@ INNO_DURABLE_SHARD_URLS='{"worker-a":"http://worker-a:3000","worker-b":"http://w
 先准备 PostgreSQL、至少 32 字符的随机 secret 和本地配置文件，然后显式迁移：
 
 ```bash
-export INNO_AUTH_MODE=better-auth
-export INNO_MULTI_USER_ENABLED=true
 export DATABASE_URL=postgresql://inno:inno@127.0.0.1:5432/inno
 export BETTER_AUTH_SECRET='replace-with-at-least-32-random-characters'
 export BETTER_AUTH_URL=http://127.0.0.1:3000

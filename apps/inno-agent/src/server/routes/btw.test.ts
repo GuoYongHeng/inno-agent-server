@@ -5,6 +5,9 @@ import { PassThrough } from "node:stream";
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildBtwContextDigest, handleBtwRoutes, type BtwRouteContext } from "./btw.js";
+import { FakeTenantStore, ctxA } from "../../workspace/fake-tenant-store.js";
+import { setRequestTenant } from "../../tenants/http.js";
+import type { TenantStore } from "../../tenants/store.js";
 
 const SESSION = "durable-1";
 
@@ -15,10 +18,12 @@ interface StubService {
 	appendAssistantNotification: ReturnType<typeof vi.fn>;
 }
 
+const tenantStore = new FakeTenantStore();
 function fakeReq(payload: unknown): HttpReq & PassThrough {
 	const stream = new PassThrough() as HttpReq & PassThrough;
 	stream.headers = {};
 	stream.end(JSON.stringify(payload));
+	setRequestTenant(stream, ctxA, tenantStore as unknown as TenantStore);
 	return stream;
 }
 
@@ -56,7 +61,7 @@ beforeEach(() => {
 		completeSideQuestion: vi.fn(),
 		appendAssistantNotification: vi.fn(async () => undefined),
 	};
-	ctx = { dataDir, durableSessions: service as never };
+	ctx = { dataDir, durableSessions: service as never, tenantStore: tenantStore as unknown as TenantStore };
 });
 
 afterEach(() => {

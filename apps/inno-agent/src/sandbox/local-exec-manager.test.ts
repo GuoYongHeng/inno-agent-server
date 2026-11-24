@@ -8,8 +8,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { DurableSessionService } from "../agent/durable-session-service.js";
 import { DurableSessionRuntime } from "../agent/durable-runtime.js";
 import { normalizeConfig } from "../config.js";
+import { saveTenantConfig } from "../tenants/config.js";
 import { runWithoutTenantContext } from "../tenants/current.js";
-import type { TenantContext } from "../tenants/store.js";
+import { setRequestTenant } from "../tenants/http.js";
+import type { TenantContext, TenantStore } from "../tenants/store.js";
+import type { Pool } from "pg";
+import { resolveRequestTenantDataRoot } from "../tenants/paths.js";
+import { FileSessionCatalog } from "../agent/session-catalog.js";
 import { LocalExecManager } from "./local-exec-manager.js";
 
 const roots: string[] = [];
@@ -19,6 +24,18 @@ afterEach(async () => {
 	await Promise.all(services.splice(0).map((service) => service.close()));
 	for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true });
 });
+
+const ctxT = { tenantId: "t", userId: "u", role: "owner" } as TenantContext;
+const tenantStore = {
+	acquireDurableStorageLock: async () => undefined,
+	claimDurableStorage: async () => 1,
+	renewDurableStorage: async () => true,
+	releaseDurableStorage: async () => {},
+} as unknown as TenantStore;
+const fakePool = {
+	query: async () => ({ rows: [], rowCount: 0 }),
+	connect: async () => ({ query: async () => ({ rows: [], rowCount: 0 }), release: () => {} }),
+} as unknown as Pool;
 
 function setup() {
 	const base = mkdtempSync(join(tmpdir(), "inno-local-exec-"));
@@ -154,16 +171,21 @@ describe("durable session with local execution", () => {
 				fauxAssistantMessage(fauxToolCall("bash", { command: "echo from-bash > made.txt" }), { stopReason: "toolUse" }),
 				fauxAssistantMessage("done"),
 			]);
+			const cfg = normalizeConfig({
+				defaultProvider: "p", defaultModel: "m",
+				providers: { p: { baseUrl: "http://x.invalid/v1", apiKey: "k", models: [{ id: "m", name: "M", reasoning: false, input: ["text"], contextWindow: 8000, maxTokens: 4000 }] } },
+			});
+			saveTenantConfig(base, ctxT.tenantId, cfg);
 			const service = new DurableSessionService({
 				dataDir: base,
-				getLocalConfig: () => normalizeConfig({
-					defaultProvider: "p", defaultModel: "m",
-					providers: { p: { baseUrl: "http://x.invalid/v1", apiKey: "k", models: [{ id: "m", name: "M", reasoning: false, input: ["text"], contextWindow: 8000, maxTokens: 4000 }] } },
-				}),
+				getLocalConfig: () => cfg,
 				enabled: true,
 				resolveWorkspaceDir: () => workspace,
 				getSandboxManager: () => new LocalExecManager(),
-				openRuntime: async (options) => {
+				pgCatalog: new FileSessionCatalog((r) => join(resolveRequestTenantDataRoot(r, base), "durable", "sessions.json")),
+				recoveryPool: fakePool,
+				tenantStore,
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -171,6 +193,7 @@ describe("durable session with local execution", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
+			setRequestTenant(req, ctxT, tenantStore);
 			const session = await service.create(req, { workspaceId: "w" });
 			const lease = await service.lease(req, session.id);
 			try {

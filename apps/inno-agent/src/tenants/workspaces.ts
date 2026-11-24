@@ -1,7 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import { TEMP_WORKSPACE_ID, type WorkspaceMeta, type WorkspaceRegistry } from "../workspace/workspace-registry.js";
 import type { WorkspaceReplica } from "../workspace/workspace-replica.js";
-import { getRequestTenant, ownsRequestResource } from "./http.js";
+import { ownsRequestResource, requireRequestTenant } from "./http.js";
 import type { TenantStore } from "./store.js";
 
 /**
@@ -13,18 +13,16 @@ import type { TenantStore } from "./store.js";
 export async function resolveRequestWorkspace(
 	req: IncomingMessage,
 	registry: WorkspaceRegistry,
-	store: TenantStore | null | undefined,
+	store: TenantStore,
 	workspaceId?: string | null,
 	replica?: WorkspaceReplica | null,
 ): Promise<WorkspaceMeta | null> {
-	const tenant = getRequestTenant(req);
+	const tenant = requireRequestTenant(req);
 	const requestedId = workspaceId?.trim() || TEMP_WORKSPACE_ID;
-	if (!tenant) return registry.getWorkspace(requestedId);
 	if (requestedId !== TEMP_WORKSPACE_ID) {
 		if (!await ownsRequestResource(req, store, "workspace", requestedId)) return null;
 		return (replica ? await replica.materializeWorkspace(tenant, requestedId) : null) ?? registry.getWorkspace(requestedId);
 	}
-	if (!store) throw new Error("Tenant store is required for an authenticated request");
 	const tempId = `tmp-${tenant.tenantId}`;
 	const existing = registry.getWorkspace(tempId) ?? (replica ? await replica.materializeWorkspace(tenant, tempId) : null);
 	if (existing && await store.ownsResource(tenant, "workspace", tempId)) {
@@ -48,17 +46,12 @@ export async function resolveRequestWorkspace(
 export async function resolveRequestWorkspaceForRead(
 	req: IncomingMessage,
 	registry: WorkspaceRegistry,
-	store: TenantStore | null | undefined,
+	store: TenantStore,
 	workspaceId?: string | null,
 	replica?: WorkspaceReplica | null,
 ): Promise<{ id: string; name: string } | null> {
-	const tenant = getRequestTenant(req);
+	const tenant = requireRequestTenant(req);
 	const requestedId = workspaceId?.trim() || TEMP_WORKSPACE_ID;
-	if (!tenant) {
-		const ws = registry.getWorkspace(requestedId);
-		return ws ? { id: ws.id, name: ws.name } : null;
-	}
-	if (!store) throw new Error("Tenant store is required for an authenticated request");
 	if (requestedId !== TEMP_WORKSPACE_ID) {
 		if (!await ownsRequestResource(req, store, "workspace", requestedId)) return null;
 		const row = await store.getWorkspaceRow(tenant, requestedId);

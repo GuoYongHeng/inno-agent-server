@@ -60,7 +60,7 @@ beforeAll(async () => {
 	reqA = { headers: {} } as IncomingMessage;
 	setRequestTenant(reqA, tenant, store);
 	dir = mkdtempSync(join(tmpdir(), "inno-bench-"));
-	catalog = new PgSessionCatalog(pool, () => join(dir, "sessions.json"));
+	catalog = new PgSessionCatalog(pool);
 });
 
 afterAll(async () => {

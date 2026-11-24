@@ -3,22 +3,18 @@ import { probeProviderModels } from "../../agent/model-probe.js";
 import {
 	deleteModel,
 	deleteProvider,
-	normalizeContentHubConfig,
-	normalizeSmartInputConfig,
+		normalizeSmartInputConfig,
 	normalizeUiConfig,
-	saveConfig,
-	setDefaultModel,
+		setDefaultModel,
 	upsertProvider,
-	normalizeSandboxConfig,
-	type InnoConfig,
+		type InnoConfig,
 	type InnoModelConfig,
 	type InnoProviderConfig,
 	type InnoSmartInputConfig,
 } from "../../config.js";
 import { logger } from "../../logger.js";
 import type { RuntimePaths } from "../../runtime.js";
-import { applyProviderProxyBypass } from "../../utils/proxy-bypass.js";
-import { getRequestTenant } from "../../tenants/http.js";
+import { requireRequestTenant } from "../../tenants/http.js";
 import { getCurrentTenantStore } from "../../tenants/current.js";
 import {
 	loadTenantConfig,
@@ -195,17 +191,13 @@ export async function handleSettingsRoutes(
 	ctx: SettingsRouteContext,
 ): Promise<boolean> {
 	const { paths } = ctx;
-	const tenant = getRequestTenant(req);
-	const tenantScoped = tenant !== null;
-	// Per-request view of local or tenant config. Tenant files start empty and
-	// never inherit deployment-owner credentials from the legacy global file.
-	let config = tenant ? loadTenantConfig(paths.dataDir, tenant.tenantId) : ctx.getConfig();
+	const tenant = requireRequestTenant(req);
+	// Per-request view of the tenant's config. Tenant files start empty and
+	// never inherit deployment-owner credentials from a global file.
+	let config = loadTenantConfig(paths.dataDir, tenant.tenantId);
 	const tenantStore = getCurrentTenantStore();
 	const save = async (next: InnoConfig): Promise<void> => {
-		config = tenant
-			? await persistTenantConfig(tenantStore, paths.dataDir, tenant.tenantId, next)
-			: saveConfig(paths.configPath, next);
-		if (!tenant) ctx.setConfig(config);
+		config = await persistTenantConfig(tenantStore, paths.dataDir, tenant.tenantId, next);
 	};
 	// Durable runtimes read the config when a session is opened, so there is no
 	// live process-wide registry to synchronise after a settings change.
@@ -214,8 +206,7 @@ export async function handleSettingsRoutes(
 	const safeSettings = () => {
 		const view = buildSafeSettings(config);
 		// The sandbox is platform-level: a tenant neither sees nor edits it.
-		if (tenantScoped) return { ...view, sandbox: undefined, sandboxEditable: false };
-		return { ...view, sandboxEditable: true, sandboxEnvKey: Boolean(process.env.E2B_API_KEY?.trim()) };
+		return { ...view, sandbox: undefined, sandboxEditable: false };
 	};
 	const rejectSharedRuntime = (feature: string): true => {
 		json(res, 409, { error: `${feature} is unavailable until its runtime is tenant-scoped` });
@@ -244,7 +235,7 @@ export async function handleSettingsRoutes(
 	if ((method === "PUT" || method === "POST" || method === "PATCH") && url === "/api/settings/providers") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const payload = parseProviderPayload(body);
-		if (tenantScoped && payload.provider.bypassProxy) {
+		if (payload.provider.bypassProxy) {
 			json(res, 400, { error: "bypassProxy is process-global and unavailable for tenant providers" });
 			return true;
 		}
@@ -253,7 +244,7 @@ export async function handleSettingsRoutes(
 			preserveApiKey: payload.preserveApiKey,
 			preserveHeaders: payload.preserveHeaders,
 		}));
-		if (!tenantScoped) applyProviderProxyBypass(config);
+
 		await refreshProviders();
 		if (payload.makeDefault) {
 			await save(setDefaultModel(config, config.defaultProvider, config.defaultModel));
@@ -438,22 +429,7 @@ export async function handleSettingsRoutes(
 	}
 
 	if (method === "PUT" && url === "/api/settings/github") {
-		if (tenantScoped) return rejectSharedRuntime("Content Hub credentials");
-		const body = (await readBody(req)) as Record<string, unknown>;
-		if (typeof body.token !== "string") {
-			json(res, 400, { error: "Missing token (string)" });
-			return true;
-		}
-		const incoming = body.token.trim();
-		// A masked value (e.g. "****abcd") means "keep the existing token".
-		const token = incoming.startsWith("****") ? (config.github?.token ?? "") : incoming;
-		config.github = token ? { token } : undefined;
-		await save(config);
-		sync();
-		// Rebuild the content source so the new auth (and higher limit) applies.
-		ctx.invalidateContentSource();
-		json(res, 200, safeSettings());
-		return true;
+		return rejectSharedRuntime("Content Hub credentials");
 	}
 
 	// --- OCR API settings (Baidu PaddleOCR-VL token / model / baseUrl) ---
@@ -483,63 +459,9 @@ export async function handleSettingsRoutes(
 		return true;
 	}
 
-	// --- Sandbox settings (platform-level; local mode only) ---
+	// --- Sandbox settings (platform-level): tenants neither see nor edit them. ---
 	if (method === "PUT" && url === "/api/settings/sandbox") {
-		if (tenantScoped) {
-			json(res, 403, { error: "Sandbox settings are managed by the server operator" });
-			return true;
-		}
-		const body = (await readBody(req)) as Record<string, unknown>;
-		const current = config.sandbox ?? {};
-		const bad = (message: string): true => { json(res, 400, { error: message }); return true; };
-		const next: NonNullable<InnoConfig["sandbox"]> = { ...current };
-		if ("enabled" in body) { if (typeof body.enabled !== "boolean") return bad("enabled must be a boolean"); next.enabled = body.enabled; }
-		if ("apiKey" in body) {
-			if (typeof body.apiKey !== "string") return bad("apiKey must be a string");
-			const incoming = body.apiKey.trim();
-			// A masked value (e.g. "****abcd") means "keep the existing key".
-			if (!incoming.startsWith("****")) next.apiKey = incoming || undefined;
-		}
-		for (const key of ["domain", "template"] as const) {
-			if (key in body) {
-				if (typeof body[key] !== "string") return bad(`${key} must be a string`);
-				const value = (body[key] as string).trim();
-				next[key] = value || undefined;
-			}
-		}
-		for (const key of ["timeoutMinutes", "commandTimeoutSeconds"] as const) {
-			if (key in body) {
-				const value = body[key];
-				if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return bad(`${key} must be a positive number`);
-				next[key] = value;
-			}
-		}
-		if ("allowInternetAccess" in body) { if (typeof body.allowInternetAccess !== "boolean") return bad("allowInternetAccess must be a boolean"); next.allowInternetAccess = body.allowInternetAccess; }
-		if ("requireApproval" in body) { if (body.requireApproval !== "always" && body.requireApproval !== "never") return bad("requireApproval must be 'always' or 'never'"); next.requireApproval = body.requireApproval; }
-		if ("allowedDomains" in body) {
-			if (!Array.isArray(body.allowedDomains) || body.allowedDomains.some((entry) => typeof entry !== "string")) return bad("allowedDomains must be an array of strings");
-			next.allowedDomains = body.allowedDomains as string[];
-		}
-		if ("limits" in body) {
-			const limits = body.limits as Record<string, unknown> | null;
-			if (!limits || typeof limits !== "object") return bad("limits must be an object");
-			const merged = { ...(current.limits ?? {}) } as Record<string, number>;
-			for (const key of ["maxConcurrent", "maxSandboxes", "maxActiveMinutesPerDay"]) {
-				if (key in limits) {
-					const value = limits[key];
-					if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return bad(`limits.${key} must be a number >= 0`);
-					merged[key] = Math.floor(value);
-				}
-			}
-			next.limits = merged;
-		}
-		if (normalizeSandboxConfig(next).enabled && !normalizeSandboxConfig(next).apiKey) {
-			return bad("Enabling the sandbox needs an API key (here or in the E2B_API_KEY environment variable)");
-		}
-		config.sandbox = next;
-		await save(config);
-		ctx.invalidateSandbox?.();
-		json(res, 200, safeSettings());
+		json(res, 403, { error: "Sandbox settings are managed by the server operator" });
 		return true;
 	}
 
@@ -566,30 +488,7 @@ export async function handleSettingsRoutes(
 
 	// --- Content Hub settings (source for skill library + presets) ---
 	if (method === "PUT" && url === "/api/settings/content-hub") {
-		if (tenantScoped) return rejectSharedRuntime("Content Hub settings");
-		const body = (await readBody(req)) as Record<string, unknown>;
-		const current = config.contentHub ?? normalizeContentHubConfig(undefined, config.github?.token);
-		const str = (key: string, fallback: string): string =>
-			typeof body[key] === "string" ? (body[key] as string).trim() : fallback;
-		// A masked token (e.g. "****abcd") means "keep the existing token".
-		const incomingToken = typeof body.token === "string" ? body.token.trim() : "";
-		const token = incomingToken.startsWith("****") ? current.token : incomingToken;
-		config.contentHub = normalizeContentHubConfig({
-			type: body.type === "bundle" ? "bundle" : "github",
-			owner: str("owner", current.owner),
-			repo: str("repo", current.repo),
-			ref: str("ref", current.ref),
-			skillsPath: str("skillsPath", current.skillsPath),
-			presetsPath: str("presetsPath", current.presetsPath),
-			baseUrl: str("baseUrl", current.baseUrl),
-			token,
-		});
-		await save(config);
-		sync();
-		// Rebuild the content source so the new hub takes effect immediately.
-		ctx.invalidateContentSource();
-		json(res, 200, safeSettings());
-		return true;
+		return rejectSharedRuntime("Content Hub settings");
 	}
 
 	// PUT /api/settings/theme — persist UI theme preference

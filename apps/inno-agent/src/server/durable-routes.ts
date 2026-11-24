@@ -16,7 +16,7 @@ import {
 	type StreamEventEnvelope,
 } from "../chat/stream-registry.js";
 import { logger } from "../logger.js";
-import { getRequestTenant, releaseRequestResource } from "../tenants/http.js";
+import { releaseRequestResource, requireRequestTenant } from "../tenants/http.js";
 import type { TenantStore } from "../tenants/store.js";
 import type { WorkspaceRegistry } from "../workspace/workspace-registry.js";
 import type { WorkspaceReplica } from "../workspace/workspace-replica.js";
@@ -27,7 +27,7 @@ import { createWorkspaceChangeMonitor } from "./workspace-change-monitor.js";
 export interface DurableHttpContext {
 	service: DurableSessionService;
 	workspaceRegistry: WorkspaceRegistry;
-	tenantStore?: TenantStore | null;
+	tenantStore: TenantStore;
 	workspaceReplica?: WorkspaceReplica | null;
 	/** True when the shared object store keeps bytes past a restart (s3/fs). */
 	objectStorageDurable?: boolean;
@@ -286,7 +286,7 @@ async function streamDurableTurn(
 		// browser's refetch never sees a missing file. Coalesced and bounded —
 		// a burst produces at most two pushes and a stalled push never blocks
 		// the stream. Only with a durable object provider + replica + tenant.
-		const requestTenant = getRequestTenant(req);
+		const requestTenant = requireRequestTenant(req);
 		const replica = httpCtx?.workspaceReplica ?? null;
 		const pushGate = replica && httpCtx?.objectStorageDurable === true && requestTenant && state.workspaceRoot
 			? createReplicaPushGate(async () => { await replica.push(requestTenant, state.workspaceId, state.workspaceRoot!); })

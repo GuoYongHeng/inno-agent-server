@@ -1,5 +1,4 @@
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Pool } from "pg";
@@ -7,9 +6,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { migrateAuthDatabase } from "../auth/migration.js";
 import { readAuthRuntimeConfig } from "../auth/config.js";
 import { startTemporaryPostgres, type TemporaryPostgres } from "../db/test-postgres.js";
-import { PgRecoveryStore } from "../agent/recovery-store.js";
 import { TenantStore } from "../tenants/store.js";
-import { prepareChannelOutbox, type ChannelOutboxRecord } from "./channel-outbox.js";
+import { type ChannelOutboxRecord } from "./channel-outbox.js";
 import { MAX_OUTBOX_PAYLOAD_BYTES, PgChannelOutbox } from "./pg-channel-outbox.js";
 
 let postgres: TemporaryPostgres;
@@ -139,40 +137,7 @@ describe("PgChannelOutbox", () => {
 		expect(await outbox.load(intent.operationId)).toBeUndefined();
 	});
 
-	it("imports this session's legacy outbox files once and leaves other sessions' files alone", async () => {
-		const legacy = join(workdir(), "outbox");
-		mkdirSync(legacy);
-		const source = join(workdir(), "src.txt");
-		writeFileSync(source, "legacy payload");
-		const mine = record(sessionA, "legacy-call");
-		const theirs = record(sessionA2, "legacy-call");
-		prepareChannelOutbox(legacy, mine, source);
-		prepareChannelOutbox(legacy, theirs, source);
-		const outbox = new PgChannelOutbox(pool, a, legacy);
-		expect(await outbox.load(mine.operationId)).toEqual(mine);
-		const payload = await outbox.payload(mine);
-		expect(readFileSync(payload!.path, "utf-8")).toBe("legacy payload");
-		payload!.cleanup();
-		const key = (op: string) => createHash("sha256").update(op).digest("hex");
-		expect(existsSync(join(legacy, `${key(mine.operationId)}.json`))).toBe(false);
-		expect(existsSync(join(legacy, `${key(mine.operationId)}.payload`))).toBe(false);
-		expect(existsSync(join(legacy, `${key(theirs.operationId)}.json`))).toBe(true);
-	});
 });
 
 describe("OCR checkpoints on PostgreSQL", () => {
-	it("imports only the session's checkpoints from the shared legacy directory", async () => {
-		const legacy = join(workdir(), "ocr");
-		mkdirSync(legacy);
-		const key = (op: string) => createHash("sha256").update(op).digest("hex");
-		const mine = `ocr_image:${sessionA}:call-1`;
-		const other = `ocr_image:${sessionA2}:call-1`;
-		for (const op of [mine, other]) writeFileSync(join(legacy, `${key(op)}.json`), JSON.stringify({ operationId: op, filePath: "a.png", jobId: "job-1" }));
-		const belongsTo = (value: unknown, sessionId: string) => (value as { operationId?: string }).operationId?.startsWith(`ocr_image:${sessionId}:`) === true;
-		const store = new PgRecoveryStore(pool, a, "ocr", { dir: () => legacy, flat: true, belongsTo });
-		expect(await store.get(sessionA, key(mine))).toMatchObject({ jobId: "job-1" });
-		expect(existsSync(join(legacy, `${key(mine)}.json`))).toBe(false);
-		expect(existsSync(join(legacy, `${key(other)}.json`))).toBe(true);
-		expect(await store.get(sessionA, key(other))).toBeUndefined();
-	});
 });

@@ -1,4 +1,5 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -6,7 +7,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createStorageConformance, type StorageConformanceAssertions } from "@earendil-works/pi-durable/testing";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+
 import type { ConversationId, ConversationRecord, EntryId, EntryRecord } from "@earendil-works/pi-durable";
 import { migrateAuthDatabase } from "../auth/migration.js";
 import { readAuthRuntimeConfig } from "../auth/config.js";
@@ -53,7 +54,7 @@ beforeAll(async () => {
 	reqA = { headers: {} } as IncomingMessage;
 	setRequestTenant(reqA, tenant, store);
 	dir = mkdtempSync(join(tmpdir(), "inno-pgdurable-"));
-	catalog = new PgSessionCatalog(pool, () => join(dir, "sessions.json"));
+	catalog = new PgSessionCatalog(pool);
 });
 
 afterAll(async () => {
@@ -167,36 +168,4 @@ describe("PgDurableStorage lease and fencing", () => {
 });
 
 describe("PgDurableStorage legacy import", () => {
-	it("imports a legacy session.sqlite once, preserving ids, seqs and records", async () => {
-		const sessionId = await createSession();
-		const legacyDir = join(dir, "legacy", sessionId);
-		const legacyPath = join(legacyDir, "session.sqlite");
-		const sqlite = await openNodeSqliteStorage(legacyPath);
-		const conversationId = await sqlite.mintId<ConversationId>();
-		const entryId = await sqlite.mintId<EntryId>();
-		const seq = await sqlite.commit([
-			{ type: "conversation", value: { id: conversationId } as ConversationRecord },
-			{ type: "entry", value: { id: entryId, conversationId, kind: "note", data: { text: "from sqlite" } } as unknown as EntryRecord },
-		], BACKGROUND_CONTEXT);
-		expect(seq).toBeGreaterThanOrEqual(1);
-		await sqlite.close(BACKGROUND_CONTEXT);
-
-		const storage = await PgDurableStorage.open(pool, sessionId, { legacySqlitePath: legacyPath });
-		const found = await storage.conversation(conversationId, BACKGROUND_CONTEXT);
-		expect(found?.id).toBe(conversationId);
-		const entry = await storage.entry(entryId, BACKGROUND_CONTEXT);
-		expect(entry?.entry.data).toEqual({ text: "from sqlite" });
-		expect(entry?.commitSeq).toBe(seq);
-		// Minted ids continue monotonically past the imported counter.
-		const minted = await storage.mintId();
-		expect(Number(minted)).toBeGreaterThan(Number(entryId));
-		await storage.close(BACKGROUND_CONTEXT);
-		expect(existsSync(legacyPath)).toBe(false);
-		expect(existsSync(`${legacyPath}.migrated`)).toBe(true);
-
-		// Reopening does not re-import.
-		const reopened = await PgDurableStorage.open(pool, sessionId, { legacySqlitePath: legacyPath });
-		expect(await reopened.conversation(conversationId, BACKGROUND_CONTEXT)).toBeDefined();
-		await reopened.close(BACKGROUND_CONTEXT);
-	});
 });

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,8 +21,6 @@ const a = { tenantId: "", userId: "user-a", role: "owner" } as TenantContext;
 const b = { tenantId: "", userId: "user-b", role: "owner" } as TenantContext;
 let reqA: IncomingMessage;
 let reqB: IncomingMessage;
-
-const legacyPath = (req: IncomingMessage) => join(dir, req === reqA ? "a" : "b", "sessions.json");
 
 async function createUser(id: string) {
 	await pool.query(
@@ -56,7 +54,7 @@ beforeAll(async () => {
 	setRequestTenant(reqA, a, store);
 	setRequestTenant(reqB, b, store);
 	dir = mkdtempSync(join(tmpdir(), "inno-pgcat-"));
-	catalog = new PgSessionCatalog(pool, legacyPath);
+	catalog = new PgSessionCatalog(pool);
 });
 
 afterAll(async () => {
@@ -125,36 +123,7 @@ describe("PgSessionCatalog", () => {
 		expect(await store.ownsResource(b, "session", newer)).toBe(false);
 	});
 
-	it("imports a legacy sessions.json once, only for sessions the tenant owns, then renames it", async () => {
-		const owned = uuid(7);
-		const foreign = uuid(8);
-		const unowned = uuid(9);
-		await store.claimResource(a, "session", owned);
-		await store.claimResource(b, "session", foreign);
-		mkdirSync(join(dir, "a"), { recursive: true });
-		writeFileSync(legacyPath(reqA), JSON.stringify([record(owned, { name: "legacy", messageCount: 4 }), record(foreign), record(unowned)]));
-		const fresh = () => new PgSessionCatalog(pool, legacyPath);
-		// Two workers importing the same file race; the result must be identical.
-		const [x, y] = [fresh(), fresh()];
-		await Promise.all([x.list(reqA), y.list(reqA)]);
-		expect(await x.get(reqA, owned)).toMatchObject({ name: "legacy", messageCount: 4 });
-		expect(await x.get(reqA, foreign)).toBeUndefined();
-		expect(await x.get(reqA, unowned)).toBeUndefined();
-		expect((await pool.query("SELECT tenant_id FROM durable_sessions WHERE id = $1", [foreign])).rowCount).toBe(0);
-		expect(existsSync(legacyPath(reqA))).toBe(false);
-		expect(existsSync(`${legacyPath(reqA)}.migrated`)).toBe(true);
-		// A session deleted afterwards is not resurrected by a restart.
-		await x.remove(reqA, owned);
-		expect(await fresh().get(reqA, owned)).toBeUndefined();
-	});
 
-	it("leaves an unreadable legacy file in place instead of failing the request", async () => {
-		mkdirSync(join(dir, "b"), { recursive: true });
-		writeFileSync(legacyPath(reqB), "{broken");
-		expect(Array.isArray(await new PgSessionCatalog(pool, legacyPath).list(reqB))).toBe(true);
-		expect(existsSync(legacyPath(reqB))).toBe(true);
-	});
-});
 
 	it("paginates by cursor without skipping or duplicating rows", async () => {
 		const same = "2030-01-01T00:00:00.000Z";
@@ -185,3 +154,4 @@ describe("PgSessionCatalog", () => {
 
 		await expect(catalog.listPage(reqA, { cursor: "not-a-cursor" })).rejects.toThrow("Invalid session list cursor");
 	});
+});

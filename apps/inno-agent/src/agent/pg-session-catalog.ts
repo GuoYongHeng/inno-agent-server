@@ -1,15 +1,12 @@
-import { existsSync, readFileSync, renameSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
 import type { Pool } from "pg";
-import { logger } from "../logger.js";
-import { getRequestTenant } from "../tenants/http.js";
+import { requireRequestTenant } from "../tenants/http.js";
 import { ResourceOwnershipError, type TenantContext } from "../tenants/store.js";
 import { setGauge, timedAsync } from "../utils/metrics.js";
 import {
 	SessionNotFoundError,
 	decodeSessionListCursor,
 	encodeSessionListCursor,
-	isSessionRecord,
 	type DurableSessionPatch,
 	type DurableSessionRecord,
 	type SessionCatalog,
@@ -76,7 +73,7 @@ export function toRecord(row: SessionRow): DurableSessionRecord {
 }
 
 function requireTenant(req: IncomingMessage): TenantContext {
-	const tenant = getRequestTenant(req);
+	const tenant = requireRequestTenant(req);
 	if (!tenant) throw new Error("The PostgreSQL session catalog requires a verified tenant");
 	return tenant;
 }
@@ -87,81 +84,15 @@ function requireTenant(req: IncomingMessage): TenantContext {
  * Creating a session writes its ownership row and catalog row in one
  * transaction, so there is no window with an owned-but-unlisted session.
  *
- * Tenants that predate this table are imported lazily from their
- * `sessions.json`, once per process on first access; the file is then renamed to
- * `sessions.json.migrated` so a stale copy can never resurrect a deleted session.
  */
 export class PgSessionCatalog implements SessionCatalog {
-	private readonly imports = new Map<string, Promise<void>>();
 
-	constructor(
-		private readonly pool: Pool,
-		/** Location of the tenant's legacy `sessions.json`. */
-		private readonly legacyCatalogPath: (req: IncomingMessage) => string,
-	) {}
+	constructor(private readonly pool: Pool) {}
 
 	private async ready(req: IncomingMessage): Promise<TenantContext> {
-		const tenant = requireTenant(req);
-		let pending = this.imports.get(tenant.tenantId);
-		if (!pending) {
-			pending = this.importLegacy(req, tenant).catch((error) => {
-				this.imports.delete(tenant.tenantId);
-				throw error;
-			});
-			this.imports.set(tenant.tenantId, pending);
-		}
-		await pending;
-		return tenant;
+		return requireTenant(req);
 	}
 
-	private async importLegacy(req: IncomingMessage, tenant: TenantContext): Promise<void> {
-		const path = this.legacyCatalogPath(req);
-		if (!existsSync(path)) return;
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(readFileSync(path, "utf-8"));
-		} catch (error) {
-			logger.error({ err: error, path }, "legacy session catalog is unreadable; leaving it in place and skipping the import");
-			return;
-		}
-		const records = Array.isArray(parsed) ? parsed.filter(isSessionRecord) : [];
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			for (const record of records) {
-				// Only sessions this tenant already owns are imported, so a hand-edited
-				// file cannot attach another tenant's session to this one.
-				await client.query(
-					`INSERT INTO durable_sessions
-					   (id, tenant_id, workspace_id, name, provider, model_id, origin, archived, message_count, preview,
-					    topic_generated, topic_upgraded, conversation_id, sandbox_id, created_at, updated_at)
-					 SELECT $2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::timestamptz, $16::timestamptz
-					 WHERE EXISTS (SELECT 1 FROM resource_ownership
-					               WHERE tenant_id = $1 AND resource_type = 'session' AND resource_id = $2)
-					 ON CONFLICT (id) DO NOTHING`,
-					[
-						tenant.tenantId, record.id, record.workspaceId, record.name, record.provider, record.modelId,
-						record.origin ?? "web", record.archived, record.messageCount, record.preview,
-						record.topicGenerated ?? null, record.topicUpgraded ?? null, record.conversationId ?? null, record.sandboxId ?? null,
-						record.createdAt, record.updatedAt,
-					],
-				);
-			}
-			await client.query("COMMIT");
-		} catch (error) {
-			await client.query("ROLLBACK").catch(() => undefined);
-			throw error;
-		} finally {
-			client.release();
-		}
-		try {
-			renameSync(path, `${path}.migrated`);
-		} catch (error) {
-			// Another worker may have renamed it first; the import itself is idempotent.
-			logger.debug({ err: error, path }, "legacy session catalog already renamed");
-		}
-		logger.info({ tenantId: tenant.tenantId, sessions: records.length }, "imported legacy session catalog into PostgreSQL");
-	}
 
 	async get(req: IncomingMessage, id: string): Promise<DurableSessionRecord | undefined> {
 		const tenant = await this.ready(req);

@@ -1,7 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rmSync } from "node:fs";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { migrateAuthDatabase } from "../auth/migration.js";
@@ -82,26 +80,6 @@ describe("PgRecoveryStore", () => {
 		await expect(new PgRecoveryStore(pool, a, "question").put(sessionId, "../x", {})).rejects.toThrow(/Invalid recovery record key/);
 	});
 
-	it("imports a tenant's legacy JSON files once and sets the directory aside", async () => {
-		const root = mkdtempSync(join(tmpdir(), "inno-legacy-"));
-		scratch.push(root);
-		const legacy = join(root, "questions", sessionId);
-		mkdirSync(legacy, { recursive: true });
-		const key = hash("legacy-op");
-		writeFileSync(join(legacy, `${key}.json`), JSON.stringify({ legacy: true }));
-		writeFileSync(join(legacy, "not-a-record.json"), "{}");
-		const store = new PgRecoveryStore(pool, a, "question", { dir: () => legacy });
-		expect(await store.get(sessionId, key)).toEqual({ legacy: true });
-		expect(existsSync(legacy)).toBe(false);
-		expect(existsSync(`${legacy}.migrated`)).toBe(true);
-		// A session this tenant does not own is never imported.
-		const foreign = join(root, "foreign");
-		mkdirSync(foreign);
-		writeFileSync(join(foreign, `${key}.json`), JSON.stringify({ stolen: true }));
-		const other = "durable-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-		expect(await new PgRecoveryStore(pool, a, "question", { dir: () => foreign }).get(other, key)).toBeUndefined();
-		await store.deleteSession(sessionId);
-	});
 });
 
 describe("question and permission stores on PostgreSQL", () => {

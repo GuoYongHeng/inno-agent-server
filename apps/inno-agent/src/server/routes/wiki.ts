@@ -9,7 +9,7 @@ import type { WikiIngestReview } from "../../memory/l2/wiki-generator.js";
 import { l2Store, checkL2Path, readJsonLines, type L2Backend } from "../../memory/l2/l2-backend.js";
 import { json, readBody, UPLOAD_MAX_BODY_BYTES } from "../http-helpers.js";
 import { listWikiPagePaths } from "../../memory/l2/wiki-page-files.js";
-import { getRequestTenant } from "../../tenants/http.js";
+import { requireRequestTenant } from "../../tenants/http.js";
 import { resolveTenantDataDir } from "../../tenants/paths.js";
 
 export interface WikiRouteContext {
@@ -75,7 +75,7 @@ export async function handleWikiRoutes(
 	url: string,
 	ctx: WikiRouteContext,
 ): Promise<boolean> {
-	const tenant = getRequestTenant(req);
+	const tenant = requireRequestTenant(req);
 	if (tenant && !ctx.dataDir) throw new Error("dataDir is required for tenant wiki storage");
 	const l2DataDir = tenant
 		? resolveTenantDataDir(req, ctx.dataDir!, "l2")

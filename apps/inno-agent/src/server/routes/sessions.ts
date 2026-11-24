@@ -10,7 +10,7 @@ import type { RemoteContentSource } from "../../content-source/index.js";
 import type { RuntimePaths } from "../../runtime.js";
 import { TEMP_WORKSPACE_ID, type WorkspaceRegistry } from "../../workspace/workspace-registry.js";
 import type { TenantStore } from "../../tenants/store.js";
-import { claimRequestResource, getRequestTenant, ownsRequestResource, releaseRequestResource } from "../../tenants/http.js";
+import { claimRequestResource, ownsRequestResource, releaseRequestResource, requireRequestTenant } from "../../tenants/http.js";
 import { resolveRequestWorkspace } from "../../tenants/workspaces.js";
 import type { WorkspaceReplica } from "../../workspace/workspace-replica.js";
 import { HttpError, decodeRouteParam, json, readBody } from "../http-helpers.js";
@@ -20,7 +20,7 @@ import { handleDurableSessionResourceRoutes, type DurableHttpContext } from "../
 export interface SessionsRouteContext {
 	workspaceRegistry: WorkspaceRegistry;
 	paths: RuntimePaths;
-	tenantStore?: TenantStore | null;
+	tenantStore: TenantStore;
 	workspaceReplica?: WorkspaceReplica | null;
 	objectStorageDurable?: boolean;
 	durableSessions: DurableHttpContext["service"];
@@ -62,7 +62,7 @@ export async function handleSessionsRoutes(
 	}
 
 	if (method === "GET" && url === "/api/sessions") {
-		const tenant = getRequestTenant(req);
+		const tenant = requireRequestTenant(req);
 		if (!tenantStore && tenant) throw new Error("Tenant store is required for an authenticated request");
 		const ownedSessionIds = tenant ? await tenantStore!.listResourceIds(tenant, "session") : null;
 		// `limit`/`cursor` opt into cursor pagination; without them the legacy
@@ -105,7 +105,7 @@ export async function handleSessionsRoutes(
 		const newWorkspaceSpec = body.newWorkspace && typeof body.newWorkspace === "object"
 			? body.newWorkspace as { name?: unknown; isTemp?: unknown }
 			: null;
-		const tenant = getRequestTenant(req);
+		const tenant = requireRequestTenant(req);
 		const presetWorkspaceId = `preset-${presetId}${tenant ? `-${tenant.tenantId}` : ""}`;
 		const existingPresetWorkspace = presetId
 			? workspaceRegistry.getWorkspace(presetWorkspaceId)

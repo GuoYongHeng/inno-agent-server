@@ -9,6 +9,10 @@ import { WorkspaceFileEnv } from "./durable-env.js";
 import { findOrphanedSessionData, removeOrphanedSessionData } from "./durable-orphans.js";
 import { DurableSessionService } from "./durable-session-service.js";
 import { createDurableMemoryRegistrations } from "./durable-memory.js";
+import { FileSessionCatalog } from "./session-catalog.js";
+import { setRequestTenant } from "../tenants/http.js";
+import type { TenantContext, TenantStore } from "../tenants/store.js";
+import type { Pool } from "pg";
 
 /**
  * H0 safety net (docs/DURABLE_ROADMAP.md): behaviour of the file-backed session
@@ -18,7 +22,19 @@ import { createDurableMemoryRegistrations } from "./durable-memory.js";
 
 const roots: string[] = [];
 const services: DurableSessionService[] = [];
+const ctxT = { tenantId: "t", userId: "u", role: "owner" } as TenantContext;
+const tenantStore = {
+	acquireDurableStorageLock: async () => undefined,
+	claimDurableStorage: async () => 1,
+	renewDurableStorage: async () => true,
+	releaseDurableStorage: async () => {},
+} as unknown as TenantStore;
+const fakePool = {
+	query: async () => ({ rows: [], rowCount: 0 }),
+	connect: async () => ({ query: async () => ({ rows: [], rowCount: 0 }), release: () => {} }),
+} as unknown as Pool;
 const req = { headers: {} } as IncomingMessage;
+setRequestTenant(req, ctxT, tenantStore);
 
 function root(): string {
 	const value = mkdtempSync(join(tmpdir(), "inno-h0-"));
@@ -36,12 +52,15 @@ function makeService(base: string): DurableSessionService {
 		}),
 		enabled: true,
 		resolveWorkspaceDir: () => base,
+		pgCatalog: new FileSessionCatalog(() => join(durableRoot(base), "sessions.json")),
+		recoveryPool: fakePool,
+		tenantStore,
 	});
 	services.push(service);
 	return service;
 }
 
-const durableRoot = (base: string) => join(base, "durable");
+const durableRoot = (base: string) => join(base, "tenants", ctxT.tenantId, "durable");
 
 afterEach(async () => {
 	await Promise.all(services.splice(0).map((service) => service.close()));

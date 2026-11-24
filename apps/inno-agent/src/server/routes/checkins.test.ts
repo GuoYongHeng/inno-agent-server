@@ -6,16 +6,21 @@ import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CheckInStore } from "../../checkins/check-in-store.js";
 import { JobStore } from "../../scheduler/job-store.js";
+import { FakeTenantStore, ctxA } from "../../workspace/fake-tenant-store.js";
+import { setRequestTenant } from "../../tenants/http.js";
+import type { TenantStore } from "../../tenants/store.js";
 import { handleCheckInsRoutes } from "./checkins.js";
 
 let dir: string;
 let jobStore: JobStore;
 let checkInStore: CheckInStore;
+let tenantStore: FakeTenantStore;
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "inno-checkins-route-"));
 	jobStore = new JobStore(join(dir, "jobs"), "Asia/Shanghai");
 	checkInStore = new CheckInStore(join(dir, "data"), "Asia/Shanghai", jobStore);
+	tenantStore = new FakeTenantStore();
 });
 
 afterEach(() => {
@@ -25,6 +30,7 @@ afterEach(() => {
 function fakeReq(body: unknown): HttpReq {
 	const req = Readable.from([JSON.stringify(body)]) as HttpReq;
 	req.headers = {};
+	setRequestTenant(req, ctxA, tenantStore as unknown as TenantStore);
 	return req;
 }
 
@@ -81,7 +87,7 @@ describe("check-ins skip/claim idempotency", () => {
 		const res = fakeRes();
 		const handled = await handleCheckInsRoutes(
 			fakeReq({ occurrenceId: occurrence.occurrenceId }), res,
-			"POST", "/api/checkins/skip", { checkInStore },
+			"POST", "/api/checkins/skip", { checkInStore, tenantStore: tenantStore as unknown as TenantStore },
 		);
 
 		expect(handled).toBe(true);
@@ -95,20 +101,20 @@ describe("check-ins skip/claim idempotency", () => {
 		const res = fakeRes();
 		await handleCheckInsRoutes(
 			fakeReq({ occurrenceId: occurrence.occurrenceId }), res,
-			"POST", "/api/checkins/skip", { checkInStore },
+			"POST", "/api/checkins/skip", { checkInStore, tenantStore: tenantStore as unknown as TenantStore },
 		);
 
 		expect(res.statusCode).toBe(409);
 	});
 
-	it("returns 409 for an unknown slot", async () => {
+	it("returns 404 for an unknown slot", async () => {
 		const res = fakeRes();
 		await handleCheckInsRoutes(
 			fakeReq({ occurrenceId: "nope" }), res,
-			"POST", "/api/checkins/skip", { checkInStore },
+			"POST", "/api/checkins/skip", { checkInStore, tenantStore: tenantStore as unknown as TenantStore },
 		);
 
-		expect(res.statusCode).toBe(409);
+		expect(res.statusCode).toBe(404);
 	});
 
 	it("lets a late claim of an already-skipped slot stand down quietly", async () => {
@@ -118,7 +124,7 @@ describe("check-ins skip/claim idempotency", () => {
 		const res = fakeRes();
 		await handleCheckInsRoutes(
 			fakeReq({ occurrenceId: occurrence.occurrenceId }), res,
-			"POST", "/api/checkins/claim", { checkInStore },
+			"POST", "/api/checkins/claim", { checkInStore, tenantStore: tenantStore as unknown as TenantStore },
 		);
 
 		expect(res.statusCode).toBe(200);

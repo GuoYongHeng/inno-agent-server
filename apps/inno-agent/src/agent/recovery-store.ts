@@ -1,7 +1,6 @@
-import { existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Pool } from "pg";
-import { logger } from "../logger.js";
 import { writeJson } from "../storage/file-store.js";
 
 export type RecoveryKind = "question" | "permission" | "ocr" | "outbox";
@@ -119,86 +118,17 @@ export class FileRecoveryStore implements RecoveryRecordStore {
 
 /**
  * Tenant-scoped rows in `recovery_records`. The tenant is fixed at construction
- * from a verified request, never taken from a caller-supplied value. A tenant's
- * records from before the move to PostgreSQL are imported once per session on
- * first access, and the legacy directory is then renamed so a stale copy can
- * never resurrect an answered question.
+ * from a verified request, never taken from a caller-supplied value.
  */
-/**
- * Records kept as JSON files before PostgreSQL. A per-session directory is
- * imported whole and renamed; a flat directory shared by all sessions is
- * imported selectively (`belongsTo`) and each imported file is removed.
- */
-export interface LegacyRecoveryFiles {
-	dir: (sessionId: string) => string;
-	flat?: boolean;
-	belongsTo?: (value: unknown, sessionId: string) => boolean;
-}
-
 export class PgRecoveryStore implements RecoveryRecordStore {
-	private readonly imported = new Map<string, Promise<void>>();
-
 	constructor(
 		private readonly pool: Pool,
 		private readonly tenantId: string,
 		private readonly kind: RecoveryKind,
-		/** Where this kind's files lived before PostgreSQL; omitted when there is nothing to import. */
-		private readonly legacy?: LegacyRecoveryFiles,
 	) {}
 
-	private async ready(sessionId: string): Promise<void> {
-		if (!this.legacy) return;
-		let pending = this.imported.get(sessionId);
-		if (!pending) {
-			pending = this.importLegacy(sessionId, this.legacy).catch((error) => {
-				this.imported.delete(sessionId);
-				throw error;
-			});
-			this.imported.set(sessionId, pending);
-		}
-		await pending;
-	}
+	private async ready(_sessionId: string): Promise<void> {}
 
-	private async importLegacy(sessionId: string, legacy: LegacyRecoveryFiles): Promise<void> {
-		const dir = legacy.dir(sessionId);
-		if (!existsSync(dir)) return;
-		const files = readdirSync(dir).filter((file) => file.endsWith(".json")).sort();
-		const imported: string[] = [];
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			for (const file of files) {
-				const key = file.slice(0, -5);
-				if (!KEY_PATTERN.test(key)) continue;
-				const path = join(dir, file);
-				let value: unknown;
-				try {
-					value = JSON.parse(readFileSync(path, "utf-8"));
-				} catch (error) {
-					logger.error({ err: error, path }, "legacy recovery record is unreadable; skipping it");
-					continue;
-				}
-				if (legacy.belongsTo && !legacy.belongsTo(value, sessionId)) continue;
-				imported.push(path);
-				await client.query(
-					`INSERT INTO recovery_records (tenant_id, session_id, kind, record_key, value, created_at, updated_at)
-					 SELECT $1, $2, $3, $4, $5::jsonb, to_timestamp($6 / 1000.0), to_timestamp($6 / 1000.0)
-					 WHERE EXISTS (SELECT 1 FROM resource_ownership
-					               WHERE tenant_id = $1 AND resource_type = 'session' AND resource_id = $2)
-					 ON CONFLICT DO NOTHING`,
-					[this.tenantId, sessionId, this.kind, key, JSON.stringify(value), statSync(path).mtimeMs],
-				);
-			}
-			await client.query("COMMIT");
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
-		}
-		if (legacy.flat) for (const path of imported) rmSync(path, { force: true });
-		else renameSync(dir, `${dir}.migrated`);
-	}
 
 	async get<T>(sessionId: string, key: string): Promise<T | undefined> {
 		assertKey(key);
@@ -245,7 +175,5 @@ export class PgRecoveryStore implements RecoveryRecordStore {
 			"DELETE FROM recovery_records WHERE tenant_id = $1 AND session_id = $2 AND kind = $3",
 			[this.tenantId, sessionId, this.kind],
 		);
-		// Also drop any not-yet-imported legacy files so they cannot be imported later.
-		if (this.legacy && !this.legacy.flat) rmSync(this.legacy.dir(sessionId), { recursive: true, force: true });
 	}
 }

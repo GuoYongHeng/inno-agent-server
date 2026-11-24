@@ -22,10 +22,6 @@ const FORWARD_HEADERS_TIMEOUT_MS = Math.max(
 	Number(process.env.INNO_DURABLE_FORWARD_TIMEOUT_MS) || 10_000,
 );
 
-function enabled(value: string | undefined): boolean {
-	return /^(1|true)$/i.test(value?.trim() ?? "");
-}
-
 const SHARD_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
 /** Worker identity: the explicit shard id, else the container/pod `HOSTNAME`
@@ -97,10 +93,6 @@ export function readDurableShardConfig(env: NodeJS.ProcessEnv): DurableShardConf
 	const rawTemplate = env.INNO_DURABLE_SHARD_URL_TEMPLATE?.trim() ?? "";
 	const localShardId = resolveDurableShardId(env);
 	if (!localShardId && !rawTargets && !rawTemplate) return null;
-	if (env.INNO_AUTH_MODE?.trim() !== "better-auth"
-		|| !enabled(env.INNO_MULTI_USER_ENABLED)) {
-		throw new Error("Durable sharding requires Better Auth and INNO_MULTI_USER_ENABLED=true");
-	}
 	if (rawTargets && rawTemplate) {
 		throw new Error("Use either INNO_DURABLE_SHARD_URLS or INNO_DURABLE_SHARD_URL_TEMPLATE, not both");
 	}

@@ -1,11 +1,11 @@
 import type { IncomingMessage } from "node:http";
 import { join } from "node:path";
-import { getRequestTenant } from "./http.js";
+import { requireRequestTenant } from "./http.js";
 import { getCurrentTenant } from "./current.js";
 
 /** Resolve private HTTP state without trusting client-provided tenant paths. */
 export function resolveRequestTenantDataRoot(req: IncomingMessage, dataDir: string): string {
-	const tenant = getRequestTenant(req);
+	const tenant = requireRequestTenant(req);
 	return tenant ? join(dataDir, "tenants", tenant.tenantId) : dataDir;
 }
 
@@ -15,7 +15,7 @@ export function resolveTenantDataDir(
 	dataDir: string,
 	domain: "l2" | "l3",
 ): string {
-	const tenant = getRequestTenant(req);
+	const tenant = requireRequestTenant(req);
 	return tenant ? join(dataDir, "tenants", tenant.tenantId, domain) : join(dataDir, domain);
 }
 

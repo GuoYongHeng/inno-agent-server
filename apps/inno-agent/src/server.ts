@@ -27,16 +27,14 @@ import { executeJob, type CreatedJobSession, type DurableJobExecution, type Dura
 import type { ScheduledJob } from "./scheduler/types.js";
 import { ChannelRegistry } from "./channels/channel.js";
 import { FeishuChannel } from "./channels/feishu/feishu-channel.js";
-import { PersonalChannelDispatcher, type PersonalChannelDispatcherOptions, type StreamEventCallback } from "./channels/personal-dispatcher.js";
+import type { PersonalChannelDispatcherOptions, StreamEventCallback } from "./channels/personal-dispatcher.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { bridgeChannelResourceId, TenantChannelManager } from "./channels/tenant-channel-manager.js";
 import { bridgeBearerToken, handleBridgeMessage } from "./channels/bridge/bridge-server.js";
 import { BridgeChannel } from "./channels/bridge/bridge-channel.js";
 import { WeChatChannel } from "./channels/wechat/wechat-channel.js";
-import type { PersonalBridgeChannelConfig } from "./config.js";
 import { ScopedJobStore } from "./scheduler/scoped-job-store.js";
 import { CheckInStore } from "./checkins/check-in-store.js";
-import { CronScheduler } from "./scheduler/cron-scheduler.js";
 import { TenantCronScheduler } from "./scheduler/tenant-cron-scheduler.js";
 import { HttpError, json, readBody } from "./server/http-helpers.js";
 import { serveStatic } from "./server/static-serve.js";
@@ -80,11 +78,11 @@ import { ContentHubCatalog } from "./content-source/catalog-service.js";
 import { readAuthRuntimeConfig, readListenConfig } from "./auth/config.js";
 import { assertSignUpAllowed, isPublicApiRequest, isTrustedOrigin, requireSession } from "./auth/http.js";
 import { createAuthRuntime } from "./auth/runtime.js";
-import { createBackgroundRequest, getRequestTenant, setRequestTenant } from "./tenants/http.js";
+import { createBackgroundRequest, requireRequestTenant, setRequestTenant } from "./tenants/http.js";
 import type { TenantContext } from "./tenants/store.js";
 import { syncTenantConfigFromStore } from "./tenants/config.js";
 import { forwardDurableTenantRequest, readDurableShardConfig } from "./tenants/durable-tenant-router.js";
-import { resolveCurrentTenantDataRoot, resolveRequestTenantDataRoot } from "./tenants/paths.js";
+import { resolveCurrentTenantDataRoot, } from "./tenants/paths.js";
 import { getCurrentTenant, getCurrentTenantStore, runWithoutTenantContext } from "./tenants/current.js";
 
 // ---------------------------------------------------------------------------
@@ -106,7 +104,7 @@ applyRuntimeEnvironment(paths);
 
 const authConfig = readAuthRuntimeConfig(process.env);
 const durableShardConfig = readDurableShardConfig(process.env);
-const listenConfig = readListenConfig(process.env, authConfig.mode);
+const listenConfig = readListenConfig(process.env);
 const auth = createAuthRuntime(authConfig);
 await auth.checkConnection();
 
@@ -151,15 +149,15 @@ const objectStorageIsDurable = (): boolean =>
  * by the workspace routes and the durable session service (T1.4).
  */
 const workspaceStoreForRequest = (request: HttpReq): WorkspaceStore => {
-	const tenant = getRequestTenant(request);
-	if (tenant && auth.tenantStore && objectStorageIsDurable()) {
+	const tenant = requireRequestTenant(request);
+	if (objectStorageIsDurable()) {
 		return new ObjectWorkspaceStore({ objects: getSharedObjectStore(), store: auth.tenantStore, context: tenant });
 	}
 	// memory provider: bytes die with the process — the local dir stays
 	// the source of truth even for authenticated requests.
 	return new LocalFsWorkspaceStore({ resolveRoot: (id) => workspaceRegistry.resolveWorkspaceDir(id) });
 };
-if (auth.tenantStore) {
+{
 	const l2Pool = auth.tenantStore.database;
 	const tenantL2Root = resolve(dataDir, "tenants");
 	setL2BackendResolver((resolvedDir) => {
@@ -167,7 +165,7 @@ if (auth.tenantStore) {
 		if (parts.length !== 2 || parts[1] !== "l2") return null;
 		const tenantId = parts[0];
 		if (!tenantId || tenantId.startsWith(".")) return null;
-		return new PgL2Backend(l2Pool, tenantId, getSharedObjectStore(), resolvedDir);
+		return new PgL2Backend(l2Pool, tenantId, getSharedObjectStore());
 	});
 }
 
@@ -193,16 +191,12 @@ let jobStore!: ScopedJobStore;
 let checkInStore!: CheckInStore;
 let channelRegistry!: ChannelRegistry;
 let workspaceRegistry!: WorkspaceRegistry;
-let feishuChannel: FeishuChannel | null = null;
-let wechatChannel: WeChatChannel | null = null;
-let dispatcher: PersonalChannelDispatcher | null = null;
 let tenantChannelManager: TenantChannelManager | null = null;
-let scheduler: CronScheduler | TenantCronScheduler | null = null;
+let scheduler: TenantCronScheduler | null = null;
 let scheduledSessionFactory: ((job: ScheduledJob, request?: HttpReq) => Promise<CreatedJobSession | null>) | undefined;
 
 let bootstrapped = false;
 let bootstrapPromise: Promise<void> | null = null;
-let bridgeToken: string | undefined;
 
 /**
  * One-shot lazy bootstrap. Idempotent — concurrent requests while the first
@@ -235,7 +229,7 @@ async function ensureBootstrapped(): Promise<void> {
 
 		workspaceRegistry = new WorkspaceRegistry(paths.workspaceDir, dataDir);
 		workspaceRegistry.ensureBootstrapped();
-		if (auth.tenantStore) {
+		{
 			workspaceReplica = new WorkspaceReplica(getSharedObjectStore(), auth.tenantStore, workspaceRegistry, join(dataDir, "workspaces", "replica"));
 			if (!objectStorageIsDurable()) {
 				logger.warn("object storage is in-memory: workspace panel reads this worker's disk; not safe for takeover");
@@ -253,18 +247,6 @@ async function ensureBootstrapped(): Promise<void> {
 		migrateLegacyPiSkills();
 
 		// ---- channels ----
-		function migrateReminderChannels(): void {
-			const defaultFeishuTarget = channelRegistry.getDefaultTarget("feishu");
-			if (!defaultFeishuTarget) return;
-			for (const job of jobStore.list()) {
-				if (job.taskType !== "push_reminder") continue;
-				if (job.channel) continue;
-				jobStore.update(job.id, {
-					channel: "feishu",
-					target: defaultFeishuTarget,
-				});
-			}
-		}
 
 		const runDurableChannelPrompt = (
 			sessionId: string,
@@ -289,23 +271,14 @@ async function ensureBootstrapped(): Promise<void> {
 			recordSessionChannel: (ch, sid?) => recordSessionChannel(ch as SessionChannel, sid, { setOriginIfEmpty: true }),
 			onSessionCreated: async (sessionId, channel) => {
 				const tenant = getCurrentTenant();
-				if (tenant) {
-					const store = getCurrentTenantStore();
-					if (!store) throw new Error("Channel session creation requires a tenant store");
-					const ws = workspaceRegistry.ensureChannelWorkspace(channel, tenant.tenantId);
-					await store.claimResource(tenant, "workspace", ws.id);
-					workspaceRegistry.bindSession(sessionId, ws.id);
-					if (workspaceReplica) {
-						await workspaceReplica.replicateWorkspace(tenant, ws);
-						await workspaceReplica.setSessionBinding(tenant, sessionId, ws.id);
-					}
-					return;
-				}
-				try {
-					const ws = workspaceRegistry.ensureChannelWorkspace(channel);
-					workspaceRegistry.bindSession(sessionId, ws.id);
-				} catch (err) {
-					logger.warn({ err }, `[sessions] failed to bind channel session ${sessionId}`);
+				const store = getCurrentTenantStore();
+				if (!tenant || !store) throw new Error("Channel session creation requires a tenant context");
+				const ws = workspaceRegistry.ensureChannelWorkspace(channel, tenant.tenantId);
+				await store.claimResource(tenant, "workspace", ws.id);
+				workspaceRegistry.bindSession(sessionId, ws.id);
+				if (workspaceReplica) {
+					await workspaceReplica.replicateWorkspace(tenant, ws);
+					await workspaceReplica.setSessionBinding(tenant, sessionId, ws.id);
 				}
 			},
 			sessionDir: join(dataDir, "sessions"),
@@ -314,13 +287,13 @@ async function ensureBootstrapped(): Promise<void> {
 			createNewSession: async (channel = "web") => {
 				const tenant = getCurrentTenant();
 				const store = getCurrentTenantStore();
-				if (tenant && !store) throw new Error("Durable channel session creation requires a tenant store");
+				if (!tenant || !store) throw new Error("Durable channel session creation requires a tenant context");
 				const req = backgroundTenantRequest();
-				const workspace = workspaceRegistry.ensureChannelWorkspace(channel, tenant?.tenantId);
-				if (tenant) await store!.claimResource(tenant, "workspace", workspace.id);
+				const workspace = workspaceRegistry.ensureChannelWorkspace(channel, tenant.tenantId);
+				await store.claimResource(tenant, "workspace", workspace.id);
 				const summary = await durableSessions.create(req, { workspaceId: workspace.id });
 				if (!workspaceRegistry.bindSession(summary.id, workspace.id)) throw new Error("Channel workspace not found");
-				if (tenant && workspaceReplica) {
+				if (workspaceReplica) {
 					await workspaceReplica.replicateWorkspace(tenant, workspace);
 					await workspaceReplica.setSessionBinding(tenant, summary.id, workspace.id);
 				}
@@ -329,35 +302,10 @@ async function ensureBootstrapped(): Promise<void> {
 			resolveSessionTarget: async (sessionId) => await durableSessions.get(backgroundTenantRequest(), sessionId) ? sessionId : null,
 		};
 
-		if (auth.mode === "local") {
-			if (config.feishu?.appId && config.channels?.feishu?.enabled) {
-				feishuChannel = new FeishuChannel(config.feishu, dataDir, config.channels.feishu);
-				channelRegistry.register(feishuChannel);
-			}
-
-			bridgeToken = config.bridge?.token;
-			if (bridgeToken) {
-				const qqConfig = config.channels?.qq as PersonalBridgeChannelConfig | undefined;
-				if (qqConfig?.enabled && qqConfig.sidecarBaseUrl) {
-					channelRegistry.register(new BridgeChannel("qq", qqConfig.sidecarBaseUrl, bridgeToken));
-				}
-				const wechatConfigBridge = config.channels?.wechat;
-				if (wechatConfigBridge?.enabled && "sidecarBaseUrl" in wechatConfigBridge && (wechatConfigBridge as PersonalBridgeChannelConfig).mode === "bridge") {
-					channelRegistry.register(new BridgeChannel("wechat", (wechatConfigBridge as PersonalBridgeChannelConfig).sidecarBaseUrl, bridgeToken));
-				}
-			}
-
-			const wechatCfg = config.channels?.wechat;
-			if (wechatCfg?.enabled && (!("mode" in wechatCfg) || (wechatCfg as { mode?: string }).mode !== "bridge")) {
-				wechatChannel = new WeChatChannel(dataDir, wechatCfg);
-				channelRegistry.register(wechatChannel);
-			}
-			migrateReminderChannels();
-		} else {
-			bridgeToken = undefined;
+		{
 			tenantChannelManager = new TenantChannelManager({
 				dataDir,
-				tenantStore: auth.tenantStore!,
+				tenantStore: auth.tenantStore,
 				dispatcher: dispatcherOptions,
 				createChannels: ({ config: tenantConfig, channelsDataDir: tenantChannelsDir, registry, dispatch }) => {
 					const tenantDataDir = dirname(tenantChannelsDir);
@@ -402,37 +350,7 @@ async function ensureBootstrapped(): Promise<void> {
 		}
 
 		// ---- agent session ----
-		// ---- post-init: dispatcher, channels, cron, WebSocket ----
-		if (auth.mode === "local") {
-			const channelsDataDir = join(dataDir, "channels");
-			ensureDir(channelsDataDir);
-			dispatcher = new PersonalChannelDispatcher({
-				...dispatcherOptions,
-				channelRegistry,
-				channelsDataDir,
-			});
-
-			if (feishuChannel) {
-				feishuChannel.onMessage((msg) => dispatcher!.handle(feishuChannel!, msg));
-				feishuChannel.start();
-
-				// Auto-discover default target on first boot if none persisted
-				if (!channelRegistry.getDefaultTarget("feishu")) {
-					feishuChannel.discoverDefaultTarget().then((target) => {
-						if (target) {
-							channelRegistry.setDefaultTarget(target);
-							logger.info({ chatId: target.chatId }, "[feishu] auto-set default target from chat list");
-						}
-					}).catch((err) => {
-						logger.warn({ err }, "[feishu] initial target discovery failed");
-					});
-				}
-			}
-			if (wechatChannel) {
-				wechatChannel.onMessage((msg) => dispatcher!.handle(wechatChannel!, msg));
-				wechatChannel.start();
-			}
-		}
+		// ---- post-init: cron, WebSocket ----
 
 		async function createScheduledSession(job: ScheduledJob, request?: HttpReq): Promise<CreatedJobSession | null> {
 			try {
@@ -440,14 +358,14 @@ async function ensureBootstrapped(): Promise<void> {
 					const req = request ?? backgroundTenantRequest();
 					const tenant = getCurrentTenant();
 					const store = getCurrentTenantStore();
-					if (tenant && !store) throw new Error("Scheduled session creation requires a tenant store");
-					const ws = workspaceRegistry.ensureChannelWorkspace("scheduler", tenant?.tenantId);
-					if (tenant) await store!.claimResource(tenant, "workspace", ws.id);
+					if (!tenant || !store) throw new Error("Scheduled session creation requires a tenant context");
+					const ws = workspaceRegistry.ensureChannelWorkspace("scheduler", tenant.tenantId);
+					await store.claimResource(tenant, "workspace", ws.id);
 					const summary = await durableSessions.create(req, { workspaceId: ws.id, origin: "scheduler" });
 					try {
-						if (tenant) await store!.claimResource(tenant, "session", summary.id);
+						await store.claimResource(tenant, "session", summary.id);
 						if (!workspaceRegistry.bindSession(summary.id, ws.id)) throw new Error("Workspace not found");
-						if (tenant && workspaceReplica) {
+						if (workspaceReplica) {
 							await workspaceReplica.replicateWorkspace(tenant, ws);
 							await workspaceReplica.setSessionBinding(tenant, summary.id, ws.id);
 						}
@@ -455,8 +373,8 @@ async function ensureBootstrapped(): Promise<void> {
 					} catch (error) {
 						await durableSessions.delete(req, summary.id).catch(() => undefined);
 						workspaceRegistry.unbindSession(summary.id);
-						if (tenant && workspaceReplica) await workspaceReplica.clearSessionBinding(tenant, summary.id).catch(() => undefined);
-						if (tenant) await store!.releaseResource(tenant, "session", summary.id).catch(() => undefined);
+						if (workspaceReplica) await workspaceReplica.clearSessionBinding(tenant, summary.id).catch(() => undefined);
+						await store.releaseResource(tenant, "session", summary.id).catch(() => undefined);
 						throw error;
 					}
 				}
@@ -476,22 +394,15 @@ async function ensureBootstrapped(): Promise<void> {
 			checkInStore,
 			createSession: createScheduledSession,
 			durableExecutor,
-			durableClaims: auth.mode === "better-auth",
+			durableClaims: true,
 		});
-		if (auth.mode === "local") {
-			scheduler = new CronScheduler(jobStore, channelRegistry, checkInStore, {
-				createSession: createScheduledSession,
-				durableExecutor,
-			});
-		} else {
-			scheduler = new TenantCronScheduler(auth.tenantStore!, jobStore, channelRegistry, checkInStore, {
-				createSession: createScheduledSession,
-				durableExecutor,
-			});
-		}
+		scheduler = new TenantCronScheduler(auth.tenantStore, jobStore, channelRegistry, checkInStore, {
+			createSession: createScheduledSession,
+			durableExecutor,
+		});
 		scheduler.start();
 
-		logger.info({ channels: auth.mode === "local" ? channelRegistry.all().map((c) => c.name).join(", ") || "none" : "tenant-scoped" }, "[inno-server] channels");
+		logger.info("[inno-server] tenant-scoped channels");
 		logger.info({ jobCount: jobStore.list().length }, "[inno-server] jobs loaded");
 
 		bootstrapped = true;
@@ -512,47 +423,10 @@ async function ensureBootstrapped(): Promise<void> {
 // Channel hot-reload
 // ---------------------------------------------------------------------------
 
-/**
- * Stop the current Feishu channel (if any) and reinitialize it from the
- * current in-memory config. Called after PUT /api/settings/channels so that
- * new credentials take effect without a server restart.
- */
+/** Reload the current tenant's Feishu channel after PUT /api/settings/channels
+ * so new credentials take effect without a server restart. */
 async function reloadFeishuChannel(): Promise<void> {
-	if (tenantChannelManager) {
-		await tenantChannelManager.reloadCurrent();
-		return;
-	}
-	// Tear down existing instance
-	channelRegistry.unregister("feishu");
-	if (feishuChannel) {
-		try { await feishuChannel.stop(); } catch { /* best effort */ }
-		feishuChannel = null;
-	}
-
-	// If feishu is now configured and enabled, create a new instance
-	if (!config.feishu?.appId || !config.channels?.feishu?.enabled) {
-		logger.info("[feishu] channel disabled or not configured, skipping reload");
-		return;
-	}
-
-	feishuChannel = new FeishuChannel(config.feishu, dataDir, config.channels.feishu);
-	channelRegistry.register(feishuChannel);
-
-	if (dispatcher) {
-		feishuChannel.onMessage((msg) => dispatcher!.handle(feishuChannel!, msg));
-	}
-	feishuChannel.start();
-	logger.info("[feishu] channel hot-reloaded with new credentials");
-
-	// Auto-discover default target if none exists yet (fixes first-time setup
-	// chicken-and-egg: user had to send FROM Feishu before agent could send TO it)
-	if (!channelRegistry.getDefaultTarget("feishu")) {
-		const target = await feishuChannel.discoverDefaultTarget();
-		if (target) {
-			channelRegistry.setDefaultTarget(target);
-			logger.info({ chatId: target.chatId }, "[feishu] auto-set default target from chat list");
-		}
-	}
+	await tenantChannelManager?.reloadCurrent();
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,7 +949,7 @@ function getSandboxManager(): SandboxBindingProvider | undefined {
 	if (sandboxManager === undefined) {
 		const sandboxConfig = normalizeSandboxConfig(config?.sandbox);
 		sandboxManager = sandboxConfig.enabled
-			? createSandboxManager(sandboxConfig, auth.tenantStore ? new PgSandboxQuotaStore(auth.tenantStore.database) : undefined)
+			? createSandboxManager(sandboxConfig, new PgSandboxQuotaStore(auth.tenantStore.database))
 			: process.env.INNO_EXEC_BACKEND === "local"
 				? new LocalExecManager({
 					...(workspaceReplica ? { replica: workspaceReplica } : {}),
@@ -1113,10 +987,8 @@ const durableSessions = new DurableSessionService({
 	tenantStore: auth.tenantStore,
 	getSandboxManager,
 	workspaceStoreFor: workspaceStoreForRequest,
-	...(auth.tenantStore ? {
-		recoveryPool: auth.tenantStore.database,
-		pgCatalog: new PgSessionCatalog(auth.tenantStore.database, (req) => join(resolveRequestTenantDataRoot(req, dataDir), "durable", "sessions.json")),
-	} : {}),
+	recoveryPool: auth.tenantStore.database,
+	pgCatalog: new PgSessionCatalog(auth.tenantStore.database),
 	workspaceReplica: {
 		materializeSession: (tenant, sessionId, catalogWorkspaceId, options) =>
 			workspaceReplica
@@ -1150,7 +1022,7 @@ interface InternalPromptPayload {
 
 /** Forward an internal prompt to the worker recorded as the session owner. */
 async function forwardJobToOwner(tenant: TenantContext, execution: InternalPromptPayload): Promise<string | null> {
-	if (!workerToken || !durableShardConfig || !auth.tenantStore) return null;
+	if (!workerToken || !durableShardConfig) return null;
 	const hint = await auth.tenantStore.durableSessionRouteHint(tenant, execution.sessionId);
 	const owner = hint.owner ?? hint.affinity;
 	if (!owner || owner === durableShardConfig.localShardId) return null;
@@ -1181,7 +1053,6 @@ async function handleInternalDurablePrompt(req: HttpReq, res: ServerResponse): P
 		&& timingSafeEqual(Buffer.from(presented), Buffer.from(workerToken));
 	if (!authenticated) { json(res, 404, { error: "Not found" }); return; }
 	await ensureBootstrapped();
-	if (!auth.tenantStore) { json(res, 503, { error: "Internal prompts require a tenant store" }); return; }
 	const body = await readBody(req) as Record<string, unknown>;
 	const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
 	const prompt = typeof body.prompt === "string" ? body.prompt : "";
@@ -1219,17 +1090,15 @@ async function handleInternalDurablePrompt(req: HttpReq, res: ServerResponse): P
 
 function backgroundTenantRequest(): HttpReq {
 	const tenant = getCurrentTenant();
-	if (!tenant) return createBackgroundRequest();
+	if (!tenant) throw new Error("Background durable execution requires a tenant context");
 	const store = getCurrentTenantStore();
 	if (!store) throw new Error("Background durable execution requires a tenant store");
 	return createBackgroundRequest(tenant, store);
 }
 
 async function executeDurableJob(req: HttpReq, execution: DurableJobExecution): Promise<string> {
-	const tenant = getRequestTenant(req);
-	const forward = tenant
-		? (payload: InternalPromptPayload) => forwardJobToOwner(tenant, payload)
-		: undefined;
+	const tenant = requireRequestTenant(req);
+	const forward = (payload: InternalPromptPayload) => forwardJobToOwner(tenant, payload);
 	// A reminder is recorded as a notice in the run's conversation; no model turn.
 	if (execution.notifyOnly) {
 		try {
@@ -1296,9 +1165,9 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		configPath: paths.configPath,
 		getConfig: () => config,
 		setConfig: (next) => { config = next; },
-		getDispatcher: () => tenantChannelManager ?? dispatcher,
-		getBridgeToken: () => bridgeToken,
-		handleBridge: auth.mode === "better-auth" ? async (authHeader, body) => {
+		getDispatcher: () => tenantChannelManager,
+		getBridgeToken: () => undefined,
+		handleBridge: async (authHeader, body) => {
 			const manager = tenantChannelManager!;
 			const token = bridgeBearerToken(authHeader);
 			const result = await manager.runWithBridgeToken(token, () => handleBridgeMessage({
@@ -1308,32 +1177,23 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 				requireChatId: true,
 			}, authHeader, body));
 			return result ?? { status: 401, body: { ok: false as const, error: "Unauthorized" } };
-		} : undefined,
-		reloadFeishuChannel,
-		getWechatChannel: () => tenantChannelManager ? tenantChannelManager.getWechatChannel() : wechatChannel,
-		setWechatChannel: (channel) => {
-			if (tenantChannelManager) tenantChannelManager.setWechatChannel(channel);
-			else wechatChannel = channel;
 		},
-		startWechatChannel: auth.mode === "better-auth"
-			? (channel) => tenantChannelManager!.startWechatChannel(channel)
-			: undefined,
-		syncChannelOwnership: auth.mode === "better-auth"
-			? (previous, next) => tenantChannelManager!.syncOwnership(previous, next)
-			: undefined,
-		beginFeishuRegistration: auth.mode === "better-auth" ? () => tenantChannelManager!.beginFeishuRegistration() : undefined,
-		pollFeishuRegistration: auth.mode === "better-auth" ? (deviceCode) => tenantChannelManager!.pollFeishuRegistration(deviceCode) : undefined,
-		trackWechatQr: auth.mode === "better-auth" ? (qrId) => tenantChannelManager!.trackWechatQr(qrId) : undefined,
-		assertWechatQr: auth.mode === "better-auth" ? (qrId) => tenantChannelManager!.assertWechatQr(qrId) : undefined,
-		confirmWechatLogin: auth.mode === "better-auth"
-			? (qrId, botId, confirm) => tenantChannelManager!.confirmWechatLogin(qrId, botId, confirm)
-			: undefined,
+		reloadFeishuChannel,
+		getWechatChannel: () => tenantChannelManager!.getWechatChannel(),
+		setWechatChannel: (channel) => tenantChannelManager!.setWechatChannel(channel),
+		startWechatChannel: (channel) => tenantChannelManager!.startWechatChannel(channel),
+		syncChannelOwnership: (previous, next) => tenantChannelManager!.syncOwnership(previous, next),
+		beginFeishuRegistration: () => tenantChannelManager!.beginFeishuRegistration(),
+		pollFeishuRegistration: (deviceCode) => tenantChannelManager!.pollFeishuRegistration(deviceCode),
+		trackWechatQr: (qrId) => tenantChannelManager!.trackWechatQr(qrId),
+		assertWechatQr: (qrId) => tenantChannelManager!.assertWechatQr(qrId),
+		confirmWechatLogin: (qrId, botId, confirm) => tenantChannelManager!.confirmWechatLogin(qrId, botId, confirm),
 	}),
 
 	// --- Skills API ---
 	skills: (req, res, method, url) => handleSkillsRoutes(req, res, method, url, {
 		skillsDir,
-		sharedSkillsReadOnly: auth.mode === "better-auth",
+		sharedSkillsReadOnly: true,
 		scheduleSkillsReload,
 		listProjectSkills,
 		setSkillEnabled,
@@ -1374,9 +1234,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		getConfig: () => config,
 		setConfig: (next) => { config = next; },
 		reloadFeishuChannel,
-		syncChannelOwnership: auth.mode === "better-auth"
-			? (previous, next) => tenantChannelManager!.syncOwnership(previous, next)
-			: undefined,
+		syncChannelOwnership: (previous, next) => tenantChannelManager!.syncOwnership(previous, next),
 		scheduleSkillsReload,
 		invalidateContentSource,
 		invalidateSandbox: () => { sandboxManager = undefined; },
@@ -1455,7 +1313,7 @@ const server = createServer(async (req, response) => {
 		if (method === "GET" && path === "/api/session") {
 			const session = await auth.getSession(req);
 			json(res, 200, {
-				mode: auth.mode,
+				mode: "better-auth",
 				allowSignUp: auth.allowSignUp,
 				durableEnabled: durableSessions.enabled,
 				durableRequired: true,
@@ -1473,31 +1331,29 @@ const server = createServer(async (req, response) => {
 		}
 
 		if (path.startsWith("/api/") && !isPublicApiRequest(method, path)) {
-			if (auth.mode === "better-auth" && !isTrustedOrigin(req.headers.origin, authConfig)) {
+			if (!isTrustedOrigin(req.headers.origin, authConfig)) {
 				throw new HttpError(403, "Untrusted request origin");
 			}
 			const session = await requireSession(req, res, auth);
-			if (auth.mode === "better-auth" && !session) return;
-			if (session && auth.tenantStore) {
-				const tenant = await auth.tenantStore.ensurePersonalTenant(session.principal.userId);
-				if (durableShardConfig) {
-					const routedReq = await forwardDurableTenantRequest(req, res, tenant, durableShardConfig,
-						(sessionId) => auth.tenantStore!.durableSessionRouteHint(tenant, sessionId));
-					if (!routedReq) return;
-					req = routedReq;
-				}
-				setRequestTenant(req, tenant, auth.tenantStore);
-				// Materialise the authoritative tenant config so this worker can
-				// serve tenant-scoped reads after taking over from another worker.
-				await syncTenantConfigFromStore(auth.tenantStore, dataDir, tenant.tenantId);
+			if (!session) return;
+			const tenant = await auth.tenantStore.ensurePersonalTenant(session.principal.userId);
+			if (durableShardConfig) {
+				const routedReq = await forwardDurableTenantRequest(req, res, tenant, durableShardConfig,
+					(sessionId) => auth.tenantStore.durableSessionRouteHint(tenant, sessionId));
+				if (!routedReq) return;
+				req = routedReq;
 			}
+			setRequestTenant(req, tenant, auth.tenantStore);
+			// Materialise the authoritative tenant config so this worker can
+			// serve tenant-scoped reads after taking over from another worker.
+			await syncTenantConfigFromStore(auth.tenantStore, dataDir, tenant.tenantId);
 		}
 
 		// Public sidecar callbacks have no cookie. Recover their tenant only from
 		// PostgreSQL token ownership, then forward the untouched body to the same
 		// durable owner before bootstrapping any local channel runtime. The owner
 		// repeats the bearer-token and ownership checks in the normal bridge route.
-		if (durableShardConfig && auth.tenantStore && method === "POST" && path === "/api/bridge/messages") {
+		if (durableShardConfig && method === "POST" && path === "/api/bridge/messages") {
 			const token = bridgeBearerToken(req.headers.authorization);
 			const tenant = token
 				? await auth.tenantStore.findResourceOwner("channel", bridgeChannelResourceId(token))

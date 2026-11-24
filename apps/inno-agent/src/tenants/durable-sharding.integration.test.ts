@@ -62,8 +62,6 @@ async function startWorker(worker: Worker): Promise<void> {
 			INNO_PORT: new URL(worker.origin).port,
 			INNO_HOST: "127.0.0.1",
 			INNO_AUTH_MODE: "better-auth",
-			INNO_MULTI_USER_ENABLED: "true",
-			INNO_DURABLE_ENABLED: "true",
 			INNO_DURABLE_SHARD_ID: worker.id,
 			INNO_DURABLE_SHARD_URLS: JSON.stringify(shardConfig.targets),
 			INNO_DURABLE_STORAGE_LEASE_MS: "2000",

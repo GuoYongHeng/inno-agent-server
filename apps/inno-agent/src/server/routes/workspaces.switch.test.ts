@@ -7,12 +7,16 @@ import type { RuntimePaths } from "../../runtime.js";
 import { streamRegistry } from "../../chat/stream-registry.js";
 import { WorkspaceRegistry } from "../../workspace/workspace-registry.js";
 import { recordWorkspaceFileAccess, resetWorkspaceActivityStoreForTests } from "../workspace-activity-store.js";
+import { FakeTenantStore, ctxA } from "../../workspace/fake-tenant-store.js";
+import { setRequestTenant } from "../../tenants/http.js";
+import type { TenantStore } from "../../tenants/store.js";
 import { handleWorkspacesRoutes, type WorkspacesRouteContext } from "./workspaces.js";
 
 function fakeReq(payload: unknown): HttpReq & PassThrough {
 	const stream = new PassThrough() as HttpReq & PassThrough;
 	stream.headers = {};
 	stream.end(JSON.stringify(payload));
+	setRequestTenant(stream, ctxA, ctx.tenantStore);
 	return stream;
 }
 
@@ -55,6 +59,7 @@ beforeEach(() => {
 	sourceRoot = registry.resolveWorkspaceDir(source.id)!;
 	resetWorkspaceActivityStoreForTests();
 	ctx = {
+		tenantStore: new FakeTenantStore() as unknown as TenantStore,
 		workspaceRegistry: registry,
 		dataDir,
 		paths: {} as RuntimePaths,

@@ -5,6 +5,11 @@ import { WorkspaceStoreError } from "./workspace-store.js";
 export class FakeTenantStore {
 	readonly rows = new Map<string, WorkspaceFileRow>();
 
+	/** Unit tests exercise the authenticated path; every resource reads as owned. */
+	async ownsResource(_context: TenantContext, _kind: string, _resourceId: string): Promise<boolean> { return true; }
+	async claimResource(_context: TenantContext, _kind: string, _resourceId: string): Promise<void> {}
+	async releaseResource(_context: TenantContext, _kind: string, _resourceId: string): Promise<void> {}
+
 	private key(context: TenantContext, workspaceId: string, relPath: string): string {
 		return `${context.tenantId}/${workspaceId}/${relPath}`;
 	}

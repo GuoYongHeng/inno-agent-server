@@ -1,7 +1,4 @@
-import { existsSync } from "node:fs";
-import { rename } from "node:fs/promises";
 import { apply } from "@earendil-works/chord/delta";
-import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import type { Context, JsonValue } from "@earendil-works/chord";
 import {
 	StorageRequestError,
@@ -33,7 +30,6 @@ import {
 	type TaskRecord,
 } from "@earendil-works/pi-durable";
 import type { Pool, QueryResult } from "pg";
-import { logger } from "../logger.js";
 
 /**
  * PostgreSQL `Storage` for pi-durable (H4): one session's records live in the
@@ -189,8 +185,6 @@ interface DocumentAction {
 export interface PgDurableStorageOptions {
 	/** Bound lease epoch; commits/mints are fenced on it when set. */
 	leaseEpoch?: number;
-	/** Legacy per-session SQLite file to import once before serving reads. */
-	legacySqlitePath?: string;
 }
 
 export class PgDurableStorage implements Storage {
@@ -208,9 +202,6 @@ export class PgDurableStorage implements Storage {
 	static async open(pool: Pool, sessionId: string, options: PgDurableStorageOptions = {}): Promise<PgDurableStorage> {
 		const storage = new PgDurableStorage(pool, sessionId, options.leaseEpoch);
 		await storage.ensureMetadata();
-		if (options.legacySqlitePath) {
-			await storage.importLegacy(options.legacySqlitePath);
-		}
 		return storage;
 	}
 
@@ -1018,98 +1009,4 @@ export class PgDurableStorage implements Storage {
 		}
 	}
 
-	/**
-	 * One-time import of a session's legacy `session.sqlite` (H4): rows are copied
-	 * verbatim into the session's `ds_*` partition, counters are taken from
-	 * `durable_metadata`, then the file is renamed so the import never repeats.
-	 */
-	private async importLegacy(legacyPath: string): Promise<void> {
-		if (!existsSync(legacyPath)) return;
-		const client = await this.pool.connect();
-		let renamed = false;
-		try {
-			const db = await openNodeSqliteDatabase(legacyPath);
-			try {
-				const tableExists = async (name: string) =>
-					(await db.get("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", name)) !== undefined;
-				if (!(await tableExists("durable_metadata"))) return;
-				const meta = await db.get("SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1") as
-					{ next_id: string; next_seq: number } | undefined;
-				if (meta === undefined) return;
-				const tableRows = async (name: string) =>
-					(await tableExists(name)) ? db.all(`SELECT * FROM ${name}`) : [];
-				await client.query("BEGIN");
-				try {
-					await client.query(
-						`UPDATE ds_metadata SET next_id = GREATEST(next_id, $2::numeric), next_seq = GREATEST(next_seq, $3)
-						 WHERE session_id = $1`,
-						[this.sessionId, meta.next_id, meta.next_seq],
-					);
-					for (const row of await tableRows("record_ids") as { id: number; record_type: string }[]) {
-						await client.query(
-							`INSERT INTO ds_record_ids (session_id, id, record_type) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-							[this.sessionId, row.id, row.record_type],
-						);
-					}
-					for (const row of await tableRows("conversations") as { id: number; owner_conversation_id: number | null; owner_task_id: number | null; record: string }[]) {
-						await client.query(
-							`INSERT INTO ds_conversations (session_id, id, owner_conversation_id, owner_task_id, record)
-							 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`,
-							[this.sessionId, row.id, row.owner_conversation_id, row.owner_task_id, row.record],
-						);
-					}
-					for (const row of await tableRows("entries") as { id: number; conversation_id: number; head: number | null; commit_seq: number; record: string }[]) {
-						await client.query(
-							`INSERT INTO ds_entries (session_id, id, conversation_id, head, commit_seq, record)
-							 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
-							[this.sessionId, row.id, row.conversation_id, row.head, row.commit_seq, row.record],
-						);
-					}
-					for (const row of await tableRows("tasks") as { id: number; conversation_id: number; kind: string; status: string; abort_requested: number; background: number; record: string }[]) {
-						await client.query(
-							`INSERT INTO ds_tasks (session_id, id, conversation_id, kind, status, abort_requested, background, record)
-							 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING`,
-							[this.sessionId, row.id, row.conversation_id, row.kind, row.status, row.abort_requested === 1, row.background === 1, row.record],
-						);
-					}
-					for (const row of await tableRows("submissions") as { id: number; conversation_id: number; request_id: string | null; status: string; record: string }[]) {
-						await client.query(
-							`INSERT INTO ds_submissions (session_id, id, conversation_id, request_id, status, record)
-							 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
-							[this.sessionId, row.id, row.conversation_id, row.request_id, row.status, row.record],
-						);
-					}
-					for (const row of await tableRows("documents") as { id: number; kind: string; family: number; key_value: string; scope_kind: string; owner_id: number; created_at: number; retired_at: number | null; record: string }[]) {
-						await client.query(
-							`INSERT INTO ds_documents (session_id, id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record)
-							 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING`,
-							[this.sessionId, row.id, row.kind, row.family, row.key_value, row.scope_kind, row.owner_id, row.created_at, row.retired_at, row.record],
-						);
-					}
-					for (const row of await tableRows("document_revisions") as { document_id: number; seq: number; kind: string; version: number; content: string }[]) {
-						await client.query(
-							`INSERT INTO ds_document_revisions (session_id, document_id, seq, kind, version, content)
-							 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
-							[this.sessionId, row.document_id, row.seq, row.kind, row.version, row.content],
-						);
-					}
-					await client.query("COMMIT");
-					renamed = true;
-				} catch (error) {
-					await client.query("ROLLBACK").catch(() => undefined);
-					throw error;
-				}
-			} finally {
-				await db.close().catch(() => undefined);
-			}
-		} finally {
-			client.release();
-		}
-		if (renamed) {
-			await rename(legacyPath, `${legacyPath}.migrated`).catch((error: unknown) => {
-				logger.warn({ err: error, legacyPath }, "failed to rename imported durable sqlite storage");
-			});
-			logger.info({ sessionId: this.sessionId, legacyPath }, "imported legacy durable sqlite storage into PostgreSQL");
-		}
-	}
 }
