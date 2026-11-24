@@ -45,11 +45,49 @@ export interface ILinkQrStatus {
 	ilink_bot_id?: string;
 }
 
-interface TokenData {
+export interface TokenData {
 	bot_token: string;
 	ilink_bot_id: string;
 	updates_buf: string;
 	login_time?: string;
+}
+
+/**
+ * Token persistence seam: the file implementation keeps the historical
+ * 0o600 wechat-token.json layout; the PostgreSQL implementation stores the
+ * same JSON in `tenant_state` so a worker restart on another host keeps the
+ * iLink session.
+ */
+export interface WechatTokenPersistence {
+	read(): TokenData | undefined;
+	write(data: TokenData): void;
+	/** Load remote state into `read()` before the client boots. */
+	hydrate?(): Promise<void>;
+}
+
+class FileWechatTokenPersistence implements WechatTokenPersistence {
+	constructor(private readonly tokenFilePath: string) {}
+
+	read(): TokenData | undefined {
+		if (!existsSync(this.tokenFilePath)) return undefined;
+		try {
+			return JSON.parse(readFileSync(this.tokenFilePath, "utf-8")) as TokenData;
+		} catch {
+			return undefined;
+		}
+	}
+
+	write(data: TokenData): void {
+		const dir = dirname(this.tokenFilePath);
+		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+		// 0o600: this file carries the live bot token.
+		writeFileSync(this.tokenFilePath, JSON.stringify(data, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
+		try {
+			chmodSync(this.tokenFilePath, 0o600);
+		} catch {
+			// permissions are best-effort (Windows)
+		}
+	}
 }
 
 function generateUin(): string {
@@ -62,10 +100,18 @@ export class ILinkClient {
 	token: string = "";
 	botId: string = "";
 	private updatesBuf: string = "";
-	private tokenFilePath: string;
+	private persistence: WechatTokenPersistence;
 
-	constructor(tokenFilePath: string) {
-		this.tokenFilePath = tokenFilePath;
+	constructor(tokenFilePathOrPersistence: string | WechatTokenPersistence) {
+		this.persistence = typeof tokenFilePathOrPersistence === "string"
+			? new FileWechatTokenPersistence(tokenFilePathOrPersistence)
+			: tokenFilePathOrPersistence;
+		this.load();
+	}
+
+	/** Hydrate a remote persistence backend and re-read the token. */
+	async init(): Promise<void> {
+		await this.persistence.hydrate?.();
 		this.load();
 	}
 
@@ -74,34 +120,21 @@ export class ILinkClient {
 	}
 
 	private load(): void {
-		if (!existsSync(this.tokenFilePath)) return;
-		try {
-			const data = JSON.parse(readFileSync(this.tokenFilePath, "utf-8")) as TokenData;
-			this.token = data.bot_token ?? "";
-			this.botId = data.ilink_bot_id ?? "";
-			this.updatesBuf = data.updates_buf ?? "";
-		} catch (err) {
-			logger.warn({ err }, "failed to load wechat token file, starting fresh");
-			// ignore corrupt file
-		}
+		const data = this.persistence.read();
+		if (!data) return;
+		this.token = data.bot_token ?? "";
+		this.botId = data.ilink_bot_id ?? "";
+		this.updatesBuf = data.updates_buf ?? "";
 	}
 
 	private save(extra?: Partial<TokenData>): void {
-		const dir = dirname(this.tokenFilePath);
-		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 		const data: TokenData = {
 			bot_token: this.token,
 			ilink_bot_id: this.botId,
 			updates_buf: this.updatesBuf,
 			...extra,
 		};
-		// 0o600: this file carries the live bot token.
-		writeFileSync(this.tokenFilePath, JSON.stringify(data, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
-		try {
-			chmodSync(this.tokenFilePath, 0o600);
-		} catch {
-			// permissions are best-effort (Windows)
-		}
+		this.persistence.write(data);
 	}
 
 	private buildHeaders(): Record<string, string> {

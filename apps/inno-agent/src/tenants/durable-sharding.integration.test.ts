@@ -324,9 +324,18 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 		if (Date.now() > deadline) throw new Error(`Bridge callback did not finish on its owner: ${JSON.stringify(runs)}`);
 		await new Promise((resolveWait) => setTimeout(resolveWait, 100));
 	}
-	const runLog = (worker: Worker) => join(worker.home, "data", "tenants", tenantId, "channels", "runs.jsonl");
-	expect(existsSync(runLog(owner))).toBe(true);
-	expect(existsSync(runLog(nonOwner))).toBe(false);
+	// The run log lives in shared tenant_state now; the x-inno-durable-shard
+	// header above already proves the callback executed on the owner.
+	const runLogPool = new Pool({ connectionString: postgres.databaseUrl });
+	try {
+		const row = await runLogPool.query<{ value: Array<{ messageId: string }> }>(
+			"SELECT value FROM tenant_state WHERE tenant_id = $1 AND key = 'channels.runs'",
+			[tenantId],
+		);
+		expect(row.rows[0]?.value?.some((entry) => entry.messageId === "shard-inbound")).toBe(true);
+	} finally {
+		await runLogPool.end();
+	}
 
 	// Takeover: kill the recorded owner mid-lease. The next session request is
 	// still hashed toward it, but the dead worker is unreachable so the request

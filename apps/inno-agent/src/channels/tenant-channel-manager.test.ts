@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -82,12 +82,21 @@ function setup() {
 			return id;
 		},
 		getCurrentSessionId: () => "wrong-global-session",
-		recordSessionChannel: () => {},
 		sessionDir,
 	};
+	const stateData = new Map<string, Map<string, unknown>>();
 	const manager = new TenantChannelManager({
 		dataDir,
 		tenantStore: store,
+		createStateStore: (tenant) => {
+			let map = stateData.get(tenant.context.tenantId);
+			if (!map) stateData.set(tenant.context.tenantId, map = new Map());
+			return {
+				get: async <T>(key: string) => map.get(key) as T | undefined,
+				set: async (key, value) => { map.set(key, value); },
+				delete: async (key) => { map.delete(key); },
+			};
+		},
 		dispatcher,
 		createChannels: ({ config, registry }) => {
 			if (config.channels?.feishu?.enabled) registry.register(channel);
@@ -96,7 +105,7 @@ function setup() {
 	});
 	managers.push(manager);
 	const run = <T>(tenantId: string, operation: () => T): T => runInTenantContext(context(tenantId), store, operation);
-	return { dataDir, manager, store, owners, run, channel };
+	return { dataDir, manager, store, owners, run, channel, stateData };
 }
 
 type TenantChannelManagerOptionsForTest = Omit<PersonalChannelDispatcherOptions, "channelRegistry" | "channelsDataDir">;
@@ -112,7 +121,7 @@ afterEach(async () => {
 
 describe("TenantChannelManager", () => {
 	it("keeps registries, targets, sessions and run logs in their owning tenant", async () => {
-		const { dataDir, manager, run } = setup();
+		const { dataDir, manager, run, stateData } = setup();
 		configure(dataDir, "tenant-a", "token-a", "app-a");
 		configure(dataDir, "tenant-b", "token-b", "app-b");
 		expect(() => manager.all()).toThrow("verified tenant");
@@ -126,8 +135,8 @@ describe("TenantChannelManager", () => {
 		expect(run("tenant-a", () => manager.getDefaultTarget("feishu")?.chatId)).toBe("external-chat");
 		expect(run("tenant-a", () => manager.getRunLog().list())).toHaveLength(1);
 		expect(run("tenant-b", () => manager.getRunLog().list())).toHaveLength(1);
-		expect(readFileSync(join(dataDir, "tenants", "tenant-a", "channels", "chat-sessions.json"), "utf-8")).toContain("tenant-a-1.jsonl");
-		expect(readFileSync(join(dataDir, "tenants", "tenant-b", "channels", "chat-sessions.json"), "utf-8")).toContain("tenant-b-2.jsonl");
+		expect(stateData.get("tenant-a")?.get("channels.chatSessions")).toMatchObject({ "feishu:external-chat": "tenant-a-1.jsonl" });
+		expect(stateData.get("tenant-b")?.get("channels.chatSessions")).toMatchObject({ "feishu:external-chat": "tenant-b-2.jsonl" });
 	});
 
 	it("claims external identities and recovers bridge context only from ownership", async () => {

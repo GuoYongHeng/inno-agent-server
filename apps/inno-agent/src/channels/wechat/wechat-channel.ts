@@ -3,7 +3,7 @@ import type { RealtimeChatChannel, MessageHandler } from "../channel.js";
 import { FileSendNotSupportedError } from "../channel.js";
 import type { IncomingMessage, PushTarget } from "../types.js";
 import type { PersonalChannelConfig } from "../../config.js";
-import { ILinkClient, AuthExpiredError, type ILinkMessage } from "./ilink-client.js";
+import { ILinkClient, AuthExpiredError, type ILinkMessage, type WechatTokenPersistence } from "./ilink-client.js";
 import { logger } from "../../logger.js";
 
 export class WeChatChannel implements RealtimeChatChannel {
@@ -17,9 +17,12 @@ export class WeChatChannel implements RealtimeChatChannel {
 	private contextTokens = new Map<string, string>();
 	private cleanupTimer: NodeJS.Timeout;
 
-	constructor(dataDir: string, channelConfig?: PersonalChannelConfig) {
-		const tokenPath = join(dataDir, "channels", "wechat-token.json");
-		this.client = new ILinkClient(tokenPath);
+	constructor(dataDirOrPersistence: string | WechatTokenPersistence, channelConfig?: PersonalChannelConfig) {
+		this.client = new ILinkClient(
+			typeof dataDirOrPersistence === "string"
+				? join(dataDirOrPersistence, "channels", "wechat-token.json")
+				: dataDirOrPersistence,
+		);
 		this.allowedUserIds = channelConfig?.allowedUserIds?.length
 			? new Set(channelConfig.allowedUserIds)
 			: null;
@@ -49,7 +52,8 @@ export class WeChatChannel implements RealtimeChatChannel {
 		this.messageHandler = handler;
 	}
 
-	start(): void {
+	async start(): Promise<void> {
+		await this.client.init();
 		if (!this.client.isLoggedIn) {
 			logger.info("[wechat] not logged in, skipping start");
 			return;

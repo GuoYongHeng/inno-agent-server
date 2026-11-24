@@ -10,7 +10,14 @@ import { getCurrentTenant } from "./current.js";
  * The tenant is resolved from the ambient request/scheduler context at call
  * time — every caller runs inside a verified tenant context.
  */
-export class TenantStateStore {
+/** Minimal KV surface `TenantJsonLedger` needs — production uses `TenantStateStore`, tests inject in-memory fakes. */
+export interface TenantStateKv {
+	get<T>(key: string): Promise<T | undefined>;
+	set(key: string, value: unknown): Promise<void>;
+	delete(key: string): Promise<void>;
+}
+
+export class TenantStateStore implements TenantStateKv {
 	constructor(private readonly pool: Pool) {}
 
 	private tenantId(): string {
@@ -40,5 +47,28 @@ export class TenantStateStore {
 			"DELETE FROM tenant_state WHERE tenant_id = $1 AND key = $2",
 			[this.tenantId(), key],
 		);
+	}
+}
+
+/**
+ * Serialized write-through wrapper over `tenant_state`: every `save` queues
+ * behind the previous one, so rapid in-memory mutations cannot interleave
+ * partial writes.
+ */
+export class TenantJsonLedger<T> {
+	private chain: Promise<unknown> = Promise.resolve();
+
+	constructor(
+		private readonly store: TenantStateKv,
+		private readonly key: string,
+	) {}
+
+	load(): Promise<T | undefined> {
+		return this.store.get<T>(this.key);
+	}
+
+	save(value: T): Promise<void> {
+		this.chain = this.chain.then(() => this.store.set(this.key, value));
+		return this.chain as Promise<void>;
 	}
 }

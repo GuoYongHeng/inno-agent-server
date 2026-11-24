@@ -2,16 +2,18 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { InnoConfig } from "../config.js";
 import { logger } from "../logger.js";
-import { ensureDir } from "../storage/file-store.js";
 import { loadTenantConfig } from "../tenants/config.js";
 import { getCurrentTenant, getCurrentTenantStore, runInTenantContext } from "../tenants/current.js";
 import type { TenantContext, TenantStore } from "../tenants/store.js";
 import { feishuRegistrationBegin, feishuRegistrationPoll } from "./feishu/feishu-registration.js";
 import { ChannelRegistry, type ChatChannel } from "./channel.js";
-import { PersonalChannelDispatcher, type PersonalChannelDispatcherOptions } from "./personal-dispatcher.js";
-import type { ChannelRunLog } from "./run-log.js";
-import type { IncomingMessage } from "./types.js";
+import { PersonalChannelDispatcher, type ChatSessionMap, type PersonalChannelDispatcherOptions } from "./personal-dispatcher.js";
+import { TenantJsonLedger, TenantStateStore, type TenantStateKv } from "../tenants/state-store.js";
+import { DedupeStore, type DedupeEntry } from "./dedupe-store.js";
+import { ChannelRunLog, type ChannelRun } from "./run-log.js";
+import type { IncomingMessage, PushTarget } from "./types.js";
 import type { WeChatChannel } from "./wechat/wechat-channel.js";
+import type { TokenData, WechatTokenPersistence } from "./wechat/ilink-client.js";
 
 export interface TenantChannelRegistration {
 	wechatChannel?: WeChatChannel;
@@ -23,6 +25,8 @@ export interface TenantChannelFactoryOptions {
 	channelsDataDir: string;
 	registry: ChannelRegistry;
 	dispatch: (channel: ChatChannel, message: IncomingMessage) => void;
+	/** PostgreSQL-backed persistence for the WeChat iLink token. */
+	wechatTokenPersistence?: WechatTokenPersistence;
 }
 
 interface TenantChannelRuntime {
@@ -30,6 +34,7 @@ interface TenantChannelRuntime {
 	registry: ChannelRegistry;
 	dispatcher: PersonalChannelDispatcher;
 	wechatChannel: WeChatChannel | null;
+	hydrated: Promise<void>;
 	stop?: () => Promise<void> | void;
 }
 
@@ -38,6 +43,8 @@ export interface TenantChannelManagerOptions {
 	tenantStore: TenantStore;
 	dispatcher: Omit<PersonalChannelDispatcherOptions, "channelRegistry" | "channelsDataDir">;
 	createChannels: (options: TenantChannelFactoryOptions) => TenantChannelRegistration;
+	/** Test seam: override the tenant_state KV (defaults to PostgreSQL). */
+	createStateStore?: (tenant: { context: TenantContext; store: TenantStore }) => TenantStateKv;
 }
 
 export function bridgeChannelResourceId(token: string): string {
@@ -88,8 +95,10 @@ export class TenantChannelManager extends ChannelRegistry {
 		return this.runtime().registry.all();
 	}
 
-	override setDefaultTarget(target: Parameters<ChannelRegistry["setDefaultTarget"]>[0]): void {
-		this.runtime().registry.setDefaultTarget(target);
+	override async setDefaultTarget(target: Parameters<ChannelRegistry["setDefaultTarget"]>[0]): Promise<void> {
+		const runtime = this.runtime();
+		await runtime.hydrated;
+		await runtime.registry.setDefaultTarget(target);
 	}
 
 	override getDefaultTarget(channelName: string): ReturnType<ChannelRegistry["getDefaultTarget"]> {
@@ -97,7 +106,9 @@ export class TenantChannelManager extends ChannelRegistry {
 	}
 
 	async handle(channel: ChatChannel, message: IncomingMessage): Promise<void> {
-		await this.runtime().dispatcher.handle(channel, message);
+		const runtime = this.runtime();
+		await runtime.hydrated;
+		await runtime.dispatcher.handle(channel, message);
 	}
 
 	getRunLog(): ChannelRunLog {
@@ -117,7 +128,7 @@ export class TenantChannelManager extends ChannelRegistry {
 		const runtime = this.runtime();
 		if (runtime.wechatChannel !== channel) throw new Error("WeChat channel is not registered for this tenant");
 		channel.onMessage((message) => this.dispatch(runtime, channel, message));
-		channel.start();
+		void Promise.resolve(channel.start()).catch((err) => logger.error({ err }, "[wechat] failed to start channel"));
 	}
 
 	/** Claim newly configured external identities before their config becomes active. */
@@ -244,8 +255,17 @@ export class TenantChannelManager extends ChannelRegistry {
 		if (existing) return existing;
 
 		const channelsDataDir = join(this.options.dataDir, "tenants", tenant.context.tenantId, "channels");
-		ensureDir(channelsDataDir);
-		const registry = new ChannelRegistry(join(channelsDataDir, "default-targets.json"));
+		const state = this.options.createStateStore?.(tenant) ?? new TenantStateStore(tenant.store.database);
+		const targetsLedger = new TenantJsonLedger<PushTarget[]>(state, "channels.defaultTargets");
+		const dedupeLedger = new TenantJsonLedger<DedupeEntry[]>(state, "channels.dedupe");
+		const runsLedger = new TenantJsonLedger<ChannelRun[]>(state, "channels.runs");
+		const chatSessionsLedger = new TenantJsonLedger<ChatSessionMap>(state, "channels.chatSessions");
+		const registry = new ChannelRegistry({
+			load: async () => (await targetsLedger.load()) ?? [],
+			save: (targets) => targetsLedger.save(targets),
+		});
+		const dedupeStore = new DedupeStore({ load: async () => (await dedupeLedger.load()) ?? [], save: (entries) => dedupeLedger.save(entries) });
+		const runLog = new ChannelRunLog({ load: async () => (await runsLedger.load()) ?? [], save: (runs) => runsLedger.save(runs) });
 		const dispatcher = new PersonalChannelDispatcher({
 			...this.options.dispatcher,
 			onSessionCreated: async (sessionId, channel) => {
@@ -255,22 +275,43 @@ export class TenantChannelManager extends ChannelRegistry {
 			authorizeSession: (sessionId) => tenant.store.ownsResource(tenant.context, "session", sessionId),
 			allowGlobalSessionFallback: false,
 			channelRegistry: registry,
-			channelsDataDir,
+			dedupeStore,
+			runLog,
+			chatSessionsLedger: { load: () => chatSessionsLedger.load(), save: (map) => chatSessionsLedger.save(map) },
 		});
 		const runtime: TenantChannelRuntime = {
 			context: tenant.context,
 			registry,
 			dispatcher,
 			wechatChannel: null,
+			hydrated: Promise.all([
+				registry.loadDefaultTargets(),
+				dedupeStore.hydrate(),
+				runLog.hydrate(),
+				dispatcher.chatSessionMapHydrated,
+			]).then(() => undefined),
 		};
 		const dispatch = (channel: ChatChannel, message: IncomingMessage): void => {
 			this.dispatch(runtime, channel, message);
+		};
+		const wechatTokenLedger = new TenantJsonLedger<TokenData>(state, "channels.wechatToken");
+		let wechatTokenCache: TokenData | undefined;
+		const wechatTokenPersistence: WechatTokenPersistence = {
+			read: () => wechatTokenCache,
+			write: (data) => {
+				wechatTokenCache = data;
+				void wechatTokenLedger.save(data).catch((err) => logger.error({ err }, "[wechat] failed to persist token"));
+			},
+			hydrate: async () => {
+				wechatTokenCache = await wechatTokenLedger.load();
+			},
 		};
 		const registration = this.options.createChannels({
 			config: loadTenantConfig(this.options.dataDir, tenant.context.tenantId),
 			channelsDataDir,
 			registry,
 			dispatch,
+			wechatTokenPersistence,
 		});
 		runtime.wechatChannel = registration.wechatChannel ?? null;
 		runtime.stop = async () => {
@@ -283,7 +324,10 @@ export class TenantChannelManager extends ChannelRegistry {
 	}
 
 	private dispatch(runtime: TenantChannelRuntime, channel: ChatChannel, message: IncomingMessage): void {
-		void runInTenantContext(runtime.context, this.options.tenantStore, () => runtime.dispatcher.handle(channel, message))
+		void runInTenantContext(runtime.context, this.options.tenantStore, async () => {
+			await runtime.hydrated;
+			await runtime.dispatcher.handle(channel, message);
+		})
 			.catch((error) => logger.error({ err: error, tenantId: runtime.context.tenantId }, "tenant channel dispatch failed"));
 	}
 }

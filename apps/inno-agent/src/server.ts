@@ -33,7 +33,9 @@ import { bridgeChannelResourceId, TenantChannelManager } from "./channels/tenant
 import { bridgeBearerToken, handleBridgeMessage } from "./channels/bridge/bridge-server.js";
 import { BridgeChannel } from "./channels/bridge/bridge-channel.js";
 import { WeChatChannel } from "./channels/wechat/wechat-channel.js";
+import type { TokenData, WechatTokenPersistence } from "./channels/wechat/ilink-client.js";
 import { PgJobStore, type JobStore } from "./scheduler/job-store.js";
+import { TenantJsonLedger, TenantStateStore } from "./tenants/state-store.js";
 import { PgCheckInStore, type CheckInStore } from "./checkins/check-in-store.js";
 import { TenantCronScheduler } from "./scheduler/tenant-cron-scheduler.js";
 import { HttpError, json, readBody } from "./server/http-helpers.js";
@@ -61,9 +63,6 @@ import { createSchedulerTools } from "./scheduler/scheduler-tools.js";
 import { handleChatRoutes } from "./server/routes/chat.js";
 import { handleBtwRoutes } from "./server/routes/btw.js";
 import {
-	mergeChannels,
-	type SessionChannel,
-	type SessionChannelMetadata,
 } from "./server/session-model.js";
 import { logger } from "./logger.js";
 import { applyRuntimeEnvironment, parseRuntimeArgs, resolveRuntimePaths } from "./runtime.js";
@@ -82,7 +81,6 @@ import { createBackgroundRequest, requireRequestTenant, setRequestTenant } from 
 import type { TenantContext } from "./tenants/store.js";
 import { syncTenantConfigFromStore } from "./tenants/config.js";
 import { forwardDurableTenantRequest, readDurableShardConfig } from "./tenants/durable-tenant-router.js";
-import { resolveCurrentTenantDataRoot, } from "./tenants/paths.js";
 import { getCurrentTenant, getCurrentTenantStore, runWithoutTenantContext } from "./tenants/current.js";
 
 // ---------------------------------------------------------------------------
@@ -188,6 +186,7 @@ const contentHubCatalog = new ContentHubCatalog({
 // initialised before any API handler that uses them runs, because the HTTP
 // handler calls ensureBootstrapped() before dispatching.
 let jobStore!: JobStore;
+let tenantStateStore: TenantStateStore | undefined;
 let checkInStore!: CheckInStore;
 let channelRegistry!: ChannelRegistry;
 let workspaceRegistry!: WorkspaceRegistry;
@@ -222,6 +221,7 @@ async function ensureBootstrapped(): Promise<void> {
 
 		// ---- stores ----
 		jobStore = new PgJobStore(auth.tenantStore.database, config.scheduler?.timezone);
+		tenantStateStore = new TenantStateStore(auth.tenantStore.database);
 		await jobStore.normalizePersistedJobs();
 		checkInStore = new PgCheckInStore(auth.tenantStore.database, config.scheduler?.timezone, jobStore);
 
@@ -268,7 +268,6 @@ async function ensureBootstrapped(): Promise<void> {
 		const dispatcherOptions: Omit<PersonalChannelDispatcherOptions, "channelRegistry" | "channelsDataDir"> = {
 			runPrompt: async () => { throw new Error("Channel prompts require an owned durable session"); },
 			getCurrentSessionId: () => "",
-			recordSessionChannel: (ch, sid?) => recordSessionChannel(ch as SessionChannel, sid, { setOriginIfEmpty: true }),
 			onSessionCreated: async (sessionId, channel) => {
 				const tenant = getCurrentTenant();
 				const store = getCurrentTenantStore();
@@ -307,7 +306,7 @@ async function ensureBootstrapped(): Promise<void> {
 				dataDir,
 				tenantStore: auth.tenantStore,
 				dispatcher: dispatcherOptions,
-				createChannels: ({ config: tenantConfig, channelsDataDir: tenantChannelsDir, registry, dispatch }) => {
+				createChannels: ({ config: tenantConfig, channelsDataDir: tenantChannelsDir, registry, dispatch, wechatTokenPersistence }) => {
 					const tenantDataDir = dirname(tenantChannelsDir);
 					let tenantFeishu: FeishuChannel | null = null;
 					let tenantWechat: WeChatChannel | null = null;
@@ -333,10 +332,10 @@ async function ensureBootstrapped(): Promise<void> {
 					}
 					const wechatConfig = tenantConfig.channels?.wechat;
 					if (wechatConfig?.enabled && (!("mode" in wechatConfig) || wechatConfig.mode !== "bridge")) {
-						tenantWechat = new WeChatChannel(tenantDataDir, wechatConfig);
+						tenantWechat = new WeChatChannel(wechatTokenPersistence!, wechatConfig);
 						registry.register(tenantWechat);
 						tenantWechat.onMessage((msg) => dispatch(tenantWechat!, msg));
-						tenantWechat.start();
+						void tenantWechat.start().catch((err) => logger.error({ err }, "[wechat] failed to start channel"));
 					}
 					return {
 						wechatChannel: tenantWechat ?? undefined,
@@ -874,32 +873,29 @@ function scheduleSkillsReload(): void {
 	// the next time they are reopened.
 }
 
-function sessionChannelMetadataPath(): string {
-	return join(resolveCurrentTenantDataRoot(dataDir), "sessions", "channels.json");
+/** Ambient-tenant state ledger shared by channel runtimes. */
+function tenantState(): TenantStateStore {
+	if (!tenantStateStore) throw new Error("tenant state store is not initialized");
+	return tenantStateStore;
 }
 
-function readSessionChannelMetadata(): SessionChannelMetadata {
-	return readJson<SessionChannelMetadata>(sessionChannelMetadataPath(), {});
-}
-
-function recordSessionChannel(
-	channel: SessionChannel,
-	explicitSessionId?: string,
-	options?: { setOriginIfEmpty?: boolean },
-): void {
-	const id = explicitSessionId;
-	if (!id) return;
-	const metadata = readSessionChannelMetadata();
-	const prev = metadata[id];
-	metadata[id] = {
-		channels: mergeChannels(prev?.channels ?? [], [channel]),
-		// origin is the immutable birthplace of the session: set once and never
-		// overwritten. Interaction tagging (e.g. a web session pushing a file to
-		// feishu) must NOT change origin, so it omits setOriginIfEmpty.
-		origin: prev?.origin ?? (options?.setOriginIfEmpty ? channel : undefined),
-		updatedAt: new Date().toISOString(),
+/**
+ * WeChat iLink token persistence backed by `tenant_state`: a worker restart on
+ * another host keeps the logged-in iLink session.
+ */
+function wechatTokenPersistence(): WechatTokenPersistence {
+	const ledger = new TenantJsonLedger<TokenData>(tenantState(), "wechat-token");
+	let cached: TokenData | undefined;
+	return {
+		read: () => cached,
+		write: (data) => {
+			cached = data;
+			void ledger.save(data).catch((err) => logger.error({ err }, "[wechat] failed to persist token"));
+		},
+		hydrate: async () => {
+			cached = await ledger.load();
+		},
 	};
-	writeJson(sessionChannelMetadataPath(), metadata);
 }
 
 /**
@@ -913,14 +909,8 @@ async function recordJobRunSession(sessionId: string, req?: HttpReq): Promise<vo
 		await durableSessions.markSchedulerOrigin(req, sessionId);
 		return;
 	}
-	const metadata = readSessionChannelMetadata();
-	const prev = metadata[sessionId];
-	metadata[sessionId] = {
-		channels: mergeChannels(prev?.channels ?? [], ["scheduler"]),
-		origin: "scheduler",
-		updatedAt: new Date().toISOString(),
-	};
-	writeJson(sessionChannelMetadataPath(), metadata);
+	// The session does not exist on this worker (sharded deployment): the
+	// owner worker applies the scheduler origin when it claims the run.
 }
 
 /**
@@ -1182,6 +1172,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		getWechatChannel: () => tenantChannelManager!.getWechatChannel(),
 		setWechatChannel: (channel) => tenantChannelManager!.setWechatChannel(channel),
 		startWechatChannel: (channel) => tenantChannelManager!.startWechatChannel(channel),
+		wechatTokenPersistence: () => wechatTokenPersistence(),
 		syncChannelOwnership: (previous, next) => tenantChannelManager!.syncOwnership(previous, next),
 		beginFeishuRegistration: () => tenantChannelManager!.beginFeishuRegistration(),
 		pollFeishuRegistration: (deviceCode) => tenantChannelManager!.pollFeishuRegistration(deviceCode),

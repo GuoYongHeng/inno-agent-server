@@ -333,7 +333,7 @@ beforeAll(async () => {
 			if (memoryPrompt) {
 				const request = JSON.parse(body) as { messages?: Array<{ role?: string }> };
 				const toolResults = request.messages?.filter((message) => message.role === "tool").length ?? 0;
-				if (toolResults < 3) {
+				if (toolResults < 2) {
 					const tenant = memoryPrompt[1];
 					const toolCalls = [{
 						id: `durable-memory-archive-${tenant}`,
@@ -993,17 +993,21 @@ describe("channel runtime isolation", () => {
 			`SELECT tenant.id, account.email FROM tenants tenant JOIN "user" account ON account.id = tenant.owner_user_id
 			 WHERE account.email IN ('channels-a@example.com', 'channels-b@example.com')`,
 		);
-		await pool.end();
 		const tenantA = tenantRows.rows.find((row) => row.email === "channels-a@example.com")!.id;
 		const tenantB = tenantRows.rows.find((row) => row.email === "channels-b@example.com")!.id;
-		const chatMapA = await readFile(join(home, "data", "tenants", tenantA, "channels", "chat-sessions.json"), "utf-8");
-		const chatMapB = await readFile(join(home, "data", "tenants", tenantB, "channels", "chat-sessions.json"), "utf-8");
-		expect(chatMapA).toContain("qq:chat-a");
-		expect(chatMapA).not.toContain("chat-b");
-		expect(chatMapB).toContain("qq:chat-b");
-		expect(chatMapB).not.toContain("chat-a");
-		const channelSessionA = JSON.parse(chatMapA)["qq:chat-a"] as string;
-		const channelSessionB = JSON.parse(chatMapB)["qq:chat-b"] as string;
+		const stateRows = await pool.query<{ tenant_id: string; value: Record<string, string> }>(
+			"SELECT tenant_id, value FROM tenant_state WHERE key = 'channels.chatSessions' AND tenant_id = ANY($1)",
+			[[tenantA, tenantB]],
+		);
+		await pool.end();
+		const chatMapA = stateRows.rows.find((row) => row.tenant_id === tenantA)?.value ?? {};
+		const chatMapB = stateRows.rows.find((row) => row.tenant_id === tenantB)?.value ?? {};
+		expect(Object.keys(chatMapA)).toContain("qq:chat-a");
+		expect(Object.keys(chatMapA)).not.toContain("chat-b");
+		expect(Object.keys(chatMapB)).toContain("qq:chat-b");
+		expect(Object.keys(chatMapB)).not.toContain("chat-a");
+		const channelSessionA = chatMapA["qq:chat-a"];
+		const channelSessionB = chatMapB["qq:chat-b"];
 		expect(channelSessionA).toMatch(/^durable-/);
 		expect(channelSessionB).toMatch(/^durable-/);
 		const channelDetailA = await (await api(cookieA, `/api/sessions/${channelSessionA}`)).json() as {
@@ -1703,7 +1707,10 @@ describe("durable session HTTP boundary", () => {
 		const nativeProviderBody = providerRequests.find((request) => request.body.includes("durable-native-inline-image"))?.body ?? "";
 		expect(nativeProviderBody).toContain("image_url");
 		expect(nativeProviderBody).toContain("aW1hZ2U=");
-		expect(nativeProviderBody).not.toContain("用户本轮上传了");
+		// The workspace-path hint is committed with the durable input so the
+		// model can open the uploaded file with tools.
+		expect(nativeProviderBody).toContain("用户本轮上传了 1 张图片");
+		expect(nativeProviderBody).toContain(".chat-images/");
 		const nativeRetry = await api(cookieA, "/api/chat/stream", {
 			method: "POST",
 			body: JSON.stringify({
@@ -1736,34 +1743,15 @@ describe("durable session HTTP boundary", () => {
 			}),
 		});
 		expect(rejectedNative.status).toBe(200);
-		expect(await rejectedNative.text()).toContain('"persisted":true');
+		// No OCR/native-image fallback: the provider's image_url rejection
+		// surfaces as a turn error instead of a silent text-only retry.
+		const rejectedText = await rejectedNative.text();
+		expect(rejectedText).toContain('"type":"error"');
+		expect(rejectedText).toContain('"persisted":false');
 		const rejectionRequests = providerRequests.filter((request) =>
 			request.body.includes("durable-image-provider-rejection"));
-		expect(rejectionRequests).toHaveLength(2);
+		expect(rejectionRequests).toHaveLength(1);
 		expect(rejectionRequests[0].body).toContain("image_url");
-		expect(rejectionRequests[0].body).not.toContain("用户本轮上传了");
-		expect(rejectionRequests[1].body).not.toContain("image_url");
-		expect(rejectionRequests[1].body).toContain("用户本轮上传了 1 张图片");
-		expect(rejectionRequests[1].body).toContain(".chat-images/");
-		const rejectedRetry = await api(cookieA, "/api/chat/stream", {
-			method: "POST",
-			body: JSON.stringify({
-				sessionId: session.id,
-				prompt: "durable-image-provider-rejection",
-				clientRequestId: "durable-image-provider-rejection-request",
-				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
-			}),
-		});
-		expect(await rejectedRetry.text()).toContain('"persisted":true');
-		expect(providerRequests.filter((request) =>
-			request.body.includes("durable-image-provider-rejection"))).toHaveLength(2);
-		const rejectedDetail = await (await api(cookieA, `/api/sessions/${session.id}`)).json() as {
-			messages: Array<{ role: string; content: string }>;
-		};
-		expect(rejectedDetail.messages.filter((message) =>
-			message.content === "durable-image-provider-rejection")).toHaveLength(1);
-		expect(rejectedDetail.messages.find((message) =>
-			message.content === "durable-image-provider-rejection")?.content).not.toContain("用户本轮上传了");
 
 		expect((await api(cookieA, "/api/settings/providers", {
 			method: "PUT",

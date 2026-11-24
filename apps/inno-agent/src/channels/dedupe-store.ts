@@ -1,7 +1,7 @@
 import { statSync } from "node:fs";
 import { readJsonl, appendJsonl, writeJsonl } from "../storage/file-store.js";
 
-interface DedupeEntry {
+export interface DedupeEntry {
 	key: string;
 	seenAt: string;
 	expiresAt: string;
@@ -16,17 +16,24 @@ const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
  */
 const DEFAULT_MAX_BYTES = 1024 * 1024;
 
+export interface DedupePersistence {
+	load(): Promise<DedupeEntry[]>;
+	save(entries: DedupeEntry[]): Promise<void>;
+}
+
 export class DedupeStore {
 	private seen = new Map<string, number>();
+	private persistChain: Promise<unknown> = Promise.resolve();
 
 	constructor(
-		private filePath: string,
+		private source: string | DedupePersistence,
 		private ttlMs = DEFAULT_TTL_MS,
 		private maxBytes = DEFAULT_MAX_BYTES,
 	) {
+		if (typeof source !== "string") return;
 		const now = Date.now();
 		let total = 0;
-		for (const entry of readJsonl<DedupeEntry>(filePath)) {
+		for (const entry of readJsonl<DedupeEntry>(source)) {
 			total++;
 			const expires = new Date(entry.expiresAt).getTime();
 			if (expires > now) {
@@ -36,6 +43,16 @@ export class DedupeStore {
 		// Boot-time compaction: if the file held expired or duplicate-key lines,
 		// rewrite it with live entries only so it doesn't grow across restarts.
 		if (total > this.seen.size) this.compact();
+	}
+
+	/** Hydrate persisted entries (persistent backends only; call once). */
+	async hydrate(): Promise<void> {
+		if (typeof this.source === "string") return;
+		const now = Date.now();
+		for (const entry of (await this.source.load()) ?? []) {
+			const expires = new Date(entry.expiresAt).getTime();
+			if (expires > now) this.seen.set(entry.key, expires);
+		}
 	}
 
 	isDuplicate(channel: string, messageId: string): boolean {
@@ -50,13 +67,17 @@ export class DedupeStore {
 		const now = new Date();
 		const expiresAt = new Date(now.getTime() + this.ttlMs);
 		this.seen.set(key, expiresAt.getTime());
-		appendJsonl(this.filePath, {
-			key,
-			seenAt: now.toISOString(),
-			expiresAt: expiresAt.toISOString(),
-		});
-		// Long-running processes never reboot, so bound the file here too.
-		if (statSync(this.filePath).size > this.maxBytes) this.compact();
+		if (typeof this.source === "string") {
+			appendJsonl(this.source, {
+				key,
+				seenAt: now.toISOString(),
+				expiresAt: expiresAt.toISOString(),
+			});
+			// Long-running processes never reboot, so bound the file here too.
+			if (statSync(this.source).size > this.maxBytes) this.compact();
+		} else {
+			this.schedulePersist();
+		}
 	}
 
 	cleanup(): void {
@@ -64,6 +85,24 @@ export class DedupeStore {
 		for (const [key, expires] of this.seen) {
 			if (expires <= now) this.seen.delete(key);
 		}
+	}
+
+	private liveEntries(): DedupeEntry[] {
+		const now = Date.now();
+		const live: DedupeEntry[] = [];
+		for (const [key, expires] of this.seen) {
+			if (expires > now) {
+				live.push({ key, seenAt: new Date(now).toISOString(), expiresAt: new Date(expires).toISOString() });
+			}
+		}
+		return live;
+	}
+
+	private schedulePersist(): void {
+		const source = this.source;
+		if (typeof source === "string") return;
+		const entries = this.liveEntries();
+		this.persistChain = this.persistChain.then(() => source.save(entries));
 	}
 
 	/** Rewrite the log with live entries only (atomic via writeJsonl). */
@@ -81,6 +120,7 @@ export class DedupeStore {
 				expiresAt: new Date(expires).toISOString(),
 			});
 		}
-		writeJsonl(this.filePath, live);
+		if (typeof this.source === "string") writeJsonl(this.source, live);
+		else this.schedulePersist();
 	}
 }

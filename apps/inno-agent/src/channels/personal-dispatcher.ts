@@ -33,7 +33,6 @@ export interface PersonalChannelDispatcherOptions {
 	 * path; durable uses its catalog ID without requiring a session file. */
 	resolveSessionTarget?: (sessionId: string) => Promise<string | null>;
 	getCurrentSessionId: () => string;
-	recordSessionChannel: (channel: string, explicitSessionId?: string) => void;
 	/** Fire-and-forget: auto-generate a topic for a session if it lacks one. */
 	maybeAutoGenerateTopic?: (sessionId: string) => void;
 	/** Called after a new session is created for a channel chat. */
@@ -42,33 +41,46 @@ export interface PersonalChannelDispatcherOptions {
 	authorizeSession?: (sessionId: string) => Promise<boolean>;
 	/** Authenticated dispatchers must always execute in an owned explicit session. */
 	allowGlobalSessionFallback?: boolean;
-	channelsDataDir: string;
+	/** File-ledger data dir (tests). Production injects the PG-backed stores below. */
+	channelsDataDir?: string;
+	/** PG-backed ledgers injected by the tenant channel manager. */
+	dedupeStore?: DedupeStore;
+	runLog?: ChannelRunLog;
+	chatSessionsLedger?: ChatSessionLedger;
 	sessionDir: string;
 }
 
 /** Persisted mapping from channel chatId to sessionId (filename). */
-type ChatSessionMap = Record<string, string>;
+export type ChatSessionMap = Record<string, string>;
+
+export interface ChatSessionLedger {
+	load(): Promise<ChatSessionMap | undefined>;
+	save(map: ChatSessionMap): Promise<void>;
+}
 
 export class PersonalChannelDispatcher {
 	private dedupeStore: DedupeStore;
 	private runLog: ChannelRunLog;
 	private opts: PersonalChannelDispatcherOptions;
-	private chatSessionMap: ChatSessionMap;
-	private chatSessionMapPath: string;
+	private chatSessionMap: ChatSessionMap = {};
+	private chatSessionMapPath: string | undefined;
+	private chatSessionPersistChain: Promise<unknown> = Promise.resolve();
+	readonly chatSessionMapHydrated: Promise<void>;
 	private cleanupTimer: NodeJS.Timeout;
 
 	constructor(opts: PersonalChannelDispatcherOptions) {
 		this.opts = opts;
-		this.dedupeStore = new DedupeStore(`${opts.channelsDataDir}/dedupe.jsonl`);
-		this.runLog = new ChannelRunLog(`${opts.channelsDataDir}/runs.jsonl`);
-		this.chatSessionMapPath = join(opts.channelsDataDir, "chat-sessions.json");
-		this.chatSessionMap = this.loadChatSessionMap();
+		this.dedupeStore = opts.dedupeStore ?? new DedupeStore(`${opts.channelsDataDir}/dedupe.jsonl`);
+		this.runLog = opts.runLog ?? new ChannelRunLog(`${opts.channelsDataDir}/runs.jsonl`);
+		this.chatSessionMapPath = opts.channelsDataDir ? join(opts.channelsDataDir, "chat-sessions.json") : undefined;
+		this.chatSessionMapHydrated = this.loadChatSessionMap();
 
 		this.cleanupTimer = setInterval(() => this.dedupeStore.cleanup(), 60 * 60 * 1000);
 		this.cleanupTimer.unref();
 	}
 
 	async handle(channel: ChatChannel, msg: IncomingMessage): Promise<void> {
+		await this.chatSessionMapHydrated;
 		if (this.dedupeStore.isDuplicate(msg.channel, msg.messageId)) {
 			return;
 		}
@@ -79,7 +91,7 @@ export class PersonalChannelDispatcher {
 		}
 
 		if (msg.chatId) {
-			this.opts.channelRegistry.setDefaultTarget({ channel: msg.channel, chatId: msg.chatId });
+			await this.opts.channelRegistry.setDefaultTarget({ channel: msg.channel, chatId: msg.chatId });
 		}
 
 		const rawText = msg.text.trim();
@@ -89,7 +101,6 @@ export class PersonalChannelDispatcher {
 			try {
 				const newSessionId = await this.opts.createNewSession(msg.channel);
 				await this.opts.onSessionCreated?.(newSessionId, msg.channel);
-				this.opts.recordSessionChannel(msg.channel, newSessionId);
 				// Bind this chatId to the new session
 				if (chatKey) {
 					this.chatSessionMap[chatKey] = newSessionId;
@@ -142,7 +153,6 @@ export class PersonalChannelDispatcher {
 				await this.opts.onSessionCreated?.(newSessionId, msg.channel);
 				this.chatSessionMap[chatKey] = newSessionId;
 				this.saveChatSessionMap();
-				this.opts.recordSessionChannel(msg.channel, newSessionId);
 				// Durable targets are catalog IDs; legacy targets are lazily-created
 				// JSONL paths. Never infer durability from a filename extension.
 				targetSessionPath = this.opts.resolveSessionTarget
@@ -195,7 +205,6 @@ export class PersonalChannelDispatcher {
 			// The shared PI session can switch to another tenant as soon as the
 			// queue releases. Attribute this run to the path we actually executed.
 			const sessionId = targetSessionPath ? basename(targetSessionPath) : this.opts.getCurrentSessionId();
-			this.opts.recordSessionChannel(msg.channel, sessionId);
 			this.opts.maybeAutoGenerateTopic?.(sessionId);
 
 			const finishedAt = new Date();
@@ -271,21 +280,34 @@ export class PersonalChannelDispatcher {
 		return sessionPath;
 	}
 
-	private loadChatSessionMap(): ChatSessionMap {
+	private async loadChatSessionMap(): Promise<void> {
+		if (this.opts.chatSessionsLedger) {
+			this.chatSessionMap = (await this.opts.chatSessionsLedger.load()) ?? {};
+			return;
+		}
 		try {
-			if (existsSync(this.chatSessionMapPath)) {
-				return JSON.parse(readFileSync(this.chatSessionMapPath, "utf-8")) as ChatSessionMap;
+			if (this.chatSessionMapPath && existsSync(this.chatSessionMapPath)) {
+				this.chatSessionMap = JSON.parse(readFileSync(this.chatSessionMapPath, "utf-8")) as ChatSessionMap;
 			}
 		} catch (err) {
 			logger.warn({ err }, "failed to load chat-sessions.json, starting fresh");
 			// ignore corrupt file
 		}
-		return {};
 	}
 
 	private saveChatSessionMap(): void {
+		if (this.opts.chatSessionsLedger) {
+			const ledger = this.opts.chatSessionsLedger;
+			const snapshot = { ...this.chatSessionMap };
+			this.chatSessionPersistChain = this.chatSessionPersistChain
+				.then(() => ledger.save(snapshot))
+				.catch((err) => logger.warn({ err }, "dispatcher failed to persist chat-session bindings"));
+			return;
+		}
 		try {
-			writeFileSync(this.chatSessionMapPath, JSON.stringify(this.chatSessionMap, null, 2), "utf-8");
+			if (this.chatSessionMapPath) {
+				writeFileSync(this.chatSessionMapPath, JSON.stringify(this.chatSessionMap, null, 2), "utf-8");
+			}
 		} catch (err) {
 			logger.warn({ err }, "dispatcher failed to save chat-sessions.json");
 		}

@@ -8,6 +8,7 @@ import { feishuRegistrationBegin, feishuRegistrationPoll } from "../../channels/
 import type { PersonalChannelDispatcher } from "../../channels/personal-dispatcher.js";
 import type { ChannelName } from "../../channels/types.js";
 import { WeChatChannel } from "../../channels/wechat/wechat-channel.js";
+import type { WechatTokenPersistence } from "../../channels/wechat/ilink-client.js";
 import type { InnoConfig } from "../../config.js";
 import { logger } from "../../logger.js";
 import { loadTenantConfig, persistTenantConfig } from "../../tenants/config.js";
@@ -36,6 +37,8 @@ export interface ChannelsRouteContext {
 	syncChannelOwnership?: (previous: InnoConfig, next: InnoConfig) => Promise<void>;
 	beginFeishuRegistration?: typeof feishuRegistrationBegin;
 	pollFeishuRegistration?: typeof feishuRegistrationPoll;
+	/** Tenant-scoped iLink token persistence for lazily created WeChat channels. */
+	wechatTokenPersistence?: () => WechatTokenPersistence;
 	trackWechatQr?: (qrId: string) => void;
 	assertWechatQr?: (qrId: string) => void;
 	confirmWechatLogin?: (qrId: string, botId: string, confirm: () => void) => Promise<void>;
@@ -130,7 +133,7 @@ export async function handleChannelsRoutes(
 			json(res, 400, { error: "Missing chatId" });
 			return true;
 		}
-		channelRegistry.setDefaultTarget({
+		await channelRegistry.setDefaultTarget({
 			channel: defaultTargetMatch.name as ChannelName,
 			chatId,
 		});
@@ -232,8 +235,9 @@ export async function handleChannelsRoutes(
 		// Lazily create the WeChat channel if not yet instantiated
 		let wechatChannel = ctx.getWechatChannel();
 		if (!wechatChannel) {
-			const wechatDataDir = tenant ? join(ctx.dataDir, "tenants", tenant.tenantId) : ctx.dataDir;
-			wechatChannel = new WeChatChannel(wechatDataDir, getConfig().channels?.wechat);
+			const persistence = ctx.wechatTokenPersistence?.()
+				?? join(ctx.dataDir, "tenants", tenant.tenantId);
+			wechatChannel = new WeChatChannel(persistence, getConfig().channels?.wechat);
 			channelRegistry.register(wechatChannel);
 			ctx.setWechatChannel(wechatChannel);
 		}
@@ -281,7 +285,7 @@ export async function handleChannelsRoutes(
 						ctx.startWechatChannel(wechatChannel);
 					} else {
 						wechatChannel.onMessage((msg) => dispatcher.handle(wechatChannel, msg));
-						wechatChannel.start();
+						void wechatChannel.start().catch((err) => logger.error({ err }, "[wechat] failed to start channel"));
 					}
 				}
 			}

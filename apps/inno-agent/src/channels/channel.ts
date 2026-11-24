@@ -1,5 +1,4 @@
 import type { IncomingMessage, PushTarget } from "./types.js";
-import { readJson, writeJson } from "../storage/file-store.js";
 
 /** Thrown when a channel cannot send files (e.g. WeChat iLink). */
 export class FileSendNotSupportedError extends Error {
@@ -67,14 +66,21 @@ export interface RealtimeChatChannel extends ChatChannel {
 	stop?(): Promise<void>;
 }
 
+export interface ChannelTargetsPersistence {
+	load(): Promise<PushTarget[]>;
+	save(targets: PushTarget[]): Promise<void>;
+}
+
 export class ChannelRegistry {
 	private _channels = new Map<string, ChatChannel>();
 	private _defaultTargets = new Map<string, PushTarget>();
 
-	constructor(private defaultTargetsPath?: string) {
-		if (!defaultTargetsPath) return;
-		const targets = readJson<PushTarget[]>(defaultTargetsPath, []);
-		for (const target of targets) {
+	constructor(private readonly targetsPersistence?: ChannelTargetsPersistence) {}
+
+	/** Hydrate persisted default targets once after construction. */
+	async loadDefaultTargets(): Promise<void> {
+		if (!this.targetsPersistence) return;
+		for (const target of await this.targetsPersistence.load()) {
 			this._defaultTargets.set(target.channel, target);
 		}
 	}
@@ -95,11 +101,9 @@ export class ChannelRegistry {
 		return [...this._channels.values()];
 	}
 
-	setDefaultTarget(target: PushTarget): void {
+	async setDefaultTarget(target: PushTarget): Promise<void> {
 		this._defaultTargets.set(target.channel, target);
-		if (this.defaultTargetsPath) {
-			writeJson(this.defaultTargetsPath, [...this._defaultTargets.values()]);
-		}
+		await this.targetsPersistence?.save([...this._defaultTargets.values()]);
 	}
 
 	getDefaultTarget(channelName: string): PushTarget | undefined {

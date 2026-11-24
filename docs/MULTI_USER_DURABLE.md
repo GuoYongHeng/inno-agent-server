@@ -98,14 +98,11 @@ execute(params, api, context)
 
 ```text
 <dataDir>/tenants/<verifiedTenantId>/
-├── config/config.json
-├── durable/                 # catalog、session SQLite、question/permission records
-├── l2/                      # wiki、manifest、index
-├── l3/                      # tenant-owned history index
-├── channels/                # dedupe、targets、outbox、run logs
-├── jobs/                    # jobs、runs、occurrences
-└── sessions/                # sidecars、SSE journals、activity
+├── config/config.json       # PG 物化出的租户配置（PG 是真源）
+└── workspaces/              # 工作区本地物化副本（对象存储是真源）
 ```
+
+会话 durable storage、catalog、L2/L3 记忆、jobs/check-ins、渠道台账（default targets、dedupe、run log、chat-session 绑定、wechat token）与 question/permission/outbox 恢复记录全部在 PostgreSQL（`ds_*`、`durable_sessions`、`tenant_jobs`、`tenant_job_runs`、`tenant_checkins`、`tenant_checkin_occurrences`、`tenant_state`、`recovery_records`）。
 
 同一个 durable storage 同时只能有一个 owner。authenticated runtime 打开期间还持有 per-session PostgreSQL advisory lock，用于防止意外 double-open；它不是网络分区下的分布式 fencing。
 
