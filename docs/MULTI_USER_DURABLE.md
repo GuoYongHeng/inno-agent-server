@@ -45,8 +45,8 @@ Personal tenant + PostgreSQL resource ownership
         ▼
 Tenant-scoped Durable catalog / workspace / config / memory
         │
-        ├── Session A runtime ── Tenant A provider/model
-        ├── Session B runtime ── Tenant B provider/model
+        ├── Session A runtime ── Tenant A 选定 model（共享目录）
+        ├── Session B runtime ── Tenant B 选定 model（共享目录）
         └── Session C runtime ── 独立 SQLite + SSE journal
 ```
 
@@ -67,7 +67,7 @@ Tenant-scoped Durable catalog / workspace / config / memory
 - 一个账号对应一个 personal tenant；当前没有 Organization/team 阶段。
 - tenant 只能来自已验证的 Better Auth session、服务端 membership 或 PostgreSQL ownership。
 - 未认证请求返回 401；跨 tenant 资源读取和执行返回 404。
-- 新用户不继承全局 provider 或频道凭证；每个 tenant 使用自己的配置文件。
+- Provider 目录、Tavily key、bridge token 和渠道端点由部署 `config.json` 统一托管，租户不可写；tenant 配置行只存选择（默认模型、渠道开关/白名单、memory/ui），同步物化到本地 config.json 供同步读路径。
 - 历史文件不会自动归属于第一个登录用户，必须运行显式 legacy-owner migration。
 - authenticated 模式移除 PI host shell/通用 host file tools 和 PTY terminal；保留的路径工具执行 canonical workspace/symlink 检查。
 - MCP、subagents、web-access、codemode、computer-use 等多用户尚未隔离的能力保持关闭，而不是伪装成 tenant-safe。
@@ -155,7 +155,7 @@ npm run build
 npm run server -- --home ./runtime --workspace ./workspace --port 3000
 ```
 
-新账号先在 Settings 中配置自己的 provider/model，再创建会话。多用户模式下 Web UI 默认使用 Durable。
+新账号在 Settings 里从服务端目录选默认模型后即可创建会话；provider 凭据与渠道端点是服务端托管字段。
 
 账号、迁移和公网限制见 [AUTHENTICATION.md](./AUTHENTICATION.md)。
 
@@ -169,7 +169,7 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
 - 独立真实服务验收：8 组通过，实际启动编译后的 `dist/server.js` 并驱动 HTTP/SSE：
   1. Better Auth 匿名 401 与 Durable probe；
   2. 跨 tenant detail/status/chat 404、legacy 409；
-  3. 两用户 provider 请求真实重叠、credentials 隔离、request-ID 去重；
+  3. 两用户 provider 请求真实重叠、共享目录下各自默认模型互不泄漏、request-ID 去重；
   4. 原生 L2/L3/channel 工具及 tenant-local 文件；
   5. BTW bring-back 去重且无模型调用；
   6. workspace write 审批、stale/cross-tenant 拒绝与文件落盘；

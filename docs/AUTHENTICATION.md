@@ -1,6 +1,6 @@
 # Authentication and tenant isolation
 
-Inno Agent defaults to single-user `local` mode. Local mode needs no PostgreSQL and listens on loopback unless network exposure is explicitly allowed. Better Auth adds cookie-based accounts for controlled server deployments; `INNO_MULTI_USER_ENABLED=true` enables the restricted multi-tenant runtime and requires Durable execution.
+Better Auth + PostgreSQL is the only runtime mode: every API request is authenticated and tenant-scoped, and the server refuses to boot without `DATABASE_URL`, `BETTER_AUTH_SECRET`, and `BETTER_AUTH_URL`. The former `INNO_AUTH_MODE`, `INNO_MULTI_USER_ENABLED`, and `INNO_ALLOW_UNAUTHENTICATED_NETWORK` switches are obsolete — setting them fails startup.
 
 For the architecture and verification scope, see [MULTI_USER_DURABLE.md](./MULTI_USER_DURABLE.md).
 
@@ -9,7 +9,6 @@ For the architecture and verification scope, see [MULTI_USER_DURABLE.md](./MULTI
 Prepare PostgreSQL and run migrations explicitly:
 
 ```sh
-export INNO_AUTH_MODE=better-auth
 export DATABASE_URL=postgresql://inno:inno@127.0.0.1:5432/inno
 export BETTER_AUTH_SECRET='replace-with-at-least-32-random-characters'
 export BETTER_AUTH_URL=http://127.0.0.1:3000
@@ -24,8 +23,6 @@ For local development, `docker compose -f deploy/docker-compose.yml up postgres`
 ## Start the restricted multi-user runtime
 
 ```sh
-export INNO_AUTH_MODE=better-auth
-export INNO_MULTI_USER_ENABLED=true
 export DATABASE_URL=postgresql://inno:inno@127.0.0.1:5432/inno
 export BETTER_AUTH_SECRET='replace-with-at-least-32-random-characters'
 export BETTER_AUTH_URL=http://127.0.0.1:3000
@@ -34,7 +31,7 @@ npm run build
 npm run server -- --home ./runtime --workspace ./workspace --port 3000
 ```
 
-Startup rejects incompatible flag combinations (for example `INNO_MULTI_USER_ENABLED=true` without Better Auth). There is only one agent runtime (Durable), so no separate "durable" switch exists. In multi-user mode:
+There is only one agent runtime (Durable), so no separate "durable" switch exists. Under authentication:
 
 - every session and agent job is Durable; an explicit `runtime: "legacy"` is rejected with `400`;
 - channel inbound, manual agent jobs, and cron/deferred runs execute through Durable sessions owned by the tenant;
@@ -56,20 +53,9 @@ Cross-origin browser requests and terminal WebSockets are restricted to `BETTER_
 
 Each account has one personal tenant. Tenant identity comes only from a verified server session/membership or PostgreSQL ownership; clients cannot select a tenant through a header or body field. Every resource has at most one owner. Owned-resource misses and cross-tenant access return 404 rather than disclosing existence.
 
-Authenticated state uses tenant-local roots such as:
+Tenant state lives in PostgreSQL (`tenant_configs`, `tenant_state`, `durable_sessions`, `tenant_jobs`, L2/L3 tables). `<dataDir>/tenants/<id>/` only holds materialised copies — a config.json mirror for synchronous readers, workspace working copies backed by the object store, and transient downloads — and is fully rebuildable.
 
-```text
-<dataDir>/tenants/<verifiedTenantId>/
-├── config/
-├── durable/
-├── l2/
-├── l3/
-├── channels/
-├── jobs/
-└── sessions/
-```
-
-Provider/default-model settings, memory flags, channels, workspaces, L2/L3 state, scheduler state, and Durable catalogs do not fall back to legacy global tenant data. Process-global read-only skill and preset catalogs are shared deliberately; authenticated shared-skill mutation is disabled, while owned workspace-private skills remain available.
+Provider credentials, the model catalog, Tavily keys, and channel endpoints/credentials are **server-managed**: they come from the deployment `config.json` and tenants cannot write them (`/api/settings/providers*` and `/api/settings/tavily` are gone; credential fields in `PUT /api/settings/channels` return 403). A tenant's config row only carries selections — default model, channel `enabled`/`allowedUserIds`, memory and UI flags. Feishu app credentials are the exception: QR registration binds a tenant's personal Feishu app. Process-global read-only skill and preset catalogs are shared deliberately; authenticated shared-skill mutation is disabled, while owned workspace-private skills remain available.
 
 ## Files from before the multi-user runtime
 
@@ -81,11 +67,11 @@ Authenticated turns remove PI host `bash`, general host file tools, and PTY term
 
 MCP, subagents, web-access, codemode, and computer-use are disabled in authenticated mode until their runtime/configuration can be tenant-scoped. Permission policy is managed `default`; tenants cannot switch a process-global `auto`/`yolo` policy. Durable workspace `write`/`edit` has its own replay-safe approval records.
 
-Channel registries, targets, dedupe, logs, sessions, and delivery state are tenant-local. Public bridge callbacks recover the tenant from the bearer token's PostgreSQL ownership record, never from request-supplied tenant identity.
+Channel registries, targets, dedupe, logs, sessions, and delivery state are tenant-scoped (PostgreSQL `tenant_state`). The bridge token is operator-managed and shared, so public bridge callbacks recover the tenant from the claimed channel identity — the bound default-target chat (`channel-chat:<channel>:<chatId>`) or a whitelisted user (`channel-user:<channel>:<userId>`) — never from request-supplied tenant identity.
 
 ## Storage and worker boundary
 
-PostgreSQL stores account, tenant, ownership, and occurrence-claim metadata; it does not make file-backed state shareable.
+PostgreSQL stores account, tenant, ownership, and occurrence-claim metadata plus all tenant ledgers (config, durable storage, memory, jobs, channel state). The data directory is scratch: workspace materialisations, config mirrors, and caches rebuild from PostgreSQL + object storage.
 
 - One durable storage has one owner at a time. Never use active-active SQLite/JSONL/NFS replicas.
 - Authenticated durable opens hold a per-session PostgreSQL advisory lock to reject accidental double-open. This is not network-partition-proof fencing.

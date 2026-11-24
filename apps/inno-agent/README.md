@@ -132,7 +132,10 @@ web/                  # 前端 (React + Tailwind + Vite)
 | PATCH | `/api/skills/:name` | 启用/关闭 Skill |
 | DELETE | `/api/skills/:name` | 删除 Skill |
 | POST | `/api/skills/reload` | 刷新技能面板（durable 会话在运行时打开时读取技能目录） |
-| GET | `/api/settings` | 配置信息 |
+| GET | `/api/settings` | 配置信息（合并视图：服务端托管目录 + 租户选择，`serverManaged` 标记供 UI 隐藏编辑入口） |
+| POST | `/api/settings/model` | 选择默认模型（租户唯一的模型写口，校验服务端目录） |
+| PUT | `/api/settings/channels` | 渠道开关/白名单（`enabled`/`personalOnly`/`allowedUserIds`；凭据与端点字段 403，由服务端托管） |
+| PUT | `/api/settings/memory` | 记忆层开关 |
 | GET/POST/PATCH/DELETE | `/api/jobs[/:id]` | 定时任务 CRUD |
 | POST | `/api/jobs/:id/run` | 立即执行任务 |
 | GET | `/api/jobs/status` | 定时任务总览状态 |
@@ -141,10 +144,10 @@ web/                  # 前端 (React + Tailwind + Vite)
 
 ## 定时任务运行时
 
-后端启动时会加载 `data/jobs/jobs.json` 并补齐旧任务的运行状态字段：
+任务台账存 PostgreSQL（`tenant_jobs` / `tenant_job_runs`）。服务端加载租户的 cron 定义并维护运行状态字段：
 
 - `nextRunAt`：根据 cron 和 timezone 计算的下一次触发时间。
 - `lastStatus` / `lastError`：最近一次运行状态。
 - `runCount` / `failureCount`：累计执行和失败次数。
 
-每次任务执行都会追加一条 JSONL 记录到 `data/jobs/runs.jsonl`，包含 run id、开始/结束时间、耗时、触发来源、错误信息和输出摘要。任务可以由后台 cron 自动触发，也可以通过 `/api/jobs/:id/run` 或 agent 工具 `run_scheduled_job` 手动触发。
+每次任务执行追加一条 `tenant_job_runs` 记录，包含 run id、开始/结束时间、耗时、触发来源、错误信息和输出摘要。任务可以由后台 cron 自动触发，也可以通过 `/api/jobs/:id/run` 或 agent 工具 `run_scheduled_job` 手动触发。

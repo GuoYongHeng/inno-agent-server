@@ -3,8 +3,10 @@
 name: inno-agent
 
 services:
-  # File-backed runtime: keep exactly one replica and stop it before replacement.
-  # PostgreSQL metadata does not make the data/workspace volumes shareable.
+  # Better Auth + PostgreSQL is the only runtime mode: every API request is
+  # tenant-scoped and tenant state lives in postgres-data / minio-data.
+  # Keep exactly one replica unless you wire up INNO_DURABLE_SHARD_* worker
+  # routing (see .env.example).
   inno-agent:
     image: inno-agent-backend:latest
     build:
@@ -29,23 +31,20 @@ services:
       # is the isolation boundary; there is no remote sandbox in compose).
       # Unset for the persistent backend — file tools only, no bash.
       INNO_EXEC_BACKEND: local
-      # Compose publishes this unauthenticated local-mode port intentionally.
-      # Use better-auth for any non-local deployment.
-      INNO_ALLOW_UNAUTHENTICATED_NETWORK: "true"
-      # Uncomment the whole block for better-auth multi-user mode (tenant
-      # metadata, L2/L3 memory and workspace manifests move into ParadeDB).
-      # DATABASE_URL: postgresql://inno:inno@postgres:5432/inno
-      # INNO_AUTH_MODE: better-auth
-      # INNO_MULTI_USER_ENABLED: "true"
-      # BETTER_AUTH_SECRET: replace-with-at-least-32-random-characters
-      # BETTER_AUTH_URL: http://localhost:3000
+      # Required — the server refuses to boot without Better Auth + Postgres.
+      # Sign-up is open by default (INNO_AUTH_ALLOW_SIGNUP=false to close it);
+      # change BETTER_AUTH_SECRET before any real deployment.
+      DATABASE_URL: postgresql://inno:inno@postgres:5432/inno
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-replace-with-at-least-32-random-characters}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      # Needed only when the browser reaches the API on a different origin
+      # than BETTER_AUTH_URL (the compose frontend proxies /api same-origin).
       # INNO_TRUSTED_ORIGINS: http://localhost:3000
       # Workspace files live in the stack's MinIO (manifest rows stay in
-      # PostgreSQL once auth is on). SDK calls use the internal endpoint;
-      # presigned upload/download URLs are issued against the host-published
-      # port so the browser can reach them — on a remote host set
+      # PostgreSQL). SDK calls use the internal endpoint; presigned
+      # upload/download URLs are issued against the host-published port so the
+      # browser can reach them — on a remote host set
       # INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT to the reachable MinIO URL.
-      # In unauthenticated local mode nothing writes to it; MinIO just sits ready.
       INNO_OBJECT_STORAGE_PROVIDER: s3
       INNO_OBJECT_STORAGE_ENDPOINT: http://minio:9000
       INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT: ${INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT:-http://localhost:9000}
@@ -60,12 +59,19 @@ services:
       minio-init:
         condition: service_completed_successfully
     volumes:
-      # Named volumes keep the container's config/data/workspace fully inside
-      # the stack — deliberately NOT bind-mounted to ../runtime or ../workspace
-      # so a dev checkout's config.json (with real API keys) never leaks in.
-      # For dev binds, override in a docker-compose.override.yml.
+      # /etc/inno-agent/config.json is the OPERATOR-MANAGED catalog: providers
+      # and apiKeys, tavily key, channel endpoints/bridge token. Tenants only
+      # pick a model and flip channel/memory toggles — their choices live in
+      # PostgreSQL. Seed this file once (see config.example.json); keep the
+      # volume persistent because it holds real credentials.
       - inno-agent-config:/etc/inno-agent
+      # Scratch: session workspaces are materialised here, config is mirrored
+      # from PostgreSQL, downloads/cache are transient. Losing this volume
+      # only loses un-pushed workspace deltas — the source of truth is
+      # postgres-data + minio-data. A tmpfs/anonymous volume also works.
       - inno-agent-data:/var/lib/inno-agent/data
+      # Same scratch semantics as inno-agent-data: a local materialisation of
+      # workspace objects whose truth is the S3 replica.
       # Global skills come from the image (/app/skills). For skill development,
       # mount a live dir instead, e.g. ../runtime/skills:/app/skills
       - inno-agent-workspace:/srv/inno-workspace

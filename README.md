@@ -17,7 +17,7 @@ Start with the [multi-user Durable guide](./docs/MULTI_USER_DURABLE.md) for the 
 Inno Agent runs every conversation on one execution path, **pi-durable**:
 
 - **Durable execution** — each conversation is an independent per-session SQLite runtime. Durable supports concurrent sessions, request-ID deduplication, crash resume, exact application SSE replay, workspace-contained file tools, replay-safe question/approval cards, session-level model switching, edit-and-resend of earlier messages, tenant-local memory/OCR/channel state, and durable scheduler/channel execution. The earlier global `AgentSession` runtime (CLI, bash terminal, MCP, subagents, OS sandbox) has been removed; old JSONL conversation history is not read.
-- **Verified tenant isolation** — Better Auth + PostgreSQL provides personal tenants and resource ownership. Provider credentials, memory, workspaces, channels, and jobs use verified tenant roots; unauthenticated requests return 401 and cross-tenant resources return 404. There is no host shell or terminal in any mode; the agent reads and writes files only inside the session workspace.
+- **Verified tenant isolation** — Better Auth + PostgreSQL provides personal tenants and resource ownership. Memory, workspaces, channels, and jobs use verified tenant roots; unauthenticated requests return 401 and cross-tenant resources return 404. There is no host shell or terminal in any mode; the agent reads and writes files only inside the session workspace.
 - **Single-owner storage** — one durable storage has one owner. Optional static tenant-owner routing uses workers with independent RWO data roots; shared active-active SQLite/NFS, automatic failover, and network-partition fencing are not supported.
 - **Honest recovery semantics** — committed state and application checkpoints recover work, but model calls, initial remote OCR submission, channel delivery, and some file mutations retain documented at-least-once crash windows.
 
@@ -80,8 +80,6 @@ npm run dev:server & npm run web:dev
 ### Multi-user Durable server
 
 ```bash
-export INNO_AUTH_MODE=better-auth
-export INNO_MULTI_USER_ENABLED=true
 export DATABASE_URL=postgresql://inno:inno@127.0.0.1:5432/inno
 export BETTER_AUTH_SECRET='replace-with-at-least-32-random-characters'
 export BETTER_AUTH_URL=http://127.0.0.1:3000
@@ -90,7 +88,7 @@ npm run auth:migrate --workspace inno-agent
 npm run server -- --home ./runtime --workspace ./workspace --port 3000
 ```
 
-Each account configures its own provider/model in Settings. This is a restricted controlled-deployment runtime, not an internet-facing account-security or production-capacity sign-off. See [Authentication](./docs/AUTHENTICATION.md) and the [multi-user Durable guide](./docs/MULTI_USER_DURABLE.md).
+The operator seeds the provider catalog in `config.json`; each account only picks a default model from it in Settings (provider credentials, search keys, and channel endpoints are server-managed). This is a restricted controlled-deployment runtime, not an internet-facing account-security or production-capacity sign-off. See [Authentication](./docs/AUTHENTICATION.md) and the [multi-user Durable guide](./docs/MULTI_USER_DURABLE.md).
 
 ## Configuration
 
@@ -118,7 +116,7 @@ Each account configures its own provider/model in Settings. This is a restricted
 }
 ```
 
-Each provider declares a `baseUrl`, an `api` (`openai-completions` or `anthropic-messages`), an `apiKey`, and a `models[]` list. The server rewrites this file when you change the default model in the UI; each conversation keeps the model it was started with until you switch it.
+Each provider declares a `baseUrl`, an `api` (`openai-completions` or `anthropic-messages`), an `apiKey`, and a `models[]` list. This file is the operator-managed catalog — tenants cannot edit providers through the API or UI; their default-model choice is stored per-tenant in PostgreSQL. Each conversation keeps the model it was started with until you switch it.
 
 ### Runtime paths
 

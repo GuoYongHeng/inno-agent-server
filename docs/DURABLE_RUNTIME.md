@@ -134,7 +134,7 @@ The current durable slice supports:
   workspace previews restore through the same deduplicated sidecar;
 - first-message fallback topics, automatic richer upgrades after six messages,
   and explicit `POST /api/sessions/:id/generate-topic`, all using the durable
-  session's pinned provider/model and isolated tenant credentials;
+  session's pinned provider/model from the shared, server-managed catalog;
 - graceful shutdown of open durable runtimes;
 - 30-day retention of completed channel/question/permission recovery records,
   cleaned only after the owning session is proved idle, plus recovery-record and
@@ -452,7 +452,7 @@ only on the selected owner, concurrent authenticated durable sessions, tenant-ow
 instantiation and stable workspace reuse, durable workspace writes with approval
 cards, stale-turn 409 and cross-tenant 404 responses, non-streaming `no_ui`
 write denial, SSE `workspace_change` events and tenant-local file activity, PostgreSQL advisory-lock
-contention/release and runtime invalidation on lock loss, per-tenant provider and
+contention/release and runtime invalidation on lock loss, shared-catalog provider and
 OCR Authorization headers, cross-tenant 404s, completed request-ID retries,
 lack of legacy JSONL creation, SSE disconnect/reconnect replay, HTTP SIGKILL/restart
 recovery of an admitted SSE turn with contiguous event IDs and no duplicate user

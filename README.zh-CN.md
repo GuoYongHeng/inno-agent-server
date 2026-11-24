@@ -17,7 +17,7 @@
 所有对话只有一条执行路径——**pi-durable**：
 
 - **Durable 执行**——每个会话是独立的 per-session SQLite runtime。支持独立会话并发、request-ID 去重、崩溃恢复、连续 SSE 回放、可恢复的问题卡/审批、会话级换模型、编辑并重发历史消息，以及 tenant-local memory/OCR/channel。早期的全局 `AgentSession` 运行时（CLI、bash 终端、MCP、子代理、系统级沙箱）已移除，旧的 JSONL 历史不再读取。
-- **经验证的租户隔离**——Better Auth + PostgreSQL 提供 personal tenant 和资源所有权。provider 凭证、记忆、工作区、频道和任务均使用 tenant 数据根；未认证返回 401，跨租户资源返回 404。任何模式下都没有宿主 shell 或终端，agent 只能在会话工作区内读写文件。
+- **经验证的租户隔离**——Better Auth + PostgreSQL 提供 personal tenant 和资源所有权。记忆、工作区、频道和任务均使用 tenant 数据根（provider 目录与凭据由服务端统一托管）；未认证返回 401，跨租户资源返回 404。任何模式下都没有宿主 shell 或终端，agent 只能在会话工作区内读写文件。
 - **单 owner 存储**——一个 durable storage 同时只有一个 owner。静态 tenant-owner 路由要求每个 worker 使用独立 RWO 数据根；不支持共享 SQLite/NFS active-active、自动 failover 或网络分区 fencing。
 - **明确的恢复语义**——已提交状态和应用 checkpoint 可以恢复，但模型调用、首次远端 OCR 提交、频道投递和部分文件 mutation 仍有 at-least-once crash window。
 
@@ -88,7 +88,7 @@ npm run auth:migrate --workspace inno-agent
 npm run server -- --home ./runtime --workspace ./workspace --port 3000
 ```
 
-每个账号在 Settings 中配置自己的 provider/model。该模式面向受控部署，不代表公网账号安全或生产容量已经验收。完整边界见[认证与租户隔离](./docs/AUTHENTICATION.md)和[多用户 Durable 指南](./docs/MULTI_USER_DURABLE.md)。
+Provider 目录由部署方在 `config.json` 中统一种子，账号只能在 Settings 中选择默认模型（provider 凭据、搜索 key、渠道端点均为服务端托管字段）。该模式面向受控部署，不代表公网账号安全或生产容量已经验收。完整边界见[认证与租户隔离](./docs/AUTHENTICATION.md)和[多用户 Durable 指南](./docs/MULTI_USER_DURABLE.md)。
 
 ## 配置
 
@@ -116,7 +116,7 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
 }
 ```
 
-每个供应商声明 `baseUrl`、`api`(`openai-completions` 或 `anthropic-messages`)、`apiKey` 和 `models[]` 列表。在 UI 中切换模型时,服务器会热更新此文件。
+每个供应商声明 `baseUrl`、`api`(`openai-completions` 或 `anthropic-messages`)、`apiKey` 和 `models[]` 列表。此文件是服务端托管的模型目录——租户无法通过 API 或 UI 修改 provider，其默认模型选择按租户存于 PostgreSQL。
 
 ### 运行时路径
 

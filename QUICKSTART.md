@@ -120,7 +120,7 @@ npm run web:dev        # 终端 2 — Vite :5173（代理 /api 到 :3000）
 
 **修改了 backend 代码不生效？** backend 跑的是编译后的 `dist/`，需要重新 `npm run build` 再重启。前端在 `web:dev` 下走 Vite HMR，改完直接刷新即可。
 
-**想换 provider？** 改 `runtime/config/config.json` 的 `defaultProvider` 和 `defaultModel`，或者在 Web UI 顶部模型选择器里切——切换会自动写回 config 文件。
+**想换 provider？** 服务端部署的模型目录由 `runtime/config/config.json` 统一管理（普通账号不能在设置页改 provider）。用户在 Web UI 顶部模型选择器或设置页里挑默认模型——选择写入 PostgreSQL 里的租户配置，不回写 config 文件。
 
 **想看 backend 日志？** `tail -f runtime/logs/server.log`（用 `restart-dev.sh` 启动的话日志在这里）。
 
