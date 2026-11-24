@@ -56,11 +56,15 @@ services:
       minio-init:
         condition: service_completed_successfully
     volumes:
-      - ../runtime/config:/etc/inno-agent
-      - ../runtime/data:/var/lib/inno-agent/data
+      # Named volumes keep the container's config/data/workspace fully inside
+      # the stack — deliberately NOT bind-mounted to ../runtime or ../workspace
+      # so a dev checkout's config.json (with real API keys) never leaks in.
+      # For dev binds, override in a docker-compose.override.yml.
+      - inno-agent-config:/etc/inno-agent
+      - inno-agent-data:/var/lib/inno-agent/data
       # Global skills come from the image (/app/skills). For skill development,
       # mount a live dir instead, e.g. ../runtime/skills:/app/skills
-      - ../workspace:/srv/inno-workspace
+      - inno-agent-workspace:/srv/inno-workspace
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s
@@ -152,3 +156,6 @@ services:
 volumes:
   postgres-data:
   minio-data:
+  inno-agent-config:
+  inno-agent-data:
+  inno-agent-workspace:
