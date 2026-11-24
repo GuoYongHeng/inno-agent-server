@@ -101,11 +101,6 @@ export interface InnoSettings {
 	};
 	bridge?: { token: string }; // masked
 	github?: { token: string }; // masked
-	ocrApi?: {
-		token: string; // masked
-		model?: string;
-		baseUrl?: string;
-	};
 	tavily?: {
 		apiKey: string; // masked
 	};

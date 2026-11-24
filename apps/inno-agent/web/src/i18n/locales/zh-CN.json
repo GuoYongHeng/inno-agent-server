@@ -463,15 +463,6 @@
 			"saved": "已保存",
 			"clear": "清除"
 		},
-		"ocr": {
-			"title": "OCR API (图片文字识别)",
-			"desc": "当接入的模型不支持图片识别时，调用百度 vl-ocr (PaddleOCR-VL) API 提取图片文字。需在百度 AI Studio 获取 token。",
-			"tokenPlaceholder": "bearer token",
-			"modelPlaceholder": "PaddleOCR-VL-1.6",
-			"baseUrlPlaceholder": "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs",
-			"saved": "已保存",
-			"clear": "清除"
-		},
 		"tavily": {
 			"title": "联网搜索 (Tavily)",
 			"desc": "为 agent 提供联网检索能力。需在 tavily.com 获取 API Key（形如 tvly-…）。未配置时 web_search 工具不可用。",
@@ -515,7 +506,7 @@
 			"maxTokens": "最大 Tokens",
 			"reasoning": "支持推理",
 			"supportsImages": "模型 API 原生支持图片",
-			"supportsImagesHint": "仅在确认 Provider 接受图片消息时开启。关闭后仍可上传图片，系统会保存图片并通过 OCR 处理。",
+			"supportsImagesHint": "仅在确认 Provider 接受图片消息时开启。关闭后仍可上传图片，但图片只保存到工作区，不发送给模型。",
 			"authHeader": "使用 Bearer 鉴权",
 			"bypassProxy": "绕过系统代理",
 			"makeDefault": "设为默认",
@@ -632,7 +623,7 @@
 				"desc": "简单模式与分层记忆开关"
 			},
 			"integrations": {
-				"desc": "内容源、OCR 与联网搜索等外部服务"
+				"desc": "内容源与联网搜索等外部服务"
 			},
 			"channels": {
 				"desc": "飞书、微信等消息渠道接入"
@@ -857,7 +848,6 @@
 		"uploadHint": "请先选择已有工作区或开始对话后再上传文件",
 		"uploadTooLarge": "有 {{count}} 个文件超过 {{limit}} 上限，未添加。",
 		"attachImage": "添加图片",
-		"attachImageViaOcr": "添加图片（当前模型将通过 OCR 处理）",
 		"selectModel": "选择模型",
 		"modelUnavailable": "暂无可用模型",
 		"manageModels": "管理模型",

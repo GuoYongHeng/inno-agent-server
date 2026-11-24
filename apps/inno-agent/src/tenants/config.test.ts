@@ -53,7 +53,6 @@ describe("tenant configuration", () => {
 		expect(config.defaultProvider).toBe("");
 		expect(config.defaultModel).toBe("");
 		expect(config.tavily).toBeUndefined();
-		expect(config.ocrApi).toBeUndefined();
 	});
 
 	it("persists providers independently and resolves them from tenant context", () => {

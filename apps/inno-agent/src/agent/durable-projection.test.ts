@@ -76,7 +76,7 @@ describe("DurableSseProjector", () => {
 				content: [
 					{ type: "text", text: "总结资料" },
 					{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
-					{ type: "text", text: "[用户本轮上传了 1 张图片，已保存到工作区：\n- .chat-images/a.png\n请调用 ocr_image。]" },
+					{ type: "text", text: "[用户本轮上传了 1 张图片，已保存到工作区：\n- .chat-images/a.png]" },
 					{ type: "text", text: context },
 					{ type: "text", text: formatRecallForPrompt([{ sessionId: "durable-old", role: "user", text: "之前的历史", ts: 1, score: 1 }]) },
 				],

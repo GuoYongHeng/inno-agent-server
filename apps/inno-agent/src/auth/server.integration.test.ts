@@ -21,9 +21,6 @@ let origin: string;
 let output = "";
 let providerServer: HttpServer;
 let providerOrigin = "";
-let ocrServer: HttpServer;
-let ocrOrigin = "";
-const ocrRequests: Array<{ authorization: string; body: string }> = [];
 const providerRequests: Array<{ authorization: string; body: string }> = [];
 const sidecarServers: HttpServer[] = [];
 const sidecarRequests: Array<{ sidecar: string; method: string; path: string; authorization: string; body: string }> = [];
@@ -347,10 +344,6 @@ beforeAll(async () => {
 							sourceType: "markdown",
 						},
 					}, {
-						id: `durable-ocr-call-${tenant}`,
-						name: "ocr_image",
-						arguments: { filePath: `https://images.local/durable-ocr-${tenant}.png` },
-					}, {
 						id: `durable-l3-recall-${tenant}`,
 						name: "l3_recall",
 						arguments: { query: `durable-topic-${tenant}` },
@@ -398,40 +391,6 @@ beforeAll(async () => {
 	});
 	await new Promise<void>((resolveListen) => providerServer.listen(0, "127.0.0.1", resolveListen));
 	providerOrigin = `http://127.0.0.1:${(providerServer.address() as AddressInfo).port}`;
-	ocrServer = createHttpServer((req, res) => {
-		let body = "";
-		req.setEncoding("utf-8");
-		req.on("data", (chunk) => { body += chunk; });
-		req.on("end", () => {
-			ocrRequests.push({ authorization: req.headers.authorization ?? "", body });
-			const path = new URL(req.url ?? "/", "http://ocr.local").pathname;
-			if (req.method === "POST" && path === "/jobs") {
-				const tenant = body.includes("durable-ocr-a") ? "a" : "b";
-				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ data: { jobId: `job-${tenant}` } }));
-				return;
-			}
-			const job = /^\/jobs\/job-(a|b)$/.exec(path);
-			if (req.method === "GET" && job) {
-				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ data: {
-					state: "done",
-					resultUrl: { jsonUrl: `${ocrOrigin}/result-${job[1]}` },
-				} }));
-				return;
-			}
-			const result = /^\/result-(a|b)$/.exec(path);
-			if (req.method === "GET" && result) {
-				res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-				res.end(`${JSON.stringify({ result: { layoutParsingResults: [{ markdown: { text: `durable-ocr-text-${result[1]}` } }] } })}\n`);
-				return;
-			}
-			res.writeHead(404);
-			res.end();
-		});
-	});
-	await new Promise<void>((resolveListen) => ocrServer.listen(0, "127.0.0.1", resolveListen));
-	ocrOrigin = `http://127.0.0.1:${(ocrServer.address() as AddressInfo).port}`;
 	[sidecarOriginA, sidecarOriginB] = await Promise.all([startSidecar("a"), startSidecar("b")]);
 	const port = await freePort();
 	origin = `http://127.0.0.1:${port}`;
@@ -465,10 +424,6 @@ afterAll(async () => {
 	if (providerServer) {
 		providerServer.closeAllConnections();
 		await new Promise<void>((resolveClose) => providerServer.close(() => resolveClose()));
-	}
-	if (ocrServer) {
-		ocrServer.closeAllConnections();
-		await new Promise<void>((resolveClose) => ocrServer.close(() => resolveClose()));
 	}
 	for (const server of sidecarServers) {
 		server.closeAllConnections();
@@ -1993,7 +1948,7 @@ describe("durable session HTTP boundary", () => {
 		expect(detail.messages.filter((message) => message.role === "user")).toHaveLength(1);
 	}, 60_000);
 
-	it("writes durable L2/OCR state only to the authenticated tenant roots", async () => {
+	it("writes durable L2 state only to the authenticated tenant roots", async () => {
 		const [cookieA, cookieB] = await Promise.all([
 			registerUser("durable-memory-a@example.com"),
 			registerUser("durable-memory-b@example.com"),
@@ -2010,11 +1965,6 @@ describe("durable session HTTP boundary", () => {
 				}),
 			});
 			expect(response.status).toBe(200);
-			const ocr = await api(cookie, "/api/settings/ocr", {
-				method: "PUT",
-				body: JSON.stringify({ token: `durable-ocr-secret-${tenant}`, baseUrl: `${ocrOrigin}/jobs` }),
-			});
-			expect(ocr.status).toBe(200);
 		};
 		await Promise.all([configure(cookieA, "a"), configure(cookieB, "b")]);
 		const runMemoryTurn = async (cookie: string, prompt: string) => {
@@ -2071,27 +2021,6 @@ describe("durable session HTTP boundary", () => {
 		expect(manifestA).not.toContain("durable-archive-b");
 		expect(manifestB).toContain("durable-archive-b");
 		expect(manifestB).not.toContain("durable-archive-a");
-		// OCR checkpoints are PostgreSQL rows scoped to the tenant, not files in its data root.
-		const readOcrCheckpoints = async (tenantId: string) => {
-			const pool = new Pool({ connectionString: postgres.databaseUrl });
-			try {
-				const rows = await pool.query<{ value: unknown }>("SELECT value FROM recovery_records WHERE tenant_id = $1 AND kind = 'ocr'", [tenantId]);
-				expect(rows.rows).toHaveLength(1);
-				return rows.rows.map((row) => JSON.stringify(row.value)).join("\n");
-			} finally {
-				await pool.end();
-			}
-		};
-		expect(existsSync(join(rootA, "ocr"))).toBe(false);
-		expect(existsSync(join(rootB, "ocr"))).toBe(false);
-		const [ocrA, ocrB] = await Promise.all([readOcrCheckpoints(tenantA), readOcrCheckpoints(tenantB)]);
-		expect(ocrA).toContain("durable-ocr-text-a");
-		expect(ocrA).not.toContain("durable-ocr-text-b");
-		expect(ocrB).toContain("durable-ocr-text-b");
-		expect(ocrB).not.toContain("durable-ocr-text-a");
-		expect(ocrRequests.find((request) => request.body.includes("durable-ocr-a"))?.authorization).toBe("bearer durable-ocr-secret-a");
-		expect(ocrRequests.find((request) => request.body.includes("durable-ocr-b"))?.authorization).toBe("bearer durable-ocr-secret-b");
-		expect(existsSync(join(home, "data", "ocr"))).toBe(false);
 	}, 60_000);
 
 	it("replays and completes an admitted durable SSE turn after SIGKILL and restart", async () => {

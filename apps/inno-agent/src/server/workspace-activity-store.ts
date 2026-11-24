@@ -176,7 +176,7 @@ function toolAccess(toolName: string): ToolWorkspaceAccess {
 	if (["ask_user_question", "todo", "question", "permission", "skill", "compact"].includes(name)) return "none";
 	if (/(^|[_-])(write|edit|patch|create|save|rename|move|delete|remove|upload)([_-]|$)/.test(name)
 		|| name === "apply_patch" || name === "create_practice_lab") return "write";
-	if (/(^|[_-])(read|open|cat|grep|find|glob|list|parse|ocr|search|stat|inspect)([_-]|$)/.test(name)) return "read";
+	if (/(^|[_-])(read|open|cat|grep|find|glob|list|parse|search|stat|inspect)([_-]|$)/.test(name)) return "read";
 	if (name === "bash" || name === "shell" || name === "exec" || name.includes("terminal")) return "unknown";
 	return "unknown";
 }

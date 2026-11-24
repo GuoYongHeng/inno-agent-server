@@ -283,11 +283,6 @@ export class DurableSessionService {
 		return new PgRecoveryStore(this.options.recoveryPool, requireRequestTenant(req).tenantId, kind);
 	}
 
-	/** OCR checkpoints. Files are tenant-wide in one directory; rows are per session. */
-	private ocrStore(req: IncomingMessage, tenantDataRoot: string): RecoveryRecordStore {
-		return new PgRecoveryStore(this.options.recoveryPool, requireRequestTenant(req).tenantId, "ocr");
-	}
-
 	private channelOutbox(req: IncomingMessage, tenantDataRoot: string): ChannelOutbox {
 		return new PgChannelOutbox(this.options.recoveryPool, requireRequestTenant(req).tenantId);
 	}
@@ -989,13 +984,6 @@ export class DurableSessionService {
 							l2Enabled: config.memory?.l2Enabled !== false,
 							l3: { memory: l3Memory, enabled: config.memory?.l3Enabled !== false },
 						};
-						const ocr = {
-							sessionId: id,
-							records: this.ocrStore(req, tenantDataRoot),
-							workspaceDir,
-							files: workspaceFiles,
-							ocrApi: config.ocrApi,
-						};
 						const baseChannelRegistry = this.options.getChannelRegistry?.();
 						const channels = baseChannelRegistry ? {
 							sessionId: id,
@@ -1043,7 +1031,6 @@ export class DurableSessionService {
 							workspaceTools: true,
 							permissions: this.permissionStore(req, id),
 							memory,
-							ocr,
 							channels,
 							questions: {
 								store: this.questionStore(req, id),
@@ -1174,7 +1161,6 @@ export class DurableSessionService {
 		await rm(this.permissionDir(req, id), { recursive: true, force: true });
 		await this.streamStore(req).deleteSession(id);
 		await this.channelOutbox(req, dataRoot).deleteSession(id);
-		await this.ocrStore(req, dataRoot).deleteSession(id);
 		await this.deleteL3Session(req, id);
 	}
 

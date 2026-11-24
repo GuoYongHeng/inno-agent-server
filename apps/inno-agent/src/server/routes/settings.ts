@@ -95,13 +95,6 @@ function buildSafeSettings(config: InnoConfig) {
 		github: config.github
 			? { token: maskSecret(config.github.token) }
 			: undefined,
-		ocrApi: config.ocrApi
-			? {
-				token: maskSecret(config.ocrApi.token),
-				model: config.ocrApi.model,
-				baseUrl: config.ocrApi.baseUrl,
-			}
-			: undefined,
 		tavily: config.tavily
 			? { apiKey: maskSecret(config.tavily.apiKey) }
 			: undefined,
@@ -432,32 +425,6 @@ export async function handleSettingsRoutes(
 		return rejectSharedRuntime("Content Hub credentials");
 	}
 
-	// --- OCR API settings (Baidu PaddleOCR-VL token / model / baseUrl) ---
-	if (method === "PUT" && url === "/api/settings/ocr") {
-		const body = (await readBody(req)) as Record<string, unknown>;
-		if (typeof body.token !== "string") {
-			json(res, 400, { error: "Missing token (string)" });
-			return true;
-		}
-		const incoming = body.token.trim();
-		// A masked value (e.g. "****abcd") means "keep the existing token".
-		const token = incoming.startsWith("****") ? (config.ocrApi?.token ?? "") : incoming;
-		const model = typeof body.model === "string" ? body.model.trim() : config.ocrApi?.model;
-		const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl.trim() : config.ocrApi?.baseUrl;
-		if (!token) {
-			config.ocrApi = undefined;
-		} else {
-			config.ocrApi = {
-				token,
-				model: model || undefined,
-				baseUrl: baseUrl || undefined,
-			};
-		}
-		await save(config);
-		sync();
-		json(res, 200, safeSettings());
-		return true;
-	}
 
 	// --- Sandbox settings (platform-level): tenants neither see nor edit them. ---
 	if (method === "PUT" && url === "/api/settings/sandbox") {

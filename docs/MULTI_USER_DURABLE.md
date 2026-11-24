@@ -13,7 +13,7 @@
 - 保留 local server 的文件存储模式（CLI 与 Desktop 已移除）；
 - 使用 `pi-durable` 为 Web 多用户服务提供独立会话并发、持久执行和崩溃恢复；
 - 使用 Better Auth + PostgreSQL 提供账号、personal tenant 和资源所有权；
-- 让模型配置、L2/L3、OCR、频道、工作区和后台任务按 tenant 隔离；
+- 让模型配置、L2/L3、频道、工作区和后台任务按 tenant 隔离；
 - 为后续静态 sharded-worker 部署保留单 owner 存储边界。
 
 ## 2. 两种运行时
@@ -58,7 +58,7 @@ Tenant-scoped Durable catalog / workspace / config / memory
 - `durable-session-service.ts`：tenant catalog、idle lease 和 authenticated storage advisory lock；
 - `durable-models.ts`：隔离的 provider/model runtime；
 - `durable-stream-store.ts` / `durable-projection.ts`：历史投影与带连续 event ID 的 SSE journal；
-- `durable-memory.ts`、`durable-ocr.ts`、`durable-channels.ts`：tenant-local 原生工具；
+- `durable-memory.ts`、`durable-channels.ts`：tenant-local 原生工具；
 - `durable-questions.ts`、`durable-permissions.ts`：可恢复的问题卡和工作区写审批；
 - `durable-job-runner.ts`：manual/cron/deferred agent job 的 Durable 执行。
 
@@ -67,7 +67,7 @@ Tenant-scoped Durable catalog / workspace / config / memory
 - 一个账号对应一个 personal tenant；当前没有 Organization/team 阶段。
 - tenant 只能来自已验证的 Better Auth session、服务端 membership 或 PostgreSQL ownership。
 - 未认证请求返回 401；跨 tenant 资源读取和执行返回 404。
-- 新用户不继承全局 provider、OCR 或频道凭证；每个 tenant 使用自己的配置文件。
+- 新用户不继承全局 provider 或频道凭证；每个 tenant 使用自己的配置文件。
 - 历史文件不会自动归属于第一个登录用户，必须运行显式 legacy-owner migration。
 - authenticated 模式移除 PI host shell/通用 host file tools 和 PTY terminal；保留的路径工具执行 canonical workspace/symlink 检查。
 - MCP、subagents、web-access、codemode、computer-use 等多用户尚未隔离的能力保持关闭，而不是伪装成 tenant-safe。
@@ -76,7 +76,7 @@ Tenant-scoped Durable catalog / workspace / config / memory
 
 ## 5. 原生工具与记忆
 
-共享 memory/OCR/channel 工具使用 pi-durable 原生执行签名：
+共享 memory/channel 工具使用 pi-durable 原生执行签名：
 
 ```ts
 execute(params, api, context)
@@ -88,10 +88,9 @@ execute(params, api, context)
 
 - Durable L2 确定性 archive/query/lint，不在恢复路径嵌套模型摘要；
 - tenant-owned legacy + committed durable history 的显式和自动 L3 recall；
-- OCR job-ID checkpoint、轮询恢复和最终结果缓存；
 - channel 文件 payload snapshot、原始目标固定、outbox completion cache；
 - workspace `read`/`write`/精确替换 `edit`，以及可恢复的 write/edit approval；
-- `ask_user_question`、BTW bring-back、结构化附件和 inline image/OCR fallback。
+- `ask_user_question`、BTW bring-back、结构化附件和 inline image。
 
 `replay: "safe"` 不代表外部世界天然 exactly-once。应用仍依赖 operation marker、checkpoint 或 outbox 处理重放。
 
@@ -103,7 +102,6 @@ execute(params, api, context)
 ├── durable/                 # catalog、session SQLite、question/permission records
 ├── l2/                      # wiki、manifest、index
 ├── l3/                      # tenant-owned history index
-├── ocr/                     # OCR checkpoints
 ├── channels/                # dedupe、targets、outbox、run logs
 ├── jobs/                    # jobs、runs、occurrences
 └── sessions/                # sidecars、SSE journals、activity
@@ -139,9 +137,9 @@ INNO_DURABLE_SHARD_URLS='{"worker-a":"http://worker-a:3000","worker-b":"http://w
 - `clientRequestId` 映射到 conversation-scoped durable request ID；已完成重试重新取得原 submission，不新增 user turn 或模型调用。
 - 进程重启后重新打开 storage 并 `resume()`；应用 SSE journal 恢复已接纳 turn，并支持 `after=<eventId>` 连续回放。
 - question/permission 的决定先持久化，再唤醒原 run；不会用 synthetic user message 恢复。
-- L2 archive（内容哈希去重）、OCR checkpoint 和 channel outbox 分别处理各自的 crash window。
+- L2 archive（内容哈希去重）和 channel outbox 分别处理各自的 crash window。
 - SQLite 使用 WAL + `synchronous=NORMAL`；宿主机/电源故障仍可能丢失最新提交。
-- 模型调用、远端 OCR 首次提交、外部频道发送以及部分文件 mutation 仍存在 **at-least-once** 窗口，不能宣称计费或外部副作用 exactly-once。
+- 模型调用、外部频道发送以及部分文件 mutation 仍存在 **at-least-once** 窗口，不能宣称计费或外部副作用 exactly-once。
 - scheduler occurrence lease 只防止同一 slot 并发执行，不是 storage lock，也不是分布式事务。
 
 完整实现约束见 [DURABLE_RUNTIME.md](./DURABLE_RUNTIME.md)。
@@ -175,13 +173,13 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
   1. Better Auth 匿名 401 与 Durable probe；
   2. 跨 tenant detail/status/chat 404、legacy 409；
   3. 两用户 provider 请求真实重叠、credentials 隔离、request-ID 去重；
-  4. 原生 L2/L3/OCR/channel 工具及 tenant-local 文件；
+  4. 原生 L2/L3/channel 工具及 tenant-local 文件；
   5. BTW bring-back 去重且无模型调用；
   6. workspace write 审批、stale/cross-tenant 拒绝与文件落盘；
   7. SIGKILL/restart 后 running turn 恢复、连续 SSE event ID、单 user turn；
   8. （已随旧运行时和 L1 移除）
 
-真实服务验收使用本地 fake provider/OCR，没有调用付费模型。channel 只验证了受控的未配置响应，没有把该结果当作真实 IM 文件投递成功。
+真实服务验收使用本地 fake provider，没有调用付费模型。channel 只验证了受控的未配置响应，没有把该结果当作真实 IM 文件投递成功。
 
 ## 10. 尚未覆盖的生产事项
 

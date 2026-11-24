@@ -79,18 +79,7 @@ export async function saveGithubSettings(token: string): Promise<InnoSettings> {
 	});
 }
 
-export interface OcrSettingsPayload {
-	token: string;
-	model?: string;
-	baseUrl?: string;
-}
 
-export async function saveOcrSettings(payload: OcrSettingsPayload): Promise<InnoSettings> {
-	return apiFetch<InnoSettings>("/api/settings/ocr", {
-		method: "PUT",
-		body: JSON.stringify(payload),
-	});
-}
 
 export async function saveTavilySettings(apiKey: string): Promise<InnoSettings> {
 	return apiFetch<InnoSettings>("/api/settings/tavily", {

@@ -463,15 +463,6 @@
 			"saved": "Saved",
 			"clear": "Clear"
 		},
-		"ocr": {
-			"title": "OCR API (image text recognition)",
-			"desc": "When the configured model cannot recognize images, calls the Baidu vl-ocr (PaddleOCR-VL) API to extract text from images. Get a token from Baidu AI Studio.",
-			"tokenPlaceholder": "bearer token",
-			"modelPlaceholder": "PaddleOCR-VL-1.6",
-			"baseUrlPlaceholder": "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs",
-			"saved": "Saved",
-			"clear": "Clear"
-		},
 		"tavily": {
 			"title": "Web Search (Tavily)",
 			"desc": "Gives the agent internet search capability. Get an API key from tavily.com (starts with tvly-). The web_search tool is unavailable until configured.",
@@ -515,7 +506,7 @@
 			"maxTokens": "Max tokens",
 			"reasoning": "reasoning",
 			"supportsImages": "Model API accepts native images",
-			"supportsImagesHint": "Enable only when the Provider accepts image messages. When off, images can still be attached, saved, and processed through OCR.",
+			"supportsImagesHint": "Enable only when the Provider accepts image messages. When off, attached images are saved to the workspace but not sent to the model.",
 			"authHeader": "use Bearer auth",
 			"bypassProxy": "bypass system proxy",
 			"makeDefault": "make default",
@@ -632,7 +623,7 @@
 				"desc": "Simple Mode and layered memory toggles"
 			},
 			"integrations": {
-				"desc": "External services: content hub, OCR and web search"
+				"desc": "External services: content hub and web search"
 			},
 			"channels": {
 				"desc": "Messaging channel integrations (Feishu, WeChat)"
@@ -857,7 +848,6 @@
 		"uploadHint": "Select an existing workspace or start a conversation before uploading files",
 		"uploadTooLarge": "{{count}} file(s) exceed the {{limit}} limit and were not added.",
 		"attachImage": "Attach image",
-		"attachImageViaOcr": "Attach image (the current model will use OCR)",
 		"selectModel": "Select model",
 		"modelUnavailable": "No models available",
 		"manageModels": "Manage models",

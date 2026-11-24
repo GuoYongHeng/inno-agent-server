@@ -236,7 +236,6 @@ describe("replay-safe tool audit", () => {
 	 *   manifest record"); deterministic, no nested model call.
 	 * Outside this group (audited in docs/DURABLE_ROADMAP.md H0 results):
 	 * ask_user_question / write+edit approval: persisted decision by stable call ID;
-	 * ocr_image: persisted remote job-ID checkpoint (submit window at-least-once);
 	 * send_file_to_channel: persistent outbox (send window at-least-once).
 	 */
 	it("pins the memory tools that may be marked replay-safe", () => {

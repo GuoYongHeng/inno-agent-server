@@ -85,7 +85,7 @@ async function replaceSessionChunks(
 
 /** Index an already projected durable history. The committed entry revision is
  * the incremental gate; user-visible projection has already removed hidden
- * attachment/OCR context, thinking, and tool payloads. */
+ * attachment context, thinking, and tool payloads. */
 export async function indexSessionMessages(
 	backend: L3Backend,
 	sessionId: string,

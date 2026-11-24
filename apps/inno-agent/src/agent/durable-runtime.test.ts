@@ -1,8 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { createServer as createHttpServer } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,7 +14,6 @@ import { readManifest } from "../memory/l2/manifest-store.js";
 import { ChannelRegistry } from "../channels/channel.js";
 import { DurableQuestionStore } from "./durable-questions.js";
 import { DurablePermissionStore } from "./durable-permissions.js";
-import { buildImagePathsHint } from "../server/inline-images.js";
 import {
 	channelOutboxPayloadPath,
 	completeChannelOutbox,
@@ -147,52 +144,6 @@ describe("DurableSessionRuntime", () => {
 		expect(durableEntriesToMessages((await runtime.snapshot()).entries).filter((message) => message.role === "user")).toHaveLength(1);
 	});
 
-	it("retries rejected native images with committed OCR context in the same submission", async () => {
-		const root = tempRoot();
-		const provider = fauxRuntime();
-		const image = { type: "image" as const, data: "aW1hZ2U=", mimeType: "image/png" };
-		const hint = buildImagePathsHint([".chat-images/image.png"]);
-		provider.faux.setResponses([
-			(context) => {
-				const body = JSON.stringify(context);
-				expect(body).toContain('"type":"image"');
-				expect(body).not.toContain("用户本轮上传了");
-				return fauxAssistantMessage([], {
-					stopReason: "error", errorMessage: "unknown variant 'image_url', expected 'text'",
-				});
-			},
-			(context) => {
-				const body = JSON.stringify(context);
-				expect(body).not.toContain('"type":"image"');
-				expect(body).toContain("用户本轮上传了");
-				expect(body).toContain(".chat-images/image.png");
-				return fauxAssistantMessage("fallback complete");
-			},
-			(context) => {
-				// Capability rejections skip native images for later turns in this runtime.
-				expect(JSON.stringify(context)).not.toContain('"type":"image"');
-				return fauxAssistantMessage("next fallback complete");
-			},
-		]);
-		const runtime = await open({ storagePath: join(root, "image-fallback.sqlite"), ...provider });
-		const content = [{ type: "text" as const, text: "inspect image" }, image, { type: "text" as const, text: hint }];
-		const submission = await runtime.submit(content, "image-fallback-request");
-		expect(await waitForText(runtime, submission.id)).toBe("fallback complete");
-		expect(provider.faux.state.callCount).toBe(2);
-
-		const duplicate = await runtime.submit(content, "image-fallback-request");
-		expect(duplicate.id).toBe(submission.id);
-		expect(await waitForText(runtime, duplicate.id)).toBe("fallback complete");
-		expect(provider.faux.state.callCount).toBe(2);
-		const next = await runtime.submit([
-			{ type: "text", text: "inspect another image" }, image, { type: "text", text: hint },
-		], "next-image-fallback-request");
-		expect(await waitForText(runtime, next.id)).toBe("next fallback complete");
-		expect(provider.faux.state.callCount).toBe(3);
-		expect(durableEntriesToMessages((await runtime.snapshot()).entries)
-			.filter((message) => message.role === "user").map((message) => message.content))
-			.toEqual(["inspect image", "inspect another image"]);
-	});
 
 	it("persists turn cancellation across close and reopen", async () => {
 		const root = tempRoot();
@@ -443,92 +394,6 @@ describe("DurableSessionRuntime", () => {
 		expect((await readManifest(l2DataDir))).toHaveLength(1);
 	}, 20_000);
 
-	it("resumes a submitted OCR job after SIGKILL without submitting it again", async () => {
-		const root = tempRoot();
-		const workspace = join(root, "workspace");
-		mkdirSync(workspace, { recursive: true });
-		writeFileSync(join(workspace, "note.png"), "fixture image");
-		let submissions = 0;
-		let polls = 0;
-		let resultFetches = 0;
-		let finished = false;
-		let notifyFirstPoll!: () => void;
-		const firstPoll = new Promise<void>((resolveFirstPoll) => { notifyFirstPoll = resolveFirstPoll; });
-		const server = createHttpServer((req, res) => {
-			const path = new URL(req.url ?? "/", "http://ocr.local").pathname;
-			if (req.method === "POST" && path === "/jobs") {
-				submissions += 1;
-				req.resume();
-				req.on("end", () => {
-					res.writeHead(200, { "Content-Type": "application/json" });
-					res.end(JSON.stringify({ data: { jobId: "ocr-crash-job" } }));
-				});
-				return;
-			}
-			if (req.method === "GET" && path === "/jobs/ocr-crash-job") {
-				polls += 1;
-				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ data: finished ? {
-					state: "done",
-					resultUrl: { jsonUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/result` },
-				} : { state: "running" } }));
-				if (polls === 1) notifyFirstPoll();
-				return;
-			}
-			if (req.method === "GET" && path === "/result") {
-				resultFetches += 1;
-				res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-				res.end(`${JSON.stringify({ result: { layoutParsingResults: [{ markdown: { text: "崩溃后恢复的 OCR 文本" } }] } })}\n`);
-				return;
-			}
-			res.writeHead(404);
-			res.end();
-		});
-		await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
-		const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/jobs`;
-		try {
-			const storagePath = join(root, "ocr-crash.sqlite");
-			const checkpointDir = join(root, "tenant", "ocr");
-			const fixture = fileURLToPath(new URL("./durable-ocr-crash-fixture.ts", import.meta.url));
-			const child = spawn(process.execPath, ["--import", "tsx", fixture, storagePath, checkpointDir, workspace, baseUrl], {
-				cwd: process.cwd(),
-				env: { ...process.env },
-				stdio: ["ignore", "pipe", "pipe"],
-			});
-			children.add(child);
-			const output = await waitForOutput(child, "submission:");
-			const submissionId = Number(/submission:(\d+)/.exec(output)?.[1]) as SubmissionId;
-			await firstPoll;
-			child.kill("SIGKILL");
-			await once(child, "exit");
-			children.delete(child);
-			finished = true;
-
-			const provider = fauxRuntime();
-			provider.faux.setResponses([fauxAssistantMessage("ocr recovered")]);
-			const runtime = await open({
-				storagePath,
-				workspaceDir: workspace,
-				ocr: {
-					sessionId: "durable-crash-ocr",
-					checkpointDir,
-					workspaceDir: workspace,
-					ocrApi: { token: "fixture-token", baseUrl },
-				},
-				...provider,
-			});
-			const recovered = await runtime.waitForSubmission(submissionId);
-			expect(recovered).toMatchObject({ status: "done", text: "ocr recovered" });
-			expect(submissions).toBe(1);
-			expect(polls).toBeGreaterThanOrEqual(2);
-			expect(resultFetches).toBe(1);
-			const messages = durableEntriesToMessages((await runtime.snapshot()).entries);
-			const tool = messages.flatMap((message) => message.tools ?? []).find((call) => call.toolCallId === "crash-ocr-call");
-			expect(JSON.stringify(tool?.result)).toContain("崩溃后恢复的 OCR 文本");
-		} finally {
-			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
-		}
-	}, 20_000);
 
 	it("replays an unconfirmed channel send from its outbox snapshot after SIGKILL", async () => {
 		const root = tempRoot();

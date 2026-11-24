@@ -217,17 +217,6 @@ export interface InnoConfig {
 	ui?: InnoUiConfig;
 	scheduler?: InnoSchedulerConfig;
 	/**
-	 * Optional OCR API config (Baidu PaddleOCR-VL). When the configured model
-	 * cannot recognize images, the agent calls the `ocr_image` tool which uses
-	 * these credentials to submit an async OCR job and poll for the markdown
-	 * result. Unconfigured → the tool returns a "not configured" hint.
-	 */
-	ocrApi?: {
-		token: string;
-		model?: string;
-		baseUrl?: string;
-	};
-	/**
 	 * Optional Tavily config. The `web_search` tool uses this API key for
 	 * internet search. Unconfigured → the tool returns a "not configured" hint.
 	 */
@@ -539,7 +528,6 @@ export function normalizeConfig(
 		smartInput: normalizeSmartInputConfig(config.smartInput),
 		ui: normalizeUiConfig(config.ui),
 		scheduler: normalizeSchedulerConfig(config.scheduler),
-		ocrApi: config.ocrApi,
 		tavily: config.tavily,
 		...(config.sandbox ? { sandbox: config.sandbox } : {}),
 		...(config.objectStorage ? { objectStorage: config.objectStorage } : {}),

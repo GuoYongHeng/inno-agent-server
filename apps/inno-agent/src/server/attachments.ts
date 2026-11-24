@@ -194,7 +194,7 @@ export function isChatAttachmentContext(text: string): boolean {
 /**
  * Build the context block appended to the model-visible copy of the user's
  * message. Paths are workspace-relative (the agent's cwd), so tools such as
- * `parse_document` / `ocr_image` can open them directly. Returns "" when
+ * `parse_document` can open them directly. Returns "" when
  * nothing survived validation.
  */
 export function buildAttachmentContext(attachments: ChatAttachments): string {

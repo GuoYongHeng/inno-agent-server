@@ -568,7 +568,7 @@ export function ChatComposer({
 						<button
 							type="button"
 							className="inno-composer-action inno-icon-button flex h-9 w-9 shrink-0 rounded-full disabled:opacity-50"
-							title={modelState.currentModelSupportsNativeImages ? t("chat.attachImage") : t("chat.attachImageViaOcr")}
+							title={t("chat.attachImage")}
 							disabled={chatIsSending || isUploading}
 							onClick={() => imageInputRef.current?.click()}
 						>

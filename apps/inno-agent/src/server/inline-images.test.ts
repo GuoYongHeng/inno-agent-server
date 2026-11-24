@@ -43,10 +43,10 @@ describe("inline chat images", () => {
 		expect(readFileSync(join(workspace, changed[0]), "utf8")).toBe("second");
 	});
 
-	it("builds the OCR path hint without changing the legacy prompt format", () => {
+	it("builds the workspace-path image hint without changing the legacy prompt format", () => {
 		const hint = buildImagePathsHint([".chat-images/a.png"]);
 		expect(hint).toContain("用户本轮上传了 1 张图片");
-		expect(hint).toContain("ocr_image");
+		expect(hint).toContain(".chat-images/a.png");
 		expect(prependImagePathsHint("总结图片", [".chat-images/a.png"])).toBe(`${hint}\n\n总结图片`);
 		expect(prependImagePathsHint("plain", [])).toBe("plain");
 	});

@@ -61,11 +61,11 @@ export function persistInlineImages(images: ImageContent[], workspaceRoot: strin
 	return paths;
 }
 
-/** Text-only models receive workspace paths rather than native image blocks. */
+/** Workspace-path record of this turn's uploads, committed with the durable input. */
 export function buildImagePathsHint(imagePaths: string[]): string {
 	if (imagePaths.length === 0) return "";
 	const list = imagePaths.map((path) => `- ${path}`).join("\n");
-	return `[用户本轮上传了 ${imagePaths.length} 张图片，已保存到工作区：\n${list}\n如果需要识别图片中的文字（当前模型可能不支持图片识别），请调用 ocr_image 工具并传入上述路径。]`;
+	return `[用户本轮上传了 ${imagePaths.length} 张图片，已保存到工作区：\n${list}]`;
 }
 
 export function prependImagePathsHint(prompt: string, imagePaths: string[]): string {

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { Pool } from "pg";
 import { writeJson } from "../storage/file-store.js";
 
-export type RecoveryKind = "question" | "permission" | "ocr" | "outbox";
+export type RecoveryKind = "question" | "permission" | "outbox";
 
 export interface RecoveryEntry<T> {
 	key: string;

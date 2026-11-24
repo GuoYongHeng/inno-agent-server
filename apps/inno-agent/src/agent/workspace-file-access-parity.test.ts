@@ -13,8 +13,6 @@ import type { WorkspaceStore } from "../workspace/workspace-store.js";
 import { ChannelRegistry } from "../channels/channel.js";
 import { createChannelTools } from "../channels/channel-tools.js";
 import { createDocumentTools } from "./document-tools.js";
-import { createOcrTools } from "./ocr-tools.js";
-import type { ConfigHolder } from "./config-holder.js";
 import { buildWorkspaceContextSections, buildWorkspaceContextSectionsFrom } from "./workspace-context.js";
 import { createL2Tools } from "../memory/l2/l2-tools.js";
 import { readManifest } from "../memory/l2/manifest-store.js";
@@ -117,33 +115,6 @@ describe("WorkspaceFileAccess tool parity (local dir vs object store)", () => {
 		expect(comparable(await missing(local))).toEqual(comparable(await missing(stored)));
 	});
 
-	it("ocr_image submits identical uploads and results on both impls", async () => {
-		const { root, local, stored } = await seedPair({ "pic.png": "png-bytes" });
-		vi.stubGlobal("fetch", vi.fn(async (input: unknown, init?: RequestInit) => {
-			if (init?.method === "POST") {
-				return new Response(JSON.stringify({ data: { jobId: "job-1" } }), { status: 200 });
-			}
-			const url = String(input);
-			if (url.includes("jsonUrl") || url.endsWith("/result")) {
-				return new Response("# OCR 文本", { status: 200 });
-			}
-			return new Response(JSON.stringify({
-				data: { state: "done", resultUrl: { jsonUrl: "https://x/result" } },
-			}), { status: 200 });
-		}));
-		const config = { current: { ocrApi: { token: "t" } } } as ConfigHolder;
-		const run = (files: WorkspaceFileAccess) => executeTool(
-			createOcrTools(config, { restrictToWorkspace: true, workspaceDir: root, files })[0] as never,
-			{ filePath: "pic.png" },
-		);
-		expect(comparable(await run(local))).toEqual(comparable(await run(stored)));
-
-		const missing = (files: WorkspaceFileAccess) => executeTool(
-			createOcrTools(config, { restrictToWorkspace: true, workspaceDir: root, files })[0] as never,
-			{ filePath: "gone.png" },
-		);
-		expect(comparable(await missing(local))).toEqual(comparable(await missing(stored)));
-	});
 
 	it("send_file_to_channel returns identical results on both impls", async () => {
 		const { root, local, stored } = await seedPair({ "report.txt": "hello channel" });

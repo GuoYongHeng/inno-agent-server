@@ -29,10 +29,8 @@ import { SandboxExecutionEnv } from "../sandbox/sandbox-env.js";
 import type { SandboxRuntimeBinding } from "../sandbox/sandbox-session.js";
 import { logger } from "../logger.js";
 import { WorkspaceFileEnv } from "./durable-env.js";
-import { withNativeImageFallback } from "./native-image-fallback.js";
 import { createDurableChannelRegistrations, resolveChannelOutbox, type DurableChannelToolOptions } from "./durable-channels.js";
 import { createDurableMemoryRegistrations, type DurableMemoryToolOptions } from "./durable-memory.js";
-import { createDurableOcrRegistrations, type DurableOcrToolOptions } from "./durable-ocr.js";
 import {
 	withDurableCommandPermission,
 	withDurableWorkspacePermission,
@@ -49,7 +47,6 @@ import {
 // Keep the original extension ID stable for existing durable registries.
 const WORKSPACE_EXTENSION_NAME = "inno.read-only";
 const MEMORY_EXTENSION_NAME = "inno.memory";
-const OCR_EXTENSION_NAME = "inno.ocr";
 const EXTRA_EXTENSION_NAME = "inno.extra";
 const CHANNEL_EXTENSION_NAME = "inno.channels";
 const QUESTION_EXTENSION_NAME = "inno.questions";
@@ -101,8 +98,6 @@ export interface DurableSessionRuntimeOptions {
 	workspaceTools?: boolean;
 	/** Tenant-local, replay-safe L2/L3 memory tools. */
 	memory?: DurableMemoryToolOptions;
-	/** Remote OCR recovery checkpoints; submission remains at-least-once. */
-	ocr?: DurableOcrToolOptions;
 	/** Persistent file-delivery outbox; external sends remain at-least-once. */
 	channels?: DurableChannelToolOptions;
 	/** Restart-safe workspace write/edit approvals. */
@@ -164,7 +159,7 @@ function createWorkspaceFileTools(permissions?: DurablePermissionStore, sandbox?
 
 /** Tools that read or write the HOST workspace by path. With a sandbox, what the
  * agent just made lives in the sandbox, so bring it to the host first. */
-const HOST_PATH_TOOLS = new Set(["parse_document", "l2_archive", "ocr_image", "send_file_to_channel"]);
+const HOST_PATH_TOOLS = new Set(["parse_document", "l2_archive", "send_file_to_channel"]);
 
 function pullBeforeHostPathTools(tools: ToolRegistration[], sandbox?: SandboxRuntimeBinding): ToolRegistration[] {
 	if (!sandbox) return tools;
@@ -182,7 +177,6 @@ function pullBeforeHostPathTools(tools: ToolRegistration[], sandbox?: SandboxRun
 function createSessionRegistry(
 	workspaceTools: boolean,
 	memory?: DurableMemoryToolOptions,
-	ocr?: DurableOcrToolOptions,
 	channels?: DurableChannelToolOptions,
 	questionTools: ToolRegistration[] = [],
 	permissions?: DurablePermissionStore,
@@ -200,12 +194,6 @@ function createSessionRegistry(
 		registry.install(defineExtension({
 			name: MEMORY_EXTENSION_NAME,
 			tools: pullBeforeHostPathTools(createDurableMemoryRegistrations(memory), sandbox),
-		}));
-	}
-	if (ocr) {
-		registry.install(defineExtension({
-			name: OCR_EXTENSION_NAME,
-			tools: pullBeforeHostPathTools(createDurableOcrRegistrations(ocr), sandbox),
 		}));
 	}
 	if (channels) {
@@ -261,18 +249,17 @@ export class DurableSessionRuntime {
 			const questionTools = options.questions
 				? await createDurableQuestionRegistrations(options.questions)
 				: [];
-			const registry = options.registry ?? createSessionRegistry(workspaceTools, options.memory, options.ocr, options.channels, questionTools, options.permissions, options.extraTools, options.sandbox);
+			const registry = options.registry ?? createSessionRegistry(workspaceTools, options.memory, options.channels, questionTools, options.permissions, options.extraTools, options.sandbox);
 			const memoryTools = options.memory ? createDurableMemoryRegistrations(options.memory) : [];
-			const ocrTools = options.ocr ? createDurableOcrRegistrations(options.ocr) : [];
 			const channelTools = options.channels ? createDurableChannelRegistrations(options.channels) : [];
 			const tools = pullBeforeHostPathTools(
-				[...memoryTools, ...ocrTools, ...channelTools, ...questionTools, ...(options.extraTools ?? [])],
+				[...memoryTools, ...channelTools, ...questionTools, ...(options.extraTools ?? [])],
 				options.sandbox,
 			);
 			const harness = await Harness.open(
 				options.openStorage ? await options.openStorage() : await openNodeSqliteStorage(storagePath),
 				{
-					models: withNativeImageFallback(options.models),
+					models: options.models,
 					registry,
 					env: options.sandbox
 						? () => new SandboxExecutionEnv(options.sandbox!.backend, options.sandbox!.remoteRoot)

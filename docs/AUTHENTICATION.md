@@ -64,13 +64,12 @@ Authenticated state uses tenant-local roots such as:
 ├── durable/
 ├── l2/
 ├── l3/
-├── ocr/
 ├── channels/
 ├── jobs/
 └── sessions/
 ```
 
-Provider/default-model settings, memory flags, OCR credentials, channels, workspaces, L2/L3 state, scheduler state, and Durable catalogs do not fall back to legacy global tenant data. Process-global read-only skill and preset catalogs are shared deliberately; authenticated shared-skill mutation is disabled, while owned workspace-private skills remain available.
+Provider/default-model settings, memory flags, channels, workspaces, L2/L3 state, scheduler state, and Durable catalogs do not fall back to legacy global tenant data. Process-global read-only skill and preset catalogs are shared deliberately; authenticated shared-skill mutation is disabled, while owned workspace-private skills remain available.
 
 ## Files from before the multi-user runtime
 
