@@ -34,7 +34,7 @@ import {
 	WorkspaceStoreError,
 	type WorkspaceStore,
 } from "../../workspace/workspace-store.js";
-import type { ObjectStore } from "../../object-store/object-store.js";
+import { sha256Hex, type ObjectStore } from "../../object-store/object-store.js";
 import { ObjectWorkspaceStore } from "../../workspace/object-workspace-store.js";
 import { workspaceObjectKey } from "../../workspace/workspace-object-key.js";
 import {
@@ -1227,10 +1227,21 @@ export async function handleWorkspacesRoutes(
 		const key = workspaceObjectKey(requestTenant.tenantId, wsId, rel);
 		const head = await objects.head(key);
 		if (!head) { json(res, 404, { error: "Upload not found — PUT the bytes to the signed URL first" }); return true; }
+		// Direct uploads carry no integrity metadata: the browser computes the
+		// sha256 of the file it meant to send and we verify the landed bytes
+		// (already fetched for the mirror) before the manifest adopts them.
+		const expectedSha256 = typeof body.sha256 === "string" && /^[0-9a-f]{64}$/i.test(body.sha256)
+			? body.sha256.toLowerCase() : null;
+		const bytes = await objects.get(key);
+		if (!bytes) { json(res, 409, { error: "Upload vanished before completion — retry" }); return true; }
+		if (expectedSha256 && sha256Hex(bytes) !== expectedSha256) {
+			await objects.delete(key).catch(() => undefined);
+			json(res, 422, { error: "Uploaded bytes failed the integrity check — retry the upload" });
+			return true;
+		}
 		try {
 			const entry = await store.adopt(wsId, rel, head.size);
-			const bytes = await objects.get(key);
-			if (bytes) mirrorWrite(wsId, rel, bytes);
+			mirrorWrite(wsId, rel, bytes);
 			json(res, 201, {
 				name: entry.name, path: rel, type: "file", size: entry.size,
 				updatedAt: new Date(entry.mtimeMs).toISOString(),

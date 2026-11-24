@@ -75,11 +75,27 @@ export async function requestWorkspaceUploadUrl(
 }
 
 /** Register a completed direct upload: the server verifies the object and writes the manifest row. */
-export async function completeWorkspaceUpload(path: string, workspaceId?: string): Promise<WorkspaceTreeNode> {
+export async function completeWorkspaceUpload(path: string, workspaceId?: string, sha256?: string): Promise<WorkspaceTreeNode> {
 	return apiFetch<WorkspaceTreeNode>("/api/workspace/upload/complete", {
 		method: "POST",
-		body: JSON.stringify(withWorkspace({ path }, workspaceId)),
+		body: JSON.stringify(withWorkspace(sha256 ? { path, sha256 } : { path }, workspaceId)),
 	});
+}
+
+/**
+ * SHA-256 of the file the browser means to send, for the server's integrity
+ * check at upload/complete. crypto.subtle needs a secure context — over plain
+ * HTTP (non-localhost) it is absent and the upload goes unverified, same as
+ * before this field existed.
+ */
+async function fileSha256Hex(file: File): Promise<string | null> {
+	try {
+		if (typeof crypto === "undefined" || !crypto.subtle) return null;
+		const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+		return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+	} catch {
+		return null;
+	}
 }
 
 /** Direct upload via the presigned URL flow; null means the deployment does not support it. */
@@ -91,6 +107,7 @@ export async function uploadWorkspaceFileDirect(
 ): Promise<WorkspaceTreeNode | null> {
 	const grant = await requestWorkspaceUploadUrl(path, file.size, workspaceId);
 	if (!grant) return null;
+	const sha256Promise = fileSha256Hex(file);
 	await new Promise<void>((resolve, reject) => {
 		const xhr = new XMLHttpRequest();
 		xhr.open("PUT", grant.uploadUrl);
@@ -105,7 +122,8 @@ export async function uploadWorkspaceFileDirect(
 		xhr.addEventListener("abort", () => reject(new Error("Direct upload cancelled")));
 		xhr.send(file);
 	});
-	return completeWorkspaceUpload(grant.path, workspaceId);
+	const sha256 = await sha256Promise;
+	return completeWorkspaceUpload(grant.path, workspaceId, sha256 ?? undefined);
 }
 
 export async function uploadWorkspaceFiles(files: Array<{ path: string; dataBase64: string }>, workspaceId?: string): Promise<{ uploaded: WorkspaceTreeNode[] }> {
