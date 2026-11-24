@@ -8,7 +8,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import { DurableSessionService } from "../agent/durable-session-service.js";
 import { DurableSessionRuntime } from "../agent/durable-runtime.js";
 import { normalizeConfig } from "../config.js";
-import { saveTenantConfig } from "../tenants/config.js";
 import { runWithoutTenantContext } from "../tenants/current.js";
 import { setRequestTenant } from "../tenants/http.js";
 import type { TenantContext, TenantStore } from "../tenants/store.js";
@@ -175,7 +174,6 @@ describe("durable session with local execution", () => {
 				defaultProvider: "p", defaultModel: "m",
 				providers: { p: { baseUrl: "http://x.invalid/v1", apiKey: "k", models: [{ id: "m", name: "M", reasoning: false, input: ["text"], contextWindow: 8000, maxTokens: 4000 }] } },
 			});
-			saveTenantConfig(base, ctxT.tenantId, cfg);
 			const service = new DurableSessionService({
 				dataDir: base,
 				getLocalConfig: () => cfg,

@@ -53,7 +53,7 @@ Cross-origin browser requests and terminal WebSockets are restricted to `BETTER_
 
 Each account has one personal tenant. Tenant identity comes only from a verified server session/membership or PostgreSQL ownership; clients cannot select a tenant through a header or body field. Every resource has at most one owner. Owned-resource misses and cross-tenant access return 404 rather than disclosing existence.
 
-Tenant state lives in PostgreSQL (`tenant_configs`, `tenant_state`, `durable_sessions`, `tenant_jobs`, L2/L3 tables). `<dataDir>/tenants/<id>/` only holds materialised copies — a config.json mirror for synchronous readers, workspace working copies backed by the object store, and transient downloads — and is fully rebuildable.
+Tenant state lives in PostgreSQL (`tenant_configs`, `tenant_state`, `durable_sessions`, `tenant_jobs`, L2/L3 tables). `<dataDir>/tenants/<id>/` only holds materialised copies — workspace working copies backed by the object store and transient downloads — and is fully rebuildable. Tenant config is read straight from `tenant_configs`; no local mirror is kept.
 
 Provider credentials, the model catalog, Tavily keys, and channel endpoints/credentials are **server-managed**: they come from the deployment `config.json` and tenants cannot write them (`/api/settings/providers*` and `/api/settings/tavily` are gone; credential fields in `PUT /api/settings/channels` return 403). A tenant's config row only carries selections — default model, channel `enabled`/`allowedUserIds`, memory and UI flags. Feishu app credentials are the exception: QR registration binds a tenant's personal Feishu app. Process-global read-only skill and preset catalogs are shared deliberately; authenticated shared-skill mutation is disabled, while owned workspace-private skills remain available.
 
@@ -71,7 +71,7 @@ Channel registries, targets, dedupe, logs, sessions, and delivery state are tena
 
 ## Storage and worker boundary
 
-PostgreSQL stores account, tenant, ownership, and occurrence-claim metadata plus all tenant ledgers (config, durable storage, memory, jobs, channel state). The data directory is scratch: workspace materialisations, config mirrors, and caches rebuild from PostgreSQL + object storage.
+PostgreSQL stores account, tenant, ownership, and occurrence-claim metadata plus all tenant ledgers (config, durable storage, memory, jobs, channel state). The data directory is scratch: workspace materialisations and caches rebuild from PostgreSQL + object storage.
 
 - One durable storage has one owner at a time. Never use active-active SQLite/JSONL/NFS replicas.
 - Authenticated durable opens hold a per-session PostgreSQL advisory lock to reject accidental double-open. This is not network-partition-proof fencing.

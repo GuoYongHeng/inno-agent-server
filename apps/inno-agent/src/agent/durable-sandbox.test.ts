@@ -6,7 +6,6 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { afterEach, describe, expect, it } from "vitest";
 import { normalizeConfig, normalizeSandboxConfig } from "../config.js";
-import { saveTenantConfig } from "../tenants/config.js";
 import { LocalDirSandboxProvider } from "../sandbox/local-backend.js";
 import { SandboxManager, SANDBOX_WORKSPACE_ROOT } from "../sandbox/sandbox-session.js";
 import { runWithoutTenantContext } from "../tenants/current.js";
@@ -58,7 +57,6 @@ function setup(approval: "always" | "never", responses: ReturnType<typeof fauxAs
 		defaultProvider: "p", defaultModel: "m",
 		providers: { p: { baseUrl: "http://x.invalid/v1", apiKey: "k", models: [{ id: "m", name: "M", reasoning: false, input: ["text"], contextWindow: 8000, maxTokens: 1000 }] } },
 	});
-	saveTenantConfig(base, ctxT.tenantId, cfg);
 	const service = new DurableSessionService({
 		dataDir: base,
 		getLocalConfig: () => cfg,

@@ -118,14 +118,13 @@ export async function handleSettingsRoutes(
 	url: string,
 	ctx: SettingsRouteContext,
 ): Promise<boolean> {
-	const { paths } = ctx;
 	const tenant = requireRequestTenant(req);
-	// Per-request view of the tenant's config. Tenant files start empty and
-	// never inherit deployment-owner credentials from a global file.
-	let config = loadTenantConfig(paths.dataDir, tenant.tenantId);
+	// Per-request view of the tenant's config. Tenant records start empty and
+	// never inherit deployment-owner credentials from the deployment file.
 	const tenantStore = getCurrentTenantStore();
+	let config = await loadTenantConfig(tenantStore, tenant.tenantId);
 	const save = async (next: InnoConfig): Promise<void> => {
-		config = await persistTenantConfig(tenantStore, paths.dataDir, tenant.tenantId, next);
+		config = await persistTenantConfig(tenantStore, tenant.tenantId, next);
 	};
 	// Durable runtimes read the config when a session is opened, so there is no
 	// live process-wide registry to synchronise after a settings change.

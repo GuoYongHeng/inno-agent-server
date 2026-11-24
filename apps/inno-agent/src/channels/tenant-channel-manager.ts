@@ -139,17 +139,28 @@ export class TenantChannelManager extends ChannelRegistry {
 		return this.runtime().dispatcher.getRunLog();
 	}
 
-	getWechatChannel(): WeChatChannel | null {
-		return this.runtime().wechatChannel;
+	/** Channels are built asynchronously from the tenant's PostgreSQL config;
+	 * await this before sync registry reads (get/all) that must see them. */
+	async ready(): Promise<void> {
+		await this.runtime().hydrated;
 	}
 
-	setWechatChannel(channel: WeChatChannel): void {
-		this.runtime().wechatChannel = channel;
+	async getWechatChannel(): Promise<WeChatChannel | null> {
+		const runtime = this.runtime();
+		await runtime.hydrated;
+		return runtime.wechatChannel;
+	}
+
+	async setWechatChannel(channel: WeChatChannel): Promise<void> {
+		const runtime = this.runtime();
+		await runtime.hydrated;
+		runtime.wechatChannel = channel;
 	}
 
 	/** QR-created channels need the same ALS rebinding as boot-time native channels. */
-	startWechatChannel(channel: WeChatChannel): void {
+	async startWechatChannel(channel: WeChatChannel): Promise<void> {
 		const runtime = this.runtime();
+		await runtime.hydrated;
 		if (runtime.wechatChannel !== channel) throw new Error("WeChat channel is not registered for this tenant");
 		channel.onMessage((message) => this.dispatch(runtime, channel, message));
 		void Promise.resolve(channel.start()).catch((err) => logger.error({ err }, "[wechat] failed to start channel"));
@@ -246,7 +257,12 @@ export class TenantChannelManager extends ChannelRegistry {
 		for (const id of candidates) {
 			if (!id) continue;
 			const context = await this.options.tenantStore.findResourceOwner("channel", id);
-			if (context) return runInTenantContext(context, this.options.tenantStore, operation);
+			if (context) {
+				return runInTenantContext(context, this.options.tenantStore, async () => {
+					await this.runtime().hydrated;
+					return operation();
+				});
+			}
 		}
 		return null;
 	}
@@ -282,14 +298,18 @@ export class TenantChannelManager extends ChannelRegistry {
 		const tenant = this.tenant();
 		const existing = this.runtimes.get(tenant.context.tenantId);
 		this.runtimes.delete(tenant.context.tenantId);
+		await existing?.hydrated.catch(() => {});
 		await existing?.stop?.();
-		this.runtime();
+		await this.runtime().hydrated;
 	}
 
 	async close(): Promise<void> {
 		const runtimes = [...this.runtimes.values()];
 		this.runtimes.clear();
-		for (const runtime of runtimes) await runtime.stop?.();
+		for (const runtime of runtimes) {
+			await runtime.hydrated.catch(() => {});
+			await runtime.stop?.();
+		}
 	}
 
 	private tenant(): { context: TenantContext; store: TenantStore } {
@@ -329,18 +349,6 @@ export class TenantChannelManager extends ChannelRegistry {
 			runLog,
 			chatSessionsLedger: { load: () => chatSessionsLedger.load(), save: (map) => chatSessionsLedger.save(map) },
 		});
-		const runtime: TenantChannelRuntime = {
-			context: tenant.context,
-			registry,
-			dispatcher,
-			wechatChannel: null,
-			hydrated: Promise.all([
-				registry.loadDefaultTargets(),
-				dedupeStore.hydrate(),
-				runLog.hydrate(),
-				dispatcher.chatSessionMapHydrated,
-			]).then(() => undefined),
-		};
 		const dispatch = (channel: ChatChannel, message: IncomingMessage): void => {
 			this.dispatch(runtime, channel, message);
 		};
@@ -356,19 +364,41 @@ export class TenantChannelManager extends ChannelRegistry {
 				wechatTokenCache = await wechatTokenLedger.load();
 			},
 		};
-		const registration = this.options.createChannels({
-			config: resolveTenantConfig(this.options.dataDir, tenant.context.tenantId, this.options.getLocalConfig()),
-			channelsDataDir,
+		const runtime: TenantChannelRuntime = {
+			context: tenant.context,
 			registry,
-			dispatch,
-			wechatTokenPersistence,
-		});
-		runtime.wechatChannel = registration.wechatChannel ?? null;
-		runtime.stop = async () => {
-			dispatcher.dispose();
-			await registration.stop?.();
-			await runtime.wechatChannel?.stop();
+			dispatcher,
+			wechatChannel: null,
+			// Channel construction needs the tenant's merged config — an async
+			// PostgreSQL read — so it happens inside the hydration step, after
+			// the ledgers. A failed hydration drops the runtime so the next
+			// access retries instead of caching a broken channel set.
+			hydrated: Promise.all([
+				registry.loadDefaultTargets(),
+				dedupeStore.hydrate(),
+				runLog.hydrate(),
+				dispatcher.chatSessionMapHydrated,
+				wechatTokenPersistence.hydrate?.(),
+			]).then(async () => {
+				const registration = this.options.createChannels({
+					config: await resolveTenantConfig(tenant.context.tenantId, this.options.getLocalConfig(), tenant.store),
+					channelsDataDir,
+					registry,
+					dispatch,
+					wechatTokenPersistence,
+				});
+				runtime.wechatChannel = registration.wechatChannel ?? null;
+				runtime.stop = async () => {
+					dispatcher.dispose();
+					await registration.stop?.();
+					await runtime.wechatChannel?.stop();
+				};
+			}),
 		};
+		runtime.hydrated.catch((err) => {
+			this.runtimes.delete(tenant.context.tenantId);
+			logger.error({ err }, "tenant channel runtime hydration failed");
+		});
 		this.runtimes.set(tenant.context.tenantId, runtime);
 		return runtime;
 	}

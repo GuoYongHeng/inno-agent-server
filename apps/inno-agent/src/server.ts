@@ -79,7 +79,6 @@ import { assertSignUpAllowed, isPublicApiRequest, isTrustedOrigin, requireSessio
 import { createAuthRuntime } from "./auth/runtime.js";
 import { createBackgroundRequest, requireRequestTenant, setRequestTenant } from "./tenants/http.js";
 import type { TenantContext } from "./tenants/store.js";
-import { syncTenantConfigFromStore } from "./tenants/config.js";
 import { bufferBody, forwardDurableTenantRequest, readDurableShardConfig, replayBodyRequest } from "./tenants/durable-tenant-router.js";
 import { getCurrentTenant, getCurrentTenantStore, runWithoutTenantContext } from "./tenants/current.js";
 
@@ -1061,7 +1060,6 @@ async function handleInternalDurablePrompt(req: HttpReq, res: ServerResponse): P
 	const breq = createBackgroundRequest({ tenantId: found.tenant_id, userId: found.owner_user_id, role: "owner" }, auth.tenantStore);
 	// Internal prompts bypass the cookie gate where tenant config is normally
 	// materialised — sync it here so the tenant's model/provider config exists.
-	await syncTenantConfigFromStore(auth.tenantStore, dataDir, found.tenant_id);
 	try {
 		if (body.notifyOnly === true) {
 			await durableSessions.appendAssistantNotification(breq, sessionId, prompt, requestId, { busyWaitMs: DURABLE_JOB_BUSY_WAIT_MS });
@@ -1186,6 +1184,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 			return { status: 401, body: { ok: false as const, error: "No tenant claims this channel identity" } };
 		},
 		reloadFeishuChannel,
+		ensureChannelsReady: () => tenantChannelManager!.ready(),
 		getWechatChannel: () => tenantChannelManager!.getWechatChannel(),
 		setWechatChannel: (channel) => tenantChannelManager!.setWechatChannel(channel),
 		startWechatChannel: (channel) => tenantChannelManager!.startWechatChannel(channel),
@@ -1354,8 +1353,7 @@ const server = createServer(async (req, response) => {
 			setRequestTenant(req, tenant, auth.tenantStore);
 			// Materialise the authoritative tenant config so this worker can
 			// serve tenant-scoped reads after taking over from another worker.
-			await syncTenantConfigFromStore(auth.tenantStore, dataDir, tenant.tenantId);
-		}
+			}
 
 		// Public sidecar callbacks have no cookie. Recover their tenant only from
 		// PostgreSQL token ownership, then forward the untouched body to the same

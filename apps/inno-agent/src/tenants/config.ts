@@ -1,24 +1,8 @@
-import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import {
-	loadConfig,
-	normalizeConfig,
-	saveConfig,
-	type InnoConfig,
-} from "../config.js";
-import { getCurrentTenant } from "./current.js";
+import { normalizeConfig, type InnoConfig } from "../config.js";
+import { getCurrentTenant, getCurrentTenantStore } from "./current.js";
 import type { TenantStore } from "./store.js";
 
 const TENANT_CONFIG_OPTIONS = { allowEmptyProviders: true } as const;
-
-export function tenantConfigDir(dataDir: string, tenantId: string): string {
-	return join(dataDir, "tenants", tenantId, "config");
-}
-
-export function tenantConfigPath(dataDir: string, tenantId: string): string {
-	return join(tenantConfigDir(dataDir, tenantId), "config.json");
-}
 
 /**
  * Authenticated accounts start without provider or integration credentials.
@@ -31,16 +15,6 @@ export function createEmptyTenantConfig(): InnoConfig {
 		defaultModel: "",
 		providers: {},
 	}, TENANT_CONFIG_OPTIONS);
-}
-
-export function loadTenantConfig(dataDir: string, tenantId: string): InnoConfig {
-	const path = tenantConfigPath(dataDir, tenantId);
-	if (!existsSync(path)) return createEmptyTenantConfig();
-	return loadConfig(path, TENANT_CONFIG_OPTIONS);
-}
-
-export function saveTenantConfig(dataDir: string, tenantId: string, config: InnoConfig): InnoConfig {
-	return saveConfig(tenantConfigPath(dataDir, tenantId), config, TENANT_CONFIG_OPTIONS);
 }
 
 const TENANT_CHANNEL_NAMES = ["feishu", "qq", "wechat", "wecom"] as const;
@@ -81,61 +55,44 @@ export function mergeTenantConfig(localConfig: InnoConfig, tenantConfig: InnoCon
 	};
 }
 
-/** Resolve configuration at execution time, inside the verified ALS tenant scope. */
-export function resolveCurrentTenantConfig(dataDir: string, localConfig: InnoConfig): InnoConfig {
-	const tenant = getCurrentTenant();
-	return tenant ? mergeTenantConfig(localConfig, loadTenantConfig(dataDir, tenant.tenantId)) : localConfig;
-}
-
-/** Effective config for a specific tenant id (channel manager, webhook routing). */
-export function resolveTenantConfig(dataDir: string, tenantId: string, localConfig: InnoConfig): InnoConfig {
-	return mergeTenantConfig(localConfig, loadTenantConfig(dataDir, tenantId));
-}
-
-function tenantConfigSyncPath(dataDir: string, tenantId: string): string {
-	return join(tenantConfigDir(dataDir, tenantId), "config.json.pg-sync");
-}
-
 /**
- * Materialise the authoritative PostgreSQL tenant config into the local file
- * when it is missing or the PG row moved past the recorded `updated_at` marker.
- * The local file stays the synchronous read path for every config consumer;
- * this runs once per authenticated request before routing/dispatch.
+ * Tenant config is a single indexed PostgreSQL row (`tenant_configs`) — the
+ * read is cheap enough to serve every consumer directly, so there is no local
+ * file or cache copy; PostgreSQL is the only source of truth.
  */
-export async function syncTenantConfigFromStore(
-	store: TenantStore,
-	dataDir: string,
+export async function loadTenantConfig(
+	store: TenantStore | null,
 	tenantId: string,
-): Promise<void> {
-	const record = await store.loadTenantConfigRecord(tenantId);
-	if (!record) return;
-	const path = tenantConfigPath(dataDir, tenantId);
-	const marker = tenantConfigSyncPath(dataDir, tenantId);
-	if (existsSync(path) && existsSync(marker)
-		&& (await readFile(marker, "utf8")) === record.updatedAt) {
-		return;
-	}
-	// Marker written after the config: a torn sync is retried on the next request.
-	await mkdir(dirname(path), { recursive: true });
-	await writeFile(path, record.config);
-	await writeFile(marker, record.updatedAt);
+): Promise<InnoConfig> {
+	const record = await store?.loadTenantConfigRecord?.(tenantId);
+	if (!record) return createEmptyTenantConfig();
+	return normalizeConfig(JSON.parse(record.config) as Record<string, unknown>, TENANT_CONFIG_OPTIONS);
 }
 
-/**
- * Tenant settings write path: updates the local file and the authoritative PG
- * row, then records the new sync marker. Pass the tenant store only inside a
- * verified tenant scope (or null to keep file-only local behaviour).
- */
+/** Persist a tenant's selections to the authoritative PG row. */
 export async function persistTenantConfig(
 	store: TenantStore | null,
-	dataDir: string,
 	tenantId: string,
 	config: InnoConfig,
 ): Promise<InnoConfig> {
-	const saved = saveTenantConfig(dataDir, tenantId, config);
-	if (store) {
-		const updatedAt = await store.saveTenantConfigRecord(tenantId, JSON.stringify(saved));
-		await writeFile(tenantConfigSyncPath(dataDir, tenantId), updatedAt);
-	}
-	return saved;
+	const normalized = normalizeConfig(config, TENANT_CONFIG_OPTIONS);
+	if (store) await store.saveTenantConfigRecord(tenantId, JSON.stringify(normalized));
+	return normalized;
+}
+
+/** Resolve configuration at execution time, inside the verified ALS tenant scope. */
+export async function resolveCurrentTenantConfig(localConfig: InnoConfig): Promise<InnoConfig> {
+	const tenant = getCurrentTenant();
+	return tenant
+		? mergeTenantConfig(localConfig, await loadTenantConfig(getCurrentTenantStore(), tenant.tenantId))
+		: localConfig;
+}
+
+/** Effective config for a specific tenant id (channel manager, webhook routing). */
+export async function resolveTenantConfig(
+	tenantId: string,
+	localConfig: InnoConfig,
+	store: TenantStore | null,
+): Promise<InnoConfig> {
+	return mergeTenantConfig(localConfig, await loadTenantConfig(store, tenantId));
 }

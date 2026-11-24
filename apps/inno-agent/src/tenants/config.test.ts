@@ -1,28 +1,30 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { InnoConfig } from "../config.js";
 import { runInTenantContext } from "./current.js";
 import {
 	createEmptyTenantConfig,
 	loadTenantConfig,
+	persistTenantConfig,
 	resolveCurrentTenantConfig,
-	saveTenantConfig,
 } from "./config.js";
 import type { TenantContext, TenantStore } from "./store.js";
 
-const tempDirs: string[] = [];
-const tenantStore = {} as TenantStore;
-
-function tempDir(): string {
-	const dir = mkdtempSync(join(tmpdir(), "inno-tenant-config-"));
-	tempDirs.push(dir);
-	return dir;
-}
-
 function context(tenantId: string): TenantContext {
 	return { tenantId, userId: `user-${tenantId}`, role: "owner" };
+}
+
+/** In-memory stand-in for the tenant_configs PostgreSQL row. */
+function fakeStore() {
+	const records = new Map<string, string>();
+	const store = {
+		loadTenantConfigRecord: async (tenantId: string) =>
+			records.has(tenantId) ? { config: records.get(tenantId)!, updatedAt: "1" } : null,
+		saveTenantConfigRecord: async (tenantId: string, configJson: string) => {
+			records.set(tenantId, configJson);
+			return "1";
+		},
+	} as unknown as TenantStore;
+	return { store, records };
 }
 
 function localConfig(): InnoConfig {
@@ -40,22 +42,18 @@ function localConfig(): InnoConfig {
 	};
 }
 
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
-
 describe("tenant configuration", () => {
-	it("does not inherit legacy providers or integration credentials", () => {
-		const dataDir = tempDir();
-		const config = loadTenantConfig(dataDir, "tenant-a");
+	it("does not inherit legacy providers or integration credentials", async () => {
+		const { store } = fakeStore();
+		const config = await loadTenantConfig(store, "tenant-a");
 		expect(config.providers).toEqual({});
 		expect(config.defaultProvider).toBe("");
 		expect(config.defaultModel).toBe("");
 		expect(config.tavily).toBeUndefined();
 	});
 
-	it("merges server-managed fields from global config with tenant selections", () => {
-		const dataDir = tempDir();
+	it("merges server-managed fields from global config with tenant selections", async () => {
+		const { store } = fakeStore();
 		const local = localConfig();
 		const tenantA = createEmptyTenantConfig();
 		// Stale tenant-side provider entries are ignored — the shared catalog
@@ -68,20 +66,20 @@ describe("tenant configuration", () => {
 		tenantA.defaultProvider = "shared";
 		tenantA.defaultModel = "model-a";
 		tenantA.channels = { qq: { enabled: true, allowedUserIds: ["u1"] } as never };
-		saveTenantConfig(dataDir, "tenant-a", tenantA);
+		await persistTenantConfig(store, "tenant-a", tenantA);
 
-		runInTenantContext(context("tenant-a"), tenantStore, () => {
-			const resolved = resolveCurrentTenantConfig(dataDir, local);
+		await runInTenantContext(context("tenant-a"), store, async () => {
+			const resolved = await resolveCurrentTenantConfig(local);
 			expect(resolved.providers.legacy.apiKey).toBe("legacy-secret");
 			expect(resolved.defaultProvider).toBe("shared");
 			expect(resolved.defaultModel).toBe("model-a");
 			expect(resolved.channels?.qq).toMatchObject({ enabled: true, allowedUserIds: ["u1"] });
 		});
-		runInTenantContext(context("tenant-b"), tenantStore, () => {
-			const resolved = resolveCurrentTenantConfig(dataDir, local);
+		await runInTenantContext(context("tenant-b"), store, async () => {
+			const resolved = await resolveCurrentTenantConfig(local);
 			expect(resolved.providers.legacy.apiKey).toBe("legacy-secret");
 			expect(resolved.defaultProvider).toBe(local.defaultProvider);
 		});
-		expect(resolveCurrentTenantConfig(dataDir, local)).toBe(local);
+		expect(await resolveCurrentTenantConfig(local)).toBe(local);
 	});
 });

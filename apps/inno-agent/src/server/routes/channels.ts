@@ -31,9 +31,11 @@ export interface ChannelsRouteContext {
 	getBridgeToken: () => string | undefined;
 	handleBridge?: (authHeader: string | undefined, body: unknown) => Promise<{ status: number; body: BridgeMessageResponse }>;
 	reloadFeishuChannel: () => Promise<void>;
-	getWechatChannel: () => WeChatChannel | null;
-	setWechatChannel: (channel: WeChatChannel) => void;
-	startWechatChannel?: (channel: WeChatChannel) => void;
+	/** Await before sync registry reads — channel construction is async (PG config). */
+	ensureChannelsReady?: () => Promise<void>;
+	getWechatChannel: () => Promise<WeChatChannel | null>;
+	setWechatChannel: (channel: WeChatChannel) => Promise<void>;
+	startWechatChannel?: (channel: WeChatChannel) => Promise<void>;
 	syncChannelOwnership?: (previous: InnoConfig, next: InnoConfig) => Promise<void>;
 	beginFeishuRegistration?: typeof feishuRegistrationBegin;
 	pollFeishuRegistration?: typeof feishuRegistrationPoll;
@@ -95,12 +97,15 @@ export async function handleChannelsRoutes(
 	const tenant = requireRequestTenant(req);
 	// Writes persist the tenant record (user fields only); reads that feed
 	// channel construction resolve the merged view (server endpoints + toggles).
-	const getConfig = () => loadTenantConfig(ctx.dataDir, tenant.tenantId);
-	const getEffectiveConfig = () => resolveTenantConfig(ctx.dataDir, tenant.tenantId, ctx.getConfig());
+	const getConfig = () => loadTenantConfig(getCurrentTenantStore(), tenant.tenantId);
+	const getEffectiveConfig = () => resolveTenantConfig(tenant.tenantId, ctx.getConfig(), getCurrentTenantStore());
+	// Channels are constructed lazily per tenant — ensure hydration before the
+	// sync registry reads below (all/get/getDefaultTarget).
+	await ctx.ensureChannelsReady?.();
 	const persistConfig = async (previous: InnoConfig, next: InnoConfig): Promise<void> => {
 		if (ctx.syncChannelOwnership) await ctx.syncChannelOwnership(previous, next);
 		try {
-			await persistTenantConfig(getCurrentTenantStore(), ctx.dataDir, tenant.tenantId, next);
+			await persistTenantConfig(getCurrentTenantStore(), tenant.tenantId, next);
 		} catch (error) {
 			if (ctx.syncChannelOwnership) {
 				try { await ctx.syncChannelOwnership(next, previous); }
@@ -209,7 +214,7 @@ export async function handleChannelsRoutes(
 			const result = await (ctx.pollFeishuRegistration?.(deviceCode) ?? feishuRegistrationPoll(deviceCode));
 			if (result.status === "confirmed" && result.appId && result.appSecret) {
 				// Save credentials to the owning tenant and start only its channel.
-				const previous = getConfig();
+				const previous = await getConfig();
 				const next: InnoConfig = {
 					...previous,
 					feishu: { appId: result.appId, appSecret: result.appSecret },
@@ -236,13 +241,13 @@ export async function handleChannelsRoutes(
 	// WeChat iLink QR login
 	if (method === "POST" && url === "/api/channels/wechat/qr-login") {
 		// Lazily create the WeChat channel if not yet instantiated
-		let wechatChannel = ctx.getWechatChannel();
+		let wechatChannel = await ctx.getWechatChannel();
 		if (!wechatChannel) {
 			const persistence = ctx.wechatTokenPersistence?.()
 				?? join(ctx.dataDir, "tenants", tenant.tenantId);
-			wechatChannel = new WeChatChannel(persistence, getEffectiveConfig().channels?.wechat);
+			wechatChannel = new WeChatChannel(persistence, (await getEffectiveConfig()).channels?.wechat);
 			channelRegistry.register(wechatChannel);
-			ctx.setWechatChannel(wechatChannel);
+			await ctx.setWechatChannel(wechatChannel);
 		}
 		try {
 			const qr = await wechatChannel.getClient().getQrCode();
@@ -267,7 +272,7 @@ export async function handleChannelsRoutes(
 			json(res, 400, { error: "Missing qrId" });
 			return true;
 		}
-		const wechatChannel = ctx.getWechatChannel();
+		const wechatChannel = await ctx.getWechatChannel();
 		if (!wechatChannel) {
 			json(res, 400, { error: "WeChat channel not initialized" });
 			return true;
@@ -285,7 +290,7 @@ export async function handleChannelsRoutes(
 				const dispatcher = ctx.getDispatcher();
 				if (!wechatChannel.isConnected && dispatcher) {
 					if (ctx.startWechatChannel) {
-						ctx.startWechatChannel(wechatChannel);
+						await ctx.startWechatChannel(wechatChannel);
 					} else {
 						wechatChannel.onMessage((msg) => dispatcher.handle(wechatChannel, msg));
 						void wechatChannel.start().catch((err) => logger.error({ err }, "[wechat] failed to start channel"));
@@ -301,7 +306,7 @@ export async function handleChannelsRoutes(
 	}
 
 	if (method === "GET" && url === "/api/channels/wechat/status") {
-		const wechatChannel = ctx.getWechatChannel();
+		const wechatChannel = await ctx.getWechatChannel();
 		if (!wechatChannel) {
 			json(res, 200, { configured: false, connected: false });
 			return true;

@@ -406,7 +406,7 @@ export class DurableSessionService {
 	async create(req: IncomingMessage, input: { workspaceId: string; origin?: "web" | "scheduler" }): Promise<DurableSessionSummary> {
 		if (!this.options.enabled) throw new DurableRuntimeDisabledError();
 		if (this.closing) throw new Error("Durable session service is shutting down");
-		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
+		const config = await resolveCurrentTenantConfig(this.options.getLocalConfig());
 		if (!config.defaultProvider || !config.defaultModel) {
 			throw new Error("Configure a provider and default model before creating a durable session");
 		}
@@ -456,7 +456,7 @@ export class DurableSessionService {
 	): Promise<DurableSessionSummary> {
 		const before = await this.get(req, id);
 		if (!before) throw new Error("Durable session not found");
-		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
+		const config = await resolveCurrentTenantConfig(this.options.getLocalConfig());
 		const provider = config.providers[selection.provider];
 		if (!provider?.models.some((model) => model.id === selection.modelId)) {
 			throw new DurableModelNotFoundError(selection.provider, selection.modelId);
@@ -526,7 +526,7 @@ export class DurableSessionService {
 	): Promise<string> {
 		const record = await this.get(req, id);
 		if (!record) throw new Error("Durable session not found");
-		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
+		const config = await resolveCurrentTenantConfig(this.options.getLocalConfig());
 		const complete = this.options.completeChat ?? completeConfiguredDurableChat;
 		const turns: DurableChatTurn[] = [];
 		if (input.contextDigest) turns.push({ role: "user", text: input.contextDigest });
@@ -545,7 +545,7 @@ export class DurableSessionService {
 	async contextUsage(req: IncomingMessage, id: string): Promise<SessionContextUsage> {
 		const record = await this.get(req, id);
 		if (!record) throw new Error("Durable session not found");
-		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
+		const config = await resolveCurrentTenantConfig(this.options.getLocalConfig());
 		const model = config.providers[record.provider]?.models.find((candidate) => candidate.id === record.modelId);
 		if (!model) return unavailableContextUsage(id, "unavailable");
 		const lease = await this.lease(req, id);
@@ -613,7 +613,7 @@ export class DurableSessionService {
 		// Capture the verified tenant's configuration before background work can
 		// outlive its HTTP ALS scope. The catalog selection stays pinned even if
 		// the tenant later changes their default model.
-		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
+		const config = await resolveCurrentTenantConfig(this.options.getLocalConfig());
 		const complete = this.options.completeTopic ?? completeConfiguredDurablePrompt;
 		let operation: Promise<DurableSessionSummary>;
 		operation = (async () => {
@@ -695,7 +695,7 @@ export class DurableSessionService {
 					.catch((error) => logger.warn({ err: error, workspaceId: record.workspaceId, rel }, "failed to mirror inline image into workspace store"));
 			}
 		}
-		const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
+		const config = await resolveCurrentTenantConfig(this.options.getLocalConfig());
 		const model = config.providers[record.provider]?.models.find((candidate) => candidate.id === record.modelId);
 		if (!model) throw new Error(`Configured durable model not found: ${record.provider}/${record.modelId}`);
 		const native = model.input.includes("image");
@@ -771,7 +771,7 @@ export class DurableSessionService {
 	async prepareRecallContext(req: IncomingMessage, id: string, prompt: string): Promise<string> {
 		if (!await this.get(req, id)) throw new Error("Durable session not found");
 		try {
-			const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
+			const config = await resolveCurrentTenantConfig(this.options.getLocalConfig());
 			if (config.memory?.l3Enabled === false || !prompt.trim()) return "";
 			const scoped = new ScopedL3Memory(this.options.dataDir, this.options.recoveryPool);
 			const recall = () => scoped.recall(prompt, id);
@@ -938,7 +938,7 @@ export class DurableSessionService {
 						observeMs("inno_advisory_lock_acquire_ms", performance.now() - lockStarted);
 					}
 					try {
-						const config = resolveCurrentTenantConfig(this.options.dataDir, this.options.getLocalConfig());
+						const config = await resolveCurrentTenantConfig(this.options.getLocalConfig());
 						const selection = await createConfiguredDurableModels(config, {
 							provider: record.provider,
 							modelId: record.modelId,

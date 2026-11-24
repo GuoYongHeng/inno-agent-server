@@ -375,9 +375,9 @@ export class TenantStore {
 	}
 
 	/**
-	 * Authoritative tenant config copy for cross-worker takeover. Workers
-	 * materialise it into their local `tenants/<id>/config/config.json` on
-	 * request entry; `updatedAt` is the sync marker.
+	 * Authoritative tenant config copy for cross-worker takeover — readers
+	 * query this row directly; no local file is materialised. `updatedAt`
+	 * remains as the row's sync marker.
 	 */
 	async loadTenantConfigRecord(tenantId: string): Promise<{ config: string; updatedAt: string } | null> {
 		const rows = await this.pool.query<{ config: string; updated_at: string }>(

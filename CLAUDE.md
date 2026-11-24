@@ -149,7 +149,7 @@ Precedence: command-line flag → env var → `~/.inno-agent/...`.
 | `--workspace` / `--workspace-dir` | `INNO_WORKSPACE_DIR` | invocation CWD |
 | `--port` | `INNO_PORT` (via config) | `3000` |
 
-Derived paths inside `dataDir`: `sessions/` (channel-binding metadata is in `tenant_state`), `preset-cache/`, plus per-tenant roots under `tenants/<tenantId>/` for workspace materialised copies and config files. Durable session storage, the session catalog, L2/L3 memory, jobs/check-ins and channel ledgers live in PostgreSQL (`ds_*`, `durable_sessions`, `tenant_jobs`, `tenant_job_runs`, `tenant_checkins`, `tenant_checkin_occurrences`, `tenant_state`). `applyRuntimeEnvironment` re-exports the resolved `INNO_*` paths back into `process.env`.
+Derived paths inside `dataDir`: `sessions/` (channel-binding metadata is in `tenant_state`), `preset-cache/`, plus per-tenant roots under `tenants/<tenantId>/` for workspace materialised copies only. Tenant config, durable session storage, the session catalog, L2/L3 memory, jobs/check-ins and channel ledgers live in PostgreSQL (`ds_*`, `durable_sessions`, `tenant_jobs`, `tenant_job_runs`, `tenant_checkins`, `tenant_checkin_occurrences`, `tenant_state`). `applyRuntimeEnvironment` re-exports the resolved `INNO_*` paths back into `process.env`.
 
 When editing path-related code, change `runtime.ts` rather than hard-coding paths in `server.ts`.
 
@@ -341,7 +341,7 @@ Deployment manifests live under `deploy/` (`Dockerfile.backend`, `Dockerfile.fro
 
 ### User-facing config (`<configDir>/config.json`)
 
-Template: `config.example.json` at repo root. Declares `defaultProvider`, `defaultModel`, a `providers` map (each with `baseUrl`, `api` ∈ {`openai-completions`, `anthropic-messages`}, `apiKey`, `models[]`), optional `server.port`, optional `channels.*` blocks, optional `bridge.token`, optional `contentHub`, `memory`, and `ui` sections. The server rewrites this file when the local user changes the default model via the UI (existing sessions keep the model pinned in their catalog record until switched individually). Authenticated users instead use `<dataDir>/tenants/<tenantId>/config/config.json`; a new tenant starts with no providers or inherited credentials and must configure a model before prompting.
+Template: `config.example.json` at repo root. Declares `defaultProvider`, `defaultModel`, a `providers` map (each with `baseUrl`, `api` ∈ {`openai-completions`, `anthropic-messages`}, `apiKey`, `models[]`), optional `server.port`, optional `channels.*` blocks, optional `bridge.token`, optional `contentHub`, `memory`, and `ui` sections. The server rewrites this file when the local user changes the default model via the UI (existing sessions keep the model pinned in their catalog record until switched individually). Authenticated tenants keep only their selections (default model, channel toggles/allow-lists, memory/ui) in the PostgreSQL `tenant_configs` row — read async on demand, never written to disk. A new tenant starts with no selection and picks a model from the server-managed catalog before prompting.
 
 Model config supports `reasoning` (boolean), `input` (modality array, e.g. `["text", "image"]`), `contextWindow`, and `maxTokens` per model entry. Provider config supports `authHeader` (boolean) and `bypassProxy` (boolean) fields.
 

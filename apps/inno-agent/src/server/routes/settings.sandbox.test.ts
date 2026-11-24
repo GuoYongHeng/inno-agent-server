@@ -8,7 +8,6 @@ import { normalizeConfig, type InnoConfig } from "../../config.js";
 import { setRequestTenant } from "../../tenants/http.js";
 import type { TenantStore } from "../../tenants/store.js";
 import { FakeTenantStore, ctxA } from "../../workspace/fake-tenant-store.js";
-import { saveTenantConfig } from "../../tenants/config.js";
 import { handleSettingsRoutes, type SettingsRouteContext } from "./settings.js";
 
 const dirs: string[] = [];
@@ -42,7 +41,6 @@ function setup() {
 		sandbox: { enabled: true, apiKey: "e2b_secret_abcd" },
 	});
 	writeFileSync(configPath, JSON.stringify(config));
-	saveTenantConfig(dir, ctxA.tenantId, config);
 	const ctx = {
 		paths: { configPath, dataDir: dir },
 		getConfig: () => config,

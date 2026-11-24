@@ -391,10 +391,9 @@ CREATE INDEX IF NOT EXISTS ds_document_revisions_kind_idx
 `;
 
 /**
- * Replicated tenant configuration. PostgreSQL is the authoritative copy so any
- * worker can serve a tenant after takeover; each worker materialises it to its
- * local `tenants/<id>/config/config.json` on request entry and every settings
- * write updates both the file and this row.
+ * Replicated tenant configuration. PostgreSQL is the only copy — any worker can
+ * serve a tenant after takeover by reading this row directly; no local file is
+ * materialised.
  */
 const TENANT_CONFIG_SQL = `
 CREATE TABLE IF NOT EXISTS tenant_configs (

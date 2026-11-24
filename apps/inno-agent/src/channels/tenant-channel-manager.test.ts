@@ -2,7 +2,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEmptyTenantConfig, saveTenantConfig } from "../tenants/config.js";
+import type { InnoConfig } from "../config.js";
+import { createEmptyTenantConfig, persistTenantConfig } from "../tenants/config.js";
 import { getCurrentTenant, runInTenantContext } from "../tenants/current.js";
 import { ResourceOwnershipError, type TenantContext, type TenantStore } from "../tenants/store.js";
 import type { ChatChannel } from "./channel.js";
@@ -23,6 +24,7 @@ function context(tenantId: string): TenantContext {
 
 function fakeTenantStore() {
 	const owners = new Map<string, TenantContext>();
+	const configs = new Map<string, string>();
 	const store = {
 		claimResource: async (owner: TenantContext, _kind: string, id: string) => {
 			const existing = owners.get(id);
@@ -34,6 +36,12 @@ function fakeTenantStore() {
 		},
 		ownsResource: async (owner: TenantContext, _kind: string, id: string) => owners.get(id)?.tenantId === owner.tenantId,
 		findResourceOwner: async (_kind: string, id: string) => owners.get(id) ?? null,
+		loadTenantConfigRecord: async (tenantId: string) =>
+			configs.has(tenantId) ? { config: configs.get(tenantId)!, updatedAt: "1" } : null,
+		saveTenantConfigRecord: async (tenantId: string, configJson: string) => {
+			configs.set(tenantId, configJson);
+			return "1";
+		},
 	};
 	return { store: store as TenantStore, owners };
 }
@@ -44,12 +52,13 @@ function tempDir(): string {
 	return dir;
 }
 
-function configure(dataDir: string, tenantId: string, token: string, appId: string): void {
+// Feishu app credentials and the enabled toggle are the tenant fields the
+// merged config reads; the bridge token is server-managed (global).
+function configure(store: TenantStore, tenantId: string, appId: string): Promise<InnoConfig> {
 	const config = createEmptyTenantConfig();
-	config.bridge = { token };
 	config.feishu = { appId, appSecret: `${tenantId}-secret` };
 	config.channels = { feishu: { enabled: true, personalOnly: true } };
-	saveTenantConfig(dataDir, tenantId, config);
+	return persistTenantConfig(store, tenantId, config);
 }
 
 function message(id: string, text: string): IncomingMessage {
@@ -125,14 +134,22 @@ afterEach(async () => {
 
 describe("TenantChannelManager", () => {
 	it("keeps registries, targets, sessions and run logs in their owning tenant", async () => {
-		const { dataDir, manager, run, stateData } = setup();
-		configure(dataDir, "tenant-a", "token-a", "app-a");
-		configure(dataDir, "tenant-b", "token-b", "app-b");
+		const { manager, store, run, stateData } = setup();
+		await configure(store, "tenant-a", "app-a");
+		await configure(store, "tenant-b", "app-b");
 		expect(() => manager.all()).toThrow("verified tenant");
 
-		await run("tenant-a", () => manager.handle(manager.get("feishu")!, message("a-1", "hello-a")));
-		await run("tenant-b", () => manager.handle(manager.get("feishu")!, message("b-1", "hello-b")));
-		await run("tenant-a", () => manager.handle(manager.get("feishu")!, message("a-1", "duplicate")));
+		await run("tenant-a", async () => {
+			await manager.ready();
+			await manager.handle(manager.get("feishu")!, message("a-1", "hello-a"));
+		});
+		await run("tenant-b", async () => {
+			await manager.ready();
+			await manager.handle(manager.get("feishu")!, message("b-1", "hello-b"));
+		});
+		await run("tenant-a", async () => {
+			await manager.handle(manager.get("feishu")!, message("a-1", "duplicate"));
+		});
 
 		expect(prompts.map((entry) => entry.tenantId)).toEqual(["tenant-a", "tenant-b"]);
 		expect(replies.map((entry) => entry.tenantId)).toEqual(["tenant-a", "tenant-b"]);
@@ -144,9 +161,9 @@ describe("TenantChannelManager", () => {
 	});
 
 	it("claims external identities and recovers bridge context only from ownership", async () => {
-		const { dataDir, manager, store, owners, run } = setup();
-		configure(dataDir, "tenant-a", "shared-token", "shared-app");
-		configure(dataDir, "tenant-b", "shared-token", "shared-app");
+		const { manager, store, owners, run } = setup();
+		await configure(store, "tenant-a", "shared-app");
+		await configure(store, "tenant-b", "shared-app");
 		const previous = createEmptyTenantConfig();
 		const next = createEmptyTenantConfig();
 		next.feishu = { appId: "shared-app", appSecret: "secret" };
@@ -171,19 +188,22 @@ describe("TenantChannelManager", () => {
 	});
 
 	it("never falls back to a global prompt without an owned channel session", async () => {
-		const { dataDir, manager, run } = setup();
-		configure(dataDir, "tenant-a", "token-a", "app-a");
-		await run("tenant-a", () => manager.handle(manager.get("feishu")!, {
-			...message("no-chat", "must-not-run"), chatId: undefined,
-		}));
+		const { manager, store, run } = setup();
+		await configure(store, "tenant-a", "app-a");
+		await run("tenant-a", async () => {
+			await manager.ready();
+			await manager.handle(manager.get("feishu")!, {
+				...message("no-chat", "must-not-run"), chatId: undefined,
+			});
+		});
 		expect(prompts).toEqual([]);
 		expect(run("tenant-a", () => manager.getRunLog().list())).toMatchObject([{ status: "error" }]);
 		expect(replies.at(-1)?.text).toContain("处理失败");
 	});
 
 	it("rebinds QR-created WeChat callbacks and stops them on reload", async () => {
-		const { dataDir, manager, run } = setup();
-		configure(dataDir, "tenant-a", "token-a", "app-a");
+		const { manager, store, run } = setup();
+		await configure(store, "tenant-a", "app-a");
 		let receive: ((message: IncomingMessage) => void) | undefined;
 		const start = vi.fn();
 		const stop = vi.fn(async () => {});
@@ -199,10 +219,10 @@ describe("TenantChannelManager", () => {
 			start,
 			stop,
 		} as unknown as WeChatChannel;
-		run("tenant-a", () => {
+		await run("tenant-a", async () => {
 			manager.register(native);
-			manager.setWechatChannel(native);
-			manager.startWechatChannel(native);
+			await manager.setWechatChannel(native);
+			await manager.startWechatChannel(native);
 		});
 		expect(start).toHaveBeenCalledOnce();
 		receive!({ ...message("wechat-after-qr", "hello"), channel: "wechat" });
@@ -214,14 +234,20 @@ describe("TenantChannelManager", () => {
 	});
 
 	it("reloads only the current tenant runtime", async () => {
-		const { dataDir, manager, run } = setup();
-		configure(dataDir, "tenant-a", "token-a", "app-a");
-		configure(dataDir, "tenant-b", "token-b", "app-b");
-		run("tenant-a", () => manager.all());
-		const channelB = run("tenant-b", () => manager.get("feishu"));
+		const { manager, store, run } = setup();
+		await configure(store, "tenant-a", "app-a");
+		await configure(store, "tenant-b", "app-b");
+		await run("tenant-a", async () => { await manager.ready(); manager.all(); });
+		const channelB = await run("tenant-b", async () => {
+			await manager.ready();
+			return manager.get("feishu");
+		});
 		await run("tenant-a", () => manager.reloadCurrent());
 		expect(stoppedChannels).toEqual(["app-a"]);
-		expect(run("tenant-b", () => manager.get("feishu"))).toBe(channelB);
+		expect(await run("tenant-b", async () => {
+			await manager.ready();
+			return manager.get("feishu");
+		})).toBe(channelB);
 	});
 
 	it("prevents another tenant from polling a Feishu device flow", async () => {
