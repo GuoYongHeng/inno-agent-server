@@ -20,7 +20,7 @@ export class FsObjectStore implements ObjectStore {
 		const target = this.path(key);
 		await mkdir(dirname(target), { recursive: true });
 		await writeFile(target, body);
-		const meta: ObjectMeta = { key, size: body.byteLength, sha256: sha256Hex(body), ...(options?.contentType ? { contentType: options.contentType } : {}) };
+		const meta: ObjectMeta = { key, size: body.byteLength, sha256: sha256Hex(body), ...(options?.contentType ? { contentType: options.contentType } : {}), mtimeMs: Date.now() };
 		await writeFile(`${target}.meta`, JSON.stringify(meta));
 		return meta;
 	}
@@ -37,7 +37,7 @@ export class FsObjectStore implements ObjectStore {
 		try {
 			const meta = JSON.parse(await readFile(`${this.path(key)}.meta`, "utf8")) as ObjectMeta;
 			const stats = await stat(this.path(key));
-			return { ...meta, size: stats.size };
+			return { ...meta, size: stats.size, mtimeMs: meta.mtimeMs ?? stats.mtimeMs };
 		} catch {
 			return null;
 		}
@@ -69,7 +69,9 @@ export class FsObjectStore implements ObjectStore {
 				else if (entry.isFile() && entry.name.endsWith(".meta")) {
 					try {
 						const meta = JSON.parse(await readFile(full, "utf8")) as ObjectMeta;
-						if (meta.key.startsWith(prefix)) out.push(meta);
+						if (!meta.key.startsWith(prefix)) continue;
+						const stats = await stat(this.path(meta.key)).catch(() => null);
+						out.push(stats ? { ...meta, mtimeMs: meta.mtimeMs ?? stats.mtimeMs } : meta);
 					} catch { /* ignore corrupt meta */ }
 				}
 			}

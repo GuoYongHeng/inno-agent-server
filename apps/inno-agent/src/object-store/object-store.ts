@@ -6,6 +6,8 @@ export interface ObjectMeta {
 	/** Lower-case hex SHA-256 of the body. */
 	sha256: string;
 	contentType?: string;
+	/** Object creation/modification time; used by the orphan sweep's grace window. */
+	mtimeMs?: number;
 }
 
 export interface PutObjectOptions {
@@ -77,7 +79,7 @@ export class MemoryObjectStore implements ObjectStore {
 	private readonly objects = new Map<string, { body: Uint8Array; meta: ObjectMeta }>();
 
 	async put(key: string, body: Uint8Array, options?: PutObjectOptions): Promise<ObjectMeta> {
-		const meta: ObjectMeta = { key, size: body.byteLength, sha256: sha256Hex(body), ...(options?.contentType ? { contentType: options.contentType } : {}) };
+		const meta: ObjectMeta = { key, size: body.byteLength, sha256: sha256Hex(body), ...(options?.contentType ? { contentType: options.contentType } : {}), mtimeMs: Date.now() };
 		this.objects.set(key, { body: Uint8Array.from(body), meta });
 		return meta;
 	}

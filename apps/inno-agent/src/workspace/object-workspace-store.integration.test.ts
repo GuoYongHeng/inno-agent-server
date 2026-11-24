@@ -6,6 +6,7 @@ import { startTemporaryPostgres, type TemporaryPostgres } from "../db/test-postg
 import { MemoryObjectStore } from "../object-store/object-store.js";
 import { TenantStore, type TenantContext } from "../tenants/store.js";
 import { ObjectWorkspaceStore } from "./object-workspace-store.js";
+import { auditAllWorkspaceObjects } from "./workspace-object-audit.js";
 import { workspaceObjectKey } from "./workspace-object-key.js";
 import { runWorkspaceStoreContract } from "./workspace-store.contract.js";
 import { WorkspaceStoreError } from "./workspace-store.js";
@@ -42,7 +43,7 @@ beforeAll(async () => {
 	}));
 	pool = new Pool({ connectionString: postgres.databaseUrl });
 	store = new TenantStore(pool);
-	await Promise.all(["contract-user", "iso-user-a", "iso-user-b", "move-user", "adopt-user"].map(createUser));
+	await Promise.all(["contract-user", "iso-user-a", "iso-user-b", "move-user", "adopt-user", "fsck-user"].map(createUser));
 });
 
 afterAll(async () => {
@@ -153,5 +154,31 @@ describe("ObjectWorkspaceStore adopt (T1.5 direct upload)", () => {
 		} catch (error) {
 			expect((error as WorkspaceStoreError).code).toBe("too_large");
 		}
+	});
+});
+
+describe("workspace object audit (orphan sweep)", () => {
+	it("finds orphans not in the manifest and repairs them past the grace window", async () => {
+		const ctx = await contextFor("fsck-user");
+		const ws = new ObjectWorkspaceStore({ objects, store, context: ctx });
+		await ws.write("fsck-ws", "kept.txt", new Uint8Array([1]));
+		// An object with no manifest row — the abandoned-upload shape.
+		const orphanKey = workspaceObjectKey(ctx.tenantId, "fsck-ws", "abandoned.bin");
+		await objects.put(orphanKey, new Uint8Array([2]));
+
+		const report = await auditAllWorkspaceObjects({
+			objects, store, graceMs: 3_600_000, tenantId: ctx.tenantId,
+		});
+		expect(report).toHaveLength(1);
+		expect(report[0]!.orphans.map((o) => o.key)).toEqual([orphanKey]);
+		expect(report[0]!.deferred.map((o) => o.key)).toEqual([orphanKey]);
+		expect(report[0]!.missing).toEqual([]);
+
+		// Inside the grace window repair must not delete it; past it, it goes.
+		const repaired = await auditAllWorkspaceObjects({
+			objects, store, graceMs: 0, repair: true, tenantId: ctx.tenantId,
+		});
+		expect(repaired[0]!.repaired).toEqual([orphanKey]);
+		expect(await objects.head(orphanKey)).toBeNull();
 	});
 });

@@ -67,7 +67,7 @@ export class S3ObjectStore implements ObjectStore {
 			...(options?.contentType ? { ContentType: options.contentType } : {}),
 			Metadata: { [SHA256_METADATA]: sha256 },
 		}));
-		return { key, size: body.byteLength, sha256, ...(options?.contentType ? { contentType: options.contentType } : {}) };
+		return { key, size: body.byteLength, sha256, ...(options?.contentType ? { contentType: options.contentType } : {}), mtimeMs: Date.now() };
 	}
 
 	async get(key: string): Promise<Uint8Array | null> {
@@ -88,6 +88,7 @@ export class S3ObjectStore implements ObjectStore {
 				size: result.ContentLength ?? 0,
 				sha256: result.Metadata?.[SHA256_METADATA] ?? "",
 				...(result.ContentType ? { contentType: result.ContentType } : {}),
+				...(result.LastModified ? { mtimeMs: result.LastModified.getTime() } : {}),
 			};
 		} catch (err) {
 			if (isNotFound(err)) return null;
@@ -121,7 +122,7 @@ export class S3ObjectStore implements ObjectStore {
 		do {
 			const page = await this.client.send(new ListObjectsV2Command({ Bucket: this.bucket, Prefix: prefix, ContinuationToken: token }));
 			for (const entry of page.Contents ?? []) {
-				if (entry.Key) found.push({ key: entry.Key, size: entry.Size ?? 0, sha256: "" });
+				if (entry.Key) found.push({ key: entry.Key, size: entry.Size ?? 0, sha256: "", ...(entry.LastModified ? { mtimeMs: entry.LastModified.getTime() } : {}) });
 			}
 			token = page.IsTruncated ? page.NextContinuationToken : undefined;
 		} while (token);

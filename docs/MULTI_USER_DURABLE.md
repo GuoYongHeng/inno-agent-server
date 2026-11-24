@@ -188,7 +188,7 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
 - K8s/Helm、RWO volume 运维、readiness/liveness、备份与回滚；
 - 有序 owner shutdown、自动 failover、网络分区 fencing；
 - 生产 HTTP/Pod 容量、成本与分片大小验证；
-- 对象存储孤儿对象清理（删 manifest 后 delete 失败留下的字节、预签名上传发起后未 complete 的暂存对象）暂无周期任务；
+- 对象存储孤儿对象已有 `npm run workspace:fsck [-- --repair] [-- --grace-ms <ms>]`（对照 `workspace_files` 清单扫描 `tenants/<t>/workspaces/<ws>/` 对象，默认 1 小时宽限期保护在途上传，--repair 才删除），但尚无自动周期调度，需运维按需或经 cron 执行；
 - 本地执行 provider 无 shell 隔离（`INNO_EXEC_BACKEND=local` 的 bash 与 worker 同权限），多租户生产环境应视为可信边界内能力或改用真实沙箱；
 - 真实沙箱 provider（E2B 协议自部署服务）尚未做 live 验收与切换；
 - Durable shell/delete/rename、branch editing、showcase export 等尚未支持的能力。

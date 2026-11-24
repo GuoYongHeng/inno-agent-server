@@ -13,6 +13,14 @@ export class FakeTenantStore {
 		return this.rows.get(this.key(context, workspaceId, relPath)) ?? null;
 	}
 
+	async listWorkspaceFiles(context: TenantContext, workspaceId: string): Promise<WorkspaceFileRow[]> {
+		const base = `${context.tenantId}/${workspaceId}/`;
+		return [...this.rows.entries()]
+			.filter(([key]) => key.startsWith(base))
+			.map(([, row]) => row)
+			.sort((a, b) => a.relPath.localeCompare(b.relPath));
+	}
+
 	async listWorkspaceFilesUnder(context: TenantContext, workspaceId: string, prefix: string, limit: number): Promise<WorkspaceFileRow[]> {
 		const base = `${context.tenantId}/${workspaceId}/`;
 		return [...this.rows.entries()]
