@@ -124,8 +124,12 @@ execute(params, api, context)
 可以使用静态 worker map 将 tenant 固定路由到拥有独立 RWO 数据卷的 worker：
 
 ```bash
-INNO_DURABLE_SHARD_ID=worker-a
+INNO_DURABLE_SHARD_ID=worker-a   # 未配置时回退 HOSTNAME（k8s StatefulSet 下即 Pod 名）
 INNO_DURABLE_SHARD_URLS='{"worker-a":"http://worker-a:3000","worker-b":"http://worker-b:3000"}'
+# k8s StatefulSet + headless service 可用模板替代逐个 URL：
+# INNO_DURABLE_SHARD_URL_TEMPLATE='http://{id}.inno-headless:3000'
+# INNO_DURABLE_SHARD_PREFIX=inno-agent   # + INNO_DURABLE_SHARD_COUNT=3 -> inno-agent-0..2
+# INNO_DURABLE_SHARD_IDS=a,b,c           # 或者显式 peers 列表
 ```
 
 不得让多个进程 active-active 共用 SQLite/JSONL/NFS 数据根。当前没有自动 failover、动态服务发现或有序跨 owner 迁移。

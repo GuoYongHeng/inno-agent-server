@@ -40,6 +40,61 @@ describe("durable tenant router", () => {
 		})).not.toThrow();
 	});
 
+	it("derives the local shard id from HOSTNAME when sharding is configured", () => {
+		const authEnv = { INNO_AUTH_MODE: "better-auth", INNO_MULTI_USER_ENABLED: "true" };
+		const config = readDurableShardConfig({
+			...authEnv,
+			HOSTNAME: "inno-agent-1",
+			INNO_DURABLE_SHARD_URLS: JSON.stringify({
+				"inno-agent-0": "http://inno-agent-0.svc:3000",
+				"inno-agent-1": "http://inno-agent-1.svc:3000",
+			}),
+		});
+		expect(config?.localShardId).toBe("inno-agent-1");
+		// Explicit id still wins over HOSTNAME.
+		expect(readDurableShardConfig({
+			...authEnv, HOSTNAME: "inno-agent-1", INNO_DURABLE_SHARD_ID: "inno-agent-0",
+			INNO_DURABLE_SHARD_URLS: JSON.stringify({ "inno-agent-0": "http://a.local", "inno-agent-1": "http://b.local" }),
+		})?.localShardId).toBe("inno-agent-0");
+		// Without sharding env, HOSTNAME alone does not enable routing.
+		expect(readDurableShardConfig({ HOSTNAME: "inno-agent-1" })).toBeNull();
+	});
+
+	it("expands a shard URL template over a peer list or StatefulSet ordinals", () => {
+		const authEnv = { INNO_AUTH_MODE: "better-auth", INNO_MULTI_USER_ENABLED: "true", HOSTNAME: "inno-0" };
+		const byIds = readDurableShardConfig({
+			...authEnv,
+			INNO_DURABLE_SHARD_URL_TEMPLATE: "http://{id}.inno-headless:3000",
+			INNO_DURABLE_SHARD_IDS: "inno-0, inno-1",
+		});
+		expect(byIds?.targets).toEqual({
+			"inno-0": "http://inno-0.inno-headless:3000",
+			"inno-1": "http://inno-1.inno-headless:3000",
+		});
+		const byOrdinals = readDurableShardConfig({
+			...authEnv,
+			INNO_DURABLE_SHARD_URL_TEMPLATE: "http://{id}.inno-headless:3000",
+			INNO_DURABLE_SHARD_PREFIX: "inno", INNO_DURABLE_SHARD_COUNT: "3",
+		});
+		expect(Object.keys(byOrdinals?.targets ?? {})).toEqual(["inno-0", "inno-1", "inno-2"]);
+		expect(() => readDurableShardConfig({
+			...authEnv,
+			INNO_DURABLE_SHARD_URL_TEMPLATE: "http://fixed:3000",
+			INNO_DURABLE_SHARD_IDS: "inno-0",
+		})).toThrow(/\{id\}/);
+		expect(() => readDurableShardConfig({
+			...authEnv,
+			INNO_DURABLE_SHARD_URL_TEMPLATE: "http://{id}:3000",
+			INNO_DURABLE_SHARD_URLS: "{}",
+			INNO_DURABLE_SHARD_IDS: "inno-0",
+		})).toThrow(/not both/);
+		expect(() => readDurableShardConfig({
+			...authEnv, HOSTNAME: "other",
+			INNO_DURABLE_SHARD_URL_TEMPLATE: "http://{id}:3000",
+			INNO_DURABLE_SHARD_IDS: "inno-0",
+		})).toThrow(/missing from/);
+	});
+
 	it("selects a stable sorted shard from the verified tenant ID", () => {
 		const config = shardConfig("worker-a", "http://a.local", "http://b.local");
 		const reversed = { ...config, targets: { "worker-b": "http://b.local", "worker-a": "http://a.local" } };

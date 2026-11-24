@@ -26,47 +26,106 @@ function enabled(value: string | undefined): boolean {
 	return /^(1|true)$/i.test(value?.trim() ?? "");
 }
 
-/** Static worker discovery. Tenant identity is never read from this config or
- * from a request header; callers pass only the verified PostgreSQL tenant. */
+const SHARD_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+/** Worker identity: the explicit shard id, else the container/pod `HOSTNAME`
+ * when sharding is configured (k8s StatefulSet / compose give every replica a
+ * stable unique hostname that matches the URL map keys). */
+export function resolveDurableShardId(env: NodeJS.ProcessEnv): string {
+	const shard = env.INNO_DURABLE_SHARD_ID?.trim();
+	if (shard) return shard;
+	if (env.INNO_DURABLE_SHARD_URLS?.trim() || env.INNO_DURABLE_SHARD_URL_TEMPLATE?.trim()) {
+		return env.HOSTNAME?.trim() ?? "";
+	}
+	return "";
+}
+
+function shardTargetOrigin(shardId: string, rawUrl: string): string {
+	if (!SHARD_ID_PATTERN.test(shardId)) throw new Error(`Invalid durable shard entry: ${shardId}`);
+	let url: URL;
+	try {
+		url = new URL(rawUrl);
+	} catch {
+		throw new Error(`Invalid durable shard URL for ${shardId}`);
+	}
+	if ((url.protocol !== "http:" && url.protocol !== "https:")
+		|| url.username || url.password || (url.pathname !== "/" && url.pathname !== "")
+		|| url.search || url.hash) {
+		throw new Error(`Durable shard URL must be an http(s) origin without credentials or paths: ${shardId}`);
+	}
+	return url.origin;
+}
+
+/** Expand `INNO_DURABLE_SHARD_URL_TEMPLATE` (a `{id}` placeholder origin) over
+ * the peer list from `INNO_DURABLE_SHARD_IDS`, or generated as
+ * `INNO_DURABLE_SHARD_PREFIX`-0..COUNT-1 for StatefulSet-style deployments. */
+function expandShardUrlTemplate(env: NodeJS.ProcessEnv): Record<string, string> {
+	const template = env.INNO_DURABLE_SHARD_URL_TEMPLATE!.trim();
+	if (!template.includes("{id}")) {
+		throw new Error("INNO_DURABLE_SHARD_URL_TEMPLATE must contain a {id} placeholder");
+	}
+	const rawIds = env.INNO_DURABLE_SHARD_IDS?.trim();
+	const prefix = env.INNO_DURABLE_SHARD_PREFIX?.trim();
+	const rawCount = env.INNO_DURABLE_SHARD_COUNT?.trim();
+	if (rawIds && (prefix || rawCount)) {
+		throw new Error("Use either INNO_DURABLE_SHARD_IDS or INNO_DURABLE_SHARD_PREFIX+INNO_DURABLE_SHARD_COUNT, not both");
+	}
+	let shardIds: string[];
+	if (rawIds) {
+		shardIds = rawIds.split(",").map((id) => id.trim()).filter(Boolean);
+	} else if (prefix && rawCount) {
+		const count = Math.max(0, Math.floor(Number(rawCount)));
+		if (!count || count > 1000) throw new Error("INNO_DURABLE_SHARD_COUNT must be a positive integer");
+		shardIds = Array.from({ length: count }, (_, index) => `${prefix}-${index}`);
+	} else {
+		throw new Error("INNO_DURABLE_SHARD_URL_TEMPLATE requires INNO_DURABLE_SHARD_IDS or INNO_DURABLE_SHARD_PREFIX+INNO_DURABLE_SHARD_COUNT");
+	}
+	const targets: Record<string, string> = {};
+	for (const shardId of shardIds) {
+		targets[shardId] = shardTargetOrigin(shardId, template.split("{id}").join(shardId));
+	}
+	return targets;
+}
+
+/** Worker discovery. `INNO_DURABLE_SHARD_URLS` gives an explicit id→origin map;
+ * `INNO_DURABLE_SHARD_URL_TEMPLATE` + peer list expands the same map for
+ * StatefulSet-style deploys. `INNO_DURABLE_SHARD_ID` defaults to `HOSTNAME`.
+ * Tenant identity is never read from this config or from a request header;
+ * callers pass only the verified PostgreSQL tenant. */
 export function readDurableShardConfig(env: NodeJS.ProcessEnv): DurableShardConfig | null {
-	const localShardId = env.INNO_DURABLE_SHARD_ID?.trim() ?? "";
 	const rawTargets = env.INNO_DURABLE_SHARD_URLS?.trim() ?? "";
-	if (!localShardId && !rawTargets) return null;
+	const rawTemplate = env.INNO_DURABLE_SHARD_URL_TEMPLATE?.trim() ?? "";
+	const localShardId = resolveDurableShardId(env);
+	if (!localShardId && !rawTargets && !rawTemplate) return null;
 	if (env.INNO_AUTH_MODE?.trim() !== "better-auth"
 		|| !enabled(env.INNO_MULTI_USER_ENABLED)) {
 		throw new Error("Durable sharding requires Better Auth and INNO_MULTI_USER_ENABLED=true");
 	}
-	if (!localShardId || !rawTargets) {
-		throw new Error("INNO_DURABLE_SHARD_ID and INNO_DURABLE_SHARD_URLS must be configured together");
+	if (rawTargets && rawTemplate) {
+		throw new Error("Use either INNO_DURABLE_SHARD_URLS or INNO_DURABLE_SHARD_URL_TEMPLATE, not both");
 	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(rawTargets);
-	} catch {
-		throw new Error("INNO_DURABLE_SHARD_URLS must be a JSON object of shard IDs to origin URLs");
-	}
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		throw new Error("INNO_DURABLE_SHARD_URLS must be a JSON object of shard IDs to origin URLs");
+	if (!localShardId || (!rawTargets && !rawTemplate)) {
+		throw new Error("A shard id (INNO_DURABLE_SHARD_ID or HOSTNAME) and INNO_DURABLE_SHARD_URLS or INNO_DURABLE_SHARD_URL_TEMPLATE must be configured together");
 	}
 	const targets: Record<string, string> = {};
-	for (const [shardId, rawUrl] of Object.entries(parsed)) {
-		if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(shardId) || typeof rawUrl !== "string") {
-			throw new Error(`Invalid durable shard entry: ${shardId}`);
-		}
-		let url: URL;
+	if (rawTemplate) {
+		Object.assign(targets, expandShardUrlTemplate(env));
+	} else {
+		let parsed: unknown;
 		try {
-			url = new URL(rawUrl);
+			parsed = JSON.parse(rawTargets);
 		} catch {
-			throw new Error(`Invalid durable shard URL for ${shardId}`);
+			throw new Error("INNO_DURABLE_SHARD_URLS must be a JSON object of shard IDs to origin URLs");
 		}
-		if ((url.protocol !== "http:" && url.protocol !== "https:")
-			|| url.username || url.password || (url.pathname !== "/" && url.pathname !== "")
-			|| url.search || url.hash) {
-			throw new Error(`Durable shard URL must be an http(s) origin without credentials or paths: ${shardId}`);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("INNO_DURABLE_SHARD_URLS must be a JSON object of shard IDs to origin URLs");
 		}
-		targets[shardId] = url.origin;
+		for (const [shardId, rawUrl] of Object.entries(parsed)) {
+			if (typeof rawUrl !== "string") throw new Error(`Invalid durable shard entry: ${shardId}`);
+			targets[shardId] = shardTargetOrigin(shardId, rawUrl);
+		}
 	}
-	if (!targets[localShardId]) throw new Error(`Local durable shard ${localShardId} is missing from INNO_DURABLE_SHARD_URLS`);
+	if (!targets[localShardId]) throw new Error(`Local durable shard ${localShardId} is missing from the durable shard URL map`);
 	return { localShardId, targets };
 }
 

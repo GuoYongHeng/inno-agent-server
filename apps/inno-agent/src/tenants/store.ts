@@ -3,6 +3,7 @@ import { hostname } from "node:os";
 import type { Pool, PoolClient } from "pg";
 import { logger } from "../logger.js";
 import { WorkspaceStoreError } from "../workspace/workspace-store.js";
+import { resolveDurableShardId } from "./durable-tenant-router.js";
 import { withTenantTransaction } from "./schema.js";
 
 export type ResourceKind = "session" | "workspace" | "job" | "channel" | "memory" | "terminal" | "permission";
@@ -116,10 +117,11 @@ const JOB_RUN_LEASE_MS = 5 * 60_000;
  * `INNO_DURABLE_STORAGE_LEASE_MS` shortens it in tests (zombie-owner takeover). */
 export const DURABLE_STORAGE_LEASE_MS = Math.max(1_000, Number(process.env.INNO_DURABLE_STORAGE_LEASE_MS) || 45_000);
 
-/** Identity recorded as `ds_metadata.owner_worker`. The configured shard id
- * is preferred so leases line up with routing; otherwise host+pid. */
+/** Identity recorded as `ds_metadata.owner_worker`. The resolved shard id
+ * (explicit config or container `HOSTNAME`) is preferred so leases line up
+ * with routing; otherwise host+pid. */
 export function durableWorkerId(env: NodeJS.ProcessEnv = process.env): string {
-	const shard = env.INNO_DURABLE_SHARD_ID?.trim();
+	const shard = resolveDurableShardId(env);
 	if (shard) return shard;
 	return `${hostname()}:${process.pid}`;
 }

@@ -615,4 +615,4 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 4. ~~pi-durable 升级时 `Storage` 与 `ExecutionEnv` 接口的稳定性~~ 已定：升级时手动验证兼容性，不依赖上游承诺。
 5. ~~沙箱技术选型和部署形态~~ 第一期不接入沙箱，暂不考虑；真实沙箱（E2B 协议服务）接入时再定自建/托管。
 6. ~~对象存储选型，以及 L2 正文是否需要租户级加密~~ 已定：对象存储用 AWS S3 SDK（`S3ObjectStore`），部署方自选 S3 兼容服务（MinIO/OSS 等）；L2 正文不做租户级加密。
-7. ~~目标规模（租户数、单租户会话数、并发 turn 数）~~ 已定：先自托管、目标服务化，并发 turn >50。静态分片 + PG 租约懒接管的架构保留，H4 完整动态路由不做。服务发现按部署形态分两路：k8s 用 StatefulSet + headless service（Pod 名即 shard id、Pod DNS 即 shard URL，可让 shard id 缺省回退 `HOSTNAME`）；docker compose 用显式 worker + `INNO_DURABLE_SHARD_URLS` 静态 map。PG worker 注册表仅在 compose 需要动态副本时再做（小工作项）。
+7. ~~目标规模（租户数、单租户会话数、并发 turn 数）~~ 已定：先自托管、目标服务化，并发 turn >50。静态分片 + PG 租约懒接管的架构保留，H4 完整动态路由不做。服务发现按部署形态分两路：k8s 用 StatefulSet + headless service——已实现：`INNO_DURABLE_SHARD_ID` 缺省回退 `HOSTNAME`（即 Pod 名），`INNO_DURABLE_SHARD_URL_TEMPLATE` + `INNO_DURABLE_SHARD_PREFIX`/`INNO_DURABLE_SHARD_COUNT`（或 `INNO_DURABLE_SHARD_IDS`）按 `{id}` 展开 peers 地址表，全 Pod 同一份环境即可；docker compose 用显式 worker + `INNO_DURABLE_SHARD_URLS` 静态 map。PG worker 注册表仅在 compose 需要动态副本时再做（小工作项）。
