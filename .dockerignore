@@ -14,3 +14,6 @@ deploy/docker-compose.yml
 # Root-only: keep apps/inno-agent/scripts (vendored pptx→svg Python converter)
 /scripts
 docs
+# Bundled global skills ship inside the backend image — never exclude them,
+# even if a broad pattern (e.g. *.md) is widened later.
+!skills/**

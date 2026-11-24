@@ -448,7 +448,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - S2 已完成（T2.1 到 T2.5，行为不变的重构）：新增 `WorkspaceFileAccess` 接口（`workspace/workspace-files.ts`：`toRelative`/`stat`/`read`/`withLocalFile`/`withLocalDir`）与两个实现——`LocalWorkspaceFileAccess`（真实目录，沿用 `checkWorkspaceMutationPath` 的判定，不复制文件）和 `StoreWorkspaceFileAccess`（任意 `WorkspaceStore`，需要真实路径时物化到 0700 临时目录并保证清理）。`parse_document`、`ocr_image`、`send_file_to_channel`（发件箱快照在临时文件清理前完成）、`l2_archive` 的文件分支、工作区上下文（`agent.md`、`.skills`）都改走该接口；`durable-session-service` 每次打开运行时创建一个 `LocalWorkspaceFileAccess`，所以当前行为与改造前一致。三个实现共用契约测试，五类工具有 Local 与 Store(对象存储) 的结果一致性测试。阶段 3 换执行目录时只需改 `durable-session-service` 里的接线。
 - S3 核心已完成（T3.0/T3.1/T3.2 的本地一期）：`INNO_EXEC_BACKEND=local` 时 `LocalExecManager`（`sandbox/local-exec-manager.ts`）经 `SandboxRuntimeBinding` 把会话工作目录挂成 `LocalDirSandbox`，`bash` 随绑定自动注册，本地与认证模式都生效；env 走 `SandboxExecutionEnv`，路径语义与真实沙箱一致。`beforeTurn` 增量 `replica.pull`（面板经对象存储的写、其他 worker 的写在下一轮前可见），`pullToHost`（每轮 settle 后）与 `release` 增量 `replica.push`。远程沙箱开启时 E2B 优先，开关默认 `persistent`（不启用本地 bash）。`LocalDirSandbox` 已生产化：文件操作做 realpath containment（逃逸符号链接报 permission_denied 而非跟随），shell 本身不隔离（第一期已知并接受）。集成测试证明：`INNO_EXEC_BACKEND=local` + fs 对象存储下 bash 写文件 → 字节进对象存储 → 删本地目录后面板照常读。
 - S3 的取舍（与阶段 3 原方案的偏差）：没有做"每任务一个临时目录"——工作目录仍是 `resolveWorkspaceDir` 的稳定路径，但作为可随时丢弃的工作副本存在（pull 可重建，push 只删除自身状态文件里已知的文件，所以从未拉取的 worker 上写路由+push 是安全的）。写路由与附件上传因此不需要改动，对象存储直写面板仍留待 T1.4。T3.5/T4 的孤儿目录清理、遗留临时目录清扫仍未做。
-- 未开始：T1.4 附件/写路由走对象存储（可选）、T1.5、T2.6、T3.3 到 T3.6、阶段 4 到 6。
+- T2.6 已完成：全局技能随后端镜像分发（见任务表）。- 未开始：T1.4 附件/写路由走对象存储（可选）、T1.5、T3.3 到 T3.6、阶段 4 到 6。
 - 守卫：对象存储未配置（默认 `memory`）时，认证模式仍读本地磁盘并在启动时告警。原因：内存对象存储进程重启后字节丢失而清单仍在，面板会列出打不开的文件，且复制器的本地状态认为已推送，不会重传。
 
 **S1 实施中的发现**：
@@ -505,7 +505,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 | T2.3 | `send_file_to_channel` 同上 | S |
 | T2.4 | 审计其余约 15 个引用 `workspaceDir` 的文件（`durable-memory`、`durable-channels`、`durable-questions`、`l2-tools` 等），逐个判断是本地路径还是应改走存储；改造完成后手写的 `HOST_PATH_TOOLS` 清单（`durable-runtime.ts`）及 `pullBeforeHostPathTools` 即可删除 | M |
 | T2.5 | `workspace-context` 的 `agent.md`、工作区 `.skills/` 改从 `WorkspaceStore` 读取 | S |
-| T2.6 | 全局技能的来源：目前全局技能目录（`INNO_SKILLS_DIR`）是 worker 本地磁盘上的状态，没有复制，换 worker 技能就丢。改为来自共享存储（对象存储，按清单同步）或随后端镜像分发，二选一待定；技能列表与说明由共享来源生成，不读 worker 本地目录；激活执行环境时把全局技能同步进环境（沿用 `SANDBOX_SKILLS_ROOT` 路径约定） | M |
+| T2.6 | ~~全局技能的来源~~ **已完成（随镜像分发）**：根目录 `skills/` 打进后端镜像（`deploy/Dockerfile.backend` 复制到 `/app/skills` 并设 `INNO_SKILLS_DIR=/app/skills`，compose 同步更新并移除本地挂载），`.dockerignore` 加了 `!skills/**` 例外。理由：认证模式下共享技能管理本来就是只读（409），与镜像分发天然一致；本地开发用 `INNO_SKILLS_DIR=./skills` 或 `runtime/skills` 调试，发版时拷进 `skills/` 重建镜像即可覆盖所有 worker。技能激活进沙箱仍走 `SANDBOX_SKILLS_ROOT` 约定，本地执行时 bash 可直接按绝对路径读 `/app/skills` | S |
 
 阶段 3：无状态执行环境（第 3 批，依赖 T0.2 与 T1.1，最关键）
 
@@ -562,7 +562,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - 执行环境把产物推回 OSS 的方式：第一版由后端 worker 经 provider 的文件接口读出再上传 OSS；沙箱阶段可评估让沙箱用预签名 URL 直传 OSS（需放行 OSS 域名并把预签名范围限定在该租户前缀）。
 - 浏览器直传时对象元数据里没有 `sha256`（`S3ObjectStore.put` 目前把 `sha256` 写进对象元数据供清单校验）：改用签名里的校验和头，或 `HeadObject` 后由后端补算；所用 OSS 对校验和头的支持程度需实测。
 - 增量推送的触发粒度（每次写文件类工具调用后，还是固定间隔）。
-- 全局技能的分发方式（T2.6）：对象存储同步（无需重新发版即可更新技能，但要处理同步与缓存）还是随后端镜像分发（简单，更新要发版）。
+- ~~全局技能的分发方式（T2.6）~~ 已定：随后端镜像分发（见 T2.6）。
 - 技能需要 API 密钥时的注入方式（按租户注入到执行环境，不写进技能文件）；第一期本地执行可暂缓，迁移到沙箱时需要。
 
 **已知风险**：
