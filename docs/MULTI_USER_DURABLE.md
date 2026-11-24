@@ -111,6 +111,16 @@ execute(params, api, context)
 
 同一个 durable storage 同时只能有一个 owner。authenticated runtime 打开期间还持有 per-session PostgreSQL advisory lock，用于防止意外 double-open；它不是网络分区下的分布式 fencing。
 
+### 工作区文件的对象存储（H5）
+
+配置了持久对象存储（`INNO_OBJECT_STORAGE_PROVIDER=s3|fs`）时，租户工作区文件的真源是**对象存储字节 + PostgreSQL `workspace_files` 清单**（`ObjectWorkspaceStore`），worker 本地目录只是可随时丢弃的工作副本：
+
+- 面板读（目录树、文件内容、raw、下载、office 预览）与写（保存、新建、重命名、删除、移动、上传、技能包）全部走 `WorkspaceStore`；写先落清单再镜像本地副本，保证执行中会话立刻可见。
+- `workspace/workspace-replica.ts` 在会话打开与每轮开始前置增量 pull、文件变更/每轮 settle/关闭时增量 push；push 只删除自身状态文件里已知的键，未拉取过的 worker 不会误删。
+- `INNO_EXEC_BACKEND=local` 时 bash/read/write/edit 经 `SandboxExecutionEnv` → `LocalDirSandbox` 在 worker 上执行（realpath 防逃逸，`INNO_EXEC_LOCAL_MAX_CONCURRENT` 限并发）；默认 `persistent` 不提供 bash。
+- `S3ObjectStore` 支持预签名：`/api/workspace/upload-url` + `/api/workspace/upload/complete` 让浏览器字节直传，`raw?download=1` 302 到短效 GET；其它 provider 返回 404 由前端回退代理。桶需配 CORS 允许浏览器 PUT。
+- 对象存储未配置（`memory`）时字节随进程死亡，面板回退读本地磁盘并在启动告警——此时多 worker 接管会丢工作区。
+
 可以使用静态 worker map 将 tenant 固定路由到拥有独立 RWO 数据卷的 worker：
 
 ```bash
@@ -178,6 +188,9 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
 - K8s/Helm、RWO volume 运维、readiness/liveness、备份与回滚；
 - 有序 owner shutdown、自动 failover、网络分区 fencing；
 - 生产 HTTP/Pod 容量、成本与分片大小验证；
+- 对象存储孤儿对象清理（删 manifest 后 delete 失败留下的字节、预签名上传发起后未 complete 的暂存对象）暂无周期任务；
+- 本地执行 provider 无 shell 隔离（`INNO_EXEC_BACKEND=local` 的 bash 与 worker 同权限），多租户生产环境应视为可信边界内能力或改用真实沙箱；
+- 真实沙箱 provider（E2B 协议自部署服务）尚未做 live 验收与切换；
 - Durable shell/delete/rename、branch editing、showcase export 等尚未支持的能力。
 
 因此，当前结果证明的是已列出的功能和隔离边界，不是无条件的生产上线承诺。
