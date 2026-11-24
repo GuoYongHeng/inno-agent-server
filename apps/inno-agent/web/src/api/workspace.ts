@@ -1,4 +1,4 @@
-import { apiFetch } from "./client.js";
+import { apiFetch, ApiError } from "./client.js";
 import type { PptxPreviewResult, WorkspaceFileDetail, WorkspaceTree, WorkspaceTreeNode } from "../types/workspace.js";
 
 function qs(workspaceId?: string): string {
@@ -55,6 +55,59 @@ export async function saveWorkspaceFile(path: string, content: string, workspace
 	});
 }
 
+/**
+ * T1.5 direct upload: ask the server for a signed PUT URL. Returns null when
+ * the deployment's object store cannot sign (fs/memory) — callers then fall
+ * back to the proxied base64 upload.
+ */
+export async function requestWorkspaceUploadUrl(
+	path: string, size: number, workspaceId?: string,
+): Promise<{ uploadUrl: string; path: string } | null> {
+	try {
+		return await apiFetch<{ uploadUrl: string; path: string }>("/api/workspace/upload-url", {
+			method: "POST",
+			body: JSON.stringify(withWorkspace({ path, size }, workspaceId)),
+		});
+	} catch (err) {
+		if (err instanceof ApiError && err.status === 404) return null;
+		throw err;
+	}
+}
+
+/** Register a completed direct upload: the server verifies the object and writes the manifest row. */
+export async function completeWorkspaceUpload(path: string, workspaceId?: string): Promise<WorkspaceTreeNode> {
+	return apiFetch<WorkspaceTreeNode>("/api/workspace/upload/complete", {
+		method: "POST",
+		body: JSON.stringify(withWorkspace({ path }, workspaceId)),
+	});
+}
+
+/** Direct upload via the presigned URL flow; null means the deployment does not support it. */
+export async function uploadWorkspaceFileDirect(
+	path: string,
+	file: File,
+	workspaceId: string | undefined,
+	onProgress?: (loaded: number, total: number) => void,
+): Promise<WorkspaceTreeNode | null> {
+	const grant = await requestWorkspaceUploadUrl(path, file.size, workspaceId);
+	if (!grant) return null;
+	await new Promise<void>((resolve, reject) => {
+		const xhr = new XMLHttpRequest();
+		xhr.open("PUT", grant.uploadUrl);
+		xhr.upload.addEventListener("progress", (event) => {
+			if (event.lengthComputable) onProgress?.(event.loaded, event.total);
+		});
+		xhr.addEventListener("load", () => {
+			if (xhr.status >= 200 && xhr.status < 300) resolve();
+			else reject(new Error(`Direct upload failed (${xhr.status})`));
+		});
+		xhr.addEventListener("error", () => reject(new Error("Direct upload failed: network error")));
+		xhr.addEventListener("abort", () => reject(new Error("Direct upload cancelled")));
+		xhr.send(file);
+	});
+	return completeWorkspaceUpload(grant.path, workspaceId);
+}
+
 export async function uploadWorkspaceFiles(files: Array<{ path: string; dataBase64: string }>, workspaceId?: string): Promise<{ uploaded: WorkspaceTreeNode[] }> {
 	return apiFetch<{ uploaded: WorkspaceTreeNode[] }>("/api/workspace/upload", {
 		method: "POST",
@@ -63,15 +116,24 @@ export async function uploadWorkspaceFiles(files: Array<{ path: string; dataBase
 }
 
 /**
- * Upload a single file via XHR so the browser can report real byte-level
- * upload progress (fetch has no upload progress events). Used by the composer
- * attachment flow where each file renders its own progress ring.
+ * Upload a single file with byte-level progress (XHR — fetch has no upload
+ * progress events). Tries the presigned direct upload first; deployments
+ * without a sign-capable object store fall back to the base64 proxy.
+ * Used by the composer attachment flow where each file renders a progress ring.
  */
-export function uploadWorkspaceFileWithProgress(
-	file: { path: string; dataBase64: string },
+export async function uploadWorkspaceFileWithProgress(
+	path: string,
+	file: File,
 	workspaceId: string | undefined,
 	onProgress?: (loaded: number, total: number) => void,
 ): Promise<WorkspaceTreeNode> {
+	const direct = await uploadWorkspaceFileDirect(path, file, workspaceId, onProgress);
+	if (direct) return direct;
+	const buffer = await file.arrayBuffer();
+	const bytes = new Uint8Array(buffer);
+	let binary = "";
+	for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+	const dataBase64 = btoa(binary);
 	return new Promise((resolve, reject) => {
 		const xhr = new XMLHttpRequest();
 		xhr.open("POST", "/api/workspace/upload");
@@ -91,7 +153,7 @@ export function uploadWorkspaceFileWithProgress(
 		});
 		xhr.addEventListener("error", () => reject(new Error("Upload failed: network error")));
 		xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
-		xhr.send(JSON.stringify(withWorkspace({ files: [file] }, workspaceId)));
+		xhr.send(JSON.stringify(withWorkspace({ files: [{ path, dataBase64 }] }, workspaceId)));
 	});
 }
 

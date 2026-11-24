@@ -6,6 +6,7 @@ import { startTemporaryPostgres, type TemporaryPostgres } from "../db/test-postg
 import { MemoryObjectStore } from "../object-store/object-store.js";
 import { TenantStore, type TenantContext } from "../tenants/store.js";
 import { ObjectWorkspaceStore } from "./object-workspace-store.js";
+import { workspaceObjectKey } from "./workspace-object-key.js";
 import { runWorkspaceStoreContract } from "./workspace-store.contract.js";
 import { WorkspaceStoreError } from "./workspace-store.js";
 
@@ -41,7 +42,7 @@ beforeAll(async () => {
 	}));
 	pool = new Pool({ connectionString: postgres.databaseUrl });
 	store = new TenantStore(pool);
-	await Promise.all(["contract-user", "iso-user-a", "iso-user-b", "move-user"].map(createUser));
+	await Promise.all(["contract-user", "iso-user-a", "iso-user-b", "move-user", "adopt-user"].map(createUser));
 });
 
 afterAll(async () => {
@@ -119,5 +120,38 @@ describe("ObjectWorkspaceStore move failure", () => {
 		expect(after.map((row) => row.relPath).sort()).toEqual(before.map((row) => row.relPath).sort());
 		// Source bytes are still intact and readable.
 		expect([...(await ws.read("move-ws", "src/f.txt"))!.body]).toEqual([9]);
+	});
+});
+
+describe("ObjectWorkspaceStore adopt (T1.5 direct upload)", () => {
+	it("registers a manifest row for bytes already in the object store", async () => {
+		const ctx = await contextFor("adopt-user");
+		const ws = new ObjectWorkspaceStore({ objects, store, context: ctx });
+		const key = workspaceObjectKey(ctx.tenantId, "adopt-ws", "docs/big.pdf");
+		await objects.put(key, new Uint8Array([1, 2, 3]));
+
+		const entry = await ws.adopt("adopt-ws", "docs/big.pdf", 3);
+		expect(entry).toMatchObject({ path: "docs/big.pdf", name: "big.pdf", kind: "file", size: 3 });
+		const read = await ws.read("adopt-ws", "docs/big.pdf");
+		expect([...read!.body]).toEqual([1, 2, 3]);
+		expect((await ws.list("adopt-ws", "docs")).entries.map((item) => item.name)).toEqual(["big.pdf"]);
+	});
+
+	it("rejects adopt over a directory or above the size cap", async () => {
+		const ctx = await contextFor("adopt-user");
+		const ws = new ObjectWorkspaceStore({ objects, store, context: ctx });
+		await ws.write("adopt-ws", "dir/file.txt", new Uint8Array([0]));
+		try {
+			await ws.adopt("adopt-ws", "dir", 10);
+			expect.unreachable();
+		} catch (error) {
+			expect((error as WorkspaceStoreError).code).toBe("is_directory");
+		}
+		try {
+			await ws.adopt("adopt-ws", "huge.bin", 200 * 1024 * 1024);
+			expect.unreachable();
+		} catch (error) {
+			expect((error as WorkspaceStoreError).code).toBe("too_large");
+		}
 	});
 });

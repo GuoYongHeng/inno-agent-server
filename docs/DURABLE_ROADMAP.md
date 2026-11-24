@@ -440,7 +440,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - **部署形态变更（已完成）**：产品定位转为分布式部署的后端 + 浏览器 Web UI，不再提供 Electron 桌面客户端。已删除 `electron/`、`build/`、mac/win/linux 打包脚本与发布工作流、`package.json` 的 `electron*` 脚本与依赖，以及前端 `window.innoDesktop` 桥接、窗口宽度扩展、`ui.closeBehavior` 配置与 `PUT /api/settings/close-behavior`。部署清单统一放在 `deploy/`：`Dockerfile.backend`（仅 API）、`Dockerfile.frontend`（nginx + 静态前端，反代 `/api`、`/health`）、`docker-compose.yml`；原单体 `Dockerfile` 与 `Dockerfile.base` 已删除。浏览器版面板开关保留为 `PanelToggles`。
 - benchmark 现状：单条读/写 ~0.2–2.7ms PG 固有开销可接受；`commit 100 entries` 批量化后仍 ~74–140ms（Docker PG 往返主导），若真实部署往返更低可复跑基线；进一步压缩需减少 fencing UPDATE/unnest INSERT 的往返（如 PREPARE 或单语句复合写）。
 
-### H5 无状态后端：会话文件离开 worker 磁盘（进行中：S0、S1、S2、S3 核心已完成，其余未开始）
+### H5 无状态后端：会话文件离开 worker 磁盘（第一期基本完成：仅剩 T3.5/T3.6 收尾确认与阶段 6 真实沙箱）
 
 **进度**（实施顺序：S0 → S1 → S2 → S3 → S4 → 阶段 6，每一步系统保持一致、可上线）：
 - S0 已完成：T0.2 故障注入测试（`agent/durable-tool-replay.test.ts`）。
@@ -450,7 +450,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 - S3 的取舍（与阶段 3 原方案的偏差）：没有做"每任务一个临时目录"——工作目录仍是 `resolveWorkspaceDir` 的稳定路径，但作为可随时丢弃的工作副本存在（pull 可重建，push 只删除自身状态文件里已知的文件，所以从未拉取的 worker 上写路由+push 是安全的）。写路由与附件上传因此不需要改动，对象存储直写面板仍留待 T1.4。T3.5/T4 的孤儿目录清理、遗留临时目录清扫仍未做。
 - S3 剩余已完成（T3.0/T3.1 的懒激活与并发上限、T4.2、T5.1）：`GatedLocalBackend` 包住 `LocalDirSandbox`，第一次文件/命令操作才占并发位（纯推理会话不占位），`INNO_EXEC_LOCAL_MAX_CONCURRENT`（默认 0 不限）超限返回 `SandboxRunError("unavailable")` 的可重试拒绝，`release` 归还；包装方法全部 async，超限是 rejected promise 而非同步抛错。指标：`inno_workspace_replica_push_ms`/`pull_ms`、`inno_workspace_replica_uploaded_bytes`/`downloaded_bytes`、`inno_local_exec_pull_ms`/`push_ms`、`inno_local_exec_pull_errors_total`/`push_errors_total`/`busy_total`/`activations_total`。T5.1 集成测试（`server.integration.test.ts`）：`INNO_EXEC_BACKEND=local` + fs 对象存储下 bash 写文件 → SIGKILL → 删本地工作区目录 → 新进程重启后打开会话经 pull 从对象存储重建本地副本并完成新一轮。测试证实一个既有恢复行为：SIGKILL 发生在 done 事件 fire-and-forget 落盘前后时，journal 里的 turn 恢复为 active，新 prompt 按设计返回 409，需先走 `/api/chat/events` 重放让孤儿 projection 收尾（真实客户端的 SSE 重连路径），此后一切正常。
 - T2.6 已完成：全局技能随后端镜像分发（见任务表）。
-- T1.4、T3.3、T3.4、T4.1、T5.2、T5.3 均已完成（见任务表）。第一期剩余：T1.5（预签名直连，可选叠加项）、T3.5/T3.6（写工具与提示词路径改写——本地 provider 下 `read`/`write`/`edit` 仍走 `WorkspaceFileEnv`，与阶段 6 的真实沙箱切换强相关）、阶段 6。
+- T1.4、T1.5、T3.3、T3.4、T4.1、T5.2、T5.3 均已完成（见任务表）。第一期剩余：T3.5/T3.6 的收尾确认（`INNO_EXEC_BACKEND=local` 下 read/write/edit/bash 已经 `SandboxExecutionEnv` 走 provider，`rebasePaths`/`promptSection` 已接入提示词与工作区技能路径；`WorkspaceFileEnv` 仍是 persistent/本地模式默认，去掉它与阶段 6 的真实沙箱切换绑定）、阶段 6。
 - 守卫：对象存储未配置（默认 `memory`）时，认证模式仍读本地磁盘并在启动时告警。原因：内存对象存储进程重启后字节丢失而清单仍在，面板会列出打不开的文件，且复制器的本地状态认为已推送，不会重传。
 
 **S1 实施中的发现**：
@@ -496,7 +496,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 | T1.2 | 本地文件版实现（本地模式仍为文件存储），与对象存储版共用同一接口；由"认证模式且已配置对象存储"选择实现 | M |
 | T1.3 | `routes/workspaces.ts`（约 1100 行）迁移到 `WorkspaceStore`，**分两步**：先迁读路由（目录树、文件内容、raw、下载文件夹、office/pptx 预览——后两者调用 LibreOffice/Python，需把对象取到系统临时文件，转换后删除），此时执行仍在本地持久目录、H4 复制负责把数据推进对象存储；写路由（保存、新建、重命名、删除、移动、上传、技能上传、导入）在执行环境切到临时目录（阶段 3）时一并迁移，避免面板写对象存储而 agent 仍读本地目录的不一致；认证模式下 `resolveRequestWorkspace` 不再创建本地目录；重写相关测试 | L |
 | T1.4 | ~~聊天附件与内联图片的上传路径改写到 `WorkspaceStore`~~ **已完成**：`workspaces.ts` 全部写路由（file/create/rename/delete/move/upload/技能上传）在 manifest 存储模式下直写 `WorkspaceStore` 并镜像到本地目录（保持 `replica.push` 增量与 exec 工作副本温热）；技能包装到临时目录后整棵子树写回 store 并镜像本地安装；附件校验走 `validateChatAttachmentsInStore`（以清单为准）、内联图片持久化后镜像进 store；`workspaceStoreFor` 提取为 server.ts 顶层 `workspaceStoreForRequest` 供路由与 service 共用 | M |
-| T1.5 | 预签名直连（叠加项，第一期可先用后端代理跑通再做，依赖 T1.1）：`ObjectStore` 增加可选 `presign`（引入 `@aws-sdk/s3-request-presigner`，与已用的 `@aws-sdk/client-s3` 同一套 SDK）；上传流程为"后端按租户前缀生成 key 并写 `pending` 清单行 → 返回短有效期预签名 PUT → 浏览器直传 → 完成回调后端 `HeadObject` 校验大小与校验和 → 改为 `ready`"，回调按 key 幂等 upsert；下载与二进制预览按需签发短有效期 GET；大于 100 MB 用分片上传；桶保持私有并配置 CORS；清单只存 key，不存 URL | M |
+| T1.5 | ~~预签名直连~~ **已完成（简化的无 pending 流程）**：`ObjectStore` 增加可选 `presignPut`/`presignGet`（仅 `S3ObjectStore` 实现，`@aws-sdk/s3-request-presigner` 与 client-s3 同钉 3.1173.0）。上传：`POST /api/workspace/upload-url`（校验路径/大小上限/`.skills` 拒绝，返回 900s PUT URL）→ 浏览器直传 → `POST /api/workspace/upload/complete`（`head` 校验存在与大小 → `ObjectWorkspaceStore.adopt` 复用 `write` 的全部结构校验写清单行 → 镜像进本地目录）。下载：`/api/workspace/raw?download=1` 在可签名时先 manifest stat 鉴权再 302 到 300s GET（带 `ResponseContentDisposition`）。前端 `uploadWorkspaceFileDirect`/`uploadWorkspaceFileWithProgress` 先试直传，404 回退 base64 代理；面板批量上传同样先试直传。**偏差**：无 `pending`/`ready` 清单状态（放弃上传留孤儿对象，与既有孤儿清理缺口同类）；无分片上传（单 PUT 预签名本身支持至 5 GB，远超 192 MiB 上限，暂不需要）；部署需为桶配 CORS 允许浏览器 PUT | M |
 
 阶段 2：按路径读文件的工具改道（第 2 批，依赖 T1.1，可与阶段 3 并行）
 
@@ -518,8 +518,8 @@ CREATE INDEX durable_sessions_tenant_updated_idx
 | T3.2 | 同步层：`WorkspaceSync` 的宿主侧换成 `WorkspaceStore`；激活时按清单拉取，之后增量推送且幂等；保留忽略目录与 20 MiB/5000 个文件/深度 24 的上限；定义删除的传播规则 | L |
 | T3.3 | ~~推送时机~~ **已完成**：`GatedLocalBackend` 在 write/mkdir/remove/rename 落盘后触发 `replica.push`（经 `createReplicaPushGate` 按工作区合并），命令在跑期间的变更延迟到命令退出时一次推送，不会推到写了一半的文件 | M |
 | T3.4 | ~~生命周期~~ **已完成/不适用**：runtime 关闭时的最终推送由 `LocalExecManager.release` 承担；`sandbox:fsck` 无需覆盖本地执行——没有每任务临时目录（S3 偏差），工作目录是可重建的工作副本，无孤儿对象；环境 ID 仅绑定期存在 | M |
-| T3.5 | 工具集：认证模式下 `read`/`write`/`edit`/`bash` 全部经 provider 执行，去掉写 worker 持久目录的 `WorkspaceFileEnv`；由配置选择 provider（本地/E2B 协议） | M |
-| T3.6 | 提示词里的路径改写（`rebasePaths`、`promptSection`）适配新流程，同时覆盖全局技能与工作区技能的路径 | S |
+| T3.5 | ~~工具集~~ **已完成（开关路径）**：`INNO_EXEC_BACKEND=local` 时绑定存在 → `durable-runtime` 为全部工具建 `SandboxExecutionEnv`，read/write/edit/bash 都经 `LocalDirSandbox` provider 执行；`WorkspaceFileEnv` 仍是 `persistent` 默认与无绑定本地模式的路径，彻底删除它与阶段 6 绑定（切默认 provider 时才不再有调用方） | M |
+| T3.6 | ~~提示词路径改写~~ **已完成**：`LocalExecManager.rebasePaths`（宿主绝对路径 → `/` 相对路径）与 `promptSection` 已接入 instructions 拼装；全局技能段与工作区上下文段都过 `rebasePaths`。已知边界：全局技能目录在工作区外，本地 exec 下 `read` 工具够不到（bash 可按绝对路径读）——这是本地执行无隔离的固有边界，阶段 6 真实沙箱下走 `SANDBOX_SKILLS_ROOT` 同步 | S |
 
 阶段 4：清理
 

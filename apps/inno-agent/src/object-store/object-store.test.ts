@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MemoryObjectStore, tenantObjectKey, tenantObjectPrefix } from "./object-store.js";
 import { createObjectStore, normalizeObjectStorageConfig } from "./index.js";
+import { S3ObjectStore } from "./s3-object-store.js";
 
 const bytes = (text: string) => new TextEncoder().encode(text);
 
@@ -88,5 +89,30 @@ describe("normalizeObjectStorageConfig", () => {
 
 	it("refuses an s3 provider without credentials", () => {
 		expect(() => createObjectStore(normalizeObjectStorageConfig({ provider: "s3", bucket: "b" }, {}))).toThrow(/accessKeyId/);
+	});
+});
+
+describe("S3ObjectStore presign (offline signing)", () => {
+	const store = new S3ObjectStore({
+		bucket: "inno", endpoint: "http://127.0.0.1:9000", region: "us-east-1",
+		accessKeyId: "key", secretAccessKey: "secret", forcePathStyle: true,
+	});
+
+	it("signs a PUT URL containing the key and a signature", async () => {
+		const url = await store.presignPut!("tenants/t1/workspaces/abc/x");
+		const parsed = new URL(url);
+		expect(parsed.pathname).toBe("/inno/tenants/t1/workspaces/abc/x");
+		expect(parsed.searchParams.get("X-Amz-Signature")).toBeTruthy();
+		expect(parsed.searchParams.get("X-Amz-Expires")).toBe("900");
+	});
+
+	it("signs a GET URL and carries response content-disposition", async () => {
+		const url = await store.presignGet!("tenants/t1/workspaces/abc/x", {
+			expiresInSeconds: 300,
+			contentDisposition: 'attachment; filename="report.pdf"',
+		});
+		const parsed = new URL(url);
+		expect(parsed.searchParams.get("X-Amz-Expires")).toBe("300");
+		expect(parsed.searchParams.get("response-content-disposition")).toBe('attachment; filename="report.pdf"');
 	});
 });

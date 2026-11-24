@@ -30,9 +30,13 @@ import type { WorkspaceReplica } from "../../workspace/workspace-replica.js";
 import { LocalFsWorkspaceStore } from "../../workspace/local-fs-workspace-store.js";
 import {
 	normalizeWorkspacePath,
+	WORKSPACE_MAX_FILE_BYTES,
 	WorkspaceStoreError,
 	type WorkspaceStore,
 } from "../../workspace/workspace-store.js";
+import type { ObjectStore } from "../../object-store/object-store.js";
+import { ObjectWorkspaceStore } from "../../workspace/object-workspace-store.js";
+import { workspaceObjectKey } from "../../workspace/workspace-object-key.js";
 import {
 	canonicalTreeRoot,
 	contentDispositionAttachment,
@@ -75,6 +79,8 @@ export interface WorkspacesRouteContext {
 	 * authenticated mode, local fs otherwise. Absent in tests → local fs.
 	 */
 	workspaceStoreFor?: (req: HttpReq) => WorkspaceStore;
+	/** Shared object store (T1.5): presigned upload/download when it supports `presign*`. */
+	objects?: () => ObjectStore;
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +563,17 @@ export async function handleWorkspacesRoutes(
 		}
 	};
 
+	// --- Presigned direct transfer (T1.5) -----------------------------------
+	// Only when the manifest store is backed by an ObjectStore that vends
+	// signed URLs (S3). Uploads PUT straight to object storage; "complete"
+	// verifies via head and adopts the row, then mirrors to the local copy
+	// like every other write route. Downloads redirect to a signed GET.
+	const objects = ctx.objects?.() ?? null;
+	const presignPut = storeBacked && objects?.presignPut ? objects.presignPut.bind(objects) : null;
+	const presignGet = storeBacked && objects?.presignGet ? objects.presignGet.bind(objects) : null;
+	const PRESIGN_UPLOAD_EXPIRES = 900;
+	const PRESIGN_DOWNLOAD_EXPIRES = 300;
+
 	const switchableSession = async (sessionId: string): Promise<{ hasHistory: boolean } | null> => {
 		const session = await durableSessions.get(req, sessionId);
 		if (!session) {
@@ -699,6 +716,30 @@ export async function handleWorkspacesRoutes(
 		const requestedPath = params.get("path") ?? "";
 		const wantsDownload = params.get("download") === "1";
 		const wsId = workspaceIdFromQuery(url);
+		// T1.5: downloads go straight to object storage when it can sign URLs —
+		// the manifest stat still authorizes, then the browser follows the
+		// redirect to a short-lived GET. Previews (download=0) keep proxying.
+		if (wantsDownload && presignGet && requestTenant) {
+			try {
+				const rel = normalizeWorkspacePath(requestedPath);
+				const entry = await store.stat(wsId, rel);
+				if (entry?.kind === "file") {
+					const location = await presignGet(
+						workspaceObjectKey(requestTenant.tenantId, wsId, rel),
+						{ expiresInSeconds: PRESIGN_DOWNLOAD_EXPIRES, contentDisposition: contentDispositionAttachment(basename(rel)) },
+					);
+					res.writeHead(302, { Location: location, "Cache-Control": "no-store" });
+					res.end();
+					return true;
+				}
+				json(res, 404, { error: "Workspace file not found" });
+				return true;
+			} catch (error) {
+				const status = workspaceReadStatus(error);
+				json(res, status ?? 500, { error: "Workspace file not found" });
+				return true;
+			}
+		}
 		let relPath: string;
 		let read;
 		try {
@@ -1130,6 +1171,73 @@ export async function handleWorkspacesRoutes(
 			size: stat.size,
 			updatedAt: stat.mtime.toISOString(),
 		});
+		return true;
+	}
+
+	// Presigned direct upload (T1.5): issue a signed PUT URL for a workspace
+	// path. 404 when the deployment has no sign-capable object store — the
+	// client then falls back to the proxied base64 upload below.
+	if (method === "POST" && url === "/api/workspace/upload-url") {
+		const body = (await readBody(req)) as Record<string, unknown>;
+		if (!presignPut || !requestTenant) { json(res, 404, { error: "Not found" }); return true; }
+		const workspace = await resolveWriteWorkspace(workspaceIdFromBody(body));
+		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
+		const filePath = typeof body.path === "string" ? body.path.trim() : "";
+		const size = typeof body.size === "number" && Number.isFinite(body.size) ? body.size : 0;
+		if (!filePath) { json(res, 400, { error: "Missing path" }); return true; }
+		if (size <= 0 || size > WORKSPACE_MAX_FILE_BYTES) { json(res, 413, { error: "File too large" }); return true; }
+		let rel: string;
+		try {
+			rel = normalizeWorkspacePath(filePath);
+		} catch {
+			json(res, 400, { error: "Invalid path" });
+			return true;
+		}
+		if (rel.split("/").includes(WORKSPACE_PRIVATE_SKILLS_DIR)) {
+			json(res, 400, { error: "Skill packages must use the skills upload endpoint" });
+			return true;
+		}
+		const key = workspaceObjectKey(requestTenant.tenantId, workspace.id, rel);
+		const uploadUrl = await presignPut(key, { expiresInSeconds: PRESIGN_UPLOAD_EXPIRES });
+		json(res, 200, { uploadUrl, path: rel, expiresIn: PRESIGN_UPLOAD_EXPIRES });
+		return true;
+	}
+
+	// Second half of the direct upload: the client PUT the bytes to object
+	// storage; verify via head and register the manifest row, then mirror into
+	// the local copy so the exec working dir stays warm like proxied uploads.
+	if (method === "POST" && url === "/api/workspace/upload/complete") {
+		const body = (await readBody(req)) as Record<string, unknown>;
+		if (!storeBacked || !objects || !requestTenant || !(store instanceof ObjectWorkspaceStore)) {
+			json(res, 404, { error: "Not found" });
+			return true;
+		}
+		const workspace = await resolveWriteWorkspace(workspaceIdFromBody(body));
+		if (!workspace) { json(res, 404, { error: "Workspace not found" }); return true; }
+		const wsId = workspace.id;
+		const filePath = typeof body.path === "string" ? body.path.trim() : "";
+		if (!filePath) { json(res, 400, { error: "Missing path" }); return true; }
+		let rel: string;
+		try {
+			rel = normalizeWorkspacePath(filePath);
+		} catch {
+			json(res, 400, { error: "Invalid path" });
+			return true;
+		}
+		const key = workspaceObjectKey(requestTenant.tenantId, wsId, rel);
+		const head = await objects.head(key);
+		if (!head) { json(res, 404, { error: "Upload not found — PUT the bytes to the signed URL first" }); return true; }
+		try {
+			const entry = await store.adopt(wsId, rel, head.size);
+			const bytes = await objects.get(key);
+			if (bytes) mirrorWrite(wsId, rel, bytes);
+			json(res, 201, {
+				name: entry.name, path: rel, type: "file", size: entry.size,
+				updatedAt: new Date(entry.mtimeMs).toISOString(),
+			});
+		} catch (error) {
+			json(res, storeStatus(error), { error: error instanceof Error ? error.message : String(error) });
+		}
 		return true;
 	}
 

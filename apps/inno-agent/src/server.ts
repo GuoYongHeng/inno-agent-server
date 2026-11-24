@@ -1256,6 +1256,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		// Read routes serve from the manifest + object store in authenticated
 		// mode; local mode (and any test without a tenant) uses the filesystem.
 		workspaceStoreFor: workspaceStoreForRequest,
+		objects: getSharedObjectStore,
 	}),
 
 	// --- Presets API (extracted to server/routes/presets.ts) ---

@@ -6,6 +6,7 @@ import {
 	renameWorkspaceItem,
 	deleteWorkspaceItem,
 	moveWorkspaceItem,
+	uploadWorkspaceFileDirect,
 	uploadWorkspaceFiles,
 	saveWorkspaceFile,
 	uploadWorkspaceSkill,
@@ -318,17 +319,28 @@ class WorkspaceStoreImpl extends EventEmitter<WorkspaceStoreEvents> {
 		this.isMutating = true;
 		this.emit("change", undefined);
 		try {
-			const items: Array<{ path: string; dataBase64: string }> = [];
+			// Prefer the presigned direct upload (T1.5): bytes go straight to
+			// object storage. A null means the deployment can't sign — fall back
+			// to the proxied base64 batch.
+			let allDirect = files.length > 0;
 			for (const file of files) {
-				const buffer = await file.arrayBuffer();
-				const bytes = new Uint8Array(buffer);
-				let binary = "";
-				for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-				const base64 = btoa(binary);
 				const filePath = parentPath ? `${parentPath}/${file.name}` : file.name;
-				items.push({ path: filePath, dataBase64: base64 });
+				const node = await uploadWorkspaceFileDirect(filePath, file, this.wsId);
+				if (!node) { allDirect = false; break; }
 			}
-			await uploadWorkspaceFiles(items, this.wsId);
+			if (!allDirect) {
+				const items: Array<{ path: string; dataBase64: string }> = [];
+				for (const file of files) {
+					const buffer = await file.arrayBuffer();
+					const bytes = new Uint8Array(buffer);
+					let binary = "";
+					for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+					const base64 = btoa(binary);
+					const filePath = parentPath ? `${parentPath}/${file.name}` : file.name;
+					items.push({ path: filePath, dataBase64: base64 });
+				}
+				await uploadWorkspaceFiles(items, this.wsId);
+			}
 			await this.loadTree();
 		} catch (err) {
 			this.error = err instanceof Error ? err.message : "Failed to upload";

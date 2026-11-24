@@ -31,7 +31,6 @@ import {
 } from "../api/workspaces.js";
 import { ApiError } from "../api/client.js";
 import type { PresetMeta } from "../types/presets.js";
-import { arrayBufferToBase64 } from "../api/uploads.js";
 import { uploadWorkspaceFileWithProgress } from "../api/workspace.js";
 import type { AttachmentRef, ChatMessage } from "../types/chat.js";
 import { fetchPresetList, readCachedPresets, removeCachedPreset } from "../utils/preset-cache.js";
@@ -1030,9 +1029,9 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 						current.map((entry) => entry.path === key && entry.source === "local" ? { ...entry, ...patchItem } : entry));
 					patch({ status: "uploading", pct: 0 });
 					try {
-						const dataBase64 = arrayBufferToBase64(await item.file.arrayBuffer());
 						const node = await uploadWorkspaceFileWithProgress(
-							{ path: item.path, dataBase64 },
+							item.path,
+							item.file,
 							targetWorkspaceId,
 							(loaded, total) => patch({ pct: total > 0 ? Math.min(100, (loaded / total) * 100) : 0 }),
 						);
@@ -1054,9 +1053,9 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 						const uid = pending.file.uid;
 						engine.setUploadProgress(uid, 0);
 						try {
-							const dataBase64 = arrayBufferToBase64(await pending.file.file.arrayBuffer());
 							const node = await uploadWorkspaceFileWithProgress(
-								{ path: pending.file.path, dataBase64 },
+								pending.file.path,
+								pending.file.file,
 								targetWorkspaceId,
 								(loaded, total) => engine.setUploadProgress(uid, total > 0 ? Math.min(100, (loaded / total) * 100) : 0),
 							);

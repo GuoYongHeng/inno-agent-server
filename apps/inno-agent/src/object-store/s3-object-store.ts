@@ -8,7 +8,8 @@ import {
 	S3Client,
 	type S3ClientConfig,
 } from "@aws-sdk/client-s3";
-import { sha256Hex, type ObjectMeta, type ObjectStore, type PutObjectOptions } from "./object-store.js";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { sha256Hex, type ObjectMeta, type ObjectStore, type PresignOptions, type PutObjectOptions } from "./object-store.js";
 
 export interface S3ObjectStoreConfig {
 	bucket: string;
@@ -114,5 +115,23 @@ export class S3ObjectStore implements ObjectStore {
 			token = page.IsTruncated ? page.NextContinuationToken : undefined;
 		} while (token);
 		return found.sort((a, b) => a.key.localeCompare(b.key));
+	}
+
+	async presignPut(key: string, options?: PresignOptions): Promise<string> {
+		return getSignedUrl(this.client, new PutObjectCommand({
+			Bucket: this.bucket,
+			Key: key,
+			...(options?.contentType ? { ContentType: options.contentType } : {}),
+		}), { expiresIn: options?.expiresInSeconds ?? 900 });
+	}
+
+	async presignGet(key: string, options?: PresignOptions): Promise<string> {
+		return getSignedUrl(this.client, new GetObjectCommand({
+			Bucket: this.bucket,
+			Key: key,
+			...(options?.contentDisposition ? { ResponseContentDisposition: options.contentDisposition } : {}),
+		}), {
+			expiresIn: options?.expiresInSeconds ?? 900,
+		});
 	}
 }

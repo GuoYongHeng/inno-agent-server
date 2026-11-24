@@ -2340,6 +2340,20 @@ describe("workspace read routes in authenticated mode", () => {
 			expect(raw.status).toBe(200);
 			expect([...new Uint8Array(await raw.arrayBuffer())]).toEqual([0, 1, 2, 255, 128]);
 
+			// T1.5: the fs provider cannot sign URLs, so the direct-upload
+			// endpoints report 404 (the client falls back to the proxy) and a
+			// download stays proxied instead of redirecting.
+			expect((await providerApi(providerOrigin, cookieA, "/api/workspace/upload-url", {
+				method: "POST",
+				body: JSON.stringify({ workspaceId: workspace.id, path: "big.bin", size: 100 }),
+			})).status).toBe(404);
+			expect((await providerApi(providerOrigin, cookieA, "/api/workspace/upload/complete", {
+				method: "POST",
+				body: JSON.stringify({ workspaceId: workspace.id, path: "bin/never-uploaded.bin" }),
+			})).status).toBe(404);
+			const download = await providerApi(providerOrigin, cookieA, `/api/workspace/raw?workspaceId=${workspace.id}&path=bin/blob.bin&download=1`, { redirect: "manual" });
+			expect(download.status).toBe(200);
+
 			const zipResponse = await providerApi(providerOrigin, cookieA, `/api/workspace/download-folder?workspaceId=${workspace.id}`);
 			expect(zipResponse.status).toBe(200);
 			const zip = Buffer.from(await zipResponse.arrayBuffer());

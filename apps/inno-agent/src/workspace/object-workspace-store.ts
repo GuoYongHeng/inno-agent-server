@@ -188,6 +188,26 @@ export class ObjectWorkspaceStore implements WorkspaceStore {
 		return this.entryOf(row);
 	}
 
+	/**
+	 * Register a manifest row for bytes already present in the object store
+	 * (T1.5 presigned direct upload): the same structural checks as `write`,
+	 * but the caller supplies the verified size instead of the body.
+	 */
+	async adopt(workspaceId: string, path: string, size: number): Promise<WorkspaceEntry> {
+		const target = normalizeWorkspacePath(path);
+		if (target === "") fail("is_directory", "cannot write the workspace root", target);
+		if (size > this.maxFileBytes) fail("too_large", `file too large: ${target}`, target);
+		const existing = await this.row(workspaceId, target);
+		if (existing?.kind === "directory") fail("is_directory", `is a directory: ${target}`, target);
+		if (!existing && (await this.summarize(workspaceId, target)).count > 0) {
+			fail("is_directory", `is a directory: ${target}`, target);
+		}
+		await this.checkAncestors(workspaceId, target);
+		const row: WorkspaceFileRow = { relPath: target, kind: "file", size, mtimeMs: Date.now() };
+		await this.options.store.putWorkspaceFile(this.options.context, workspaceId, row);
+		return this.entryOf(row);
+	}
+
 	async mkdir(workspaceId: string, path: string): Promise<WorkspaceEntry> {
 		const target = normalizeWorkspacePath(path);
 		if (target === "") return { path: "", name: "", kind: "directory", size: 0, mtimeMs: 0 };

@@ -12,6 +12,14 @@ export interface PutObjectOptions {
 	contentType?: string;
 }
 
+export interface PresignOptions {
+	/** Seconds until the URL stops working. Callers pick per use (upload: minutes). */
+	expiresInSeconds?: number;
+	contentType?: string;
+	/** presignGet only: Content-Disposition header the storage returns to the browser. */
+	contentDisposition?: string;
+}
+
 /**
  * Blob storage for data too large or too opaque for PostgreSQL (uploaded PDFs,
  * Office files, images). Backed by S3-compatible storage: Alibaba Cloud OSS in
@@ -29,6 +37,14 @@ export interface ObjectStore {
 	/** Delete every object under a prefix; returns how many were removed. */
 	deletePrefix(prefix: string): Promise<number>;
 	list(prefix: string): Promise<ObjectMeta[]>;
+	/**
+	 * Optional (T1.5): a short-lived URL a browser can PUT bytes to directly.
+	 * Providers that cannot vend signed URLs (fs, memory) leave this undefined
+	 * and callers fall back to proxying through the API.
+	 */
+	presignPut?(key: string, options?: PresignOptions): Promise<string>;
+	/** Optional (T1.5): a short-lived URL a browser can GET bytes from directly. */
+	presignGet?(key: string, options?: PresignOptions): Promise<string>;
 }
 
 export function sha256Hex(body: Uint8Array): string {
