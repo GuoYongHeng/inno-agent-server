@@ -70,8 +70,10 @@ services:
       inno-agent:
         condition: service_healthy
 
+  # ParadeDB (PostgreSQL 17 + vector/pg_trgm/pg_search): the tenant schema and
+  # L2/L3 memory layers require BM25 search, which stock postgres lacks.
   postgres:
-    image: postgres:18-alpine
+    image: paradedb/paradedb:v0.22.2-pg17
     environment:
       POSTGRES_USER: inno
       POSTGRES_PASSWORD: inno
