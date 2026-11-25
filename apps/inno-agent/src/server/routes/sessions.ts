@@ -22,7 +22,6 @@ export interface SessionsRouteContext {
 	paths: RuntimePaths;
 	tenantStore: TenantStore;
 	workspaceReplica?: WorkspaceReplica | null;
-	objectStorageDurable?: boolean;
 	durableSessions: DurableHttpContext["service"];
 }
 
@@ -54,7 +53,6 @@ export async function handleSessionsRoutes(
 				workspaceRegistry,
 				tenantStore,
 				workspaceReplica,
-				objectStorageDurable: ctx.objectStorageDurable,
 			});
 		}
 	}

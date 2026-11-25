@@ -98,7 +98,6 @@ src/                  # 后端 (Node.js)
 │   └── l3/           # L3 会话记录的 sqlite 索引与阈值召回
 └── storage/          # 文件存储
 
-.inno/skills/         # Inno Agent 实际加载的项目级 Skills 目录
 
 web/                  # 前端 (React + Tailwind + Vite)
 ├── src/
@@ -127,10 +126,10 @@ web/                  # 前端 (React + Tailwind + Vite)
 | PUT | `/api/wiki/page` | 保存 Wiki 页面 |
 | GET | `/api/wiki/graph` | 知识图谱数据 |
 | GET | `/api/wiki/stats` | Wiki 统计 |
-| GET | `/api/skills` | Skills 列表（读取 skills 目录） |
-| POST | `/api/skills/upload` | 上传 `<skill-name>.zip` 并解压到 `.inno/skills/<name>/` |
-| PATCH | `/api/skills/:name` | 启用/关闭 Skill |
-| DELETE | `/api/skills/:name` | 删除 Skill |
+| GET | `/api/skills` | Skills 列表（`skill_catalog`：平台共享 + 本租户上传） |
+| POST | `/api/skills/upload` | 上传 `<skill-name>.zip`，发布到对象存储 `tenants/<t>/skills/` 并归租户所有 |
+| PATCH | `/api/skills/:name` | 启用/关闭 Skill（`tenant_skills`） |
+| DELETE | `/api/skills/:name` | 删除 Skill（仅租户自有；平台共享技能只读） |
 | POST | `/api/skills/reload` | 刷新技能面板（durable 会话在运行时打开时读取技能目录） |
 | GET | `/api/settings` | 配置信息（合并视图：服务端托管目录 + 租户选择，`serverManaged` 标记供 UI 隐藏编辑入口） |
 | POST | `/api/settings/model` | 选择默认模型（租户唯一的模型写口，校验服务端目录） |

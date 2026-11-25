@@ -1,16 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { isDurableObjectStorageProvider } from "../object-store/index.js";
 import { createReplicaPushGate, workspaceChangePublisher } from "./replica-push.js";
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-describe("isDurableObjectStorageProvider", () => {
-	it("treats only persistent providers as durable", () => {
-		expect(isDurableObjectStorageProvider("s3")).toBe(true);
-		expect(isDurableObjectStorageProvider("fs")).toBe(true);
-		expect(isDurableObjectStorageProvider("memory")).toBe(false);
-	});
-});
 
 describe("createReplicaPushGate", () => {
 	it("coalesces a burst into at most two pushes", async () => {
@@ -56,7 +47,7 @@ describe("workspaceChangePublisher", () => {
 		expect(published).toHaveLength(1);
 	});
 
-	it("publishes synchronously with no gate (local / memory mode)", () => {
+	it("publishes synchronously with no gate", () => {
 		const published: unknown[] = [];
 		const publish = workspaceChangePublisher((event) => published.push(event), null);
 		publish({ type: "workspace_change" });

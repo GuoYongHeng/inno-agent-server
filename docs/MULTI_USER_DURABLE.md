@@ -67,7 +67,7 @@ Tenant-scoped Durable catalog / workspace / config / memory
 - 一个账号对应一个 personal tenant；当前没有 Organization/team 阶段。
 - tenant 只能来自已验证的 Better Auth session、服务端 membership 或 PostgreSQL ownership。
 - 未认证请求返回 401；跨 tenant 资源读取和执行返回 404。
-- Provider 目录、Tavily key、bridge token 和渠道端点由部署 `config.json` 统一托管，租户不可写；tenant 配置行只存选择（默认模型、渠道开关/白名单、memory/ui），消费方直接 await 查询，不落本地文件。
+- Provider 目录、Tavily key、bridge token 和渠道端点由 `platform_config` 行统一托管（启动时以 `config.json` 中仍存在的可变键为 seed），租户不可写；tenant 配置行只存选择（默认模型、渠道开关/白名单、memory/ui），消费方直接 await 查询，不落本地文件。
 - 历史文件不会自动归属于第一个登录用户，必须运行显式 legacy-owner migration。
 - authenticated 模式移除 PI host shell/通用 host file tools 和 PTY terminal；保留的路径工具执行 canonical workspace/symlink 检查。
 - MCP、subagents、web-access、codemode、computer-use 等多用户尚未隔离的能力保持关闭，而不是伪装成 tenant-safe。
@@ -100,7 +100,7 @@ execute(params, api, context)
 INNO_WORKSPACE_DIR          local exec 的工作副本（可丢，从对象存储重建）
 INNO_CONFIG_DIR             config.json
 INNO_SKILLS_DIR             镜像 seed；正文发布后在对象存储
-对象存储                    platform/skills/…、tenants/<t>/workspaces/…、l2/…、outbox/…
+对象存储                    platform/skills/…、tenants/<t>/skills/…、tenants/<t>/workspaces/…、l2/…、outbox/…
 PostgreSQL                  见下一节
 ```
 
@@ -118,7 +118,7 @@ PostgreSQL                  见下一节
 - `workspace/workspace-replica.ts` 按增量 pull/push 同步；push 只删除自身状态文件里已知的键，未拉取过的 worker 不会误删。pull 是**按需**的：会话打开只下载提示词必需路径（`agent.md`、`.skills/`）与目录骨架，其余文件行登记为待物化；文件工具/stat 读 miss 或漂移时经 `materializeFile` 单文件拉取，local exec 的 bash 无法逐文件拦截、每次 `run` 前做一次全量增量同步（无变更时只花一轮清单对比）。文件变更/每轮 settle/关闭时增量 push 不变。
 - `INNO_EXEC_BACKEND=local` 时 bash/read/write/edit 经 `SandboxExecutionEnv` → `LocalDirSandbox` 在 worker 上执行（realpath 防逃逸，`INNO_EXEC_LOCAL_MAX_CONCURRENT` 限并发）；默认 `persistent` 不提供 bash。
 - `S3ObjectStore` 支持预签名：`/api/workspace/upload-url` + `/api/workspace/upload/complete` 让浏览器字节直传，`raw?download=1` 302 到短效 GET；其它 provider 返回 404 由前端回退代理。桶需配 CORS 允许浏览器 PUT。
-- 对象存储未配置（`memory`）时字节随进程死亡，面板回退读本地磁盘并在启动告警——此时多 worker 接管会丢工作区。
+- 对象存储是**启动硬依赖**（`INNO_OBJECT_STORAGE_PROVIDER=s3|fs` 必填，无 memory 模式）；没有可用 provider 时服务在 bootstrap 直接失败。因此用户面文件 I/O 永远不会把本地盘当作事实源。
 
 可以使用静态 worker map 将 tenant 固定路由到拥有独立 RWO 数据卷的 worker：
 

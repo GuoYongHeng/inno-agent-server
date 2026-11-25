@@ -4,11 +4,7 @@ import type { ObjectStore } from "../object-store/object-store.js";
 import { sha256Hex } from "../object-store/object-store.js";
 import { formatSkillsForPrompt, loadSkillsFromDir } from "../agent/skills.js";
 import type { SkillCatalogRecord } from "./catalog-store.js";
-import {
-	skillFileObjectKey,
-	skillManifestObjectKey,
-	type SkillManifest,
-} from "./skill-object-key.js";
+import { skillFileKey, skillManifestKey, type SkillManifest } from "./skill-object-key.js";
 
 /** System-managed mirror of enabled platform skills inside a session workspace. */
 export const GLOBAL_SKILLS_WORKSPACE_DIR = ".global-skills";
@@ -28,7 +24,7 @@ export async function materializeSkill(
 	workspaceDir: string,
 ): Promise<string> {
 	const destRoot = join(workspaceDir, GLOBAL_SKILLS_WORKSPACE_DIR, skill.skillId);
-	const manifestKey = skillManifestObjectKey(skill.skillId, skill.version);
+	const manifestKey = skillManifestKey(skill);
 	const manifestBytes = await objects.get(manifestKey);
 	if (!manifestBytes) {
 		throw new Error(`Skill manifest missing for ${skill.skillId}@${skill.version}`);
@@ -47,7 +43,7 @@ export async function materializeSkill(
 				// rewrite below
 			}
 		}
-		const key = skillFileObjectKey(skill.skillId, skill.version, file.relPath);
+		const key = skillFileKey(skill, file.relPath);
 		const body = await objects.get(key);
 		if (!body) throw new Error(`Skill object missing: ${key}`);
 		writeBytes(localPath, body);

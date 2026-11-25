@@ -10,6 +10,8 @@ export interface SkillCatalogRecord {
 	publishedAt: string;
 	publishedBy: string | null;
 	source: string | null;
+	/** NULL = platform-shared (image seed/operator); set = the owning tenant's upload. */
+	ownerTenantId: string | null;
 }
 
 export interface TenantSkillListing extends SkillCatalogRecord {
@@ -27,6 +29,7 @@ interface CatalogRow {
 	published_at: Date | string;
 	published_by: string | null;
 	source: string | null;
+	owner_tenant_id: string | null;
 }
 
 interface TenantSkillRow extends CatalogRow {
@@ -50,6 +53,7 @@ function mapCatalog(row: CatalogRow): SkillCatalogRecord {
 		publishedAt: asIso(row.published_at) ?? new Date(0).toISOString(),
 		publishedBy: row.published_by,
 		source: row.source,
+		ownerTenantId: row.owner_tenant_id,
 	};
 }
 
@@ -65,12 +69,14 @@ export class SkillCatalogStore {
 		disableModelInvocation?: boolean;
 		publishedBy?: string | null;
 		source?: string | null;
+		/** Owning tenant for tenant-published skills; omit for platform-shared. */
+		ownerTenantId?: string | null;
 	}): Promise<SkillCatalogRecord> {
 		const result = await this.pool.query<CatalogRow>(
 			`INSERT INTO skill_catalog (
 				skill_id, name, description, version, object_prefix,
-				disable_model_invocation, published_by, source, published_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+				disable_model_invocation, published_by, source, owner_tenant_id, published_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
 			ON CONFLICT (skill_id) DO UPDATE SET
 				name = EXCLUDED.name,
 				description = EXCLUDED.description,
@@ -79,6 +85,7 @@ export class SkillCatalogStore {
 				disable_model_invocation = EXCLUDED.disable_model_invocation,
 				published_by = EXCLUDED.published_by,
 				source = EXCLUDED.source,
+				owner_tenant_id = COALESCE(EXCLUDED.owner_tenant_id, skill_catalog.owner_tenant_id),
 				published_at = CURRENT_TIMESTAMP
 			RETURNING *`,
 			[
@@ -90,15 +97,35 @@ export class SkillCatalogStore {
 				Boolean(record.disableModelInvocation),
 				record.publishedBy ?? null,
 				record.source ?? null,
+				record.ownerTenantId ?? null,
 			],
 		);
 		return mapCatalog(result.rows[0]!);
+	}
+
+	/** Remove a tenant-owned skill. `tenant_skills` rows cascade away with it. */
+	async deleteForTenant(skillId: string, tenantId: string): Promise<boolean> {
+		const result = await this.pool.query(
+			"DELETE FROM skill_catalog WHERE skill_id = $1 AND owner_tenant_id = $2",
+			[skillId, tenantId],
+		);
+		return (result.rowCount ?? 0) > 0;
 	}
 
 	async get(skillId: string): Promise<SkillCatalogRecord | null> {
 		const result = await this.pool.query<CatalogRow>(
 			"SELECT * FROM skill_catalog WHERE skill_id = $1",
 			[skillId],
+		);
+		return result.rows[0] ? mapCatalog(result.rows[0]) : null;
+	}
+
+	/** Platform-shared or owned-by-this-tenant lookup (visibility boundary). */
+	async getForTenant(skillId: string, tenantId: string): Promise<SkillCatalogRecord | null> {
+		const result = await this.pool.query<CatalogRow>(
+			`SELECT * FROM skill_catalog
+			 WHERE skill_id = $1 AND (owner_tenant_id IS NULL OR owner_tenant_id = $2)`,
+			[skillId, tenantId],
 		);
 		return result.rows[0] ? mapCatalog(result.rows[0]) : null;
 	}
@@ -116,6 +143,7 @@ export class SkillCatalogStore {
 			 FROM skill_catalog c
 			 LEFT JOIN tenant_skills t
 			   ON t.skill_id = c.skill_id AND t.tenant_id = $1
+			 WHERE c.owner_tenant_id IS NULL OR c.owner_tenant_id = $1
 			 ORDER BY c.name ASC`,
 			[tenantId],
 		);
@@ -132,6 +160,7 @@ export class SkillCatalogStore {
 			 FROM tenant_skills t
 			 JOIN skill_catalog c ON c.skill_id = t.skill_id
 			 WHERE t.tenant_id = $1 AND t.enabled
+			   AND (c.owner_tenant_id IS NULL OR c.owner_tenant_id = $1)
 			 ORDER BY c.name ASC`,
 			[tenantId],
 		);
@@ -139,7 +168,7 @@ export class SkillCatalogStore {
 	}
 
 	async setEnabled(tenantId: string, skillId: string, enabled: boolean): Promise<TenantSkillListing | null> {
-		const exists = await this.get(skillId);
+		const exists = await this.getForTenant(skillId, tenantId);
 		if (!exists) return null;
 		await this.pool.query(
 			`INSERT INTO tenant_skills (tenant_id, skill_id, enabled, installed_at)
@@ -166,6 +195,7 @@ export class SkillCatalogStore {
 		const result = await db.query(
 			`INSERT INTO tenant_skills (tenant_id, skill_id, enabled, installed_at)
 			 SELECT $1, skill_id, true, CURRENT_TIMESTAMP FROM skill_catalog
+			 WHERE owner_tenant_id IS NULL
 			 ON CONFLICT (tenant_id, skill_id) DO NOTHING`,
 			[tenantId],
 		);
@@ -178,6 +208,7 @@ export class SkillCatalogStore {
 			`INSERT INTO tenant_skills (tenant_id, skill_id, enabled, installed_at)
 			 SELECT tenants.id, skill_catalog.skill_id, true, CURRENT_TIMESTAMP
 			 FROM tenants CROSS JOIN skill_catalog
+			 WHERE skill_catalog.owner_tenant_id IS NULL
 			 ON CONFLICT (tenant_id, skill_id) DO NOTHING`,
 		);
 		return result.rowCount ?? 0;

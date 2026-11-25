@@ -11,14 +11,22 @@ import { renderPrometheus } from "./utils/metrics.js";
 import { createServer, type IncomingMessage as HttpReq, type ServerResponse } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
-import { loadConfig, normalizeSandboxConfig, readLoggingDir, type InnoConfig } from "./config.js";
+import { normalizeSandboxConfig, readLoggingDir, type InnoConfig } from "./config.js";
+import {
+	platformSkillDisabled,
+	readRawConfigFile,
+	resolvePlatformConfig,
+	savePlatformConfigDoc,
+	withSkillDisabled,
+	type PlatformConfigDoc,
+} from "./platform-config.js";
 import { installFetchLogger } from "./utils/fetch-logger.js";
 import { applyProviderProxyBypass } from "./utils/proxy-bypass.js";
-import { ensureDir, readJson, readText, writeJson, writeText } from "./storage/file-store.js";
+import { ensureDir, readJson, readText, writeText } from "./storage/file-store.js";
 import { closeDeferredRuns, configureDeferredRuns } from "./scheduler/deferred-runs.js";
 import { DurableSessionBusyError, DurableSessionService } from "./agent/durable-session-service.js";
 import { DURABLE_JOB_BUSY_WAIT_MS, runDurableJobPrompt } from "./agent/durable-job-runner.js";
@@ -55,13 +63,14 @@ import { handleSessionsRoutes } from "./server/routes/sessions.js";
 import { handleWikiRoutes } from "./server/routes/wiki.js";
 import { setL2BackendResolver } from "./memory/l2/l2-backend.js";
 import { PgL2Backend } from "./memory/l2/pg-l2-backend.js";
-import { createObjectStore, isDurableObjectStorageProvider, normalizeObjectStorageConfig, type ObjectStore } from "./object-store/index.js";
+import { createObjectStore, normalizeObjectStorageConfig, type ObjectStore } from "./object-store/index.js";
 import { handlePresetsRoutes } from "./server/routes/presets.js";
 import { readPresetAgentMd, resolvePresetMeta } from "./presets/preset-store.js";
 import { loadSkillsFromDir } from "./agent/skills.js";
-import { SkillCatalogStore, type TenantSkillListing } from "./skills/catalog-store.js";
-import { buildCatalogSkillsSection } from "./skills/materialize.js";
-import { publishSkillsFromRoot } from "./skills/publish.js";
+import { SkillCatalogStore, type SkillCatalogRecord, type TenantSkillListing } from "./skills/catalog-store.js";
+import { buildCatalogSkillsSection, materializeSkill } from "./skills/materialize.js";
+import { publishSkillFromDir, publishSkillsFromRoot } from "./skills/publish.js";
+import { skillFileKey, skillManifestKey, skillObjectsPrefix, type SkillManifest } from "./skills/skill-object-key.js";
 import type { CatalogSkillListing } from "./server/routes/skills.js";
 import { createSchedulerTools } from "./scheduler/scheduler-tools.js";
 import { handleChatRoutes } from "./server/routes/chat.js";
@@ -74,7 +83,6 @@ import { applyRuntimeEnvironment, parseRuntimeArgs, resolveRuntimePaths } from "
 import { createGracefulShutdownHandler, installProcessFallbacks } from "./utils/process-fallback.js";
 import { TEMP_WORKSPACE_ID, WorkspaceRegistry, type WorkspaceMeta } from "./workspace/workspace-registry.js";
 import { WorkspaceReplica } from "./workspace/workspace-replica.js";
-import { LocalFsWorkspaceStore } from "./workspace/local-fs-workspace-store.js";
 import { ObjectWorkspaceStore } from "./workspace/object-workspace-store.js";
 import type { WorkspaceStore } from "./workspace/workspace-store.js";
 import type { RemoteContentSource } from "./content-source/index.js";
@@ -118,6 +126,13 @@ const port = parsed.options.port
 
 // Config is loaded on first API request, not at startup.
 let config!: InnoConfig;
+
+/**
+ * The stored platform_config document (mutable config + sidecars like the
+ * legacy skill-disable list). Populated during bootstrap; skill routes read
+ * it through `platformSkillDisabled`.
+ */
+let platformDoc: PlatformConfigDoc | undefined;
 
 // ---------------------------------------------------------------------------
 // Lazy bootstrap — directories, stores, channels, and agent session are
@@ -165,6 +180,38 @@ function toCatalogSkillListing(row: TenantSkillListing): CatalogSkillListing {
 	};
 }
 
+/** Fetch a published skill's file manifest from object storage. */
+async function loadSkillManifest(record: SkillCatalogRecord): Promise<SkillManifest> {
+	const bytes = await getSharedObjectStore().get(skillManifestKey(record));
+	if (!bytes) throw new Error(`Skill manifest missing for ${record.skillId}@${record.version}`);
+	return JSON.parse(new TextDecoder().decode(bytes)) as SkillManifest;
+}
+
+/**
+ * Publish a skill directory into object storage + skill_catalog and enable it
+ * for the publishing tenant. Shared uploads never touch `skillsDir` — the
+ * image directory is only a boot-time seed.
+ */
+async function publishSkillDirToCatalog(
+	skillDir: string,
+	source: string,
+	tenant: TenantContext,
+): Promise<CatalogSkillListing> {
+	const result = await publishSkillFromDir({
+		objects: getSharedObjectStore(),
+		catalog: getSkillCatalog(),
+		skillDir,
+		source,
+		publishedBy: tenant.userId,
+		// Tenant uploads are tenant-owned: bodies under tenants/<id>/skills/,
+		// catalog row visible only to the uploader. Platform seeds stay shared.
+		ownerTenantId: tenant.tenantId,
+	});
+	const row = await getSkillCatalog().setEnabled(tenant.tenantId, result.skillId, true);
+	if (!row) throw new Error(`Skill ${result.skillId} failed to enable after publish`);
+	return toCatalogSkillListing(row);
+}
+
 /** Publish image-baked skills into object store + catalog, then opt tenants in. */
 async function seedSkillCatalogFromImage(): Promise<void> {
 	try {
@@ -183,25 +230,14 @@ async function seedSkillCatalogFromImage(): Promise<void> {
 	}
 }
 /**
- * The in-memory object store loses all bytes on restart, so manifest-backed
- * reads would list files whose objects are gone forever. Only s3/fs providers
- * may back the workspace-panel read path; "memory" keeps the old disk reads.
- */
-const objectStorageIsDurable = (): boolean =>
-	isDurableObjectStorageProvider(normalizeObjectStorageConfig(config?.objectStorage).provider);
-/**
  * Per-request workspace store: manifest + object store for authenticated
- * tenants on durable object storage; the local filesystem otherwise. Shared
- * by the workspace routes and the durable session service (T1.4).
+ * tenants. The local workspace dir is only the execution mirror — user-facing
+ * file I/O never treats it as the source of truth. Shared by the workspace
+ * routes and the durable session service (T1.4).
  */
 const workspaceStoreForRequest = (request: HttpReq): WorkspaceStore => {
 	const tenant = requireRequestTenant(request);
-	if (objectStorageIsDurable()) {
-		return new ObjectWorkspaceStore({ objects: getSharedObjectStore(), store: auth.tenantStore, context: tenant });
-	}
-	// memory provider: bytes die with the process — the local dir stays
-	// the source of truth even for authenticated requests.
-	return new LocalFsWorkspaceStore({ resolveRoot: (id) => workspaceRegistry.resolveWorkspaceDir(id) });
+	return new ObjectWorkspaceStore({ objects: getSharedObjectStore(), store: auth.tenantStore, context: tenant });
 };
 {
 	const l2Pool = auth.tenantStore.database;
@@ -256,7 +292,15 @@ async function ensureBootstrapped(): Promise<void> {
 		logger.info("[inno-server] first meaningful request — bootstrapping...");
 
 		// ---- config (loaded lazily, not at process start) ----
-		config = loadConfig(paths.configPath);
+		// Mutable platform config lives in the `platform_config` row so every
+		// worker shares one copy; config.json only supplies immutable fields
+		// plus a per-boot seed for any mutable keys it still carries.
+		const resolved = await resolvePlatformConfig(
+			auth.tenantStore.database,
+			readRawConfigFile(paths.configPath),
+		);
+		config = resolved.config;
+		platformDoc = await seedSkillRegistryFromFile(resolved.doc);
 		applyProviderProxyBypass(config);
 		getSandboxManager(); // fail fast on a sandbox config that cannot work
 
@@ -275,10 +319,9 @@ async function ensureBootstrapped(): Promise<void> {
 		workspaceRegistry = new WorkspaceRegistry(paths.workspaceDir);
 		workspaceRegistry.ensureBootstrapped();
 		{
+			// Fails fast when no fs/s3 object storage is configured — the server
+			// cannot run without one.
 			workspaceReplica = new WorkspaceReplica(getSharedObjectStore(), auth.tenantStore, workspaceRegistry);
-			if (!objectStorageIsDurable()) {
-				logger.warn("object storage is in-memory: workspace panel reads this worker's disk; not safe for takeover");
-			}
 		}
 		migrateLegacyPiSkills();
 		await seedSkillCatalogFromImage();
@@ -807,42 +850,36 @@ function migrateLegacyPiSkills(): void {
 	}
 }
 
-interface SkillRegistry {
-	disabled: string[];
-}
-
-function skillRegistryPath(): string {
-	return join(paths.configDir, "skills.json");
-}
-
-function readSkillRegistry(): SkillRegistry {
-	const registry = readJson<Partial<SkillRegistry>>(skillRegistryPath(), {});
-	return {
-		disabled: Array.isArray(registry.disabled)
-			? registry.disabled.filter((item): item is string => typeof item === "string")
-			: [],
-	};
-}
-
-function writeSkillRegistry(registry: SkillRegistry): void {
-	ensureDir(paths.configDir);
-	writeJson(skillRegistryPath(), registry);
+/**
+ * One-time migration: if the platform_config document has never carried the
+ * skill-disable list, adopt a legacy `<configDir>/skills.json` into it.
+ * The file is left in place but never read again after the row exists.
+ */
+async function seedSkillRegistryFromFile(doc: PlatformConfigDoc): Promise<PlatformConfigDoc> {
+	if (doc.skillRegistry !== undefined) return doc;
+	const registryPath = join(paths.configDir, "skills.json");
+	if (!existsSync(registryPath)) return doc;
+	const raw = readJson<{ disabled?: unknown }>(registryPath, {});
+	const disabled = Array.isArray(raw.disabled)
+		? raw.disabled.filter((item): item is string => typeof item === "string")
+		: [];
+	const next: PlatformConfigDoc = { ...doc, skillRegistry: { disabled } };
+	try {
+		await savePlatformConfigDoc(auth.tenantStore.database, next);
+	} catch (err) {
+		logger.warn({ err }, "failed to seed skills.json disable list into platform_config");
+	}
+	return next;
 }
 
 function disabledSkillNames(): Set<string> {
-	return new Set(readSkillRegistry().disabled);
+	return platformSkillDisabled(platformDoc);
 }
 
-function setSkillEnabled(name: string, enabled: boolean): void {
-	const registry = readSkillRegistry();
-	const disabled = new Set(registry.disabled);
-	if (enabled) {
-		disabled.delete(name);
-	} else {
-		disabled.add(name);
-	}
-	writeSkillRegistry({ disabled: Array.from(disabled).sort() });
-	writeDisabledSkillsIgnoreFile(disabled);
+async function setSkillEnabled(name: string, enabled: boolean): Promise<void> {
+	platformDoc = withSkillDisabled(platformDoc ?? {}, name, enabled);
+	await savePlatformConfigDoc(auth.tenantStore.database, platformDoc);
+	writeDisabledSkillsIgnoreFile(platformSkillDisabled(platformDoc));
 }
 
 function writeDisabledSkillsIgnoreFile(disabled: Set<string>): void {
@@ -1283,6 +1320,97 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 				const row = await getSkillCatalog().setEnabled(tenant.tenantId, skillId, true);
 				return row ? toCatalogSkillListing(row) : null;
 			},
+			installPackage: async (fileName, data) => {
+				const tenant = requireRequestTenant(req);
+				const tempRoot = mkdtempSync(join(tmpdir(), "inno-skill-pub-"));
+				try {
+					const ext = extname(fileName).toLowerCase();
+					const installed = ext === ".zip"
+						? installSkillZip(fileName, data, tempRoot)
+						: installSkillMarkdown(fileName, data, tempRoot);
+					return await publishSkillDirToCatalog(join(tempRoot, installed.name), "upload", tenant);
+				} finally {
+					rmSync(tempRoot, { recursive: true, force: true });
+				}
+			},
+			importFromLibrary: async (skillName) => {
+				const tenant = requireRequestTenant(req);
+				const tempRoot = mkdtempSync(join(tmpdir(), "inno-skill-lib-"));
+				try {
+					const extractDir = join(tempRoot, "extract");
+					ensureDir(extractDir);
+					await getContentSource().downloadItem("skills", skillName, extractDir);
+					const staged = join(tempRoot, "staged");
+					ensureDir(staged);
+					const installed = installSkillFromExtractedDir(extractDir, slugifySkillName(skillName), staged);
+					return await publishSkillDirToCatalog(join(staged, installed.name), "library-import", tenant);
+				} finally {
+					rmSync(tempRoot, { recursive: true, force: true });
+				}
+			},
+			describe: async (skillId) => {
+				const tenant = requireRequestTenant(req);
+				const record = await getSkillCatalog().getForTenant(skillId, tenant.tenantId);
+				if (!record) return null;
+				const manifest = await loadSkillManifest(record);
+				const listing = (await getSkillCatalog().listForTenant(tenant.tenantId))
+					.find((row) => row.skillId === skillId)
+					?? { ...record, enabled: false, installedAt: null };
+				return { entry: toCatalogSkillListing(listing), files: manifest.files };
+			},
+			readFile: async (skillId, relPath) => {
+				const tenant = requireRequestTenant(req);
+				const record = await getSkillCatalog().getForTenant(skillId, tenant.tenantId);
+				if (!record) return null;
+				const manifest = await loadSkillManifest(record);
+				const clean = relPath.replace(/^\/+/, "");
+				if (!clean || clean.split("/").some((part) => part === ".." || part === "")) return null;
+				if (!manifest.files.some((file) => file.relPath === clean)) return null;
+				return getSharedObjectStore().get(skillFileKey(record, clean));
+			},
+			writeFile: async (skillId, relPath, content) => {
+				const tenant = requireRequestTenant(req);
+				const record = await getSkillCatalog().get(skillId);
+				if (!record) return null;
+				if (record.ownerTenantId !== tenant.tenantId) {
+					throw Object.assign(new Error("Only the owning tenant can modify this skill"), { statusCode: 403 });
+				}
+				const tempRoot = mkdtempSync(join(tmpdir(), "inno-skill-edit-"));
+				try {
+					const dir = await materializeSkill(getSharedObjectStore(), record, tempRoot);
+					// materializeSkill drops the manifest copy into the root — it is
+					// bookkeeping, not package content, and must not be republished.
+					rmSync(join(dir, "_manifest.json"), { force: true });
+					const target = join(dir, relPath);
+					if (!existsSync(target) || !statSync(target).isFile()) return null;
+					writeFileSync(target, content, "utf-8");
+					const result = await publishSkillFromDir({
+						objects: getSharedObjectStore(),
+						catalog: getSkillCatalog(),
+						skillDir: dir,
+						source: "edit",
+						publishedBy: tenant.userId,
+					});
+					const listing = (await getSkillCatalog().listForTenant(tenant.tenantId))
+						.find((row) => row.skillId === result.skillId);
+					return listing ? toCatalogSkillListing(listing) : null;
+				} finally {
+					rmSync(tempRoot, { recursive: true, force: true });
+				}
+			},
+			delete: async (skillId) => {
+				const tenant = requireRequestTenant(req);
+				const record = await getSkillCatalog().get(skillId);
+				if (!record) return false;
+				if (record.ownerTenantId !== tenant.tenantId) {
+					throw Object.assign(new Error("Only the owning tenant can delete this skill"), { statusCode: 403 });
+				}
+				if (!(await getSkillCatalog().deleteForTenant(skillId, tenant.tenantId))) return false;
+				await getSharedObjectStore()
+					.deletePrefix(skillObjectsPrefix(record))
+					.catch((err) => logger.warn({ err, skillId }, "failed to delete published skill objects"));
+				return true;
+			},
 		},
 		scheduleSkillsReload,
 		listProjectSkills,
@@ -1296,7 +1424,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	// --- Sessions API (extracted to server/routes/sessions.ts) ---
 	sessions: (req, res, method, url) => handleSessionsRoutes(req, res, method, url, {
 		workspaceRegistry, paths, tenantStore: auth.tenantStore, durableSessions,
-		workspaceReplica, objectStorageDurable: objectStorageIsDurable(),
+		workspaceReplica,
 	}),
 
 	// --- Wiki + L2 raw upload API (extracted to server/routes/wiki.ts) ---
@@ -1338,7 +1466,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	// --- Chat API (extracted to server/routes/chat.ts) ---
 	chat: (req, res, method, url) => handleChatRoutes(req, res, method, url, {
 		workspaceRegistry, tenantStore: auth.tenantStore, durableSessions,
-		workspaceReplica, objectStorageDurable: objectStorageIsDurable(),
+		workspaceReplica,
 	}),
 });
 

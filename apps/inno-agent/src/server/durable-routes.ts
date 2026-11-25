@@ -29,8 +29,6 @@ export interface DurableHttpContext {
 	workspaceRegistry: WorkspaceRegistry;
 	tenantStore: TenantStore;
 	workspaceReplica?: WorkspaceReplica | null;
-	/** True when the shared object store keeps bytes past a restart (s3/fs). */
-	objectStorageDurable?: boolean;
 }
 
 function errorStatus(error: unknown): number {
@@ -291,7 +289,7 @@ async function streamDurableTurn(
 		// the stream. Only with a durable object provider + replica + tenant.
 		const requestTenant = requireRequestTenant(req);
 		const replica = httpCtx?.workspaceReplica ?? null;
-		const pushGate = replica && httpCtx?.objectStorageDurable === true && requestTenant && state.workspaceRoot
+		const pushGate = replica && requestTenant && state.workspaceRoot
 			? createReplicaPushGate(async () => { await replica.push(requestTenant, state.workspaceId, state.workspaceRoot!); })
 			: null;
 		const publishChange = workspaceChangePublisher(

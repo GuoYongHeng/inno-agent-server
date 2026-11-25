@@ -49,9 +49,13 @@ apt-get update && apt-get install -y unzip zip bash && rm -rf /var/lib/apt/lists
 | `NODE_ENV` | `production` | 生产模式 |
 | `INNO_HOME` | `/var/lib/inno-agent`（Docker） | 主目录 |
 | `INNO_CONFIG_DIR` | `/etc/inno-agent`（Docker） | 配置文件目录 |
-| `INNO_SKILLS_DIR` | `<home>/skills` | 技能包目录 |
-| `INNO_WORKSPACE_DIR` | `/srv/inno-workspace`（Docker） | 默认工作区目录 |
+| `INNO_SKILLS_DIR` | `<home>/skills` | 平台技能 seed 目录（启动时发布进对象存储 catalog，非运行时真源） |
+| `INNO_WORKSPACE_DIR` | `/srv/inno-workspace`（Docker） | 默认工作区目录（对象存储的一次性执行镜像，非事实源） |
 | `INNO_PORT` | `3000` | HTTP 服务端口 |
+| `INNO_OBJECT_STORAGE_PROVIDER` | — | **必填** `s3` \| `fs`（无 memory 模式，缺失时启动失败） |
+| `INNO_OBJECT_STORAGE_DIR` | — | `provider=fs` 时对象键镜像到的目录（单机/测试） |
+| `INNO_OBJECT_STORAGE_ENDPOINT` / `_BUCKET` / `_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` / `_REGION` | — | `provider=s3` 的连接参数（OSS / MinIO / S3） |
+| `INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT` | `ENDPOINT` | 预签名 URL 面向浏览器的 endpoint（可选） |
 | `LANG` | `en_US.UTF-8` | 系统语言编码 |
 
 ### 2.4 目录结构和权限

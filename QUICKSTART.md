@@ -6,6 +6,8 @@
 
 - Node.js **>= 22.19.0**（`node -v` 检查；pi-durable 的最低版本要求）
 - npm（随 Node 自带）
+- **PostgreSQL**（ParadeDB pg17 镜像，`vector`/`pg_trgm`/`pg_search`）— 多用户登录与全部租户状态都在库里，见 [docs/AUTHENTICATION.md](./docs/AUTHENTICATION.md)
+- **对象存储**（必填，无 memory 模式）— 本地开发最简方式是 `fs` provider：`INNO_OBJECT_STORAGE_PROVIDER=fs` + `INNO_OBJECT_STORAGE_DIR=<某个目录>`；生产用 s3/OSS/MinIO
 - 一个 LLM provider 的 API key
   - Anthropic / OpenAI / DeepSeek / 任意 OpenAI-compatible 端点 / Ollama 本地都可以
 
@@ -71,6 +73,13 @@ cp config.example.json runtime/config/config.json
 ## 4. 启动
 
 ```bash
+# 对象存储必填：本地开发用 fs provider 即可
+export INNO_OBJECT_STORAGE_PROVIDER=fs
+export INNO_OBJECT_STORAGE_DIR=./runtime/objects
+# PostgreSQL 连接（见 docs/AUTHENTICATION.md）
+export DATABASE_URL=postgres://...
+
+npm run auth:migrate   # 首次启动前跑迁移
 npm run server -- --home ./runtime --workspace ./workspace --port 3000
 ```
 
@@ -120,7 +129,7 @@ npm run web:dev        # 终端 2 — Vite :5173（代理 /api 到 :3000）
 
 **修改了 backend 代码不生效？** backend 跑的是编译后的 `dist/`，需要重新 `npm run build` 再重启。前端在 `web:dev` 下走 Vite HMR，改完直接刷新即可。
 
-**想换 provider？** 服务端部署的模型目录由 `runtime/config/config.json` 统一管理（普通账号不能在设置页改 provider）。用户在 Web UI 顶部模型选择器或设置页里挑默认模型——选择写入 PostgreSQL 里的租户配置，不回写 config 文件。
+**想换 provider？** 服务端部署的模型目录由平台配置统一管理（`platform_config` 行，`config.json` 里的可变键在启动时作为 seed 写入；普通账号不能在设置页改 provider）。用户在 Web UI 顶部模型选择器或设置页里挑默认模型——选择写入 PostgreSQL 里的租户配置，不回写 config 文件。
 
 **想看 backend 日志？** `tail -f runtime/logs/server.log`（用 `restart-dev.sh` 启动的话日志在这里）。
 
@@ -132,6 +141,6 @@ npm run web:dev        # 终端 2 — Vite :5173（代理 /api 到 :3000）
 - Better Auth + PostgreSQL 多用户启动：[docs/AUTHENTICATION.md](./docs/AUTHENTICATION.md)
 - 完整文档见 [README.md](./README.md)
 - 写入审批与文件访问边界:[docs/PERMISSIONS.md](./docs/PERMISSIONS.md)
-- 自定义 skill：把 `<skill-name>.zip` 通过 Web UI 的 Skills 页面上传，或直接放进 `runtime/skills/<name>/`
+- 自定义 skill：把 `<skill-name>.zip` 通过 Web UI 的 Skills 页面上传（存对象存储 `tenants/<t>/skills/`）；放进 `runtime/skills/` 的目录只在启动时作为平台 seed 发布进 catalog
 - 配 Feishu / WeChat 渠道：编辑 `runtime/config/config.json` 的 `channels` 块
 - 部署到生产：参考 README 的 Production Shape 一节，或用 `deploy/` 目录下的 `Dockerfile` / `docker-compose.yml`

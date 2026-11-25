@@ -24,6 +24,7 @@ class MemoryCatalog {
 		disableModelInvocation?: boolean;
 		publishedBy?: string | null;
 		source?: string | null;
+		ownerTenantId?: string | null;
 	}): Promise<SkillCatalogRecord> {
 		const row: SkillCatalogRecord = {
 			skillId: record.skillId,
@@ -34,6 +35,7 @@ class MemoryCatalog {
 			disableModelInvocation: Boolean(record.disableModelInvocation),
 			publishedAt: new Date().toISOString(),
 			publishedBy: record.publishedBy ?? null,
+			ownerTenantId: record.ownerTenantId ?? null,
 			source: record.source ?? null,
 		};
 		this.rows.set(row.skillId, row);

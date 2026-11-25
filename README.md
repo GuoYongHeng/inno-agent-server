@@ -116,7 +116,7 @@ The operator seeds the provider catalog in `config.json`; each account only pick
 }
 ```
 
-Each provider declares a `baseUrl`, an `api` (`openai-completions` or `anthropic-messages`), an `apiKey`, and a `models[]` list. This file is the operator-managed catalog — tenants cannot edit providers through the API or UI; their default-model choice is stored per-tenant in PostgreSQL. Each conversation keeps the model it was started with until you switch it.
+Each provider declares a `baseUrl`, an `api` (`openai-completions` or `anthropic-messages`), an `apiKey`, and a `models[]` list. Only immutable deployment fields (`server`, `sandbox`, `objectStorage`, `logging`, `presets`) must live in this file — mutable platform config (providers, channel credentials, Tavily, hub, memory/ui/scheduler defaults) is stored in the PostgreSQL `platform_config` row so every worker shares one copy; mutable keys still present in `config.json` act as a per-boot seed that overrides the stored copy. This file is the operator-managed catalog — tenants cannot edit providers through the API or UI; their default-model choice is stored per-tenant in PostgreSQL. Each conversation keeps the model it was started with until you switch it.
 
 ### Runtime paths
 
@@ -139,7 +139,7 @@ The agent has no shell and no host execution. Its file tools (`read`, `write`, `
 
 ### Content Hub
 
-**Platform skills** are stored in object storage under `platform/skills/<id>/<version>/` with rows in `skill_catalog`; each tenant enables skills in `tenant_skills`. Image `INNO_SKILLS_DIR` is seeded into the catalog on boot; operators publish updates with `npm run skills:publish` (needs `DATABASE_URL` + object storage). The remote **content hub** (`contentHub` in `config.json`, default [`Chloris-Blaxk/inno-agent-hub`](https://github.com/Chloris-Blaxk/inno-agent-hub)) is a browse index — tenant “import” only enables already-published catalog skills. Simple Mode presets are not part of the hub: they ship in the image via `presets.dir`.
+**Platform skills** are stored in object storage under `platform/skills/<id>/<version>/` with rows in `skill_catalog`; each tenant enables skills in `tenant_skills`. Image `INNO_SKILLS_DIR` is seeded into the catalog on boot; operators publish updates with `npm run skills:publish` (needs `DATABASE_URL` + object storage). Platform skills are read/enable-only for tenants. **Tenant-uploaded skills** (Web UI upload or content-hub import) are stored under `tenants/<tenantId>/skills/<id>/<version>/`, visible only to their owning tenant (`skill_catalog.owner_tenant_id`), and fully editable/deletable by that owner — no shared local skills directory is ever written. The remote **content hub** (`contentHub` in `config.json`, default [`Chloris-Blaxk/inno-agent-hub`](https://github.com/Chloris-Blaxk/inno-agent-hub)) is a browse index — tenant “import” only enables already-published catalog skills. Simple Mode presets are not part of the hub: they ship in the image via `presets.dir`.
 
 ## Architecture
 
@@ -187,6 +187,12 @@ INNO_CONFIG_DIR=/etc/inno-agent \
 INNO_SKILLS_DIR=/var/lib/inno-agent/skills \
 INNO_WORKSPACE_DIR=/srv/inno-workspace \
 INNO_PORT=3000 \
+# Object storage is REQUIRED (fs or s3 — the server refuses to boot without it):
+INNO_OBJECT_STORAGE_PROVIDER=s3 \
+INNO_OBJECT_STORAGE_ENDPOINT=... \
+INNO_OBJECT_STORAGE_BUCKET=... \
+INNO_OBJECT_STORAGE_ACCESS_KEY_ID=... \
+INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY=... \
 npm run server
 ```
 

@@ -553,6 +553,32 @@ CREATE INDEX IF NOT EXISTS tenant_skills_tenant_enabled_idx
 	ON tenant_skills (tenant_id)
 	WHERE enabled;
 `;
+/**
+ * Platform-level mutable configuration. Single row (id = 1) holding the JSON
+ * document that used to live in config.json: provider catalog, channel
+ * credentials, search keys, feature toggles and the legacy skill-disable
+ * list. config.json now only carries immutable deployment fields; mutable
+ * keys present there are seeded into this row on boot. Shared by every
+ * worker so replicas cannot drift.
+ */
+/**
+ * Tenant-owned skills: rows published by a tenant get owner_tenant_id set;
+ * platform seeds stay NULL. Tenant uploads publish object bodies under
+ * tenants/<id>/skills/ instead of the shared platform/ prefix.
+ */
+const SKILL_CATALOG_OWNER_SQL = `
+ALTER TABLE skill_catalog ADD COLUMN IF NOT EXISTS owner_tenant_id text NULL REFERENCES tenants (id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS skill_catalog_owner_idx ON skill_catalog (owner_tenant_id) WHERE owner_tenant_id IS NOT NULL;
+`;
+
+const PLATFORM_CONFIG_SQL = `
+CREATE TABLE IF NOT EXISTS platform_config (
+	id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+	config TEXT NOT NULL,
+	updated_at timestamptz NOT NULL DEFAULT now()
+);
+`;
+
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
@@ -573,6 +599,8 @@ export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 17, name: "session_preset_id", sql: `
 ALTER TABLE durable_sessions ADD COLUMN IF NOT EXISTS preset_id text;
 ` },
+	{ version: 18, name: "platform_config", sql: PLATFORM_CONFIG_SQL },
+	{ version: 19, name: "skill_catalog_owner", sql: SKILL_CATALOG_OWNER_SQL },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

@@ -26,10 +26,6 @@ if (!databaseUrl) {
 	process.exit(2);
 }
 const config = normalizeObjectStorageConfig(undefined);
-if (config.provider === "memory") {
-	console.error("INNO_OBJECT_STORAGE_PROVIDER must be fs or s3 (memory objects vanish with the process)");
-	process.exit(2);
-}
 
 const graceMs = Number(value("--grace-ms") ?? 3_600_000);
 const pool = new Pool({ connectionString: databaseUrl });

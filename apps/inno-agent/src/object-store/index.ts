@@ -1,5 +1,5 @@
 import { FsObjectStore } from "./fs-object-store.js";
-import { MemoryObjectStore, type ObjectStore } from "./object-store.js";
+import type { ObjectStore } from "./object-store.js";
 import { S3ObjectStore, type S3ObjectStoreConfig } from "./s3-object-store.js";
 
 export * from "./object-store.js";
@@ -11,8 +11,8 @@ export { S3ObjectStore, type S3ObjectStoreConfig } from "./s3-object-store.js";
  * environment, never from a tenant's config.
  */
 export interface InnoObjectStorageConfig {
-	/** "memory" keeps objects in process; "fs" mirrors keys under `fsRoot` (single-host or tests); "s3" targets OSS, MinIO or S3. */
-	provider: "memory" | "fs" | "s3";
+	/** "fs" mirrors keys under `fsRoot` (single-host or tests); "s3" targets OSS, MinIO or S3. The server refuses to boot without one configured. */
+	provider: "fs" | "s3";
 	fsRoot?: string;
 	bucket?: string;
 	endpoint?: string;
@@ -34,9 +34,14 @@ export function normalizeObjectStorageConfig(raw: RawObjectStorageConfig | undef
 	const accessKeyId = text(raw?.accessKeyId, env.INNO_OBJECT_STORAGE_ACCESS_KEY_ID);
 	const secretAccessKey = text(raw?.secretAccessKey, env.INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY);
 	const rawProvider = raw?.provider ?? text(env.INNO_OBJECT_STORAGE_PROVIDER);
-	const provider = rawProvider === "s3" || rawProvider === "fs" || rawProvider === "memory"
-		? rawProvider
-		: (bucket && accessKeyId) ? "s3" : "memory";
+	if (rawProvider && rawProvider !== "s3" && rawProvider !== "fs") {
+		throw new Error(`INNO_OBJECT_STORAGE_PROVIDER must be "fs" or "s3", got "${rawProvider}"`);
+	}
+	const provider: InnoObjectStorageConfig["provider"] | undefined =
+		(rawProvider === "s3" || rawProvider === "fs" ? rawProvider : undefined) ?? ((bucket && accessKeyId) ? "s3" : undefined);
+	if (!provider) {
+		throw new Error("Object storage is required: set INNO_OBJECT_STORAGE_PROVIDER (fs|s3) plus INNO_OBJECT_STORAGE_DIR for fs, or bucket/credentials for s3");
+	}
 	const fsRoot = text(raw?.fsRoot, env.INNO_OBJECT_STORAGE_DIR);
 	const pathStyleEnv = env.INNO_OBJECT_STORAGE_FORCE_PATH_STYLE;
 	return {
@@ -55,17 +60,7 @@ export function normalizeObjectStorageConfig(raw: RawObjectStorageConfig | undef
 	};
 }
 
-/**
- * Whether the provider keeps bytes beyond this process. The `memory` store
- * loses objects on restart — manifests must not treat it as the source of
- * truth for reads (the local workspace dir is, with the replica as mirror).
- */
-export function isDurableObjectStorageProvider(provider: InnoObjectStorageConfig["provider"]): boolean {
-	return provider !== "memory";
-}
-
 export function createObjectStore(config: InnoObjectStorageConfig): ObjectStore {
-	if (config.provider === "memory") return new MemoryObjectStore();
 	if (config.provider === "fs") {
 		if (!config.fsRoot) throw new Error("Filesystem object storage needs INNO_OBJECT_STORAGE_DIR");
 		return new FsObjectStore(config.fsRoot);

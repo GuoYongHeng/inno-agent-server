@@ -128,8 +128,8 @@ class GatedLocalBackend implements SandboxBackend {
  * authenticated mode `beforeTurn` pulls replica changes (so writes made
  * through the object store or on another worker appear before the turn) and
  * `pullToHost`/`release` push local changes back — after every settled
- * submission and on close. Without a replica (local or in-memory object
- * storage) the directory is the only copy, as before.
+ * submission and on close. Without a replica the directory is the only
+ * copy, as before.
  */
 export class LocalExecManager implements SandboxBindingProvider {
 	private active = 0;

@@ -22,7 +22,6 @@ export interface ChatRouteContext {
 	tenantStore: TenantStore;
 	durableSessions: DurableHttpContext["service"];
 	workspaceReplica?: DurableHttpContext["workspaceReplica"];
-	objectStorageDurable?: boolean;
 }
 
 /** /api/chat* route domain. Returns true when the request was handled. */
@@ -37,7 +36,6 @@ export async function handleChatRoutes(
 	const durableContext: DurableHttpContext = {
 		service: durableSessions, workspaceRegistry, tenantStore,
 		workspaceReplica: ctx.workspaceReplica ?? null,
-		objectStorageDurable: ctx.objectStorageDurable,
 	};
 
 	const ownsSession = (sessionId: string) => ownsRequestResource(req, tenantStore, "session", sessionId);

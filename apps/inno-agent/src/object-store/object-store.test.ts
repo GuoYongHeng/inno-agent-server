@@ -70,9 +70,9 @@ describe("MemoryObjectStore", () => {
 });
 
 describe("normalizeObjectStorageConfig", () => {
-	it("defaults to the in-memory store", () => {
-		expect(normalizeObjectStorageConfig(undefined, {}).provider).toBe("memory");
-		expect(createObjectStore(normalizeObjectStorageConfig(undefined, {}))).toBeInstanceOf(MemoryObjectStore);
+	it("requires an explicit fs or s3 provider — there is no in-memory mode", () => {
+		expect(() => normalizeObjectStorageConfig(undefined, {})).toThrow(/Object storage is required/);
+		expect(() => normalizeObjectStorageConfig({ provider: "memory" as never }, {})).toThrow(/fs.*s3|s3.*fs/);
 	});
 
 	it("reads MinIO settings from the environment with path-style addressing", () => {

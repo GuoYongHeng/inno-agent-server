@@ -17,7 +17,7 @@ const paths = resolveRuntimePaths();
 const graceMinutes = Number(value("--grace-minutes") ?? 60);
 
 let sandboxSettings;
-try { sandboxSettings = loadConfig(paths.configPath).sandbox; } catch { sandboxSettings = undefined; }
+try { sandboxSettings = loadConfig(paths.configPath, { allowEmptyProviders: true }).sandbox; } catch { sandboxSettings = undefined; }
 const sandbox = normalizeSandboxConfig(sandboxSettings);
 if (!sandbox.apiKey) {
 	console.error("No sandbox API key: set sandbox.apiKey in config.json or E2B_API_KEY");

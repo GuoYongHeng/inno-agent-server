@@ -46,7 +46,7 @@ async function main(): Promise<void> {
 
 	const paths = resolveRuntimePaths();
 	const config = existsSync(paths.configPath)
-		? loadConfig(paths.configPath)
+		? loadConfig(paths.configPath, { allowEmptyProviders: true })
 		: undefined;
 	const objects = createObjectStore(normalizeObjectStorageConfig(config?.objectStorage));
 	const pool = new Pool({ connectionString: databaseUrl });

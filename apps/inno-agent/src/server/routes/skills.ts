@@ -4,6 +4,7 @@ import { existsSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, 
 import { basename, extname, join, relative } from "node:path";
 import { logger } from "../../logger.js";
 import type { SkillLibraryItem } from "../../content-source/types.js";
+import type { SkillManifestFile } from "../../skills/skill-object-key.js";
 import { isWithin } from "../../utils/path-safety.js";
 import {
 	canonicalTreeRoot,
@@ -45,6 +46,18 @@ export interface SkillsCatalogContext {
 	setEnabled: (skillId: string, enabled: boolean) => Promise<CatalogSkillListing | null>;
 	/** Enable a published catalog skill; returns null when not in catalog. */
 	enableIfPublished: (skillId: string) => Promise<CatalogSkillListing | null>;
+	/** Upload .zip/.md → publish bodies to object storage + catalog, enable for the tenant. */
+	installPackage: (fileName: string, data: Buffer) => Promise<CatalogSkillListing>;
+	/** Content-hub import → publish when missing, enable for the tenant. Throws on failure. */
+	importFromLibrary: (name: string) => Promise<CatalogSkillListing>;
+	/** Catalog record + manifest file list; null when the skill is not published. */
+	describe: (skillId: string) => Promise<{ entry: CatalogSkillListing; files: SkillManifestFile[] } | null>;
+	/** Bytes of one packaged file; null when the skill or file is missing. */
+	readFile: (skillId: string, relPath: string) => Promise<Uint8Array | null>;
+	/** Overwrite one packaged file and republish; null when the skill is missing. */
+	writeFile: (skillId: string, relPath: string, content: string) => Promise<CatalogSkillListing | null>;
+	/** Unpublish: drop the catalog row (tenant_skills cascade) and the object bodies. */
+	delete: (skillId: string) => Promise<boolean>;
 }
 
 export interface SkillsRouteContext {
@@ -55,18 +68,49 @@ export interface SkillsRouteContext {
 	catalog?: SkillsCatalogContext;
 	scheduleSkillsReload: () => void;
 	listProjectSkills: () => unknown[];
-	setSkillEnabled: (name: string, enabled: boolean) => void;
+	setSkillEnabled: (name: string, enabled: boolean) => Promise<void>;
 	installSkillZip: (fileName: string, data: Buffer) => { name: string; filePath: string };
 	installSkillMarkdown: (fileName: string, data: Buffer) => { name: string; filePath: string };
 	listSkillLibrary: (forceRefresh?: boolean) => Promise<SkillLibraryItem[]>;
 	importSkillFromLibrary: (name: string) => Promise<{ name: string; filePath: string }>;
 }
 
-function isCatalogEnablePath(method: string, url: string): boolean {
-	if (method === "POST" && (url.endsWith("/enable") || url.endsWith("/disable"))) return true;
-	if (method === "POST" && url === "/api/skill-library/import") return true;
-	if (method === "PATCH" && /^\/api\/skills\/[^/]+$/.test(url.split("?")[0] ?? url)) return true;
-	return false;
+/** Build the UI tree shape from a published skill's flat manifest file list. */
+function manifestToTree(files: SkillManifestFile[], updatedAt: string): WorkspaceTreeNode[] {
+	interface MutableDir {
+		node: WorkspaceTreeNode;
+		dirs: Map<string, MutableDir>;
+	}
+	const root: MutableDir = { node: { name: "", path: "", type: "directory", size: 0, updatedAt, children: [] }, dirs: new Map() };
+	for (const file of files) {
+		const parts = file.relPath.split("/").filter(Boolean);
+		if (parts.length === 0) continue;
+		let dir = root;
+		for (const part of parts.slice(0, -1)) {
+			let next = dir.dirs.get(part);
+			if (!next) {
+				const path = dir.node.path ? `${dir.node.path}/${part}` : part;
+				next = { node: { name: part, path, type: "directory", size: 0, updatedAt, children: [] }, dirs: new Map() };
+				dir.dirs.set(part, next);
+				dir.node.children!.push(next.node);
+			}
+			dir = next;
+		}
+		const name = parts[parts.length - 1]!;
+		dir.node.children!.push({
+			name,
+			path: dir.node.path ? `${dir.node.path}/${name}` : name,
+			type: "file",
+			size: file.size,
+			updatedAt,
+		});
+	}
+	const sortLevel = (nodes: WorkspaceTreeNode[]): void => {
+		nodes.sort((a, b) => Number(b.type === "directory") - Number(a.type === "directory") || a.name.localeCompare(b.name, "zh-CN"));
+		for (const node of nodes) if (node.children) sortLevel(node.children);
+	};
+	sortLevel(root.node.children ?? []);
+	return root.node.children ?? [];
 }
 
 /**
@@ -83,10 +127,10 @@ export async function handleSkillsRoutes(
 ): Promise<boolean> {
 	const { skillsDir } = ctx;
 
-	// Authenticated mode: tenants may enable/disable published catalog skills
-	// but cannot mutate shared skill bodies (upload/edit/delete stay 409).
-	// Workspace-private .skills remain available through owned workspace routes.
-	if (ctx.sharedSkillsReadOnly && method !== "GET" && !(ctx.catalog && isCatalogEnablePath(method, url))) {
+	// With a platform catalog every mutation below goes through object storage
+	// + skill_catalog — no shared local directory is touched. The read-only
+	// guard only matters when the catalog is absent (legacy local mode).
+	if (ctx.sharedSkillsReadOnly && !ctx.catalog && method !== "GET") {
 		json(res, 409, { error: "Shared skill management is read-only in authenticated mode" });
 		return true;
 	}
@@ -136,11 +180,20 @@ export async function handleSkillsRoutes(
 			return true;
 		}
 		const data = Buffer.from(dataBase64, "base64");
+		if (ctx.catalog) {
+			try {
+				const entry = await ctx.catalog.installPackage(fileName, data);
+				json(res, 201, entry);
+			} catch (err) {
+				json(res, 400, { error: err instanceof Error ? err.message : "Failed to install skill package" });
+			}
+			return true;
+		}
 		const ext = extname(fileName).toLowerCase();
 		const skill = ext === ".zip"
 			? ctx.installSkillZip(fileName, data)
 			: ctx.installSkillMarkdown(fileName, data);
-		ctx.setSkillEnabled(skill.name, true);
+		await ctx.setSkillEnabled(skill.name, true);
 		const installed = ctx.listProjectSkills().find((entry) => (entry as { name: string }).name === skill.name);
 		json(res, 201, installed ?? { name: skill.name });
 		ctx.scheduleSkillsReload();
@@ -149,7 +202,7 @@ export async function handleSkillsRoutes(
 
 	if (method === "POST" && url === "/api/skills/reload") {
 		ctx.scheduleSkillsReload();
-		json(res, 200, { reloaded: true, skills: ctx.listProjectSkills() });
+		json(res, 200, { reloaded: true, skills: ctx.catalog ? await ctx.catalog.listForTenant() : ctx.listProjectSkills() });
 		return true;
 	}
 
@@ -173,17 +226,19 @@ export async function handleSkillsRoutes(
 			return true;
 		}
 		if (ctx.catalog) {
-			const entry = await ctx.catalog.enableIfPublished(slugifySkillName(skillName));
-			if (!entry) {
-				json(res, 404, { error: "Skill is not published in the platform catalog" });
-				return true;
+			try {
+				const entry = await ctx.catalog.enableIfPublished(slugifySkillName(skillName))
+					?? await ctx.catalog.importFromLibrary(skillName);
+				json(res, 201, entry);
+			} catch (err) {
+				logger.warn({ err }, "failed to import skill from library");
+				json(res, 502, { error: err instanceof Error ? err.message : "Failed to import skill" });
 			}
-			json(res, 201, entry);
 			return true;
 		}
 		try {
 			const installed = await ctx.importSkillFromLibrary(skillName);
-			ctx.setSkillEnabled(installed.name, true);
+			await ctx.setSkillEnabled(installed.name, true);
 			const entry = ctx.listProjectSkills().find((s) => (s as { name: string }).name === installed.name);
 			json(res, 201, entry ?? { name: installed.name });
 			ctx.scheduleSkillsReload();
@@ -217,7 +272,7 @@ export async function handleSkillsRoutes(
 			return true;
 		}
 		if (typeof body.enabled === "boolean") {
-			ctx.setSkillEnabled(name, body.enabled);
+			await ctx.setSkillEnabled(name, body.enabled);
 		}
 		ctx.scheduleSkillsReload();
 		json(res, 200, ctx.listProjectSkills().find((entry) => (entry as { name: string }).name === name));
@@ -227,13 +282,25 @@ export async function handleSkillsRoutes(
 	const skillDeleteMatch = matchRoute("DELETE", method, url, "/api/skills/:name");
 	if (skillDeleteMatch) {
 		const name = slugifySkillName(decodeURIComponent(skillDeleteMatch.name));
+		if (ctx.catalog) {
+			try {
+				if (!(await ctx.catalog.delete(name))) {
+					json(res, 404, { error: "Skill not found" });
+					return true;
+				}
+				json(res, 204, null);
+			} catch (err) {
+				json(res, (err as { statusCode?: number }).statusCode ?? 500, { error: err instanceof Error ? err.message : "Failed to delete skill" });
+			}
+			return true;
+		}
 		const skillDir = join(skillsDir, name);
 		if (!existsSync(skillDir)) {
 			json(res, 404, { error: "Skill not found" });
 			return true;
 		}
 		rmSync(skillDir, { recursive: true, force: true });
-		ctx.setSkillEnabled(name, true);
+		await ctx.setSkillEnabled(name, true);
 		ctx.scheduleSkillsReload();
 		json(res, 204, null);
 		return true;
@@ -243,6 +310,12 @@ export async function handleSkillsRoutes(
 	const skillContentGetMatch = matchRoute("GET", method, url, "/api/skills/:name/content");
 	if (skillContentGetMatch) {
 		const name = slugifySkillName(decodeURIComponent(skillContentGetMatch.name));
+		if (ctx.catalog) {
+			const body = await ctx.catalog.readFile(name, "SKILL.md");
+			if (!body) { json(res, 404, { error: "Skill not found" }); return true; }
+			json(res, 200, { name, content: new TextDecoder().decode(body) });
+			return true;
+		}
 		const filePath = join(skillsDir, name, "SKILL.md");
 		if (!existsSync(filePath)) { json(res, 404, { error: "Skill not found" }); return true; }
 		json(res, 200, { name, content: readFileSync(filePath, "utf-8") });
@@ -253,10 +326,20 @@ export async function handleSkillsRoutes(
 	const skillContentPutMatch = matchRoute("PUT", method, url, "/api/skills/:name/content");
 	if (skillContentPutMatch) {
 		const name = slugifySkillName(decodeURIComponent(skillContentPutMatch.name));
-		const filePath = join(skillsDir, name, "SKILL.md");
-		if (!existsSync(filePath)) { json(res, 404, { error: "Skill not found" }); return true; }
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const content = typeof body.content === "string" ? body.content : "";
+		if (ctx.catalog) {
+			try {
+				const entry = await ctx.catalog.writeFile(name, "SKILL.md", content);
+				if (!entry) { json(res, 404, { error: "Skill not found" }); return true; }
+				json(res, 200, { name, saved: true });
+			} catch (err) {
+				json(res, (err as { statusCode?: number }).statusCode ?? 500, { error: err instanceof Error ? err.message : "Failed to save skill" });
+			}
+			return true;
+		}
+		const filePath = join(skillsDir, name, "SKILL.md");
+		if (!existsSync(filePath)) { json(res, 404, { error: "Skill not found" }); return true; }
 		writeFileSync(filePath, content, "utf-8");
 		ctx.scheduleSkillsReload();
 		json(res, 200, { name, saved: true });
@@ -267,6 +350,19 @@ export async function handleSkillsRoutes(
 	const skillTreeMatch = matchRoute("GET", method, url, "/api/skills/:name/tree");
 	if (skillTreeMatch) {
 		const name = slugifySkillName(decodeURIComponent(skillTreeMatch.name));
+		if (ctx.catalog) {
+			const described = await ctx.catalog.describe(name);
+			if (!described) { json(res, 404, { error: "Skill not found" }); return true; }
+			json(res, 200, {
+				name,
+				path: "",
+				type: "directory",
+				size: described.files.reduce((sum, f) => sum + f.size, 0),
+				updatedAt: described.entry.publishedAt,
+				children: manifestToTree(described.files, described.entry.publishedAt),
+			});
+			return true;
+		}
 		const skillDir = join(skillsDir, name);
 		if (!existsSync(skillDir) || !statSync(skillDir).isDirectory()) {
 			json(res, 404, { error: "Skill not found" });
@@ -333,6 +429,40 @@ export async function handleSkillsRoutes(
 	const skillFileGetMatch = matchRoute("GET", method, url.split("?")[0], "/api/skills/:name/file");
 	if (skillFileGetMatch && method === "GET") {
 		const name = slugifySkillName(decodeURIComponent(skillFileGetMatch.name));
+		if (ctx.catalog) {
+			const params = new URL(url, "http://localhost").searchParams;
+			const relPath = (params.get("path") ?? "").replace(/^\/+/, "");
+			const described = await ctx.catalog.describe(name);
+			const meta = described?.files.find((f) => f.relPath === relPath);
+			if (!described || !meta) { json(res, 404, { error: "File not found" }); return true; }
+			const kind = workspaceFileKind(relPath);
+			const forceText = params.get("forceText") === "1";
+			if (!forceText && (kind === "binary" || kind === "pdf" || kind === "image")) {
+				json(res, 200, {
+					path: relPath,
+					name: basename(relPath),
+					kind,
+					mimeType: contentTypeForWorkspaceFile(relPath),
+					size: meta.size,
+					updatedAt: described.entry.publishedAt,
+					url: `/api/skills/${encodeURIComponent(name)}/raw?path=${encodeURIComponent(relPath)}`,
+				});
+				return true;
+			}
+			const body = await ctx.catalog.readFile(name, relPath);
+			if (!body) { json(res, 404, { error: "File not found" }); return true; }
+			if (body.byteLength > 1024 * 1024) { json(res, 413, { error: "File too large" }); return true; }
+			json(res, 200, {
+				path: relPath,
+				name: basename(relPath),
+				kind: forceText ? "text" : kind,
+				mimeType: forceText ? "text/plain; charset=utf-8" : contentTypeForWorkspaceFile(relPath),
+				size: body.byteLength,
+				updatedAt: described.entry.publishedAt,
+				content: new TextDecoder().decode(body),
+			});
+			return true;
+		}
 		const skillDir = join(skillsDir, name);
 		if (!existsSync(skillDir)) { json(res, 404, { error: "Skill not found" }); return true; }
 		const params = new URL(url, "http://localhost").searchParams;
@@ -374,12 +504,25 @@ export async function handleSkillsRoutes(
 	const skillFilePutMatch = matchRoute("PUT", method, url, "/api/skills/:name/file");
 	if (skillFilePutMatch) {
 		const name = slugifySkillName(decodeURIComponent(skillFilePutMatch.name));
-		const skillDir = join(skillsDir, name);
-		if (!existsSync(skillDir)) { json(res, 404, { error: "Skill not found" }); return true; }
 		const body = (await readBody(req)) as Record<string, unknown>;
-		const relPath = typeof body.path === "string" ? body.path.trim() : "";
+		const relPath = typeof body.path === "string" ? body.path.trim().replace(/^\/+/, "") : "";
 		const content = typeof body.content === "string" ? body.content : "";
 		if (!relPath) { json(res, 400, { error: "Missing path" }); return true; }
+		if (ctx.catalog) {
+			const described = await ctx.catalog.describe(name);
+			const meta = described?.files.find((f) => f.relPath === relPath);
+			if (!described || !meta) { json(res, 404, { error: "File not found" }); return true; }
+			try {
+				const entry = await ctx.catalog.writeFile(name, relPath, content);
+				if (!entry) { json(res, 404, { error: "Skill not found" }); return true; }
+				json(res, 200, { path: relPath, saved: true, size: Buffer.byteLength(content), updatedAt: entry.publishedAt });
+			} catch (err) {
+				json(res, (err as { statusCode?: number }).statusCode ?? 500, { error: err instanceof Error ? err.message : "Failed to save skill" });
+			}
+			return true;
+		}
+		const skillDir = join(skillsDir, name);
+		if (!existsSync(skillDir)) { json(res, 404, { error: "Skill not found" }); return true; }
 		const fullPath = safeJoinReal(skillDir, relPath.replace(/^\/+/, ""));
 		if (!fullPath || !existsSync(fullPath) || !statSync(fullPath).isFile()) {
 			json(res, 404, { error: "File not found" });
@@ -396,6 +539,15 @@ export async function handleSkillsRoutes(
 	const skillRawMatch = matchRoute("GET", method, url.split("?")[0], "/api/skills/:name/raw");
 	if (skillRawMatch) {
 		const name = slugifySkillName(decodeURIComponent(skillRawMatch.name));
+		if (ctx.catalog) {
+			const params = new URL(url, "http://localhost").searchParams;
+			const relPath = (params.get("path") ?? "").replace(/^\/+/, "");
+			const body = await ctx.catalog.readFile(name, relPath);
+			if (!body) { json(res, 404, { error: "File not found" }); return true; }
+			res.writeHead(200, { "Content-Type": contentTypeForWorkspaceFile(relPath), "Cache-Control": "no-cache" });
+			res.end(Buffer.from(body));
+			return true;
+		}
 		const skillDir = join(skillsDir, name);
 		if (!existsSync(skillDir)) { json(res, 404, { error: "Skill not found" }); return true; }
 		const params = new URL(url, "http://localhost").searchParams;

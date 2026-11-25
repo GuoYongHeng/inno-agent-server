@@ -6,9 +6,10 @@ import type { ObjectStore } from "../object-store/object-store.js";
 import { sha256Hex } from "../object-store/object-store.js";
 import type { SkillCatalogStore } from "./catalog-store.js";
 import {
-	skillFileObjectKey,
-	skillManifestObjectKey,
+	skillFileKey,
+	skillManifestKey,
 	skillVersionObjectPrefix,
+	tenantSkillVersionObjectPrefix,
 	type SkillManifest,
 } from "./skill-object-key.js";
 
@@ -48,6 +49,12 @@ export interface PublishSkillOptions {
 	skillDir: string;
 	source?: string;
 	publishedBy?: string;
+	/**
+	 * Owning tenant for tenant-published uploads: bodies go under
+	 * tenants/<id>/skills/ and the catalog row is only visible to the owner.
+	 * Omit for platform-shared (image seed / operator publish).
+	 */
+	ownerTenantId?: string;
 }
 
 export interface PublishSkillResult {
@@ -98,10 +105,12 @@ export async function publishSkillFromDir(options: PublishSkillOptions): Promise
 		versionHash.update("\n");
 	}
 	const version = versionHash.digest("hex").slice(0, 16);
-	const objectPrefix = skillVersionObjectPrefix(skillId, version);
+	const objectPrefix = options.ownerTenantId
+		? tenantSkillVersionObjectPrefix(options.ownerTenantId, skillId, version)
+		: skillVersionObjectPrefix(skillId, version);
 	const existing = await options.catalog.get(skillId);
 	if (existing?.version === version && existing.objectPrefix === objectPrefix) {
-		const manifestKey = skillManifestObjectKey(skillId, version);
+		const manifestKey = skillManifestKey({ objectPrefix });
 		if (await options.objects.head(manifestKey)) {
 			return {
 				skillId,
@@ -124,11 +133,11 @@ export async function publishSkillFromDir(options: PublishSkillOptions): Promise
 	};
 
 	for (const entry of entries) {
-		const key = skillFileObjectKey(skillId, version, entry.relPath);
+		const key = skillFileKey({ objectPrefix }, entry.relPath);
 		await options.objects.put(key, entry.body);
 	}
 	await options.objects.put(
-		skillManifestObjectKey(skillId, version),
+		skillManifestKey({ objectPrefix }),
 		new TextEncoder().encode(JSON.stringify(manifest, null, 2)),
 		{ contentType: "application/json" },
 	);
@@ -142,6 +151,7 @@ export async function publishSkillFromDir(options: PublishSkillOptions): Promise
 		disableModelInvocation,
 		publishedBy: options.publishedBy ?? null,
 		source: options.source ?? "publish",
+		...(options.ownerTenantId ? { ownerTenantId: options.ownerTenantId } : {}),
 	});
 
 	return {

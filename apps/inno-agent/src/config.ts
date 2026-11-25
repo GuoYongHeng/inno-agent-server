@@ -588,6 +588,11 @@ export function loadConfig(
 	}
 }
 
+/**
+ * Write a normalized config.json. Only used by tooling/tests today: the
+ * server keeps mutable platform settings in `platform_config` and never
+ * writes this file at runtime.
+ */
 export function saveConfig(
 	configPathOrDir: string,
 	config: InnoConfig,
@@ -598,8 +603,8 @@ export function saveConfig(
 		: join(configPathOrDir, "config.json");
 	const normalized = normalizeConfig(config, options);
 	// Atomic write (tmp + rename): a crash mid-write must not leave a truncated
-	// config.json — the server hot-rewrites this file on every model switch.
-	// 0o600: the file carries plaintext provider API keys and the bridge token.
+	// config.json. 0o600: the file can carry plaintext provider API keys and
+	// the bridge token when used as a seed.
 	writeJson(configPath, normalized, { mode: 0o600 });
 	return normalized;
 }
