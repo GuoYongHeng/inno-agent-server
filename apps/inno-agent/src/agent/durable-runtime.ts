@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, realpath } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
@@ -7,7 +8,9 @@ import {
 	AssistantEntry,
 	createRegistry,
 	defineExtension,
+	GenerationTask,
 	Harness,
+	hook,
 	watchEvents,
 	type AgentEvent,
 	type AgentEventStream,
@@ -28,6 +31,8 @@ import { createBashTool, createEditTool, createReadTool, createWriteTool } from 
 import { SandboxExecutionEnv } from "../sandbox/sandbox-env.js";
 import type { SandboxRuntimeBinding } from "../sandbox/sandbox-session.js";
 import { logger } from "../logger.js";
+import { expandNativeImageMarkers } from "../server/inline-images.js";
+import { resolveContainedPath } from "../utils/path-safety.js";
 import { WorkspaceFileEnv } from "./durable-env.js";
 import { createDurableChannelRegistrations, resolveChannelOutbox, type DurableChannelToolOptions } from "./durable-channels.js";
 import { createDurableMemoryRegistrations, type DurableMemoryToolOptions } from "./durable-memory.js";
@@ -50,6 +55,7 @@ const MEMORY_EXTENSION_NAME = "inno.memory";
 const EXTRA_EXTENSION_NAME = "inno.extra";
 const CHANNEL_EXTENSION_NAME = "inno.channels";
 const QUESTION_EXTENSION_NAME = "inno.questions";
+const NATIVE_IMAGE_EXTENSION_NAME = "inno.native-images";
 export const DURABLE_RECOVERY_RECORD_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** Durable SQLite is single-owner. This guard covers accidental double-open in
@@ -182,6 +188,7 @@ function createSessionRegistry(
 	permissions?: DurablePermissionStore,
 	extraTools: ToolRegistration[] = [],
 	sandbox?: SandboxRuntimeBinding,
+	images?: { workspaceDir: string; materialize?: (relPath: string) => Promise<boolean> },
 ): Registry {
 	const registry = createRegistry();
 	if (workspaceTools) {
@@ -212,6 +219,23 @@ function createSessionRegistry(
 		registry.install(defineExtension({
 			name: EXTRA_EXTENSION_NAME,
 			tools: pullBeforeHostPathTools(extraTools, sandbox),
+		}));
+	}
+	if (images) {
+		const { workspaceDir, materialize } = images;
+		registry.install(defineExtension({
+			name: NATIVE_IMAGE_EXTENSION_NAME,
+			hooks: [hook(GenerationTask, {
+				async beforeRequest(request) {
+					const expanded = await expandNativeImageMarkers(request.messages, async (relPath) => {
+						if (materialize) await materialize(relPath).catch(() => false);
+						const abs = resolveContainedPath(workspaceDir, relPath);
+						if (!abs || !existsSync(abs)) return undefined;
+						return readFileSync(abs).toString("base64");
+					});
+					return expanded ? { messages: expanded } : undefined;
+				},
+			})],
 		}));
 	}
 	return registry;
@@ -249,7 +273,18 @@ export class DurableSessionRuntime {
 			const questionTools = options.questions
 				? await createDurableQuestionRegistrations(options.questions)
 				: [];
-			const registry = options.registry ?? createSessionRegistry(workspaceTools, options.memory, options.channels, questionTools, options.permissions, options.extraTools, options.sandbox);
+			const registry = options.registry ?? createSessionRegistry(
+				workspaceTools,
+				options.memory,
+				options.channels,
+				questionTools,
+				options.permissions,
+				options.extraTools,
+				options.sandbox,
+				options.workspaceDir
+					? { workspaceDir: options.workspaceDir, ...(options.workspaceMaterialize ? { materialize: options.workspaceMaterialize } : {}) }
+					: undefined,
+			);
 			const memoryTools = options.memory ? createDurableMemoryRegistrations(options.memory) : [];
 			const channelTools = options.channels ? createDurableChannelRegistrations(options.channels) : [];
 			const tools = pullBeforeHostPathTools(

@@ -60,7 +60,9 @@ import {
 	isLargeTextPaste,
 	localPendingUpload,
 	pendingUploadId,
+	chatImageObjectPath,
 	prepareInlineImage,
+	toChatImageRef,
 	resizeComposerTextarea,
 	workspacePendingUpload,
 	type PendingPasteBlock,
@@ -1075,7 +1077,20 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 					else await workspaceStore.loadTree();
 				}
 
-				const imagesToSend = pendingImages.length > 0 ? pendingImages.map(({ data, mimeType }) => ({ data, mimeType })) : undefined;
+				const uploadedImages = [];
+				for (const image of pendingImages) {
+					try {
+						const node = await uploadWorkspaceFileWithProgress(
+							chatImageObjectPath(image.mimeType),
+							image.file,
+							targetWorkspaceId,
+						);
+						uploadedImages.push(toChatImageRef(node.path, image));
+					} catch {
+						failedNames.push(image.name);
+					}
+				}
+				const imagesToSend = uploadedImages.length > 0 ? uploadedImages : undefined;
 				const bindings = engine && outgoing
 					? engine.finalizeBindings(outgoing.readyBindings, uploadedForBindings)
 					: [];
@@ -1087,12 +1102,13 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 					),
 				);
 				const messageContent = input || (
-					pendingImages.length > 0
+					uploadedImages.length > 0
 						? t("chat.describeImage")
 						: hasAttachments
 							? t("chat.describeAttachment")
 							: ""
 				);
+				if (!messageContent) return;
 
 				const editTarget = editTargetRef.current;
 				if (editTarget && editTarget.sessionId === targetSessionId) {
@@ -1312,9 +1328,9 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	}, []);
 
 	const addImageFiles = useCallback((files: File[]) => {
-		filterUploadFiles(files).forEach((file) => {
-			void prepareInlineImage(file).then((prepared) => setInlineImages((prev) => [...prev, prepared]));
-		});
+		const accepted = filterUploadFiles(files);
+		if (accepted.length === 0) return;
+		setInlineImages((prev) => [...prev, ...accepted.map((file) => prepareInlineImage(file))]);
 	}, [filterUploadFiles]);
 
 	const addLocalFiles = useCallback((files: File[]) => {
@@ -1388,7 +1404,11 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 		event.target.value = "";
 	}, [addImageFiles]);
 	const removeInlineImage = useCallback((index: number) => {
-		setInlineImages((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
+		setInlineImages((prev) => {
+			const removed = prev[index];
+			if (removed?.previewUrl.startsWith("blob:")) URL.revokeObjectURL(removed.previewUrl);
+			return prev.filter((_, currentIndex) => currentIndex !== index);
+		});
 	}, []);
 
 	const handleFiles = useCallback((event: ChangeEvent<HTMLInputElement>) => {

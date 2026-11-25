@@ -22,7 +22,7 @@ npm run build    # 编译 backend + 前端，约 10s
 ## 3. 配置 API key
 
 ```bash
-mkdir -p runtime/config runtime/data runtime/skills workspace
+mkdir -p runtime/config runtime/skills workspace
 cp config.example.json runtime/config/config.json
 ```
 

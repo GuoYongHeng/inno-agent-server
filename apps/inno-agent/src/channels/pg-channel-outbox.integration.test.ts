@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Pool } from "pg";
@@ -6,9 +6,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { migrateAuthDatabase } from "../auth/migration.js";
 import { readAuthRuntimeConfig } from "../auth/config.js";
 import { startTemporaryPostgres, type TemporaryPostgres } from "../db/test-postgres.js";
+import { MemoryObjectStore, tenantObjectKey } from "../object-store/object-store.js";
 import { TenantStore } from "../tenants/store.js";
 import { type ChannelOutboxRecord } from "./channel-outbox.js";
-import { MAX_OUTBOX_PAYLOAD_BYTES, PgChannelOutbox } from "./pg-channel-outbox.js";
+import { MAX_OUTBOX_PAYLOAD_BYTES, PgChannelOutbox, outboxObjectKey } from "./pg-channel-outbox.js";
 
 let postgres: TemporaryPostgres;
 let pool: Pool;
@@ -58,50 +59,62 @@ afterAll(async () => {
 });
 
 describe("PgChannelOutbox", () => {
-	it("snapshots a file so another worker can resume the send after the original changes", async () => {
+	it("snapshots a file in object storage so another worker can resume after the original changes", async () => {
 		const dir = workdir();
 		const source = join(dir, "课件.pdf");
 		const bytes = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x00, 0xff, 0x10, 0x80]);
 		writeFileSync(source, bytes);
-		const sender = new PgChannelOutbox(pool, a);
+		const objects = new MemoryObjectStore();
+		const sender = new PgChannelOutbox(pool, a, objects);
 		const intent = record(sessionA, "call-1", { fileName: "课件.pdf" });
 		const first = await sender.prepare(intent, source);
-		expect(readFileSync(first.path).equals(bytes)).toBe(true);
-		first.cleanup();
-		expect(existsSync(first.path)).toBe(false);
+		expect(Buffer.from(first.bytes!).equals(bytes)).toBe(true);
+		expect(first.path).toBeUndefined();
+		const key = outboxObjectKey(a, intent.operationId);
+		expect(key.startsWith(`${tenantObjectKey(a, "outbox", sessionA)}/`)).toBe(true);
+		expect(Buffer.from((await objects.get(key))!).equals(bytes)).toBe(true);
+		expect((await pool.query("SELECT COUNT(*)::int AS n FROM recovery_blobs")).rows[0].n).toBe(0);
 
 		writeFileSync(source, "changed after the intent was committed");
-		const otherWorker = new PgChannelOutbox(pool, a);
+		const otherWorker = new PgChannelOutbox(pool, a, objects);
 		const loaded = await otherWorker.load(intent.operationId);
 		expect(loaded).toEqual(intent);
 		const resumed = await otherWorker.payload(loaded!);
-		expect(readFileSync(resumed!.path).equals(bytes)).toBe(true);
-		expect(resumed!.path.endsWith("课件.pdf")).toBe(true);
-		resumed!.cleanup();
+		expect(Buffer.from(resumed!.bytes!).equals(bytes)).toBe(true);
 	});
 
 	it("records completion so a replay returns it without a payload", async () => {
 		const dir = workdir();
 		const source = join(dir, "a.txt");
 		writeFileSync(source, "x");
-		const outbox = new PgChannelOutbox(pool, a);
+		const objects = new MemoryObjectStore();
+		const outbox = new PgChannelOutbox(pool, a, objects);
 		const intent = record(sessionA, "call-done");
 		(await outbox.prepare(intent, source)).cleanup();
 		await outbox.complete(intent, { text: "sent", details: { ok: true } });
-		expect((await new PgChannelOutbox(pool, a).load(intent.operationId))?.completion).toEqual({ text: "sent", details: { ok: true } });
+		expect((await new PgChannelOutbox(pool, a, objects).load(intent.operationId))?.completion).toEqual({ text: "sent", details: { ok: true } });
 	});
 
 	it("never shows one tenant's outbox to another", async () => {
-		const outbox = new PgChannelOutbox(pool, a);
-		expect(await new PgChannelOutbox(pool, b).load(record(sessionA, "call-1").operationId)).toBeUndefined();
-		expect(await outbox.load(record(sessionA, "call-1").operationId)).toBeDefined();
+		const objects = new MemoryObjectStore();
+		const outbox = new PgChannelOutbox(pool, a, objects);
+		const intent = record(sessionA, "call-tenant");
+		const dir = workdir();
+		const source = join(dir, "t.txt");
+		writeFileSync(source, "secret");
+		await outbox.prepare(intent, source);
+		expect(await new PgChannelOutbox(pool, b, objects).load(intent.operationId)).toBeUndefined();
+		expect(await outbox.load(intent.operationId)).toBeDefined();
+		expect(await objects.get(outboxObjectKey(b, intent.operationId))).toBeNull();
+		expect(await objects.get(outboxObjectKey(a, intent.operationId))).not.toBeNull();
 	});
 
-	it("prunes only this session's expired completions and their payloads", async () => {
+	it("prunes only this session's expired completions and their object payloads", async () => {
 		const dir = workdir();
 		const source = join(dir, "a.txt");
 		writeFileSync(source, "payload");
-		const outbox = new PgChannelOutbox(pool, a);
+		const objects = new MemoryObjectStore();
+		const outbox = new PgChannelOutbox(pool, a, objects);
 		const done = record(sessionA2, "prune-done");
 		const pending = record(sessionA2, "prune-pending");
 		const otherSession = record(sessionA, "prune-other");
@@ -113,6 +126,7 @@ describe("PgChannelOutbox", () => {
 		expect(await outbox.pruneCompletedForIdleSession(sessionA2, Date.now() + 1_000)).toBe(1);
 		expect(await outbox.load(done.operationId)).toBeUndefined();
 		expect(await outbox.payload(done)).toBeUndefined();
+		expect(await objects.get(outboxObjectKey(a, done.operationId))).toBeNull();
 		expect(await outbox.load(pending.operationId)).toBeDefined();
 		expect(await outbox.payload(pending)).toBeDefined();
 		expect(await outbox.load(otherSession.operationId)).toBeDefined();
@@ -120,21 +134,24 @@ describe("PgChannelOutbox", () => {
 		expect(await outbox.deleteSession(sessionA2)).toBe(1);
 		expect(await outbox.load(pending.operationId)).toBeUndefined();
 		expect(await outbox.payload(pending)).toBeUndefined();
+		expect(await objects.get(outboxObjectKey(a, pending.operationId))).toBeNull();
 		expect((await pool.query("SELECT COUNT(*)::int AS n FROM recovery_blobs WHERE tenant_id = $1 AND session_id = $2", [a, sessionA2])).rows[0].n).toBe(0);
+		expect(await objects.get(outboxObjectKey(a, otherSession.operationId))).not.toBeNull();
 	});
 
 	it("refuses a payload over the size limit and leaves nothing behind", async () => {
 		const dir = workdir();
 		const source = join(dir, "big.bin");
 		writeFileSync(source, "");
-		// A sparse file avoids allocating the limit in the test.
 		const fd = await import("node:fs").then((fs) => fs.openSync(source, "w"));
 		(await import("node:fs")).ftruncateSync(fd, MAX_OUTBOX_PAYLOAD_BYTES + 1);
 		(await import("node:fs")).closeSync(fd);
-		const outbox = new PgChannelOutbox(pool, a);
+		const objects = new MemoryObjectStore();
+		const outbox = new PgChannelOutbox(pool, a, objects);
 		const intent = record(sessionA, "call-big");
 		await expect(outbox.prepare(intent, source)).rejects.toThrow(/outbox limit/);
 		expect(await outbox.load(intent.operationId)).toBeUndefined();
+		expect(await objects.get(outboxObjectKey(a, intent.operationId))).toBeNull();
+		expect((await pool.query("SELECT COUNT(*)::int AS n FROM recovery_blobs WHERE tenant_id = $1", [a])).rows[0].n).toBe(0);
 	});
-
 });

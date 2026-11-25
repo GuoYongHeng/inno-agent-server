@@ -1,34 +1,27 @@
 import { createServer, type Server } from "node:http";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 /**
  * Privacy tests for the LLM fetch logger (issue #162): by default, request
  * and response bodies must NOT be written to the log file — only metadata.
  * LOG_LLM_BODY=1 opts back into (truncated) body logging.
  *
- * The logger resolves its log directory lazily from INNO_DATA_DIR on each
- * write, so pointing that env var at a tmp dir captures this file's output.
+ * The logger writes to process.stdout, so this file spies on it to capture
+ * its own output.
  * installFetchLogger wraps globalThis.fetch for the whole test process, so
  * every fetch below goes through the wrapper.
  */
 
 const SECRET_MARKER = "sk-super-secret-prompt-content";
 
-let dataDir: string;
+let captured = "";
+let stdoutSpy: { mockRestore(): void };
 let server: Server;
 let baseUrl: string;
 
 function readLog(): string {
-	const logDir = join(dataDir, "log");
-	if (!existsSync(logDir)) return "";
-	return readdirSync(logDir)
-		.filter((f) => f.startsWith("server-"))
-		.map((f) => readFileSync(join(logDir, f), "utf-8"))
-		.join("");
+	return captured;
 }
 
 async function waitForLog(predicate: (log: string) => boolean): Promise<string> {
@@ -42,8 +35,13 @@ async function waitForLog(predicate: (log: string) => boolean): Promise<string> 
 }
 
 beforeAll(async () => {
-	dataDir = mkdtempSync(join(tmpdir(), "inno-fetchlog-"));
-	process.env.INNO_DATA_DIR = dataDir;
+	stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(((chunk: unknown, ...rest: unknown[]) => {
+		captured += typeof chunk === "string" ? chunk : Buffer.from(chunk as Uint8Array).toString("utf-8");
+		const cb = rest.find((arg) => typeof arg === "function") as (() => void) | undefined;
+		cb?.();
+		return true;
+	}) as typeof process.stdout.write);
+	process.env.LOG_LEVEL = "info";
 	delete process.env.LOG_LLM_BODY;
 
 	server = createServer((req, res) => {
@@ -62,7 +60,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
 	await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
-	rmSync(dataDir, { recursive: true, force: true });
+	stdoutSpy.mockRestore();
 });
 
 describe("fetch logger privacy", () => {

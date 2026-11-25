@@ -45,7 +45,7 @@ beforeAll(async () => {
 	const workspaceDir = mkdtempSync(join(tmpdir(), "inno-replica-bench-ws-"));
 	const stateDir = mkdtempSync(join(tmpdir(), "inno-replica-bench-state-"));
 	dirs.push(workspaceDir, stateDir);
-	replica = new WorkspaceReplica(new FsObjectStore(objectsDir), store, new WorkspaceRegistry(workspaceDir, stateDir), stateDir);
+	replica = new WorkspaceReplica(new FsObjectStore(objectsDir), store, new WorkspaceRegistry(workspaceDir));
 });
 
 afterAll(async () => {

@@ -1,5 +1,4 @@
 import { timingSafeEqual } from "node:crypto";
-import { join } from "node:path";
 import type { InnoConfig } from "../config.js";
 import { logger } from "../logger.js";
 import { resolveTenantConfig } from "../tenants/config.js";
@@ -22,7 +21,6 @@ export interface TenantChannelRegistration {
 
 export interface TenantChannelFactoryOptions {
 	config: InnoConfig;
-	channelsDataDir: string;
 	registry: ChannelRegistry;
 	dispatch: (channel: ChatChannel, message: IncomingMessage) => void;
 	/** PostgreSQL-backed persistence for the WeChat iLink token. */
@@ -39,7 +37,6 @@ interface TenantChannelRuntime {
 }
 
 export interface TenantChannelManagerOptions {
-	dataDir: string;
 	tenantStore: TenantStore;
 	/** Deployment config: providers, shared bridge token and channel endpoints. */
 	getLocalConfig: () => InnoConfig;
@@ -324,7 +321,6 @@ export class TenantChannelManager extends ChannelRegistry {
 		const existing = this.runtimes.get(tenant.context.tenantId);
 		if (existing) return existing;
 
-		const channelsDataDir = join(this.options.dataDir, "tenants", tenant.context.tenantId, "channels");
 		const state = this.options.createStateStore?.(tenant) ?? new TenantStateStore(tenant.store.database);
 		const targetsLedger = new TenantJsonLedger<PushTarget[]>(state, "channels.defaultTargets");
 		const dedupeLedger = new TenantJsonLedger<DedupeEntry[]>(state, "channels.dedupe");
@@ -382,7 +378,6 @@ export class TenantChannelManager extends ChannelRegistry {
 			]).then(async () => {
 				const registration = this.options.createChannels({
 					config: await resolveTenantConfig(tenant.context.tenantId, this.options.getLocalConfig(), tenant.store),
-					channelsDataDir,
 					registry,
 					dispatch,
 					wechatTokenPersistence,

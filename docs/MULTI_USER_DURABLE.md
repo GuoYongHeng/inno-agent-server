@@ -90,27 +90,23 @@ execute(params, api, context)
 - tenant-owned legacy + committed durable history 的显式和自动 L3 recall；
 - channel 文件 payload snapshot、原始目标固定、outbox completion cache；
 - workspace `read`/`write`/精确替换 `edit`，以及可恢复的 write/edit approval；
-- `ask_user_question`、BTW bring-back、结构化附件和 inline image。
+- `ask_user_question`、BTW bring-back、结构化附件。聊天图片由浏览器先上传到 `.chat-images/`，消息里只有路径。
 
 `replay: "safe"` 不代表外部世界天然 exactly-once。应用仍依赖 operation marker、checkpoint 或 outbox 处理重放。
 
 ## 6. 存储布局与单 owner 规则
 
 ```text
-<workspaceDir>/ (INNO_WORKSPACE_DIR)
-├── .tmp/                          # 临时工作区
-├── <slug>-<hash>/                 # 命名工作区（workspace 文件本地副本）
-└── .channels/<tenantId>/<channel>/  # 渠道工作区本地副本
-
-<dataDir>/
-├── workspaces/registry.json       # workspace 元信息 scratch（真源 tenant_workspaces）
-├── workspaces/replica/            # 对象存储 pull/push 状态
-└── tenants/<verifiedTenantId>/    # 附件记录、文件访问追踪、渠道暂存等元数据 scratch（无文件字节）
+INNO_WORKSPACE_DIR          local exec 的工作副本（可丢，从对象存储重建）
+INNO_CONFIG_DIR             config.json
+INNO_SKILLS_DIR             镜像 seed；正文发布后在对象存储
+对象存储                    platform/skills/…、tenants/<t>/workspaces/…、l2/…、outbox/…
+PostgreSQL                  见下一节
 ```
 
-工作区文件字节真源在对象存储（`tenants/<t>/workspaces/<ws>/<path>` 键）；本地副本只是 pull 出来的工作缓存，丢失后可重建。
+工作区文件字节真源在对象存储（`tenants/<t>/workspaces/<ws>/<path>`，聊天图片在 `.chat-images/`）。渠道发送快照在 `tenants/<t>/outbox/…`，不进 `recovery_blobs`。本地副本只是 pull 出来的工作缓存。
 
-会话 durable storage、catalog、L2/L3 记忆、jobs/check-ins、渠道台账（default targets、dedupe、run log、chat-session 绑定、wechat token）与 question/permission/outbox 恢复记录全部在 PostgreSQL（`ds_*`、`durable_sessions`、`tenant_jobs`、`tenant_job_runs`、`tenant_checkins`、`tenant_checkin_occurrences`、`tenant_state`、`recovery_records`）。
+会话 durable storage、catalog、L2/L3、jobs/check-ins、渠道台账与 question/permission/outbox **意图**在 PostgreSQL（`ds_*`、`durable_sessions`、`tenant_jobs`、`tenant_job_runs`、`tenant_checkins`、`tenant_checkin_occurrences`、`tenant_state`、`recovery_records`、`skill_catalog`、`tenant_skills`）。延迟执行的倒计时不在库里，挂在拉起它的进程上。
 
 同一个 durable storage 同时只能有一个 owner。authenticated runtime 打开期间还持有 per-session PostgreSQL advisory lock，用于防止意外 double-open；它不是网络分区下的分布式 fencing。
 

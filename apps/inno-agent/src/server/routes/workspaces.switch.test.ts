@@ -6,7 +6,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RuntimePaths } from "../../runtime.js";
 import { streamRegistry } from "../../chat/stream-registry.js";
 import { WorkspaceRegistry } from "../../workspace/workspace-registry.js";
-import { recordWorkspaceFileAccess, resetWorkspaceActivityStoreForTests } from "../workspace-activity-store.js";
+import { recordWorkspaceFileAccess } from "../workspace-activity-store.js";
+import { FileStateKv } from "../../tenants/state-store.js";
 import { FakeTenantStore, ctxA } from "../../workspace/fake-tenant-store.js";
 import { setRequestTenant } from "../../tenants/http.js";
 import type { TenantStore } from "../../tenants/store.js";
@@ -49,7 +50,7 @@ beforeEach(() => {
 	dir = mkdtempSync(`${tmpdir()}/workspace-route-`);
 	dataDir = `${dir}/data`;
 	const workspaceDir = `${dir}/workspaces`;
-	registry = new WorkspaceRegistry(workspaceDir, dataDir);
+	registry = new WorkspaceRegistry(workspaceDir);
 	registry.ensureBootstrapped();
 	const source = registry.createWorkspace({ name: "源工作区" });
 	const target = registry.createWorkspace({ name: "目标工作区" });
@@ -57,11 +58,10 @@ beforeEach(() => {
 	sessionId = "durable-route-session";
 	registry.bindSession(sessionId, source.id);
 	sourceRoot = registry.resolveWorkspaceDir(source.id)!;
-	resetWorkspaceActivityStoreForTests();
 	ctx = {
 		tenantStore: new FakeTenantStore() as unknown as TenantStore,
 		workspaceRegistry: registry,
-		dataDir,
+		stateKv: new FileStateKv(dataDir),
 		paths: {} as RuntimePaths,
 		installSkillZip: () => { throw new Error("not used"); },
 		installSkillMarkdown: () => { throw new Error("not used"); },
@@ -74,7 +74,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	resetWorkspaceActivityStoreForTests();
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -82,7 +81,7 @@ describe("session workspace switch routes", () => {
 	it("previews tracked files and binds only after the confirmed switch", async () => {
 		writeFileSync(`${sourceRoot}/notes.md`, "keep me");
 		writeFileSync(`${sourceRoot}/move.md`, "move me");
-		recordWorkspaceFileAccess(dataDir, {
+		await recordWorkspaceFileAccess(new FileStateKv(dataDir), {
 			sessionId,
 			workspaceId: registry.getSessionWorkspaceId(sessionId),
 			workspaceRoot: sourceRoot,

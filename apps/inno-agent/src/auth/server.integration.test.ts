@@ -124,7 +124,6 @@ async function startServer(): Promise<void> {
 			...process.env,
 			INNO_HOME: home,
 			INNO_CONFIG_DIR: join(home, "config"),
-			INNO_DATA_DIR: join(home, "data"),
 			INNO_SKILLS_DIR: join(home, "skills"),
 			INNO_WORKSPACE_DIR: join(home, "workspace"),
 			INNO_PORT: port,
@@ -173,6 +172,10 @@ async function startSidecar(sidecar: string): Promise<string> {
 beforeAll(async () => {
 	postgres = await startTemporaryPostgres();
 	home = await mkdtemp(join(tmpdir(), "inno-server-auth-"));
+	// Presets ship in the image; the test image carries one preset.
+	await mkdir(join(home, "presets", "durable-preset"), { recursive: true });
+	await writeFile(join(home, "presets", "durable-preset", "preset.json"), JSON.stringify({ id: "durable-preset", name: "Durable preset" }));
+	await writeFile(join(home, "presets", "durable-preset", "agent.md"), "durable preset workspace instructions");
 	providerServer = createHttpServer((req, res) => {
 		let body = "";
 		req.setEncoding("utf-8");
@@ -180,7 +183,7 @@ beforeAll(async () => {
 		req.on("end", async () => {
 			if (req.method === "GET" && req.url === "/index.json") {
 				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ presets: [{ id: "durable-preset", name: "Durable preset" }] }));
+				res.end(JSON.stringify({ skills: [] }));
 				return;
 			}
 			providerRequests.push({ authorization: req.headers.authorization ?? "", body });
@@ -424,6 +427,7 @@ beforeAll(async () => {
 			qq: { enabled: false, mode: "bridge", sidecarBaseUrl: sidecarOriginA },
 		},
 		contentHub: { type: "bundle", baseUrl: providerOrigin },
+		presets: { dir: join(home, "presets") },
 	}));
 	await migrateAuthDatabase(readAuthRuntimeConfig({
 		DATABASE_URL: postgres.databaseUrl,
@@ -578,9 +582,22 @@ describe("session sidecar tenant isolation", () => {
 		});
 		// One tenant cannot read or write the other's session state.
 		expect((await api(cookieB, `/api/btw/state/${sessionA}`)).status).toBe(404);
-		expect(existsSync(join(home, "data", "sessions", "btw.json"))).toBe(false);
-		expect(existsSync(join(home, "data", "tenants", tenantA, "sessions", "btw.json"))).toBe(true);
-		expect(existsSync(join(home, "data", "tenants", tenantB, "sessions", "btw.json"))).toBe(true);
+		// The sidecar lives in PostgreSQL, one row per tenant and session, never on disk.
+		const statePool = new Pool({ connectionString: postgres.databaseUrl });
+		try {
+			const rows = await statePool.query<{ tenant_id: string; key: string }>(
+				"SELECT tenant_id, key FROM tenant_state WHERE key LIKE 'btw:%' AND tenant_id = ANY($1)",
+				[[tenantA, tenantB]],
+			);
+			const keys = rows.rows.map((row) => `${row.tenant_id}|${row.key}`);
+			expect(keys).toContain(`${tenantA}|btw:session:${sessionA}`);
+			expect(keys).toContain(`${tenantB}|btw:session:${sessionB}`);
+			expect(keys).not.toContain(`${tenantB}|btw:session:${sessionA}`);
+			expect(keys).toContain(`${tenantA}|btw:window`);
+			expect(keys).toContain(`${tenantB}|btw:window`);
+		} finally {
+			await statePool.end();
+		}
 	}, 30_000);
 });
 
@@ -690,11 +707,6 @@ describe("job and check-in tenant isolation", () => {
 			registerUser("jobs-b@example.com"),
 		]);
 		await configureTestProvider(cookieB);
-		await mkdir(join(home, "data", "jobs"), { recursive: true });
-		await writeFile(join(home, "data", "jobs", "jobs.json"), JSON.stringify([{
-			id: "job_legacy", name: "legacy global", cron: "0 9 * * *", timezone: "UTC", enabled: true,
-			taskType: "custom_prompt", prompt: "must stay hidden",
-		}]));
 		const created = await api(cookieA, "/api/jobs", {
 			method: "POST", body: JSON.stringify({
 				name: "tenant a review", cron: "0 9 * * *", timezone: "Asia/Shanghai", enabled: true,
@@ -763,8 +775,6 @@ describe("L2 tenant storage", () => {
 			registerUser("memory-a@example.com"),
 			registerUser("memory-b@example.com"),
 		]);
-		await mkdir(join(home, "data", "l2"), { recursive: true });
-		await writeFile(join(home, "data", "l2", "legacy.md"), "legacy global memory");
 
 		expect((await api(cookieA, "/api/wiki/page", {
 			method: "PUT", body: JSON.stringify({ path: "private.md", content: "tenant-a-wiki" }),
@@ -1026,7 +1036,6 @@ describe("channel runtime isolation", () => {
 		expect(channelImage, JSON.stringify(channelMessageA)).toBeDefined();
 		expect((await api(cookieA, channelImage!.previewUrl)).status).toBe(200);
 		expect(await (await api(cookieB, `/api/sessions/${channelSessionB}`)).json()).toMatchObject({ runtime: "durable" });
-		expect(existsSync(join(home, "data", "channels", "chat-sessions.json"))).toBe(false);
 		const workspacesA = await (await api(cookieA, "/api/workspaces")).json() as Array<{ id: string }>;
 		const workspacesB = await (await api(cookieB, "/api/workspaces")).json() as Array<{ id: string }>;
 		expect(workspacesA.map((workspace) => workspace.id)).toContain(`channel-qq-${tenantA}`);
@@ -1268,7 +1277,6 @@ describe("durable session HTTP boundary", () => {
 		expect(detailA.messages.filter((message) => message.role === "user" && message.content === "durable-a-main-prompt")).toHaveLength(1);
 		const listB = await (await api(cookieB, "/api/sessions")).json() as Array<{ id: string }>;
 		expect(listB.some((session) => session.id === sessionA.id)).toBe(false);
-		expect(existsSync(join(home, "data", "sessions", `${sessionA.id}.jsonl`))).toBe(false);
 
 		const disconnected = await api(cookieA, "/api/chat/stream", {
 			method: "POST",
@@ -1350,15 +1358,17 @@ describe("durable session HTTP boundary", () => {
 		expect(file.status).toBe(200);
 		expect(await file.json()).toMatchObject({ path: "nested/durable-preview.txt", content: "durable preview content" });
 
-		const tenantIds = await readdir(join(home, "data", "tenants"));
-		const activityFiles = await Promise.all(tenantIds.map(async (tenantId) => {
-			try {
-				return await readFile(join(home, "data", "tenants", tenantId, "sessions", "workspace-activity.json"), "utf-8");
-			} catch {
-				return "";
-			}
-		}));
-		const activity = activityFiles.find((content) => content.includes(session.id)) ?? "";
+		const activityPool = new Pool({ connectionString: postgres.databaseUrl });
+		let activity = "";
+		try {
+			const rows = await activityPool.query<{ value: unknown }>(
+				"SELECT value FROM tenant_state WHERE key = $1",
+				[`activity:${session.id}`],
+			);
+			activity = rows.rows.map((row) => JSON.stringify(row.value)).join("\n");
+		} finally {
+			await activityPool.end();
+		}
 		expect(activity).toContain("nested/durable-preview.txt");
 
 		const noUiCreated = await api(cookie, "/api/sessions", {
@@ -1390,10 +1400,6 @@ describe("durable session HTTP boundary", () => {
 	}, 60_000);
 
 	it("instantiates preset workspaces for durable sessions with tenant ownership", async () => {
-		const presetDir = join(home, "data", "preset-cache", "durable-preset");
-		await mkdir(presetDir, { recursive: true });
-		await writeFile(join(presetDir, "preset.json"), JSON.stringify({ id: "durable-preset", name: "Durable preset" }));
-		await writeFile(join(presetDir, "agent.md"), "durable preset workspace instructions");
 		const [cookieA, cookieB] = await Promise.all([
 			registerUser("durable-preset-a@example.com"),
 			registerUser("durable-preset-b@example.com"),
@@ -1407,9 +1413,12 @@ describe("durable session HTTP boundary", () => {
 		const session = await first.json() as { id: string; runtime: string; workspaceId: string };
 		expect(session.runtime).toBe("durable");
 		expect(session.workspaceId).toMatch(/^preset-durable-preset-/);
+		// Preset agent.md stays in the image — never copied into the workspace.
 		const instructions = await api(cookieA, `/api/workspace/file?path=agent.md&workspaceId=${encodeURIComponent(session.workspaceId)}`);
-		expect(instructions.status).toBe(200);
-		expect(await instructions.json()).toMatchObject({ content: "durable preset workspace instructions" });
+		expect(instructions.status).toBe(404);
+		const detail = await api(cookieA, `/api/sessions/${session.id}`);
+		expect(detail.status).toBe(200);
+		expect(await detail.json()).toMatchObject({ id: session.id, workspaceId: session.workspaceId });
 		const second = await createPreset();
 		expect(second.status).toBe(201);
 		expect(await second.json()).toMatchObject({ runtime: "durable", workspaceId: session.workspaceId });
@@ -1631,13 +1640,32 @@ describe("durable session HTTP boundary", () => {
 		});
 		expect(nonStreaming.status).toBe(200);
 		expect(providerRequests.find((request) => request.body.includes("durable-nonstream-attachment"))?.body).toContain("普通附件");
+		const embedded = await api(cookieA, "/api/chat/stream", {
+			method: "POST",
+			body: JSON.stringify({
+				sessionId: session.id,
+				prompt: "durable-embedded-image",
+				clientRequestId: "durable-embedded-image-request",
+				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
+			}),
+		});
+		expect(embedded.status).toBe(400);
+		const uploadedNative = await api(cookieA, "/api/workspace/upload", {
+			method: "POST",
+			body: JSON.stringify({
+				workspaceId: workspace.id,
+				files: [{ path: ".chat-images/native.png", dataBase64: "aW1hZ2U=" }],
+			}),
+		});
+		expect(uploadedNative.status).toBe(201);
+		const nativeImageRef = { workspacePath: ".chat-images/native.png", mimeType: "image/png" };
 		const nativeImage = await api(cookieA, "/api/chat/stream", {
 			method: "POST",
 			body: JSON.stringify({
 				sessionId: session.id,
 				prompt: "durable-native-inline-image",
 				clientRequestId: "durable-native-inline-image-request",
-				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
+				images: [nativeImageRef],
 			}),
 		});
 		expect(nativeImage.status).toBe(200);
@@ -1655,7 +1683,7 @@ describe("durable session HTTP boundary", () => {
 				sessionId: session.id,
 				prompt: "durable-native-inline-image",
 				clientRequestId: "durable-native-inline-image-request",
-				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
+				images: [nativeImageRef],
 			}),
 		});
 		expect(nativeRetry.status).toBe(200);
@@ -1677,7 +1705,7 @@ describe("durable session HTTP boundary", () => {
 				sessionId: session.id,
 				prompt: "durable-image-provider-rejection",
 				clientRequestId: "durable-image-provider-rejection-request",
-				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
+				images: [nativeImageRef],
 			}),
 		});
 		expect(rejectedNative.status).toBe(200);
@@ -1697,14 +1725,21 @@ describe("durable session HTTP boundary", () => {
 		})).status).toBe(200);
 		const textSession = await (await api(cookieA, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable" }),
-		})).json() as { id: string };
+		})).json() as { id: string; workspaceId: string };
+		expect((await api(cookieA, "/api/workspace/upload", {
+			method: "POST",
+			body: JSON.stringify({
+				workspaceId: textSession.workspaceId,
+				files: [{ path: ".chat-images/text.png", dataBase64: "aW1hZ2U=" }],
+			}),
+		})).status).toBe(201);
 		const textOnly = await api(cookieA, "/api/chat", {
 			method: "POST",
 			body: JSON.stringify({
 				sessionId: textSession.id,
 				prompt: "durable-text-only-inline-image",
 				clientRequestId: "durable-text-only-inline-image-request",
-				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
+				images: [{ workspacePath: ".chat-images/text.png", mimeType: "image/png" }],
 			}),
 		});
 		expect(textOnly.status).toBe(200);
@@ -1891,8 +1926,6 @@ describe("durable session HTTP boundary", () => {
 		} finally {
 			await pool.end();
 		}
-		const rootA = join(home, "data", "tenants", tenantA);
-		const rootB = join(home, "data", "tenants", tenantB);
 		// The L2 manifest lives in PostgreSQL scoped to the tenant, not files in its data root.
 		const readManifest = async (tenantId: string) => {
 			const pool = new Pool({ connectionString: postgres.databaseUrl });
@@ -1904,8 +1937,6 @@ describe("durable session HTTP boundary", () => {
 				await pool.end();
 			}
 		};
-		expect(existsSync(join(rootA, "l2", "manifest.jsonl"))).toBe(false);
-		expect(existsSync(join(rootB, "l2", "manifest.jsonl"))).toBe(false);
 		const [manifestA, manifestB] = await Promise.all([readManifest(tenantA), readManifest(tenantB)]);
 		expect(manifestA).toContain("durable-archive-a");
 		expect(manifestA).not.toContain("durable-archive-b");
@@ -1994,7 +2025,6 @@ describe("workspace read routes in authenticated mode", () => {
 				...process.env,
 				INNO_HOME: providerHome,
 				INNO_CONFIG_DIR: join(providerHome, "config"),
-				INNO_DATA_DIR: join(providerHome, "data"),
 				INNO_SKILLS_DIR: join(providerHome, "skills"),
 				INNO_WORKSPACE_DIR: join(providerHome, "workspace"),
 				INNO_PORT: String(port),
@@ -2368,4 +2398,12 @@ describe("workspace read routes in authenticated mode", () => {
 			await rm(objectStoreDir, { recursive: true, force: true });
 		}
 	}, 90_000);
+});
+
+describe("local disk footprint", () => {
+	it("keeps tenant state out of the local disk: no data dir, scratch dir or virtual tenant root", () => {
+		expect(existsSync(join(home, "data"))).toBe(false);
+		expect(existsSync(join(home, "workspace", ".inno-scratch"))).toBe(false);
+		expect(existsSync("/inno-virtual")).toBe(false);
+	});
 });

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { readFileSync, statSync } from "node:fs";
 import type { Pool } from "pg";
+import type { ObjectStore } from "../object-store/object-store.js";
+import { tenantObjectKey, tenantObjectPrefix } from "../object-store/object-store.js";
 import {
 	outboxSessionId,
 	type ChannelOutbox,
@@ -11,7 +11,7 @@ import {
 	type OutboxPayload,
 } from "./channel-outbox.js";
 
-/** A snapshot larger than this is refused: the whole file goes through memory and one row. */
+/** A snapshot larger than this is refused before upload. */
 export const MAX_OUTBOX_PAYLOAD_BYTES = 100 * 1024 * 1024;
 
 const KIND = "outbox";
@@ -20,17 +20,23 @@ function keyOf(operationId: string): string {
 	return createHash("sha256").update(operationId).digest("hex");
 }
 
+/** Deterministic object-store key for an outbox payload (tenant + session + op hash). */
+export function outboxObjectKey(tenantId: string, operationId: string): string {
+	return tenantObjectKey(tenantId, "outbox", outboxSessionId(operationId), keyOf(operationId));
+}
+
 /**
- * Tenant-scoped channel outbox in PostgreSQL: the record is a `recovery_records`
- * row and the payload snapshot a `recovery_blobs` row written in the same
- * transaction, so there is never a record without its payload. Any worker can
- * resume an interrupted send. A snapshot is written to a private temporary
- * file only for the duration of the upload.
- * */
+ * Tenant-scoped channel outbox: intent / completion live in `recovery_records`;
+ * the file snapshot lives in the platform ObjectStore under
+ * `tenants/<tenant>/outbox/<session>/<opHash>`. Binary payloads never enter
+ * PostgreSQL. Put-then-record leaves a rare orphan object on a failed insert
+ * (best-effort delete); record-without-object fails closed on resume.
+ */
 export class PgChannelOutbox implements ChannelOutbox {
 	constructor(
 		private readonly pool: Pool,
 		private readonly tenantId: string,
+		private readonly objects: ObjectStore,
 	) {}
 
 	async load(operationId: string): Promise<ChannelOutboxRecord | undefined> {
@@ -47,11 +53,8 @@ export class PgChannelOutbox implements ChannelOutbox {
 		return record;
 	}
 
-	private materialize(record: ChannelOutboxRecord, bytes: Buffer): OutboxPayload {
-		const dir = mkdtempSync(join(tmpdir(), "inno-outbox-"));
-		const path = join(dir, basename(record.fileName ?? record.filePath) || "file");
-		writeFileSync(path, bytes, { mode: 0o600 });
-		return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+	private materialize(bytes: Uint8Array): OutboxPayload {
+		return { bytes: new Uint8Array(bytes), cleanup() {} };
 	}
 
 	async prepare(record: ChannelOutboxRecord, sourceFilePath: string): Promise<OutboxPayload> {
@@ -59,39 +62,26 @@ export class PgChannelOutbox implements ChannelOutbox {
 		if (statSync(sourceFilePath).size > MAX_OUTBOX_PAYLOAD_BYTES) {
 			throw new Error(`File is larger than the ${MAX_OUTBOX_PAYLOAD_BYTES / 1024 / 1024} MB outbox limit`);
 		}
-		const bytes = readFileSync(sourceFilePath);
-		const key = keyOf(record.operationId);
-		const client = await this.pool.connect();
+		const bytes = new Uint8Array(readFileSync(sourceFilePath));
+		const objectKey = outboxObjectKey(this.tenantId, record.operationId);
+		const recordKey = keyOf(record.operationId);
+		await this.objects.put(objectKey, bytes, { contentType: "application/octet-stream" });
 		try {
-			await client.query("BEGIN");
-			await client.query(
-				`INSERT INTO recovery_blobs (tenant_id, session_id, kind, record_key, payload) VALUES ($1, $2, $3, $4, $5)
-				 ON CONFLICT (tenant_id, session_id, kind, record_key) DO UPDATE SET payload = EXCLUDED.payload`,
-				[this.tenantId, sessionId, KIND, key, bytes],
-			);
-			await client.query(
+			await this.pool.query(
 				`INSERT INTO recovery_records (tenant_id, session_id, kind, record_key, value) VALUES ($1, $2, $3, $4, $5::jsonb)
 				 ON CONFLICT (tenant_id, session_id, kind, record_key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
-				[this.tenantId, sessionId, KIND, key, JSON.stringify(record)],
+				[this.tenantId, sessionId, KIND, recordKey, JSON.stringify(record)],
 			);
-			await client.query("COMMIT");
 		} catch (error) {
-			await client.query("ROLLBACK");
+			await this.objects.delete(objectKey).catch(() => undefined);
 			throw error;
-		} finally {
-			client.release();
 		}
-		return this.materialize(record, bytes);
+		return this.materialize(bytes);
 	}
 
 	async payload(record: ChannelOutboxRecord): Promise<OutboxPayload | undefined> {
-		const sessionId = outboxSessionId(record.operationId);
-		const result = await this.pool.query<{ payload: Buffer }>(
-			"SELECT payload FROM recovery_blobs WHERE tenant_id = $1 AND session_id = $2 AND kind = $3 AND record_key = $4",
-			[this.tenantId, sessionId, KIND, keyOf(record.operationId)],
-		);
-		const bytes = result.rows[0]?.payload;
-		return bytes ? this.materialize(record, bytes) : undefined;
+		const bytes = await this.objects.get(outboxObjectKey(this.tenantId, record.operationId));
+		return bytes ? this.materialize(bytes) : undefined;
 	}
 
 	async complete(record: ChannelOutboxRecord, completion: ChannelOutboxCompletion): Promise<void> {
@@ -104,48 +94,30 @@ export class PgChannelOutbox implements ChannelOutbox {
 	}
 
 	async pruneCompletedForIdleSession(sessionId: string, completedBefore: number): Promise<number> {
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			const expired = await client.query<{ record_key: string }>(
-				`DELETE FROM recovery_records
-				 WHERE tenant_id = $1 AND session_id = $2 AND kind = $3
-				   AND value ? 'completion' AND updated_at <= to_timestamp($4 / 1000.0)
-				 RETURNING record_key`,
-				[this.tenantId, sessionId, KIND, completedBefore],
-			);
-			if (expired.rowCount) {
-				await client.query(
-					"DELETE FROM recovery_blobs WHERE tenant_id = $1 AND session_id = $2 AND kind = $3 AND record_key = ANY($4::text[])",
-					[this.tenantId, sessionId, KIND, expired.rows.map((row) => row.record_key)],
-				);
+		const expired = await this.pool.query<{ record_key: string; value: ChannelOutboxRecord }>(
+			`DELETE FROM recovery_records
+			 WHERE tenant_id = $1 AND session_id = $2 AND kind = $3
+			   AND value ? 'completion' AND updated_at <= to_timestamp($4 / 1000.0)
+			 RETURNING record_key, value`,
+			[this.tenantId, sessionId, KIND, completedBefore],
+		);
+		for (const row of expired.rows) {
+			const operationId = row.value?.operationId;
+			if (operationId) {
+				await this.objects.delete(outboxObjectKey(this.tenantId, operationId)).catch(() => undefined);
+			} else {
+				await this.objects.delete(tenantObjectKey(this.tenantId, "outbox", sessionId, row.record_key)).catch(() => undefined);
 			}
-			await client.query("COMMIT");
-			return expired.rowCount ?? 0;
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
 		}
+		return expired.rowCount ?? 0;
 	}
 
 	async deleteSession(sessionId: string): Promise<number> {
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			const removed = await client.query(
-				"DELETE FROM recovery_records WHERE tenant_id = $1 AND session_id = $2 AND kind = $3",
-				[this.tenantId, sessionId, KIND],
-			);
-			await client.query("DELETE FROM recovery_blobs WHERE tenant_id = $1 AND session_id = $2 AND kind = $3", [this.tenantId, sessionId, KIND]);
-			await client.query("COMMIT");
-			return removed.rowCount ?? 0;
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
-		}
+		const removed = await this.pool.query(
+			"DELETE FROM recovery_records WHERE tenant_id = $1 AND session_id = $2 AND kind = $3",
+			[this.tenantId, sessionId, KIND],
+		);
+		await this.objects.deletePrefix(tenantObjectPrefix(this.tenantId, "outbox", sessionId));
+		return removed.rowCount ?? 0;
 	}
 }

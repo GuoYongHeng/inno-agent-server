@@ -13,7 +13,8 @@ import { requireRequestTenant } from "../../tenants/http.js";
 import { resolveTenantDataDir } from "../../tenants/paths.js";
 
 export interface WikiRouteContext {
-	l2DataDir: string;
+	/** Local-mode L2 directory (tests). Authenticated requests use the tenant's PostgreSQL backend. */
+	l2DataDir?: string;
 	dataDir?: string;
 }
 
@@ -79,7 +80,7 @@ export async function handleWikiRoutes(
 	if (tenant && !ctx.dataDir) throw new Error("dataDir is required for tenant wiki storage");
 	const l2DataDir = tenant
 		? resolveTenantDataDir(req, ctx.dataDir!, "l2")
-		: ctx.l2DataDir;
+		: ctx.l2DataDir ?? (() => { throw new Error("L2 storage requires a tenant"); })();
 	const store = l2Store(l2DataDir);
 
 	// --- Wiki API ---

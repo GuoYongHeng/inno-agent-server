@@ -42,7 +42,6 @@ RUN sed -i 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/d
 ENV NODE_ENV=production \
     INNO_HOME=/var/lib/inno-agent \
     INNO_CONFIG_DIR=/etc/inno-agent \
-    INNO_DATA_DIR=/var/lib/inno-agent/data \
     INNO_SKILLS_DIR=/app/skills \
     INNO_WORKSPACE_DIR=/srv/inno-workspace \
     INNO_PORT=3000
@@ -61,6 +60,9 @@ COPY --from=build /app/apps/inno-agent/scripts ./apps/inno-agent/scripts
 # Authenticated mode already serves them read-only, so every worker serves
 # the same catalog without any runtime sync.
 COPY skills/ /app/skills/
+# Preset workspace templates are baked next to the package (default
+# `<codeDir>/presets`; override with `presets.dir` in config.json).
+COPY apps/inno-agent/presets/ /app/apps/inno-agent/presets/
 
 EXPOSE 3000
 

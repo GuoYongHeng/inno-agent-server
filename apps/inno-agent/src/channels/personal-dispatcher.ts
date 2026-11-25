@@ -47,7 +47,8 @@ export interface PersonalChannelDispatcherOptions {
 	dedupeStore?: DedupeStore;
 	runLog?: ChannelRunLog;
 	chatSessionsLedger?: ChatSessionLedger;
-	sessionDir: string;
+	/** Legacy file-backed session targets (tests). Production resolves targets through `resolveSessionTarget`. */
+	sessionDir?: string;
 }
 
 /** Persisted mapping from channel chatId to sessionId (filename). */
@@ -136,8 +137,8 @@ export class PersonalChannelDispatcher {
 
 		if (msg.attachments) {
 			for (const att of msg.attachments) {
-				if (att.type === "file" && att.filePath) {
-					prompt += `\n\n[附件已下载到: ${att.filePath}]`;
+				if (att.type === "file") {
+					prompt += `\n\n[用户发送了文件「${att.fileName ?? "未命名"}」，通道暂不支持读取文件内容]`;
 				}
 			}
 		}
@@ -157,7 +158,7 @@ export class PersonalChannelDispatcher {
 				// JSONL paths. Never infer durability from a filename extension.
 				targetSessionPath = this.opts.resolveSessionTarget
 					? await this.opts.resolveSessionTarget(newSessionId)
-					: resolve(join(this.opts.sessionDir, newSessionId));
+					: resolve(join(this.opts.sessionDir ?? ".", newSessionId));
 				if (!targetSessionPath) throw new Error("Created channel session is not executable");
 				logger.info({ chatKey, newSessionId }, "dispatcher auto-created session");
 			} catch (err) {
@@ -270,7 +271,7 @@ export class PersonalChannelDispatcher {
 			this.saveChatSessionMap();
 			return null;
 		}
-		const sessionPath = resolve(join(this.opts.sessionDir, targetSessionId));
+		const sessionPath = resolve(join(this.opts.sessionDir ?? ".", targetSessionId));
 		if (!existsSync(sessionPath)) {
 			// Session was deleted — remove stale mapping
 			delete this.chatSessionMap[chatKey];

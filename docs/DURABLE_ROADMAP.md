@@ -381,7 +381,7 @@ CREATE INDEX durable_sessions_tenant_updated_idx
    - 已知限制：本地/认证两条路径的文件视图语义有差异（PG 没有目录，只有路径键），但都在 `L2Backend` 抽象内；wiki 页面写合并（`wiki-page-merge`）与摘要检查点（`ingest-progress`）仍是非持久的本地缓存，不迁移；两个 worker 并发归档同一内容时去重靠 content hash 读-改-写，非数据库仲裁，依赖 H4 的单 owner 路由。
 
 **第 1 批实现说明**：
-- 抽象为异步的 `RecoveryRecordStore`（`agent/recovery-store.ts`）：本地模式仍是 JSON 文件（目录布局不变），认证模式是 `recovery_records` 表，主键 `(tenant_id, session_id, kind, record_key)`，`record_key` 即工具调用 operation ID 的 SHA-256，所以幂等键就是主键。question、permission、OCR 检查点走它；渠道发件箱用 `recovery_records`（kind `outbox`）加 `recovery_blobs`（快照字节，与记录同事务写入，上限 100 MB）；SSE 流日志用 `stream_turns`/`stream_events`（批量写入保序，结束后 5 分钟可重放）。
+- 抽象为异步的 `RecoveryRecordStore`（`agent/recovery-store.ts`）：本地模式仍是 JSON 文件（目录布局不变），认证模式是 `recovery_records` 表，主键 `(tenant_id, session_id, kind, record_key)`，`record_key` 即工具调用 operation ID 的 SHA-256，所以幂等键就是主键。question、permission、OCR 检查点走它；渠道发件箱用 `recovery_records`（kind `outbox`）加 ObjectStore 快照（`tenants/<t>/outbox/...`，上限 100 MB；不再写 `recovery_blobs`）；SSE 流日志用 `stream_turns`/`stream_events`（批量写入保序，结束后 5 分钟可重放）。
 - 旧文件在认证租户首次访问某会话时一次性导入（只导入该租户拥有的会话；per-session 目录改名为 `.migrated`，共享目录里的 OCR/发件箱文件逐个删除）。**旧的 SSE 流日志文件不导入**：它只覆盖结束后 5 分钟或进行中的回合，升级窗口内的进行中回合需要用户重发。
 - 同步文件代码天然的原子性没有了：`DurableQuestionStore`/`DurablePermissionStore` 内部用 `SerialQueue` 串行化，避免同一进程里 `present` 用旧快照覆盖已答复的记录。
 - 集成测试发现并修复两个 PG 特有的问题：`jsonb` 不保留键顺序（原来按 `JSON.stringify` 比较重放时的参数会误报"参数变了"，现用 `canonicalJson`）；`jsonb` 不能存 U+0000（审批键里的 `\0` 分隔符不再入库，命令预览里的 NUL 替换为 U+FFFD）。

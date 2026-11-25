@@ -95,7 +95,6 @@ function setup() {
 	};
 	const stateData = new Map<string, Map<string, unknown>>();
 	const manager = new TenantChannelManager({
-		dataDir,
 		tenantStore: store,
 		getLocalConfig: () => createEmptyTenantConfig() && Object.assign(createEmptyTenantConfig(), {
 			bridge: { token: "shared-token" },

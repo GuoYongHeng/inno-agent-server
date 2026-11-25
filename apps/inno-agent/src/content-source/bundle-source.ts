@@ -1,7 +1,4 @@
 import { spawnSync } from "node:child_process";
-import { rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import type { InnoContentHubConfig } from "../config.js";
 import { ensureDir } from "../storage/file-store.js";
 import { logger } from "../logger.js";
@@ -16,17 +13,15 @@ import {
 /**
  * index.json shape served by a bundle service:
  *   {
- *     "skills":  [{ "id": "...", "name": "...", "description": "...", ... }],
- *     "presets": [{ "id": "...", "name": "...", "description": "...", "icon": "..." }]
+ *     "skills":  [{ "id": "...", "name": "...", "description": "...", ... }]
  *   }
  * `id` is the directory name (used for routing/download); `name` is the display
  * name. For backward compatibility, `name` is used as the id when `id` is absent.
  * Each listed item's files are fetched as a single tarball from
- *   GET {baseUrl}/{skills|presets}/{id}.tar.gz
+ *   GET {baseUrl}/skills/{id}.tar.gz
  */
 interface BundleIndex {
 	skills?: Array<{ id?: unknown; name?: unknown } & Record<string, unknown>>;
-	presets?: Array<{ id?: unknown; name?: unknown } & Record<string, unknown>>;
 }
 
 const INDEX_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -76,7 +71,7 @@ export class BundleServiceSource implements RemoteContentSource {
 
 	async listItems(category: ContentCategory, opts: ListOpts = {}): Promise<RemoteItem[]> {
 		const index = await this.getIndex(opts.forceRefresh);
-		const raw = (category === "skills" ? index.skills : index.presets) ?? [];
+		const raw = (category === "skills" ? index.skills : undefined) ?? [];
 		const items: RemoteItem[] = [];
 		for (const entry of raw) {
 			// `id` is the directory name (routing/download key). Fall back to
@@ -106,20 +101,13 @@ export class BundleServiceSource implements RemoteContentSource {
 			throw new Error(`Failed to download ${category}/${name} (${res.status} ${res.statusText})`);
 		}
 		const buf = Buffer.from(await res.arrayBuffer());
-		const tmpRoot = join(tmpdir(), `inno-bundle-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		const tarPath = join(tmpRoot, "item.tar.gz");
-		ensureDir(tmpRoot);
 		ensureDir(targetDir);
-		try {
-			writeFileSync(tarPath, buf);
-			// Extract with system tar (available on macOS/Linux/Win10+), stripping
-			// the leading <name>/ component so files land directly in targetDir.
-			const result = spawnSync("tar", ["-xzf", tarPath, "-C", targetDir, "--strip-components=1"], { encoding: "utf-8" });
-			if (result.status !== 0) {
-				throw new Error((result.stderr || "").trim() || "Unable to extract bundle tarball");
-			}
-		} finally {
-			rmSync(tmpRoot, { recursive: true, force: true });
+		// Extract with system tar (available on macOS/Linux/Win10+) straight from
+		// memory — the tarball never touches disk — stripping the leading <name>/
+		// component so files land directly in targetDir.
+		const result = spawnSync("tar", ["-xzf", "-", "-C", targetDir, "--strip-components=1"], { input: buf });
+		if (result.status !== 0) {
+			throw new Error((result.stderr?.toString() || "").trim() || "Unable to extract bundle tarball");
 		}
 		logger.info({ category, name, targetDir }, "content-source: extracted bundle item");
 	}

@@ -1,3 +1,4 @@
+import { FileStateKv } from "../../tenants/state-store.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -61,7 +62,7 @@ beforeEach(() => {
 		completeSideQuestion: vi.fn(),
 		appendAssistantNotification: vi.fn(async () => undefined),
 	};
-	ctx = { dataDir, durableSessions: service as never, tenantStore: tenantStore as unknown as TenantStore };
+	ctx = { stateKv: new FileStateKv(dataDir), durableSessions: service as never, tenantStore: tenantStore as unknown as TenantStore };
 });
 
 afterEach(() => {

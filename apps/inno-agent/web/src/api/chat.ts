@@ -1,18 +1,26 @@
 import { apiFetch, streamSSE, streamSSEGet } from "./client.js";
 import type { ChatAttachments, PermissionDecisionKind, QuestionnaireResult, StreamEventEnvelope, StreamSnapshot } from "../types/chat.js";
 
-export interface InlineImage {
-	data: string;
+/** A chat image already stored in the workspace object store. Bytes never ride in the chat body. */
+export interface ChatImageRef {
+	workspacePath: string;
 	mimeType: string;
+	/** Local preview only. Stripped before the request. */
+	previewUrl?: string;
 }
 
-export async function postChat(prompt: string, sessionId?: string | null, images?: InlineImage[], attachments?: ChatAttachments): Promise<string> {
+function wireImages(images?: ChatImageRef[]): Array<{ workspacePath: string; mimeType: string }> | undefined {
+	if (!images?.length) return undefined;
+	return images.map(({ workspacePath, mimeType }) => ({ workspacePath, mimeType }));
+}
+
+export async function postChat(prompt: string, sessionId?: string | null, images?: ChatImageRef[], attachments?: ChatAttachments): Promise<string> {
 	const res = await apiFetch<{ response: string }>("/api/chat", {
 		method: "POST",
 		body: JSON.stringify({
 			prompt,
 			sessionId: sessionId ?? undefined,
-			images: images?.length ? images : undefined,
+			images: wireImages(images),
 			attachments: attachments && (attachments.bindings.length || attachments.loose.length) ? attachments : undefined,
 		}),
 	});
@@ -24,14 +32,14 @@ export function streamChat(
 	sessionId: string,
 	clientRequestId: string,
 	signal?: AbortSignal,
-	images?: InlineImage[],
+	images?: ChatImageRef[],
 	attachments?: ChatAttachments,
 ): AsyncGenerator<StreamEventEnvelope> {
 	return streamSSE<StreamEventEnvelope>("/api/chat/stream", {
 		prompt,
 		sessionId,
 		clientRequestId,
-		images: images?.length ? images : undefined,
+		images: wireImages(images),
 		attachments: attachments && (attachments.bindings.length || attachments.loose.length) ? attachments : undefined,
 	}, signal);
 }

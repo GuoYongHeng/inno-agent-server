@@ -28,11 +28,12 @@ export interface SessionRow {
 	topic_upgraded: boolean | null;
 	conversation_id: string | null;
 	sandbox_id: string | null;
+	preset_id: string | null;
 	created_at: Date;
 	updated_at: Date;
 }
 
-export const COLUMNS = "id, workspace_id, name, provider, model_id, origin, archived, message_count, preview, topic_generated, topic_upgraded, conversation_id, sandbox_id, created_at, updated_at";
+export const COLUMNS = "id, workspace_id, name, provider, model_id, origin, archived, message_count, preview, topic_generated, topic_upgraded, conversation_id, sandbox_id, preset_id, created_at, updated_at";
 
 /** Patch field -> column. `id` is never patchable and `version` is bumped by every update. */
 const PATCH_COLUMNS: Record<keyof DurableSessionPatch, string> = {
@@ -50,6 +51,7 @@ const PATCH_COLUMNS: Record<keyof DurableSessionPatch, string> = {
 	archived: "archived",
 	conversationId: "conversation_id",
 	sandboxId: "sandbox_id",
+	presetId: "preset_id",
 };
 
 export function toRecord(row: SessionRow): DurableSessionRecord {
@@ -69,6 +71,7 @@ export function toRecord(row: SessionRow): DurableSessionRecord {
 		...(row.topic_upgraded !== null ? { topicUpgraded: row.topic_upgraded } : {}),
 		...(row.conversation_id !== null ? { conversationId: row.conversation_id } : {}),
 		...(row.sandbox_id !== null ? { sandboxId: row.sandbox_id } : {}),
+		...(row.preset_id !== null ? { presetId: row.preset_id } : {}),
 	};
 }
 
@@ -149,12 +152,13 @@ export class PgSessionCatalog implements SessionCatalog {
 			await client.query(
 				`INSERT INTO durable_sessions
 				   (id, tenant_id, workspace_id, name, provider, model_id, origin, archived, message_count, preview,
-				    topic_generated, topic_upgraded, conversation_id, sandbox_id, created_at, updated_at)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::timestamptz, $16::timestamptz)`,
+				    topic_generated, topic_upgraded, conversation_id, sandbox_id, preset_id, created_at, updated_at)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::timestamptz, $17::timestamptz)`,
 				[
 					record.id, tenant.tenantId, record.workspaceId, record.name, record.provider, record.modelId,
 					record.origin ?? "web", record.archived, record.messageCount, record.preview,
 					record.topicGenerated ?? null, record.topicUpgraded ?? null, record.conversationId ?? null, record.sandboxId ?? null,
+					record.presetId ?? null,
 					record.createdAt, record.updatedAt,
 				],
 			);

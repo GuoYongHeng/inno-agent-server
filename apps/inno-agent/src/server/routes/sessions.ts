@@ -3,10 +3,10 @@ import { logger } from "../../logger.js";
 import {
 	PRESET_UNAVAILABLE_CODE,
 	PresetUnavailableError,
-	ensurePresetAvailable,
+	resolvePresetMeta,
 	instantiatePreset,
 } from "../../presets/preset-store.js";
-import type { RemoteContentSource } from "../../content-source/index.js";
+import type { PresetMeta } from "../../presets/preset-store.js";
 import type { RuntimePaths } from "../../runtime.js";
 import { TEMP_WORKSPACE_ID, type WorkspaceRegistry } from "../../workspace/workspace-registry.js";
 import type { TenantStore } from "../../tenants/store.js";
@@ -24,8 +24,6 @@ export interface SessionsRouteContext {
 	workspaceReplica?: WorkspaceReplica | null;
 	objectStorageDurable?: boolean;
 	durableSessions: DurableHttpContext["service"];
-	getContentSource: () => RemoteContentSource;
-	getCachedPresetAvailability?: (presetId: string) => boolean | null;
 }
 
 /**
@@ -39,7 +37,7 @@ export async function handleSessionsRoutes(
 	url: string,
 	ctx: SessionsRouteContext,
 ): Promise<boolean> {
-	const { workspaceRegistry, paths, getContentSource, getCachedPresetAvailability, tenantStore, durableSessions } = ctx;
+	const { workspaceRegistry, paths, tenantStore, durableSessions } = ctx;
 	const workspaceReplica = ctx.workspaceReplica ?? null;
 
 	// Every session subresource is protected before any metadata access.
@@ -127,15 +125,11 @@ export async function handleSessionsRoutes(
 		}
 		// Validate stale preset cards before creating anything. A preset that has
 		// already been loaded keeps working through its stable workspace even if
-		// the remote catalog later removes it.
+		// a later image no longer ships it.
+		let presetMeta: PresetMeta | undefined;
 		if (presetId && !existingPresetWorkspace) {
 			try {
-				await ensurePresetAvailable(
-					paths,
-					getContentSource(),
-					presetId,
-					getCachedPresetAvailability?.(presetId) ?? null,
-				);
+				presetMeta = resolvePresetMeta(paths, presetId);
 			} catch (err) {
 				if (err instanceof PresetUnavailableError) {
 					json(res, 404, {
@@ -157,7 +151,7 @@ export async function handleSessionsRoutes(
 		}
 
 		const workspace = presetId
-			? existingPresetWorkspace ?? instantiatePreset(paths, workspaceRegistry, presetId, tenant?.tenantId)
+			? existingPresetWorkspace ?? instantiatePreset(paths, workspaceRegistry, presetMeta!, tenant?.tenantId)
 			: newWorkspaceSpec && !newWorkspaceSpec.isTemp
 				? workspaceRegistry.createWorkspace({
 					name: typeof newWorkspaceSpec.name === "string" ? newWorkspaceSpec.name : undefined,
@@ -171,7 +165,10 @@ export async function handleSessionsRoutes(
 		let createdId = "";
 		let claimed = false;
 		try {
-			const summary = await durableSessions.create(req, { workspaceId: workspace.id });
+			const summary = await durableSessions.create(req, {
+				workspaceId: workspace.id,
+				...(presetId ? { presetId } : {}),
+			});
 			createdId = summary.id;
 			if (!workspaceRegistry.bindSession(summary.id, workspace.id)) throw new Error("Workspace not found");
 			if (workspaceReplica && tenant) {

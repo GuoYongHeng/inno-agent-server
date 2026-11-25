@@ -45,8 +45,8 @@ export class GitHubContentSource implements RemoteContentSource {
 	constructor(private readonly hub: InnoContentHubConfig) {}
 
 	private prefixFor(category: ContentCategory): string {
-		const dir = category === "skills" ? this.hub.skillsPath : this.hub.presetsPath;
-		return `${dir}/`;
+		void category;
+		return `${this.hub.skillsPath}/`;
 	}
 
 	private headers(): Record<string, string> {

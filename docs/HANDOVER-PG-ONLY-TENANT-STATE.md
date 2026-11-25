@@ -49,14 +49,15 @@ Web 端按 `serverManaged` 标志隐藏 AddProviderWizard、模型编辑/删除�
 ### 3.3 存储布局
 
 ```text
-PG（真源）            : tenant_configs、tenant_state、tenant_jobs*、tenant_checkins*、
-                      ds_*（durable storage）、durable_sessions、recovery_records、
-                      workspace_files manifest、L2/L3 表、tenant_workspaces
-对象存储（文件字节真源）: tenants/<t>/workspaces/<ws>/<path>、L2 二进制原件
-INNO_WORKSPACE_DIR    : workspace 本地副本（.tmp/.pub/<wsId>/.channels/<t>/<ch>/.presets/...），scratch
-INNO_DATA_DIR         : 元数据 scratch（attachments.json、workspace-activity.json、
-                        replica 状态、registry.json 镜像）+ log/ + 缓存 + 渠道暂存
-INNO_CONFIG_DIR       : config.json（运维目录）+ skills.json（全局技能开关，auth 下只读）
+PG（真源）            : tenant_configs、tenant_state、tenant_skills、skill_catalog、tenant_jobs*、tenant_checkins*、
+                      ds_*、durable_sessions（含 preset_id）、recovery_records、
+                      workspace_files、L2/L3 文本与索引、tenant_workspaces
+对象存储（文件字节）  : platform/skills/…、tenants/<t>/workspaces/…（含 .chat-images/）、
+                      tenants/<t>/l2/…、tenants/<t>/outbox/…
+INNO_WORKSPACE_DIR    : 工作区本地副本（local exec 的执行目录）。预设打开时是空目录。
+INNO_CONFIG_DIR       : config.json。skills.json 只是本地 seed 目录的 ignore 列表。
+INNO_SKILLS_DIR       : 镜像/本地技能 seed，启动时写入 skill_catalog；租户开关是 tenant_skills。
+日志                  : 默认 stdout；config.json 的 logging.dir 非空才写文件。
 ```
 
 本地磁盘没有任何"丢了找不回"的字节；compose 只挂 `postgres-data`/`minio-data`/`inno-agent-config` 三个卷。
@@ -91,6 +92,6 @@ INNO_CONFIG_DIR       : config.json（运维目录）+ skills.json（全局技�
 ## 6. 遗留事项 / 可做方向
 
 - `runtime.ts` 仍派生 `sessions/`、`jobs/`、`l2/`、`l3/` 路径——authenticated 模式基本不写，属本地模式遗留，未清理。
-- `INNO_DATA_DIR`/`INNO_WORKSPACE_DIR` env 仍在（scratch 位置指针），如要极简可删 env 只留 `INNO_HOME` 推导，代价是 scratch 不可独立重定位。
-- `skills.json` 全局技能开关在 auth 下只读，未做 per-tenant 技能开关。
+- `INNO_DATA_DIR`/`--data` 已删除。持久字节在 PostgreSQL 或对象存储。`INNO_WORKSPACE_DIR` 仍是 local exec 的工作副本。zip / Office 预览会短时使用系统临时目录。预设不拷进工作区。延迟任务定时器和进行中的 SSE 订阅在进程内存里。
+- 租户技能开关是 `tenant_skills`。`skills.json` 不是租户开关。
 - L1 learner-profile 的磁盘残留不做迁移（DURABLE_ROADMAP 已声明忽略）。

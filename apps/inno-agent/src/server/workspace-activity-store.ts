@@ -1,10 +1,9 @@
 import { isAbsolute, relative, resolve } from "node:path";
-import { readJson, writeJson } from "../storage/file-store.js";
+import { updateTenantState, type TenantStateKv } from "../tenants/state-store.js";
 import { isWithin } from "../utils/path-safety.js";
 import { normalizeWorkspaceRelativePath, WORKSPACE_IGNORES } from "./file-helpers.js";
 import type { ChatAttachments } from "./attachments.js";
-import { attachmentsMetadataPath, type SessionAttachmentsMetadata } from "./attachments-store.js";
-import { traceMetadataPath, type SessionTraceMetadata } from "./trace-store.js";
+import { readSessionAttachments } from "./attachments-store.js";
 
 /**
  * The workspace activity sidecar deliberately stores metadata only.  It never
@@ -27,42 +26,12 @@ export interface WorkspaceActivitySession {
 	trackingIncomplete?: boolean;
 }
 
-export type WorkspaceActivityMetadata = Record<string, WorkspaceActivitySession>;
-
-interface ActivityCache {
-	dataDir: string;
-	metadata: WorkspaceActivityMetadata;
-}
-
-let cache: ActivityCache | null = null;
-
-export function workspaceActivityMetadataPath(dataDir: string): string {
-	return `${dataDir}/sessions/workspace-activity.json`.replaceAll("\\", "/");
-}
-
-function readMetadata(dataDir: string): WorkspaceActivityMetadata {
-	if (!cache || cache.dataDir !== dataDir) {
-		cache = { dataDir, metadata: readJson<WorkspaceActivityMetadata>(workspaceActivityMetadataPath(dataDir), {}) };
-	}
-	return cache.metadata;
-}
-
-function writeMetadata(dataDir: string, metadata: WorkspaceActivityMetadata): void {
-	cache = { dataDir, metadata };
-	writeJson(workspaceActivityMetadataPath(dataDir), metadata);
-}
-
-export function resetWorkspaceActivityStoreForTests(): void {
-	cache = null;
-}
+const activityKey = (sessionId: string) => `activity:${sessionId}`;
 
 /** Remove metadata for a deleted session without touching any workspace file. */
-export function clearWorkspaceActivity(dataDir: string, sessionId: string): void {
-	if (!sessionId) return;
-	const metadata = readMetadata(dataDir);
-	if (!metadata[sessionId]) return;
-	delete metadata[sessionId];
-	writeMetadata(dataDir, metadata);
+export function clearWorkspaceActivity(kv: TenantStateKv, sessionId: string): Promise<void> {
+	if (!sessionId) return Promise.resolve();
+	return kv.delete(activityKey(sessionId));
 }
 
 function normalizeRecordedPath(workspaceRoot: string, rawPath: string): string | null {
@@ -91,8 +60,8 @@ function mergeAccess(a: WorkspaceFileAccess, b: WorkspaceFileAccess): WorkspaceF
 }
 
 /** Record one or more known paths for a session turn. */
-export function recordWorkspaceFileAccess(
-	dataDir: string,
+export async function recordWorkspaceFileAccess(
+	kv: TenantStateKv,
 	input: {
 		sessionId: string;
 		workspaceId: string;
@@ -101,44 +70,43 @@ export function recordWorkspaceFileAccess(
 		access: WorkspaceFileAccess;
 		seenAt?: string;
 	},
-): void {
+): Promise<void> {
 	if (!input.sessionId || !input.workspaceId || input.paths.length === 0) return;
-	const metadata = readMetadata(dataDir);
-	const seen = new Set<string>();
 	const now = input.seenAt ?? new Date().toISOString();
-	for (const rawPath of input.paths) {
-		const path = normalizeRecordedPath(input.workspaceRoot, rawPath);
-		if (!path || seen.has(path)) continue;
-		seen.add(path);
-		const session = metadata[input.sessionId] ?? { files: [] };
-		const existing = session.files.find((item) => item.workspaceId === input.workspaceId && item.path === path);
-		if (existing) {
-			existing.access = mergeAccess(existing.access, input.access);
-			existing.lastSeenAt = now;
-		} else {
-			session.files.push({
-				sessionId: input.sessionId,
-				workspaceId: input.workspaceId,
-				path,
-				access: input.access,
-				firstSeenAt: now,
-				lastSeenAt: now,
-			});
+	await updateTenantState<WorkspaceActivitySession, void>(kv, activityKey(input.sessionId), (current) => {
+		const session: WorkspaceActivitySession = current ?? { files: [] };
+		const seen = new Set<string>();
+		for (const rawPath of input.paths) {
+			const path = normalizeRecordedPath(input.workspaceRoot, rawPath);
+			if (!path || seen.has(path)) continue;
+			seen.add(path);
+			const existing = session.files.find((item) => item.workspaceId === input.workspaceId && item.path === path);
+			if (existing) {
+				existing.access = mergeAccess(existing.access, input.access);
+				existing.lastSeenAt = now;
+			} else {
+				session.files.push({
+					sessionId: input.sessionId,
+					workspaceId: input.workspaceId,
+					path,
+					access: input.access,
+					firstSeenAt: now,
+					lastSeenAt: now,
+				});
+			}
 		}
-		metadata[input.sessionId] = session;
-	}
-	writeMetadata(dataDir, metadata);
+		return { next: session, result: undefined };
+	});
 }
 
 /** Mark that one or more historical accesses could not be classified safely. */
-export function markWorkspaceTrackingIncomplete(dataDir: string, sessionId: string): void {
+export async function markWorkspaceTrackingIncomplete(kv: TenantStateKv, sessionId: string): Promise<void> {
 	if (!sessionId) return;
-	const metadata = readMetadata(dataDir);
-	const session = metadata[sessionId] ?? { files: [] };
-	if (session.trackingIncomplete) return;
-	session.trackingIncomplete = true;
-	metadata[sessionId] = session;
-	writeMetadata(dataDir, metadata);
+	await updateTenantState<WorkspaceActivitySession, void>(kv, activityKey(sessionId), (current) => {
+		const session: WorkspaceActivitySession = current ?? { files: [] };
+		if (session.trackingIncomplete) return { next: current, result: undefined };
+		return { next: { ...session, trackingIncomplete: true }, result: undefined };
+	});
 }
 
 const PATH_KEYS = new Set([
@@ -212,8 +180,8 @@ function extractToolActivity(toolName: string, args: unknown): {
  * actually reading it, and guessing here would make the migration list less
  * trustworthy.
  */
-export function recordToolWorkspaceActivity(
-	dataDir: string,
+export async function recordToolWorkspaceActivity(
+	kv: TenantStateKv,
 	input: {
 		sessionId: string;
 		workspaceId: string;
@@ -222,11 +190,11 @@ export function recordToolWorkspaceActivity(
 		args?: unknown;
 		seenAt?: string;
 	},
-): void {
+): Promise<void> {
 	const { paths, access, incomplete } = extractToolActivity(input.toolName, input.args);
-	if (incomplete) markWorkspaceTrackingIncomplete(dataDir, input.sessionId);
+	if (incomplete) await markWorkspaceTrackingIncomplete(kv, input.sessionId);
 	if (paths.length === 0 || access === "unknown" || access === "none") return;
-	recordWorkspaceFileAccess(dataDir, {
+	await recordWorkspaceFileAccess(kv, {
 		...input,
 		paths,
 		access,
@@ -234,10 +202,10 @@ export function recordToolWorkspaceActivity(
 }
 
 export function recordWorkspaceAttachmentActivity(
-	dataDir: string,
+	kv: TenantStateKv,
 	input: { sessionId: string; workspaceId: string; workspaceRoot: string; attachments: ChatAttachments; seenAt?: string },
-): void {
-	recordWorkspaceFileAccess(dataDir, {
+): Promise<void> {
+	return recordWorkspaceFileAccess(kv, {
 		...input,
 		paths: attachmentPaths(input.attachments),
 		access: "read",
@@ -266,103 +234,13 @@ function addEphemeralActivity(
 	current.lastSeenAt = current.lastSeenAt > entry.lastSeenAt ? current.lastSeenAt : entry.lastSeenAt;
 }
 
-function legacyTraceActivities(
-	dataDir: string,
+async function legacyAttachmentActivities(
+	kv: TenantStateKv,
 	sessionId: string,
 	workspaceId: string,
 	workspaceRoot: string,
-): { files: WorkspaceFileActivity[]; incomplete: boolean; hasTrace: boolean } {
-	const traceMetadata = readJson<SessionTraceMetadata>(traceMetadataPath(dataDir), {});
-	const entries = traceMetadata[sessionId] ?? [];
-	const map = new Map<string, WorkspaceFileActivity>();
-	let incomplete = false;
-	for (const entry of entries) {
-		for (const envelope of entry.events ?? []) {
-			const event = envelope.event ?? {};
-			const type = typeof event.type === "string" ? event.type : "";
-			if (type === "workspace_change") {
-				const eventWorkspaceId = typeof event.workspaceId === "string" && event.workspaceId ? event.workspaceId : null;
-				if (!eventWorkspaceId) {
-					incomplete = true;
-					continue;
-				}
-				if (eventWorkspaceId !== workspaceId) continue;
-				if (event.truncated === true) incomplete = true;
-				const changes = Array.isArray(event.changes) ? event.changes : [];
-				for (const change of changes) {
-					if (!change || typeof change !== "object" || typeof (change as Record<string, unknown>).path !== "string") {
-						incomplete = true;
-						continue;
-					}
-					const path = normalizeRecordedPath(workspaceRoot, (change as Record<string, string>).path);
-					if (!path) {
-						incomplete = true;
-						continue;
-					}
-					addEphemeralActivity(map, {
-						sessionId,
-						workspaceId,
-						path,
-						access: "write",
-						firstSeenAt: envelope.occurredAt ?? "",
-						lastSeenAt: envelope.occurredAt ?? "",
-					});
-				}
-				continue;
-			}
-			if (type !== "tool_start" && type !== "tool_call_start" && type !== "tool_call_end") continue;
-			const eventWorkspaceId = typeof event.workspaceId === "string" && event.workspaceId ? event.workspaceId : null;
-			if (!eventWorkspaceId) {
-				// Tool traces without a persisted workspace binding are unsafe to
-				// attribute after a session has been switched between workspaces.
-				incomplete = true;
-				continue;
-			}
-			if (eventWorkspaceId !== workspaceId) continue;
-			// The assistant-side start event often has no arguments; the matching
-			// end/execution event carries the usable path. Do not turn that normal
-			// streaming shape into a false incomplete-tracking warning.
-			if (type === "tool_call_start" && event.args === undefined) continue;
-			const toolName = typeof event.toolName === "string" ? event.toolName : "";
-			const { paths, access, incomplete: toolIncomplete } = extractToolActivity(toolName, event.args);
-			if (access === "none") continue;
-			if (access === "unknown") {
-				incomplete = true;
-				continue;
-			}
-			if (toolIncomplete) incomplete = true;
-			if (paths.length === 0) {
-				incomplete = true;
-				continue;
-			}
-			for (const rawPath of paths) {
-				const path = normalizeRecordedPath(workspaceRoot, rawPath);
-				if (!path) {
-					incomplete = true;
-					continue;
-				}
-				addEphemeralActivity(map, {
-					sessionId,
-					workspaceId,
-					path,
-					access,
-					firstSeenAt: envelope.occurredAt ?? "",
-					lastSeenAt: envelope.occurredAt ?? "",
-				});
-			}
-		}
-	}
-	return { files: [...map.values()], incomplete, hasTrace: entries.length > 0 };
-}
-
-function legacyAttachmentActivities(
-	dataDir: string,
-	sessionId: string,
-	workspaceId: string,
-	workspaceRoot: string,
-): { files: WorkspaceFileActivity[]; incomplete: boolean; hasAttachments: boolean } {
-	const metadata = readJson<SessionAttachmentsMetadata>(attachmentsMetadataPath(dataDir), {});
-	const entries = metadata[sessionId] ?? [];
+): Promise<{ files: WorkspaceFileActivity[]; incomplete: boolean; hasAttachments: boolean }> {
+	const entries = await readSessionAttachments(kv, sessionId);
 	const map = new Map<string, WorkspaceFileActivity>();
 	let incomplete = false;
 	for (const entry of entries) {
@@ -385,35 +263,33 @@ function legacyAttachmentActivities(
 }
 
 /**
- * Read current and best-effort legacy activity for a session/workspace.  The
- * legacy fallback intentionally reports incomplete tracking because old
- * traces did not persist the workspace binding for every tool call.
+ * Read current and best-effort fallback activity for a session/workspace. The
+ * attachment-derived fallback intentionally reports incomplete tracking when
+ * a session has no explicit activity record, because attachments alone do not
+ * show every file the agent touched.
  */
-export function getWorkspaceFileActivities(
-	dataDir: string,	input: {
+export async function getWorkspaceFileActivities(
+	kv: TenantStateKv,
+	input: {
 		sessionId: string;
 		workspaceId: string;
 		workspaceRoot: string;
 		hasSessionHistory?: boolean;
 	},
-): { files: WorkspaceFileActivity[]; trackingIncomplete: boolean } {
+): Promise<{ files: WorkspaceFileActivity[]; trackingIncomplete: boolean }> {
 	const map = new Map<string, WorkspaceFileActivity>();
-	const current = readMetadata(dataDir)[input.sessionId];
+	const current = await kv.get<WorkspaceActivitySession>(activityKey(input.sessionId));
 	const currentFiles = current?.files.filter((entry) => entry.workspaceId === input.workspaceId) ?? [];
 	for (const entry of currentFiles) addEphemeralActivity(map, entry);
-	const legacyTrace = legacyTraceActivities(dataDir, input.sessionId, input.workspaceId, input.workspaceRoot);
-	for (const entry of legacyTrace.files) addEphemeralActivity(map, entry);
-	const legacyAttachments = legacyAttachmentActivities(dataDir, input.sessionId, input.workspaceId, input.workspaceRoot);
+	const legacyAttachments = await legacyAttachmentActivities(kv, input.sessionId, input.workspaceId, input.workspaceRoot);
 	for (const entry of legacyAttachments.files) addEphemeralActivity(map, entry);
 	const currentIncomplete = current?.trackingIncomplete === true;
-	// New turns have both the trace and this sidecar.  Only treat trace or
-	// attachment metadata as a legacy-only fallback when no current activity
+	// Only treat attachment metadata as a fallback when no current activity
 	// record exists; otherwise every successfully tracked turn would be marked
-	// incomplete merely because it also has a normal trace.
+	// incomplete merely because it also has attachments.
 	const hasCurrentActivity = currentFiles.length > 0;
-	const legacyOnly = !hasCurrentActivity && (legacyTrace.hasTrace || legacyAttachments.hasAttachments);
+	const legacyOnly = !hasCurrentActivity && legacyAttachments.hasAttachments;
 	const trackingIncomplete = currentIncomplete
-		|| legacyTrace.incomplete
 		|| legacyAttachments.incomplete
 		|| legacyOnly
 		|| (input.hasSessionHistory === true && !current && !legacyOnly);

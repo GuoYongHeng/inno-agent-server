@@ -36,3 +36,4 @@ apps/inno-agent/docs/
 *.key
 .env.*
 !.env.example
+.inno-scratch/

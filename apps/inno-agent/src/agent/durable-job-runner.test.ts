@@ -81,7 +81,7 @@ describe("runDurableJobPrompt", () => {
 		const { service, submit } = fixture();
 		const image = { type: "image" as const, data: "aW1hZ2U=", mimeType: "image/png" };
 		const prepared = {
-			nativeImages: native ? [image] : [],
+			vision: native,
 			images: [{ mimeType: "image/png", workspacePath: ".chat-images/channel.png" }],
 			fallbackContext: "Image path hints",
 			workspaceId: "workspace-1",
@@ -97,10 +97,12 @@ describe("runDurableJobPrompt", () => {
 		expect(service.recordTurnMetadata).toHaveBeenCalledWith(req, "durable-session", null, prepared, "describe this", "channel-request");
 		expect(submit).toHaveBeenCalledWith([
 			{ type: "text", text: "describe this" },
-			...(native ? [image] : []),
+			...(native ? [{ type: "text", text: "[inno-native-images]\n.chat-images/channel.png\timage/png\n[/inno-native-images]" }] : []),
 			{ type: "text", text: "Image path hints" },
 			{ type: "text", text: "recalled context" },
 		], "channel-request");
+		const submitted = JSON.stringify(submit.mock.calls.at(-1));
+		expect(submitted).not.toContain(image.data);
 	});
 
 	it("leases with the default busy wait and honors a per-call override", async () => {

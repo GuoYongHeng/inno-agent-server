@@ -49,7 +49,6 @@ apt-get update && apt-get install -y unzip zip bash && rm -rf /var/lib/apt/lists
 | `NODE_ENV` | `production` | 生产模式 |
 | `INNO_HOME` | `/var/lib/inno-agent`（Docker） | 主目录 |
 | `INNO_CONFIG_DIR` | `/etc/inno-agent`（Docker） | 配置文件目录 |
-| `INNO_DATA_DIR` | `<home>/data` | 数据目录（L2/L3 + sessions + jobs） |
 | `INNO_SKILLS_DIR` | `<home>/skills` | 技能包目录 |
 | `INNO_WORKSPACE_DIR` | `/srv/inno-workspace`（Docker） | 默认工作区目录 |
 | `INNO_PORT` | `3000` | HTTP 服务端口 |
@@ -99,8 +98,8 @@ apt-get update && apt-get install -y unzip zip bash && rm -rf /var/lib/apt/lists
 其他格式的依赖通过 npm 包预编译二进制捆绑，无需安装系统级库：
 
 - PDF 解析：`@hyzyla/pdfium`（WASM），`pdfjs-dist`（WASM）
-- 图片/OCR：`sharp`（捆绑 libvips 预编译），`tesseract.js`（WASM）
 - 支持的格式：`.pdf` `.docx` `.xlsx` `.pptx` `.png` `.jpg` `.jpeg` `.gif` `.webp` `.tiff`
+- 没有独立 OCR 包。扫描件解析失败时由文档解析器返回空文本错误。
 - 文件大小上限：100MB
 
 ### 3.3 Python 科学计算环境（Miniforge）
@@ -197,18 +196,12 @@ ENV PATH=${CONDA_DIR}/bin:${PATH}
 ENV NODE_ENV=production \
     INNO_HOME=/var/lib/inno-agent \
     INNO_CONFIG_DIR=/etc/inno-agent \
-    INNO_DATA_DIR=/var/lib/inno-agent/data \
     INNO_SKILLS_DIR=/var/lib/inno-agent/skills \
     INNO_WORKSPACE_DIR=/srv/inno-workspace \
     INNO_PORT=3000
 
 # 创建必要的目录结构
 RUN mkdir -p /etc/inno-agent \
-    /var/lib/inno-agent/data/l2 \
-    /var/lib/inno-agent/data/l3 \
-    /var/lib/inno-agent/data/sessions \
-    /var/lib/inno-agent/data/jobs \
-    /var/lib/inno-agent/data/log \
     /var/lib/inno-agent/skills \
     /srv/inno-workspace
 
@@ -239,13 +232,11 @@ ENV PATH=/opt/conda/bin:${PATH}
 Inno Agent
 ├── [运行时必要] unzip ──────────────── 技能包安装、ZIP 校验
 ├── [运行时必要] zip ────────────────── 工作区下载打包
-├── [运行时可选] Node.js >= 22.5 ────── L3 跨对话记忆 (node:sqlite)
+├── [单测遗留] Node.js >= 22.5 ──────── 文件版 L3 fake（node:sqlite）；生产 L3 用 ParadeDB BM25
 ├── [运行时可选] Miniforge ──────────── Python 科学计算环境 (conda-forge)
 │
-├── [原生模块] sharp/libvips ────────── 图像处理 (C++/预编译)
 ├── [原生模块] koffi ────────────────── C FFI 动态库加载 (C/N-API)
 ├── [原生模块] @hyzyla/pdfium ───────── PDF 解析 (C++→WASM)
-├── [原生模块] tesseract.js ─────────── OCR 文字识别 (C++→WASM)
 │
 ├── [构建时] node >= 22.19 ──────────── TypeScript 编译 + 运行时 / pi-durable
 ├── [构建时] python3 ────────────────── 原生模块 node-gyp 编译

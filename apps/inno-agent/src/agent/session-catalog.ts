@@ -24,6 +24,8 @@ export interface DurableSessionRecord {
 	conversationId?: string;
 	/** The remote sandbox this session runs shell and file tools in, once one exists. */
 	sandboxId?: string;
+	/** Simple Mode preset this session was opened from (image template id). */
+	presetId?: string;
 }
 
 export const DURABLE_ID_PATTERN = /^durable-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -96,6 +98,7 @@ export function isSessionRecord(value: unknown): value is DurableSessionRecord {
 		&& (record.topicGenerated === undefined || typeof record.topicGenerated === "boolean")
 		&& (record.topicUpgraded === undefined || typeof record.topicUpgraded === "boolean")
 		&& (record.origin === undefined || record.origin === "web" || record.origin === "scheduler")
+		&& (record.presetId === undefined || typeof record.presetId === "string")
 		&& typeof record.archived === "boolean";
 }
 

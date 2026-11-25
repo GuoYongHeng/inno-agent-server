@@ -1,5 +1,5 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
-import type { UserInput } from "@earendil-works/pi-durable";
+import { buildDurableUserInput } from "../agent/durable-user-input.js";
 import { contentDispositionAttachment } from "./file-helpers.js";
 import { sessionToMarkdown } from "./session-markdown.js";
 import { DurableBranchError } from "../agent/durable-runtime.js";
@@ -239,19 +239,22 @@ function startSse(res: ServerResponse): void {
 	});
 }
 
+function chatImagesAreEmbedded(raw: unknown): boolean {
+	return Array.isArray(raw) && raw.some((item) => item && typeof item === "object" && typeof (item as { data?: unknown }).data === "string");
+}
+
 function durableUserInput(
 	prompt: string,
 	attachments: PreparedDurableAttachments | null,
 	images: PreparedDurableImages | null,
 	recallContext: string,
-): UserInput {
-	if (!attachments && !images && !recallContext) return prompt;
-	const content: Exclude<UserInput, string> = [{ type: "text", text: prompt }];
-	content.push(...(images?.nativeImages ?? []));
-	if (images?.fallbackContext) content.push({ type: "text", text: images.fallbackContext });
-	if (attachments) content.push({ type: "text", text: attachments.context });
-	if (recallContext) content.push({ type: "text", text: recallContext });
-	return content;
+) {
+	return buildDurableUserInput(prompt, {
+		...(images?.vision ? { nativeImages: images.images } : {}),
+		...(images?.fallbackContext ? { fallbackContext: images.fallbackContext } : {}),
+		...(attachments ? { attachmentContext: attachments.context } : {}),
+		...(recallContext ? { recallContext } : {}),
+	});
 }
 
 async function streamDurableTurn(
@@ -304,18 +307,16 @@ async function streamDurableTurn(
 			const paths = (changeEvent.changes ?? [])
 				.map((change) => typeof change.path === "string" ? change.path : "")
 				.filter(Boolean);
-			try {
-				service.recordWorkspaceWriteActivity(
-					req,
-					state.sessionId,
-					state.workspaceId,
-					state.workspaceRoot,
-					paths,
-					changeEvent.truncated === true,
-				);
-			} catch (error) {
+			void service.recordWorkspaceWriteActivity(
+				req,
+				state.sessionId,
+				state.workspaceId,
+				state.workspaceRoot,
+				paths,
+				changeEvent.truncated === true,
+			).catch((error: unknown) => {
 				logger.warn({ err: error, sessionId: state.sessionId, turnId: state.turnId }, "durable workspace activity write failed");
-			}
+			});
 			if (!state.terminalEventPublished) {
 				publishChange({ ...changeEvent, workspaceId: state.workspaceId });
 			}
@@ -527,6 +528,10 @@ export async function handleDurableChatRoutes(
 		const prompt = typeof body.prompt === "string" ? body.prompt : "";
 		const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
 		if (!prompt || !sessionId) { json(res, 400, { error: "Missing prompt or sessionId" }); return true; }
+		if (chatImagesAreEmbedded(body.images)) {
+			json(res, 400, { error: "Chat images must be workspace file references" });
+			return true;
+		}
 		await restoreDurableStream(req, ctx.service, sessionId);
 		if (streamRegistry.getActiveForSession(sessionId)) {
 			json(res, 409, { error: "Session already has an active chat turn" });
@@ -551,7 +556,7 @@ export async function handleDurableChatRoutes(
 			lease = await ctx.service.lease(req, sessionId);
 			await lease.runtime.bindQuestionTurn({ turnId: requestId, noUi: true });
 			await lease.runtime.bindPermissionTurn({ turnId: requestId, noUi: true });
-			ctx.service.recordTurnMetadata(req, sessionId, attachments, images, prompt, requestId);
+			await ctx.service.recordTurnMetadata(req, sessionId, attachments, images, prompt, requestId);
 			const submission = await lease.runtime.submit(durableUserInput(prompt, attachments, images, recallContext), requestId);
 			await ctx.service.noteSubmission(req, sessionId, prompt);
 			const result = await lease.runtime.waitForSubmission(submission.id);
@@ -576,6 +581,10 @@ export async function handleDurableChatRoutes(
 	const clientRequestId = typeof body.clientRequestId === "string" ? body.clientRequestId : "";
 	if (!prompt || !sessionId || !clientRequestId) {
 		json(res, 400, { error: "Missing prompt, sessionId or clientRequestId" });
+		return true;
+	}
+	if (chatImagesAreEmbedded(body.images)) {
+		json(res, 400, { error: "Chat images must be workspace file references" });
 		return true;
 	}
 	await restoreDurableStream(req, ctx.service, sessionId);
@@ -623,7 +632,7 @@ export async function handleDurableChatRoutes(
 		json(res, 500, { error: error instanceof Error ? error.message : String(error) });
 		return true;
 	}
-	ctx.service.recordTurnMetadata(req, sessionId, attachments, images, prompt, clientRequestId);
+	await ctx.service.recordTurnMetadata(req, sessionId, attachments, images, prompt, clientRequestId);
 	publishDurableEvent(streamContext, { type: "stream_state", status: "queued" });
 	startSse(res);
 	let ended = false;

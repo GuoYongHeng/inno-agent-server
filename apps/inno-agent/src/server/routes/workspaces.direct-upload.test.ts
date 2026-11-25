@@ -5,7 +5,7 @@ import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RuntimePaths } from "../../runtime.js";
 import { WorkspaceRegistry } from "../../workspace/workspace-registry.js";
-import { resetWorkspaceActivityStoreForTests } from "../workspace-activity-store.js";
+import { FileStateKv } from "../../tenants/state-store.js";
 import { MemoryObjectStore, sha256Hex } from "../../object-store/object-store.js";
 import { FakeTenantStore, ctxA } from "../../workspace/fake-tenant-store.js";
 import { ObjectWorkspaceStore } from "../../workspace/object-workspace-store.js";
@@ -58,14 +58,13 @@ const WS_ID = "direct-ws";
 
 beforeEach(() => {
 	dir = mkdtempSync(`${tmpdir()}/workspace-direct-`);
-	const registry = new WorkspaceRegistry(`${dir}/workspaces`, `${dir}/data`);
+	const registry = new WorkspaceRegistry(`${dir}/workspaces`);
 	registry.ensureBootstrapped();
-	resetWorkspaceActivityStoreForTests();
 	objects = new MemoryObjectStore();
 	tenantStore = new RouteTenantStore({ id: WS_ID, name: "ws" });
 	ctx = {
 		workspaceRegistry: registry,
-		dataDir: `${dir}/data`,
+		stateKv: new FileStateKv(`${dir}/data`),
 		paths: {} as RuntimePaths,
 		tenantStore: tenantStore as unknown as TenantStore,
 		installSkillZip: () => { throw new Error("not used"); },
@@ -79,7 +78,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	resetWorkspaceActivityStoreForTests();
 	rmSync(dir, { recursive: true, force: true });
 });
 

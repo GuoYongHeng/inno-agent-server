@@ -120,9 +120,13 @@ export function deleteChannelOutboxForSession(outboxDir: string, sessionId: stri
 	return removed;
 }
 
-/** A payload snapshot as a local file the channel can upload. Call `cleanup` once the send finished. */
+/**
+ * A payload snapshot the channel can upload: raw `bytes` (object-store outbox,
+ * loaded for the upload) or a local `path` (file outbox used by unit tests).
+ */
 export interface OutboxPayload {
-	path: string;
+	path?: string;
+	bytes?: Uint8Array;
 	cleanup(): void;
 }
 
@@ -135,8 +139,9 @@ export function outboxSessionId(operationId: string): string {
 
 /**
  * Persistent send intent for `send_file_to_channel`: the target, a snapshot of
- * the file, and a completion marker. Files in local mode, PostgreSQL rows when
- * authenticated (see `pg-channel-outbox.ts`).
+ * the file, and a completion marker. File-backed for unit tests; authenticated
+ * mode keeps the intent in `recovery_records` and the bytes in ObjectStore
+ * (see `pg-channel-outbox.ts`).
  */
 export interface ChannelOutbox {
 	load(operationId: string): Promise<ChannelOutboxRecord | undefined>;

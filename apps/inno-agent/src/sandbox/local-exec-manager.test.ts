@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
+import { FileStateKv } from "../tenants/state-store.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -47,7 +48,7 @@ function setup() {
 const input = (over: Record<string, unknown> = {}) => ({
 	sessionId: "s1",
 	hostWorkspaceDir: "",
-	stateDir: "",
+	stateKv: new FileStateKv(""),
 	persistSandboxId: async () => {},
 	...over,
 });

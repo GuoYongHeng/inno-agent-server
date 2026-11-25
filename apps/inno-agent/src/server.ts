@@ -2,7 +2,6 @@
 // pino-caller call sites map back to the original TS source locations.
 import "source-map-support/register.js";
 
-import { auditDurableData } from "./agent/durable-audit.js";
 import { PgSessionCatalog } from "./agent/pg-session-catalog.js";
 import { createSandboxManager } from "./sandbox/index.js";
 import { LocalExecManager } from "./sandbox/local-exec-manager.js";
@@ -16,7 +15,7 @@ import { cpSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeF
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
-import { loadConfig, normalizeSandboxConfig, type InnoConfig } from "./config.js";
+import { loadConfig, normalizeSandboxConfig, readLoggingDir, type InnoConfig } from "./config.js";
 import { installFetchLogger } from "./utils/fetch-logger.js";
 import { applyProviderProxyBypass } from "./utils/proxy-bypass.js";
 import { ensureDir, readJson, readText, writeJson, writeText } from "./storage/file-store.js";
@@ -58,16 +57,22 @@ import { setL2BackendResolver } from "./memory/l2/l2-backend.js";
 import { PgL2Backend } from "./memory/l2/pg-l2-backend.js";
 import { createObjectStore, isDurableObjectStorageProvider, normalizeObjectStorageConfig, type ObjectStore } from "./object-store/index.js";
 import { handlePresetsRoutes } from "./server/routes/presets.js";
+import { readPresetAgentMd, resolvePresetMeta } from "./presets/preset-store.js";
 import { loadSkillsFromDir } from "./agent/skills.js";
+import { SkillCatalogStore, type TenantSkillListing } from "./skills/catalog-store.js";
+import { buildCatalogSkillsSection } from "./skills/materialize.js";
+import { publishSkillsFromRoot } from "./skills/publish.js";
+import type { CatalogSkillListing } from "./server/routes/skills.js";
 import { createSchedulerTools } from "./scheduler/scheduler-tools.js";
 import { handleChatRoutes } from "./server/routes/chat.js";
 import { handleBtwRoutes } from "./server/routes/btw.js";
 import {
 } from "./server/session-model.js";
-import { logger } from "./logger.js";
+import { configureLogging, logger } from "./logger.js";
+import { VIRTUAL_TENANT_ROOT } from "./tenants/paths.js";
 import { applyRuntimeEnvironment, parseRuntimeArgs, resolveRuntimePaths } from "./runtime.js";
 import { createGracefulShutdownHandler, installProcessFallbacks } from "./utils/process-fallback.js";
-import { DEFAULT_WORKSPACE_ID, TEMP_WORKSPACE_ID, WorkspaceRegistry, type WorkspaceMeta } from "./workspace/workspace-registry.js";
+import { TEMP_WORKSPACE_ID, WorkspaceRegistry, type WorkspaceMeta } from "./workspace/workspace-registry.js";
 import { WorkspaceReplica } from "./workspace/workspace-replica.js";
 import { LocalFsWorkspaceStore } from "./workspace/local-fs-workspace-store.js";
 import { ObjectWorkspaceStore } from "./workspace/object-workspace-store.js";
@@ -98,6 +103,7 @@ installFetchLogger();
 const parsed = parseRuntimeArgs(process.argv.slice(2));
 const paths = resolveRuntimePaths(parsed.options);
 applyRuntimeEnvironment(paths);
+configureLogging({ dir: readLoggingDir(paths.configPath) });
 
 const authConfig = readAuthRuntimeConfig(process.env);
 const durableShardConfig = readDurableShardConfig(process.env);
@@ -119,8 +125,7 @@ let config!: InnoConfig;
 // Before that, no INNO_HOME subdirectories or files are created.
 // ---------------------------------------------------------------------------
 
-const dataDir = paths.dataDir;
-const l2DataDir = paths.l2DataDir;
+const dataDir = VIRTUAL_TENANT_ROOT;
 const skillsDir = paths.skillsDir;
 
 // Authenticated tenants keep L2 wiki state in PostgreSQL + object storage
@@ -133,6 +138,50 @@ const getSharedObjectStore = (): ObjectStore => {
 	}
 	return sharedObjectStore;
 };
+
+let skillCatalogStore: SkillCatalogStore | null = null;
+const getSkillCatalog = (): SkillCatalogStore => {
+	if (!skillCatalogStore) {
+		skillCatalogStore = new SkillCatalogStore(auth.tenantStore.database);
+	}
+	return skillCatalogStore;
+};
+
+function toCatalogSkillListing(row: TenantSkillListing): CatalogSkillListing {
+	return {
+		name: row.name,
+		description: row.description,
+		enabled: row.enabled,
+		loaded: row.enabled,
+		filePath: `catalog:${row.skillId}@${row.version}`,
+		size: 0,
+		updatedAt: row.publishedAt,
+		diagnostics: [],
+		skillId: row.skillId,
+		version: row.version,
+		disableModelInvocation: row.disableModelInvocation,
+		source: row.source,
+		publishedAt: row.publishedAt,
+	};
+}
+
+/** Publish image-baked skills into object store + catalog, then opt tenants in. */
+async function seedSkillCatalogFromImage(): Promise<void> {
+	try {
+		const results = await publishSkillsFromRoot({
+			objects: getSharedObjectStore(),
+			catalog: getSkillCatalog(),
+			skillsRoot: skillsDir,
+			source: "image-seed",
+		});
+		const enabled = await getSkillCatalog().enableAllForAllTenants();
+		if (results.length > 0 || enabled > 0) {
+			logger.info({ published: results.length, tenantSkillRows: enabled }, "skill catalog seed complete");
+		}
+	} catch (err) {
+		logger.warn({ err }, "skill catalog seed failed");
+	}
+}
 /**
  * The in-memory object store loses all bytes on restart, so manifest-backed
  * reads would list files whose objects are gone forever. Only s3/fs providers
@@ -175,7 +224,6 @@ const workspaceStoreForRequest = (request: HttpReq): WorkspaceStore => {
 let workspaceReplica: WorkspaceReplica | null = null;
 
 const contentHubCatalog = new ContentHubCatalog({
-	dataDir,
 	paths,
 	skillsDir,
 	getConfig: () => config,
@@ -213,8 +261,6 @@ async function ensureBootstrapped(): Promise<void> {
 		getSandboxManager(); // fail fast on a sandbox config that cannot work
 
 		// ---- data directories ----
-		ensureDir(paths.sessionDir);
-		ensureDir(paths.jobsDir);
 		ensureDir(paths.skillsDir);
 		ensureDir(paths.workspaceDir);
 
@@ -226,24 +272,16 @@ async function ensureBootstrapped(): Promise<void> {
 
 		channelRegistry = new ChannelRegistry();
 
-		workspaceRegistry = new WorkspaceRegistry(paths.workspaceDir, dataDir);
+		workspaceRegistry = new WorkspaceRegistry(paths.workspaceDir);
 		workspaceRegistry.ensureBootstrapped();
 		{
-			workspaceReplica = new WorkspaceReplica(getSharedObjectStore(), auth.tenantStore, workspaceRegistry, join(dataDir, "workspaces", "replica"));
+			workspaceReplica = new WorkspaceReplica(getSharedObjectStore(), auth.tenantStore, workspaceRegistry);
 			if (!objectStorageIsDurable()) {
 				logger.warn("object storage is in-memory: workspace panel reads this worker's disk; not safe for takeover");
 			}
 		}
-		try {
-			const sessionFiles = existsSync(paths.sessionDir)
-				? readdirSync(paths.sessionDir).filter((f) => f.endsWith(".jsonl"))
-				: [];
-			workspaceRegistry.migrateUnboundSessions(sessionFiles, DEFAULT_WORKSPACE_ID);
-		} catch (err) {
-			logger.warn({ err }, "[sessions] unbound-session migration failed");
-		}
-
 		migrateLegacyPiSkills();
+		await seedSkillCatalogFromImage();
 
 		// ---- channels ----
 
@@ -279,7 +317,6 @@ async function ensureBootstrapped(): Promise<void> {
 					await workspaceReplica.setSessionBinding(tenant, sessionId, ws.id);
 				}
 			},
-			sessionDir: join(dataDir, "sessions"),
 			runPromptInSession: (sessionId, prompt, images) => runDurableChannelPrompt(sessionId, prompt, undefined, images),
 			runPromptStreamingInSession: (sessionId, prompt, onEvent, images) => runDurableChannelPrompt(sessionId, prompt, onEvent, images),
 			createNewSession: async (channel = "web") => {
@@ -302,16 +339,14 @@ async function ensureBootstrapped(): Promise<void> {
 
 		{
 			tenantChannelManager = new TenantChannelManager({
-				dataDir,
 				tenantStore: auth.tenantStore,
 				getLocalConfig: () => config,
 				dispatcher: dispatcherOptions,
-				createChannels: ({ config: tenantConfig, channelsDataDir: tenantChannelsDir, registry, dispatch, wechatTokenPersistence }) => {
-					const tenantDataDir = dirname(tenantChannelsDir);
+				createChannels: ({ config: tenantConfig, registry, dispatch, wechatTokenPersistence }) => {
 					let tenantFeishu: FeishuChannel | null = null;
 					let tenantWechat: WeChatChannel | null = null;
 					if (tenantConfig.feishu?.appId && tenantConfig.channels?.feishu?.enabled) {
-						tenantFeishu = new FeishuChannel(tenantConfig.feishu, tenantDataDir, tenantConfig.channels.feishu);
+						tenantFeishu = new FeishuChannel(tenantConfig.feishu, tenantConfig.channels.feishu);
 						registry.register(tenantFeishu);
 						tenantFeishu.onMessage((msg) => dispatch(tenantFeishu!, msg));
 						tenantFeishu.start();
@@ -733,9 +768,6 @@ function listSkillLibrary(forceRefresh = false) {
 	return contentHubCatalog.listSkillLibrary(forceRefresh);
 }
 
-function listPresetLibrary(forceRefresh = false) {
-	return contentHubCatalog.listPresetLibrary(forceRefresh);
-}
 
 /**
  * Import a skill from the remote library into the global skills directory.
@@ -953,6 +985,7 @@ function getSandboxManager(): SandboxBindingProvider | undefined {
 
 const durableSessions = new DurableSessionService({
 	dataDir,
+	getStateKv: () => tenantStateStore,
 	getLocalConfig: () => config,
 	enabled: true,
 	resolveWorkspaceDir: (sessionId, fallbackWorkspaceId) => workspaceRegistry.resolveWorkspaceDir(
@@ -960,6 +993,37 @@ const durableSessions = new DurableSessionService({
 	) ?? undefined,
 	getChannelRegistry: () => channelRegistry,
 	skillsDir,
+	resolveCatalogSkillsSection: async ({ tenant, workspaceDir, extraSkillIds }) => {
+		try {
+			const catalog = getSkillCatalog();
+			const enabled = await catalog.listEnabledForTenant(tenant.tenantId);
+			const byId = new Map(enabled.map((row) => [row.skillId, row]));
+			for (const skillId of extraSkillIds ?? []) {
+				if (byId.has(skillId)) continue;
+				const row = await catalog.get(skillId);
+				if (row) byId.set(skillId, row);
+				else logger.warn({ skillId, tenantId: tenant.tenantId }, "preset-bound skill missing from catalog");
+			}
+			const skills = [...byId.values()];
+			if (skills.length === 0) return undefined;
+			return await buildCatalogSkillsSection({
+				objects: getSharedObjectStore(),
+				skills,
+				workspaceDir,
+			});
+		} catch (err) {
+			logger.warn({ err, tenantId: tenant.tenantId }, "catalog skills section failed; falling back to skillsDir");
+			return undefined;
+		}
+	},
+	resolvePresetAgentSection: (presetId) => readPresetAgentMd(paths, presetId),
+	resolvePresetSkillIds: (presetId) => {
+		try {
+			return resolvePresetMeta(paths, presetId).skills;
+		} catch {
+			return [];
+		}
+	},
 	getSchedulerTools: () => createSchedulerTools(jobStore, channelRegistry, checkInStore, {
 		// "Run this job now" from a conversation: give the run a durable session of its own.
 		runJob: async (job) => {
@@ -978,6 +1042,7 @@ const durableSessions = new DurableSessionService({
 	getSandboxManager,
 	workspaceStoreFor: workspaceStoreForRequest,
 	recoveryPool: auth.tenantStore.database,
+	objectStore: getSharedObjectStore(),
 	pgCatalog: new PgSessionCatalog(auth.tenantStore.database),
 	workspaceReplica: {
 		materializeSession: (tenant, sessionId, catalogWorkspaceId, options) =>
@@ -1150,7 +1215,6 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	// --- Channels + bridge (extracted to server/routes/channels.ts) ---
 	channels: (req, res, method, url) => handleChannelsRoutes(req, res, method, url, {
 		channelRegistry,
-		dataDir,
 		configPath: paths.configPath,
 		getConfig: () => config,
 		setConfig: (next) => { config = next; },
@@ -1201,6 +1265,25 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	skills: (req, res, method, url) => handleSkillsRoutes(req, res, method, url, {
 		skillsDir,
 		sharedSkillsReadOnly: true,
+		catalog: {
+			listForTenant: async () => {
+				const tenant = requireRequestTenant(req);
+				const rows = await getSkillCatalog().listForTenant(tenant.tenantId);
+				return rows.map(toCatalogSkillListing);
+			},
+			setEnabled: async (skillId, enabled) => {
+				const tenant = requireRequestTenant(req);
+				const row = await getSkillCatalog().setEnabled(tenant.tenantId, skillId, enabled);
+				return row ? toCatalogSkillListing(row) : null;
+			},
+			enableIfPublished: async (skillId) => {
+				const tenant = requireRequestTenant(req);
+				const existing = await getSkillCatalog().get(skillId);
+				if (!existing) return null;
+				const row = await getSkillCatalog().setEnabled(tenant.tenantId, skillId, true);
+				return row ? toCatalogSkillListing(row) : null;
+			},
+		},
 		scheduleSkillsReload,
 		listProjectSkills,
 		setSkillEnabled,
@@ -1212,18 +1295,17 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 
 	// --- Sessions API (extracted to server/routes/sessions.ts) ---
 	sessions: (req, res, method, url) => handleSessionsRoutes(req, res, method, url, {
-		workspaceRegistry, paths, getContentSource, tenantStore: auth.tenantStore, durableSessions,
+		workspaceRegistry, paths, tenantStore: auth.tenantStore, durableSessions,
 		workspaceReplica, objectStorageDurable: objectStorageIsDurable(),
-		getCachedPresetAvailability: (presetId) => contentHubCatalog.getCachedPresetAvailability(presetId),
 	}),
 
 	// --- Wiki + L2 raw upload API (extracted to server/routes/wiki.ts) ---
-	wiki: (req, res, method, url) => handleWikiRoutes(req, res, method, url, { l2DataDir, dataDir }),
+	wiki: (req, res, method, url) => handleWikiRoutes(req, res, method, url, { dataDir }),
 
 
 	// --- Workspace API + registry + session binding (extracted to server/routes/workspaces.ts) ---
 	workspaces: (req, res, method, url) => handleWorkspacesRoutes(req, res, method, url, {
-		workspaceRegistry, dataDir, paths, tenantStore: auth.tenantStore,
+		workspaceRegistry, stateKv: tenantState(), paths, tenantStore: auth.tenantStore,
 		installSkillZip, installSkillMarkdown, scheduleSkillsReload, importWorkspaceZip, durableSessions,
 		workspaceReplica,
 		// Read routes serve from the manifest + object store in authenticated
@@ -1233,7 +1315,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 	}),
 
 	// --- Presets API (extracted to server/routes/presets.ts) ---
-	presets: (req, res, method, url) => handlePresetsRoutes(req, res, method, url, { paths, listPresetLibrary }),
+	presets: (req, res, method, url) => handlePresetsRoutes(req, res, method, url, { paths }),
 
 	// --- Settings API (extracted to server/routes/settings.ts) ---
 	settings: (req, res, method, url) => handleSettingsRoutes(req, res, method, url, {
@@ -1249,7 +1331,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 
 	// --- Btw side-question API (extracted to server/routes/btw.ts) ---
 	btw: (req, res, method, url) => handleBtwRoutes(req, res, method, url, {
-		dataDir, tenantStore: auth.tenantStore,
+		stateKv: tenantState(), tenantStore: auth.tenantStore,
 		durableSessions,
 	}),
 
@@ -1344,6 +1426,9 @@ const server = createServer(async (req, response) => {
 			const session = await requireSession(req, res, auth);
 			if (!session) return;
 			const tenant = await auth.tenantStore.ensurePersonalTenant(session.principal.userId);
+			await getSkillCatalog().enableAllForTenant(tenant.tenantId).catch((err) => {
+				logger.warn({ err, tenantId: tenant.tenantId }, "failed to opt tenant into skill catalog");
+			});
 			if (durableShardConfig) {
 				const routedReq = await forwardDurableTenantRequest(req, res, tenant, durableShardConfig,
 					(sessionId) => auth.tenantStore.durableSessionRouteHint(tenant, sessionId));
@@ -1467,23 +1552,4 @@ process.on("SIGINT", gracefulShutdown);
 server.listen(port, listenConfig.host, () => {
 	console.log(`[inno-server] listening on http://${listenConfig.host}:${port}`);
 	console.log(`[inno-server] config: ${paths.configPath}`);
-	// Report-only orphan audit; repair is an explicit offline step (durable-fsck).
-	setImmediate(async () => {
-		try {
-			const pool = auth.tenantStore?.database;
-			const audits = await auditDurableData(paths.dataDir, pool ? {
-				knownIds: async (tenantId) => new Set((await pool.query<{ id: string }>(
-					"SELECT id FROM durable_sessions WHERE tenant_id = $1", [tenantId])).rows.map((row) => row.id)),
-			} : {});
-			for (const audit of audits) {
-				if (audit.error) logger.warn({ owner: audit.owner, error: audit.error }, "durable data audit failed");
-				else if (audit.orphans.length) {
-					logger.warn({ owner: audit.owner, orphans: audit.orphans.map((o) => o.sessionId) },
-						"orphaned durable session data found; run `npm run durable:fsck -- --repair` to remove it");
-				}
-			}
-		} catch (err) {
-			logger.warn({ err }, "durable data audit crashed");
-		}
-	});
 });

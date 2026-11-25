@@ -11,12 +11,12 @@ import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import type { Pool } from "pg";
 import type { IncomingMessage } from "node:http";
-import type { ImageContent } from "@earendil-works/pi-ai";
 import { join } from "node:path";
 import type { InnoConfig } from "../config.js";
 import type { ChannelOutbox } from "../channels/channel-outbox.js";
 import { PgChannelOutbox } from "../channels/pg-channel-outbox.js";
 import type { ChannelRegistry } from "../channels/channel.js";
+import type { ObjectStore } from "../object-store/object-store.js";
 import { resolveCurrentTenantConfig } from "../tenants/config.js";
 import { runInTenantContext } from "../tenants/current.js";
 import { requireRequestTenant } from "../tenants/http.js";
@@ -35,8 +35,12 @@ import {
 	mergeSessionAttachments,
 	recordSessionAttachments,
 } from "../server/attachments-store.js";
+import { FileStateKv, type TenantStateKv } from "../tenants/state-store.js";
+import { clearSessionBtw } from "../server/btw-store.js";
 import { clearWorkspaceActivity, markWorkspaceTrackingIncomplete, recordWorkspaceAttachmentActivity, recordWorkspaceFileAccess } from "../server/workspace-activity-store.js";
-import { buildImagePathsHint, parseInlineImages, persistInlineImages } from "../server/inline-images.js";
+import { existsSync } from "node:fs";
+import { buildImagePathsHint, parseChatImageRefs, parseInlineImages, persistInlineImages } from "../server/inline-images.js";
+import { resolveContainedPath } from "../utils/path-safety.js";
 import { fallbackTopicFromMessages, generateSessionTopicWithCompletion } from "../server/session-topic.js";
 import {
 	completeConfiguredDurableChat,
@@ -91,7 +95,8 @@ export interface PreparedDurableAttachments {
 }
 
 export interface PreparedDurableImages {
-	nativeImages: ImageContent[];
+	/** The session model accepts image input, so the transcript marker is expanded at request time. */
+	vision: boolean;
 	images: Array<{ mimeType: string; workspacePath: string }>;
 	fallbackContext: string;
 	workspaceId: string;
@@ -124,14 +129,34 @@ interface OpenedRuntime {
 
 export interface DurableSessionServiceOptions {
 	dataDir: string;
+	/** Tenant-scoped sidecar state (attachments, workspace activity) in `tenant_state`.
+	 * Lazy because the PostgreSQL pool is created during server bootstrap; unit tests
+	 * omit it and get a file-backed fake rooted at the request's tenant data root. */
+	getStateKv?: () => TenantStateKv | undefined;
 	getLocalConfig: () => InnoConfig;
 	enabled: boolean;
 	resolveWorkspaceDir: (sessionId: string, fallbackWorkspaceId: string) => string | undefined;
 	/** Lazy because the server's channel registry is built during agent bootstrap. */
 	getChannelRegistry?: () => ChannelRegistry | undefined;
 	/** Shared skills directory. Enabled skills are listed in every session's
-	 * instructions and read through the session's `read` tool. */
+	 * instructions and read through the session's `read` tool. Used as a
+	 * fallback when the platform skill catalog is empty / unavailable. */
 	skillsDir?: string;
+	/**
+	 * Platform skill catalog (object store + tenant_skills). When set, the
+	 * session materializes enabled skills into `.global-skills/` and prefers
+	 * that prompt section over `skillsDir`. `extraSkillIds` are preset-bound
+	 * catalog skills merged with the tenant's enabled set for this session.
+	 */
+	resolveCatalogSkillsSection?: (input: {
+		tenant: TenantContext;
+		workspaceDir: string;
+		extraSkillIds?: string[];
+	}) => Promise<string | undefined>;
+	/** Read-only preset `agent.md` from the image (never from the workspace). */
+	resolvePresetAgentSection?: (presetId: string) => string | undefined;
+	/** Platform skill ids declared on a preset template. */
+	resolvePresetSkillIds?: (presetId: string) => string[];
 	/** Lazy for the same reason: job stores are created during server bootstrap. */
 	getSchedulerTools?: () => ToolRegistration[];
 	tenantStore: TenantStore;
@@ -139,6 +164,8 @@ export interface DurableSessionServiceOptions {
 	pgCatalog: SessionCatalog;
 	/** PostgreSQL pool for recovery records — the only store; JSON files are gone. */
 	recoveryPool: Pool;
+	/** Blob store for channel outbox payloads. Required whenever `send_file_to_channel` runs. */
+	objectStore?: ObjectStore;
 	/** When set, every session runs its shell and file tools in a remote sandbox. */
 	getSandboxManager?: () => SandboxBindingProvider | undefined;
 	openRuntime?: typeof DurableSessionRuntime.open;
@@ -267,6 +294,10 @@ export class DurableSessionService {
 		return join(resolveRequestTenantDataRoot(req, this.options.dataDir), "durable");
 	}
 
+	private stateKv(req: IncomingMessage): TenantStateKv {
+		return this.options.getStateKv?.() ?? new FileStateKv(resolveRequestTenantDataRoot(req, this.options.dataDir));
+	}
+
 	private runtimeKey(req: IncomingMessage, id: string): string {
 		return join(this.root(req), "storage", id);
 	}
@@ -283,8 +314,12 @@ export class DurableSessionService {
 		return new PgRecoveryStore(this.options.recoveryPool, requireRequestTenant(req).tenantId, kind);
 	}
 
-	private channelOutbox(req: IncomingMessage, tenantDataRoot: string): ChannelOutbox {
-		return new PgChannelOutbox(this.options.recoveryPool, requireRequestTenant(req).tenantId);
+	private channelOutbox(req: IncomingMessage, _tenantDataRoot: string): ChannelOutbox {
+		const objects = this.options.objectStore;
+		if (!objects) {
+			throw new Error("Channel outbox requires an ObjectStore; binary payloads are not stored in PostgreSQL");
+		}
+		return new PgChannelOutbox(this.options.recoveryPool, requireRequestTenant(req).tenantId, objects);
 	}
 
 	private permissionStore(req: IncomingMessage, id: string): DurablePermissionStore {
@@ -403,7 +438,11 @@ export class DurableSessionService {
 		return { sessions: page.records.map(toSummary), nextCursor: page.nextCursor };
 	}
 
-	async create(req: IncomingMessage, input: { workspaceId: string; origin?: "web" | "scheduler" }): Promise<DurableSessionSummary> {
+	async create(req: IncomingMessage, input: {
+		workspaceId: string;
+		origin?: "web" | "scheduler";
+		presetId?: string;
+	}): Promise<DurableSessionSummary> {
 		if (!this.options.enabled) throw new DurableRuntimeDisabledError();
 		if (this.closing) throw new Error("Durable session service is shutting down");
 		const config = await resolveCurrentTenantConfig(this.options.getLocalConfig());
@@ -428,6 +467,7 @@ export class DurableSessionService {
 			modelId: config.defaultModel,
 			origin: input.origin ?? "web",
 			archived: false,
+			...(input.presetId ? { presetId: input.presetId } : {}),
 		};
 		await this.catalogFor(req).insert(req, record);
 		return toSummary(record);
@@ -676,50 +716,64 @@ export class DurableSessionService {
 	}
 
 	async prepareImages(req: IncomingMessage, id: string, raw: unknown, requestId: string): Promise<PreparedDurableImages | null> {
-		const parsed = parseInlineImages(raw);
-		if (parsed.length === 0) return null;
+		const refs = parseChatImageRefs(raw);
+		const embedded = refs ? [] : parseInlineImages(raw);
+		if (!refs && embedded.length === 0) return null;
 		const record = await this.get(req, id);
 		if (!record) throw new Error("Durable session not found");
 		const workspaceRoot = this.options.resolveWorkspaceDir(id, record.workspaceId);
 		if (!workspaceRoot) throw new Error(`Durable session workspace not found: ${record.workspaceId}`);
-		const paths = persistInlineImages(parsed, workspaceRoot, requestId);
-		if (paths.length !== parsed.length) throw new Error("Failed to persist every durable inline image");
-		// Mirror into the manifest store so the files are durable immediately —
-		// the local copy above is what the model reads during this turn.
 		const store = this.workspaceStore(req);
-		if (store && record.workspaceId) {
-			for (const [index, image] of parsed.entries()) {
-				const rel = paths[index];
-				if (!rel) continue;
-				await store.write(record.workspaceId, rel, Buffer.from(image.data, "base64"))
-					.catch((error) => logger.warn({ err: error, workspaceId: record.workspaceId, rel }, "failed to mirror inline image into workspace store"));
+		let images: Array<{ mimeType: string; workspacePath: string }>;
+		if (refs) {
+			for (const image of refs) {
+				if (store && record.workspaceId) {
+					const entry = await store.stat(record.workspaceId, image.workspacePath);
+					if (!entry || entry.kind !== "file") throw new Error(`Chat image is not in the workspace: ${image.workspacePath}`);
+				} else {
+					const abs = resolveContainedPath(workspaceRoot, image.workspacePath);
+					if (!abs || !existsSync(abs)) throw new Error(`Chat image is not in the workspace: ${image.workspacePath}`);
+				}
 			}
+			images = refs;
+		} else {
+			// Channel and other server-side callers still hand us bytes. The browser does not.
+			const paths = persistInlineImages(embedded, workspaceRoot, requestId);
+			if (paths.length !== embedded.length) throw new Error("Failed to persist every durable inline image");
+			if (store && record.workspaceId) {
+				for (const [index, image] of embedded.entries()) {
+					const rel = paths[index];
+					if (!rel) continue;
+					await store.write(record.workspaceId, rel, Buffer.from(image.data, "base64"))
+						.catch((error) => logger.warn({ err: error, workspaceId: record.workspaceId, rel }, "failed to mirror inline image into workspace store"));
+				}
+			}
+			images = embedded.map((image, index) => ({ mimeType: image.mimeType, workspacePath: paths[index]! }));
 		}
 		const config = await resolveCurrentTenantConfig(this.options.getLocalConfig());
 		const model = config.providers[record.provider]?.models.find((candidate) => candidate.id === record.modelId);
 		if (!model) throw new Error(`Configured durable model not found: ${record.provider}/${record.modelId}`);
-		const native = model.input.includes("image");
 		return {
-			nativeImages: native ? parsed : [],
-			images: parsed.map((image, index) => ({ mimeType: image.mimeType, workspacePath: paths[index] })),
-			fallbackContext: buildImagePathsHint(paths),
+			vision: model.input.includes("image"),
+			images,
+			fallbackContext: buildImagePathsHint(images.map((image) => image.workspacePath)),
 			workspaceId: record.workspaceId,
 			workspaceRoot,
 		};
 	}
 
-	recordTurnMetadata(
+	async recordTurnMetadata(
 		req: IncomingMessage,
 		id: string,
 		attachments: PreparedDurableAttachments | null,
 		images: PreparedDurableImages | null,
 		prompt: string,
 		requestId: string,
-	): void {
+	): Promise<void> {
 		if (!attachments && !images) return;
-		const dataRoot = resolveRequestTenantDataRoot(req, this.options.dataDir);
+		const kv = this.stateKv(req);
 		const workspaceId = attachments?.workspaceId ?? images?.workspaceId;
-		recordSessionAttachments(dataRoot, id, {
+		await recordSessionAttachments(kv, id, {
 			promptContent: prompt,
 			...(attachments ? { attachments: attachments.attachments } : {}),
 			...(images ? { images: images.images } : {}),
@@ -728,7 +782,7 @@ export class DurableSessionService {
 			requestId,
 		});
 		if (attachments) {
-			recordWorkspaceAttachmentActivity(dataRoot, {
+			await recordWorkspaceAttachmentActivity(kv, {
 				sessionId: id,
 				workspaceId: attachments.workspaceId,
 				workspaceRoot: attachments.workspaceRoot,
@@ -736,7 +790,7 @@ export class DurableSessionService {
 			});
 		}
 		if (images) {
-			recordWorkspaceFileAccess(dataRoot, {
+			await recordWorkspaceFileAccess(kv, {
 				sessionId: id,
 				workspaceId: images.workspaceId,
 				workspaceRoot: images.workspaceRoot,
@@ -746,18 +800,18 @@ export class DurableSessionService {
 		}
 	}
 
-	recordWorkspaceWriteActivity(
+	async recordWorkspaceWriteActivity(
 		req: IncomingMessage,
 		id: string,
 		workspaceId: string,
 		workspaceRoot: string,
 		paths: string[],
 		trackingIncomplete: boolean,
-	): void {
-		const dataRoot = resolveRequestTenantDataRoot(req, this.options.dataDir);
-		if (trackingIncomplete) markWorkspaceTrackingIncomplete(dataRoot, id);
+	): Promise<void> {
+		const kv = this.stateKv(req);
+		if (trackingIncomplete) await markWorkspaceTrackingIncomplete(kv, id);
 		if (paths.length === 0) return;
-		recordWorkspaceFileAccess(dataRoot, {
+		await recordWorkspaceFileAccess(kv, {
 			sessionId: id,
 			workspaceId,
 			workspaceRoot,
@@ -819,8 +873,8 @@ export class DurableSessionService {
 		const lease = await this.lease(req, id);
 		try {
 			const snapshot = await lease.runtime.snapshot();
-			const messages = mergeSessionAttachments(
-				resolveRequestTenantDataRoot(req, this.options.dataDir),
+			const messages = await mergeSessionAttachments(
+				this.stateKv(req),
 				id,
 				durableEntriesToMessages(snapshot.entries),
 			);
@@ -1003,7 +1057,7 @@ export class DurableSessionService {
 								tenantContext: tenant,
 								countTenantSandboxes: async () => (await this.catalogFor(req).list(req)).filter((entry) => entry.sandboxId).length,
 								...(this.options.skillsDir ? { hostSkillsDir: this.options.skillsDir } : {}),
-								stateDir: join(this.root(req), "storage", id),
+								stateKv: this.stateKv(req),
 								persistSandboxId: async (sandboxId) => { await this.update(req, id, { sandboxId }); },
 							})
 							: undefined;
@@ -1017,10 +1071,32 @@ export class DurableSessionService {
 							instructions: [
 								INNO_SYSTEM_PROMPT,
 								sandbox?.promptSection,
-								sandbox
-									? sandbox.rebasePaths(buildGlobalSkillsSection(this.options.skillsDir) ?? "")
-									: buildGlobalSkillsSection(this.options.skillsDir),
-								...(await buildWorkspaceContextSectionsFrom(workspaceFiles)).map((section) => sandbox ? sandbox.rebasePaths(section) : section),
+								await (async () => {
+									const extraSkillIds = record.presetId
+										? this.options.resolvePresetSkillIds?.(record.presetId)
+										: undefined;
+									const catalogSection = this.options.resolveCatalogSkillsSection
+										? await this.options.resolveCatalogSkillsSection({
+											tenant,
+											workspaceDir,
+											...(extraSkillIds?.length ? { extraSkillIds } : {}),
+										})
+										: undefined;
+									const section = catalogSection
+										?? buildGlobalSkillsSection(this.options.skillsDir);
+									if (!section) return undefined;
+									return sandbox ? sandbox.rebasePaths(section) : section;
+								})(),
+								...(record.presetId
+									? (() => {
+										const agent = this.options.resolvePresetAgentSection?.(record.presetId);
+										if (!agent) return [] as string[];
+										const section = `# 预设说明\n\n${agent}`;
+										return [sandbox ? sandbox.rebasePaths(section) : section];
+									})()
+									// Preset sessions ignore leftover workspace agent.md / .skills
+									// from the old copy-into-workspace model.
+									: (await buildWorkspaceContextSectionsFrom(workspaceFiles)).map((section) => sandbox ? sandbox.rebasePaths(section) : section)),
 							].filter((section): section is string => Boolean(section)).join("\n\n"),
 							...(sandbox ? { sandbox } : {}),
 							workspaceDir,
@@ -1152,8 +1228,10 @@ export class DurableSessionService {
 		this.questionStores.delete(key);
 		this.permissionStores.delete(key);
 		const dataRoot = resolveRequestTenantDataRoot(req, this.options.dataDir);
-		clearSessionAttachments(dataRoot, id);
-		clearWorkspaceActivity(dataRoot, id);
+		const kv = this.stateKv(req);
+		await clearSessionAttachments(kv, id);
+		await clearWorkspaceActivity(kv, id);
+		await clearSessionBtw(kv, id);
 		await rm(join(this.root(req), "storage", id), { recursive: true, force: true });
 		await this.recoveryStore(req, "question").deleteSession(id);
 		await this.recoveryStore(req, "permission").deleteSession(id);

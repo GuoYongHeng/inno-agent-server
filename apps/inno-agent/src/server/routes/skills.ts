@@ -23,10 +23,36 @@ import { json, matchRoute, readBody, UPLOAD_MAX_BODY_BYTES } from "../http-helpe
  * shared skill-store module; until then this ctx keeps the route domain
  * behavior-identical.
  */
+/** Shape compatible with the web `SkillInfo` panel, plus catalog fields. */
+export interface CatalogSkillListing {
+	name: string;
+	description: string;
+	enabled: boolean;
+	loaded: boolean;
+	filePath: string;
+	size: number;
+	updatedAt: string;
+	diagnostics: string[];
+	skillId: string;
+	version: string;
+	disableModelInvocation: boolean;
+	source: string | null;
+	publishedAt: string;
+}
+
+export interface SkillsCatalogContext {
+	listForTenant: () => Promise<CatalogSkillListing[]>;
+	setEnabled: (skillId: string, enabled: boolean) => Promise<CatalogSkillListing | null>;
+	/** Enable a published catalog skill; returns null when not in catalog. */
+	enableIfPublished: (skillId: string) => Promise<CatalogSkillListing | null>;
+}
+
 export interface SkillsRouteContext {
 	skillsDir: string;
 	/** Authenticated tenants share the admin-managed skill directory read-only. */
 	sharedSkillsReadOnly?: boolean;
+	/** Platform catalog + tenant_skills (authenticated mode). */
+	catalog?: SkillsCatalogContext;
 	scheduleSkillsReload: () => void;
 	listProjectSkills: () => unknown[];
 	setSkillEnabled: (name: string, enabled: boolean) => void;
@@ -34,6 +60,13 @@ export interface SkillsRouteContext {
 	installSkillMarkdown: (fileName: string, data: Buffer) => { name: string; filePath: string };
 	listSkillLibrary: (forceRefresh?: boolean) => Promise<SkillLibraryItem[]>;
 	importSkillFromLibrary: (name: string) => Promise<{ name: string; filePath: string }>;
+}
+
+function isCatalogEnablePath(method: string, url: string): boolean {
+	if (method === "POST" && (url.endsWith("/enable") || url.endsWith("/disable"))) return true;
+	if (method === "POST" && url === "/api/skill-library/import") return true;
+	if (method === "PATCH" && /^\/api\/skills\/[^/]+$/.test(url.split("?")[0] ?? url)) return true;
+	return false;
 }
 
 /**
@@ -50,20 +83,47 @@ export async function handleSkillsRoutes(
 ): Promise<boolean> {
 	const { skillsDir } = ctx;
 
-	// The PI resource loader has one process-global skill directory. Tenant
-	// writes would change every account's future prompts, so authenticated mode
-	// exposes the admin-managed catalog read-only. Workspace-private .skills
-	// remain available through the owned workspace routes.
-	if (ctx.sharedSkillsReadOnly && method !== "GET") {
+	// Authenticated mode: tenants may enable/disable published catalog skills
+	// but cannot mutate shared skill bodies (upload/edit/delete stay 409).
+	// Workspace-private .skills remain available through owned workspace routes.
+	if (ctx.sharedSkillsReadOnly && method !== "GET" && !(ctx.catalog && isCatalogEnablePath(method, url))) {
 		json(res, 409, { error: "Shared skill management is read-only in authenticated mode" });
 		return true;
 	}
 
 	if (method === "GET" && url === "/api/skills") {
+		if (ctx.catalog) {
+			json(res, 200, await ctx.catalog.listForTenant());
+			return true;
+		}
 		// Do not call reloadResources() here — it is queued behind the agent
 		// loop, so it stalls while an LLM turn is streaming. Listing from
 		// disk is enough for displaying the panel.
 		json(res, 200, ctx.listProjectSkills());
+		return true;
+	}
+
+	const enableMatch = matchRoute("POST", method, url, "/api/skills/:name/enable");
+	if (enableMatch && ctx.catalog) {
+		const name = slugifySkillName(decodeURIComponent(enableMatch.name));
+		const entry = await ctx.catalog.setEnabled(name, true);
+		if (!entry) {
+			json(res, 404, { error: "Skill not found in catalog" });
+			return true;
+		}
+		json(res, 200, entry);
+		return true;
+	}
+
+	const disableMatch = matchRoute("POST", method, url, "/api/skills/:name/disable");
+	if (disableMatch && ctx.catalog) {
+		const name = slugifySkillName(decodeURIComponent(disableMatch.name));
+		const entry = await ctx.catalog.setEnabled(name, false);
+		if (!entry) {
+			json(res, 404, { error: "Skill not found in catalog" });
+			return true;
+		}
+		json(res, 200, entry);
 		return true;
 	}
 
@@ -112,6 +172,15 @@ export async function handleSkillsRoutes(
 			json(res, 400, { error: "Missing skill name" });
 			return true;
 		}
+		if (ctx.catalog) {
+			const entry = await ctx.catalog.enableIfPublished(slugifySkillName(skillName));
+			if (!entry) {
+				json(res, 404, { error: "Skill is not published in the platform catalog" });
+				return true;
+			}
+			json(res, 201, entry);
+			return true;
+		}
 		try {
 			const installed = await ctx.importSkillFromLibrary(skillName);
 			ctx.setSkillEnabled(installed.name, true);
@@ -128,12 +197,25 @@ export async function handleSkillsRoutes(
 	const skillToggleMatch = matchRoute("PATCH", method, url, "/api/skills/:name");
 	if (skillToggleMatch) {
 		const name = slugifySkillName(decodeURIComponent(skillToggleMatch.name));
+		const body = (await readBody(req)) as Record<string, unknown>;
+		if (ctx.catalog) {
+			if (typeof body.enabled !== "boolean") {
+				json(res, 400, { error: "enabled boolean required" });
+				return true;
+			}
+			const entry = await ctx.catalog.setEnabled(name, body.enabled);
+			if (!entry) {
+				json(res, 404, { error: "Skill not found in catalog" });
+				return true;
+			}
+			json(res, 200, entry);
+			return true;
+		}
 		const skillFile = join(skillsDir, name, "SKILL.md");
 		if (!existsSync(skillFile)) {
 			json(res, 404, { error: "Skill not found" });
 			return true;
 		}
-		const body = (await readBody(req)) as Record<string, unknown>;
 		if (typeof body.enabled === "boolean") {
 			ctx.setSkillEnabled(name, body.enabled);
 		}

@@ -9,8 +9,8 @@
  * service tomorrow — is then a config change, not a code change.
  */
 
-/** The two logical content categories the hub serves. */
-export type ContentCategory = "skills" | "presets";
+/** The content categories the hub serves (presets ship in the image, not from the hub). */
+export type ContentCategory = "skills";
 
 /** One listable item (a skill or a preset), keyed by its directory name. */
 export interface RemoteItem {
@@ -58,7 +58,6 @@ export interface SkillLibraryItem {
 /** The marker file that identifies a directory as an item of each category. */
 export const CATEGORY_MARKER: Record<ContentCategory, string> = {
 	skills: "SKILL.md",
-	presets: "preset.json",
 };
 
 /** Validate a single-segment item name (blocks path traversal). */

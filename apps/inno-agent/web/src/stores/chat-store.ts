@@ -1,6 +1,6 @@
 import { EventEmitter } from "./event-emitter.js";
 import { streamChat, abortChat, getChatStatus, streamSessionEvents, submitChatQuestion, submitChatPermission, formatQuestionnaireAsPrompt } from "../api/chat.js";
-import type { InlineImage } from "../api/chat.js";
+import type { ChatImageRef } from "../api/chat.js";
 import type { ChatAttachments, ChatMessage, ChatStreamEvent, ChatToolRecord, ChatTraceStep, PendingPermission, PendingQuestion, PermissionDecisionKind, QuestionnaireResult, StreamEventEnvelope, StreamSnapshot, WorkspaceFileChange } from "../types/chat.js";
 import { notebookStore } from "./notebook-store.js";
 import { appStore } from "./app-store.js";
@@ -107,7 +107,7 @@ export class ChatStoreImpl extends EventEmitter<ChatStoreEvents> {
 	/** Last user prompt sent, kept so users can Retry. */
 	lastUserPrompt: string | null = null;
 	/** Images from the last send, kept so users can Retry. */
-	lastImages: InlineImage[] | undefined = undefined;
+	lastImages: ChatImageRef[] | undefined = undefined;
 	/** Pending question from agent's ask_user_question tool */
 	pendingQuestion: PendingQuestion | null = null;
 	/** Question IDs the user has already answered. Suppresses stale replays
@@ -148,9 +148,9 @@ export class ChatStoreImpl extends EventEmitter<ChatStoreEvents> {
 	/** Last time any stream envelope was applied; a stale value after a page
 	 *  resume means the in-flight stream likely died while suspended. */
 	private lastStreamActivityAt = 0;
-	private retryInputBySession = new Map<string, { prompt: string; images?: InlineImage[]; attachments?: ChatAttachments }>();
+	private retryInputBySession = new Map<string, { prompt: string; images?: ChatImageRef[]; attachments?: ChatAttachments }>();
 
-	async send(prompt: string, images?: InlineImage[], sessionIdOverride?: string | null, attachments?: ChatAttachments): Promise<void> {
+	async send(prompt: string, images?: ChatImageRef[], sessionIdOverride?: string | null, attachments?: ChatAttachments): Promise<void> {
 		if ((!prompt.trim() && !images?.length && !hasAttachmentFiles(attachments)) || this.isSending) return;
 		const { sessionsStore } = await import("./sessions-store.js");
 		const targetSessionId = sessionIdOverride === undefined
@@ -166,8 +166,8 @@ export class ChatStoreImpl extends EventEmitter<ChatStoreEvents> {
 			role: "user",
 			content: prompt,
 			timestamp: Date.now(),
-			images: images?.map(({ data, mimeType }) => ({
-				previewUrl: `data:${mimeType};base64,${data}`,
+			images: images?.map(({ previewUrl, mimeType, workspacePath }) => ({
+				previewUrl: previewUrl ?? `/api/workspace/raw?path=${encodeURIComponent(workspacePath)}`,
 				mimeType,
 			})),
 			attachments,

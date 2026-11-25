@@ -189,7 +189,7 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 				};
 			}
 
-			let resolved: string;
+			let resolved: string | { bytes: Uint8Array };
 			// A snapshot materialised from the outbox is a temporary file in some backends.
 			let snapshot: OutboxPayload | undefined;
 			let filesRelPath: string | undefined;
@@ -201,7 +201,7 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 						details: { error: "outbox_payload_missing", filePath: outbox.filePath } as Record<string, unknown>,
 					};
 				}
-				resolved = snapshot.path;
+				resolved = snapshot.bytes ? { bytes: snapshot.bytes } : snapshot.path!;
 			} else {
 				// Resolve and validate the file path within the workspace.
 				const files = deps.files;
@@ -270,7 +270,7 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 				};
 				try {
 					snapshot = await durable!.outbox.prepare(outbox, localFile);
-					resolved = snapshot.path;
+					resolved = snapshot.bytes ? { bytes: snapshot.bytes } : snapshot.path!;
 					return undefined;
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
@@ -362,7 +362,7 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 			}
 
 			if (!outbox && durable && operationId) {
-				const failed = await prepareOutbox(resolved);
+				const failed = await prepareOutbox(resolved as string);
 				if (failed) return failed;
 			}
 			return doSend();

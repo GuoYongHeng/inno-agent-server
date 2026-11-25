@@ -56,7 +56,6 @@ async function startWorker(worker: Worker): Promise<void> {
 			...process.env,
 			INNO_HOME: worker.home,
 			INNO_CONFIG_DIR: join(worker.home, "config"),
-			INNO_DATA_DIR: join(worker.home, "data"),
 			INNO_SKILLS_DIR: join(worker.home, "skills"),
 			INNO_WORKSPACE_DIR: join(worker.home, "workspace"),
 			INNO_PORT: new URL(worker.origin).port,
@@ -268,8 +267,6 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 	expect(created.status).toBe(201);
 	expect(created.headers.get("x-inno-durable-shard")).toBe(ownerId);
 	const session = await created.json() as { id: string; workspaceId: string };
-	const tenantStorage = (worker: Worker) => join(worker.home, "data", "tenants", tenantId, "durable", "storage", session.id, "session.sqlite");
-	expect(existsSync(tenantStorage(nonOwner))).toBe(false);
 
 	// A session-scoped request without a recorded live owner still follows the
 	// tenant hash; the receiving worker claims the storage lease as it opens the
@@ -303,7 +300,6 @@ it("routes a verified tenant and its durable stream to one owning worker", async
 	const status = await api(owner, cookie, `/api/chat/status/${session.id}`);
 	expect(status.status).toBe(200);
 	await status.text();
-	expect(existsSync(tenantStorage(nonOwner))).toBe(false);
 
 	const bridgeToken = "durable-shard-bridge-token";
 	const channels = await api(nonOwner, cookie, "/api/settings/channels", {

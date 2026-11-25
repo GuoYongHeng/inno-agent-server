@@ -18,7 +18,7 @@ export interface ChatChannel {
 	 * Send a local file to a push target. Optional: channels that do not support
 	 * file delivery throw {@link FileSendNotSupportedError}.
 	 */
-	sendFile?(target: PushTarget, filePath: string, fileName?: string): Promise<void>;
+	sendFile?(target: PushTarget, file: string | { bytes: Uint8Array }, fileName?: string): Promise<void>;
 }
 
 /**

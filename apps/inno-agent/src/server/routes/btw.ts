@@ -5,7 +5,7 @@ import type { SessionMessageSummary } from "../session-model.js";
 import type { TenantStore } from "../../tenants/store.js";
 import { ownsRequestResource } from "../../tenants/http.js";
 import type { DurableHttpContext } from "../durable-routes.js";
-import { resolveRequestTenantDataRoot } from "../../tenants/paths.js";
+import type { TenantStateKv } from "../../tenants/state-store.js";
 import {
 	readBtwState,
 	writeBtwState,
@@ -26,7 +26,8 @@ import {
  */
 
 export interface BtwRouteContext {
-	dataDir: string;
+	/** Per-tenant sidecar state (`tenant_state`). */
+	stateKv: TenantStateKv;
 	tenantStore: TenantStore;
 	durableSessions: DurableHttpContext["service"];
 }
@@ -195,9 +196,8 @@ export async function handleBtwRoutes(
 			json(res, 404, { error: "Session not found" });
 			return true;
 		}
-		const stateDataRoot = resolveRequestTenantDataRoot(req, ctx.dataDir);
 		if (method === "GET") {
-			json(res, 200, readBtwState(stateDataRoot, sessionId));
+			json(res, 200, await readBtwState(ctx.stateKv, sessionId));
 			return true;
 		}
 		const body = await readBody(req);
@@ -206,7 +206,7 @@ export async function handleBtwRoutes(
 			json(res, 400, { error: "Malformed btw state" });
 			return true;
 		}
-		json(res, 200, writeBtwState(stateDataRoot, sessionId, parsed));
+		json(res, 200, await writeBtwState(ctx.stateKv, sessionId, parsed));
 		return true;
 	}
 

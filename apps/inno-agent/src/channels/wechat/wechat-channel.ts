@@ -139,7 +139,7 @@ export class WeChatChannel implements RealtimeChatChannel {
 		await this.client.sendText(target.chatId, text, contextToken);
 	}
 
-	async sendFile(_target: PushTarget, _filePath: string, _fileName?: string): Promise<void> {
+	async sendFile(_target: PushTarget, _file: string | { bytes: Uint8Array }, _fileName?: string): Promise<void> {
 		// iLink only exposes a text send API; file delivery is not supported.
 		throw new FileSendNotSupportedError(this.name);
 	}

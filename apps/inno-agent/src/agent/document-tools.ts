@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { resolve, isAbsolute } from "node:path";
 import { parseDocument, screenshotDocument, DocumentParseError } from "../memory/l2/document-parser.js";
 import { logger } from "../logger.js";
+import { formatNativeImageMarker, persistInlineImages } from "../server/inline-images.js";
 import { defineInnoTool } from "./inno-tool.js";
 import { LocalWorkspaceFileAccess } from "../workspace/local-workspace-file-access.js";
 import type { WorkspaceFileAccess } from "../workspace/workspace-files.js";
@@ -137,11 +138,12 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolRegi
 				}
 			}
 
-			const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [
+			const content: Array<{ type: "text"; text: string }> = [
 				{ type: "text", text: lines.join("\n") },
 			];
 
-			// Screenshots
+			// Screenshots stay on disk / object storage. The transcript keeps a path
+			// marker; the generation hook expands it only for the provider request.
 			if (typed.includeScreenshots) {
 				try {
 					reportProgress("正在生成页面截图", "screenshots");
@@ -149,13 +151,17 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolRegi
 					const screenshots = relPath !== undefined
 						? await files.withLocalFile(relPath, (localPath) => takeShots(localPath)) ?? []
 						: await takeShots(resolvedPath);
-					for (const shot of screenshots) {
-						content.push({
-							type: "image",
+					const persisted = persistInlineImages(
+						screenshots.map((shot) => ({
+							type: "image" as const,
 							data: shot.imageBuffer.toString("base64"),
 							mimeType: "image/png",
-						});
-					}
+						})),
+						workspaceDir,
+						`parse-document:${typed.filePath}:${screenshots.length}`,
+					);
+					const marker = formatNativeImageMarker(persisted.map((workspacePath) => ({ workspacePath, mimeType: "image/png" })));
+					if (marker) content.push({ type: "text", text: marker });
 				} catch (err) {
 					logger.warn({ err }, "document screenshot generation failed");
 					content.push({

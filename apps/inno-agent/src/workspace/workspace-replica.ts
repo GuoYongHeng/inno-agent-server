@@ -1,8 +1,7 @@
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { logger } from "../logger.js";
 import type { ObjectStore } from "../object-store/object-store.js";
-import { readJson, writeJson } from "../storage/file-store.js";
 import type { TenantContext, TenantStore } from "../tenants/store.js";
 import { incCounter, observeMs } from "../utils/metrics.js";
 import { isWithin } from "../utils/path-safety.js";
@@ -22,7 +21,7 @@ import { TEMP_WORKSPACE_ID, type WorkspaceMeta, type WorkspaceRegistry } from ".
  * which is documented in the roadmap.
  */
 
-const IGNORED_DIRS = new Set([".git", "node_modules", "__pycache__", ".venv", ".cache"]);
+const IGNORED_DIRS = new Set([".git", "node_modules", "__pycache__", ".venv", ".cache", ".global-skills"]);
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_FILES = 5_000;
 const MAX_DEPTH = 24;
@@ -54,28 +53,34 @@ function b64(value: string): string {
 }
 
 export class WorkspaceReplica {
+	/**
+	 * What this process last pushed or pulled per (tenant, workspace). It is how
+	 * `push` tells "deleted locally" from "never materialised"; losing it on a
+	 * restart is safe because `pull` re-records every file it reconciles and a
+	 * file absent from the state is simply re-uploaded, never deleted.
+	 */
+	private readonly states = new Map<string, ReplicaState>();
+
 	constructor(
 		private readonly objects: ObjectStore,
 		private readonly store: TenantStore,
 		private readonly registry: WorkspaceRegistry,
-		private readonly stateDir: string,
 	) {}
 
 	private objectKey(context: TenantContext, workspaceId: string, rel: string): string {
 		return workspaceObjectKey(context.tenantId, workspaceId, rel);
 	}
 
-	private statePath(context: TenantContext, workspaceId: string): string {
-		return join(this.stateDir, `${b64(context.tenantId)}--${b64(workspaceId)}.json`);
+	private stateKey(context: TenantContext, workspaceId: string): string {
+		return `${b64(context.tenantId)}--${b64(workspaceId)}`;
 	}
 
 	private loadState(context: TenantContext, workspaceId: string): ReplicaState {
-		const state = readJson<ReplicaState>(this.statePath(context, workspaceId), { files: {} });
-		return state.files && typeof state.files === "object" ? state : { files: {} };
+		return this.states.get(this.stateKey(context, workspaceId)) ?? { files: {} };
 	}
 
 	private saveState(context: TenantContext, workspaceId: string, state: ReplicaState): void {
-		writeJson(this.statePath(context, workspaceId), state);
+		this.states.set(this.stateKey(context, workspaceId), state);
 	}
 
 	// ---- Registry + binding replication -------------------------------------
@@ -89,7 +94,7 @@ export class WorkspaceReplica {
 	async deleteWorkspace(context: TenantContext, workspaceId: string): Promise<void> {
 		await this.store.deleteWorkspaceRow(context, workspaceId);
 		await this.objects.deletePrefix(workspaceObjectPrefix(context.tenantId, workspaceId));
-		rmSync(this.statePath(context, workspaceId), { force: true });
+		this.states.delete(this.stateKey(context, workspaceId));
 	}
 
 	async setSessionBinding(context: TenantContext, sessionId: string, workspaceId: string): Promise<void> {

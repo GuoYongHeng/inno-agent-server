@@ -1,7 +1,6 @@
 import { existsSync, readdirSync } from "node:fs";
 import { normalizeContentHubConfig, type InnoConfig, type InnoContentHubConfig } from "../config.js";
 import { logger } from "../logger.js";
-import { listBundledPresets, listRemotePresets, type PresetMeta } from "../presets/preset-store.js";
 import { slugifySkillName } from "../server/file-helpers.js";
 import { extractFrontmatterFields } from "../server/skill-frontmatter.js";
 import type { RuntimePaths } from "../runtime.js";
@@ -14,7 +13,6 @@ import {
 } from "./types.js";
 
 export interface ContentHubCatalogOptions {
-	dataDir: string;
 	paths: RuntimePaths;
 	skillsDir: string;
 	getConfig: () => InnoConfig;
@@ -34,7 +32,7 @@ export class ContentHubCatalog {
 	private readonly loads = new Map<ContentCategory, Promise<unknown>>();
 
 	constructor(private readonly options: ContentHubCatalogOptions) {
-		this.cache = new CatalogSnapshotCache(options.dataDir, () => this.hubKey(this.currentHub()));
+		this.cache = new CatalogSnapshotCache(() => this.hubKey(this.currentHub()));
 	}
 
 	getSource(): RemoteContentSource {
@@ -45,13 +43,6 @@ export class ContentHubCatalog {
 			this.sourceHubKey = key;
 		}
 		return this.source;
-	}
-
-	/** Return whether the last successful remote preset snapshot contains an id. */
-	getCachedPresetAvailability(id: string): boolean | null {
-		const cached = this.cachedItems<PresetMeta>("presets");
-		if (!cached) return null;
-		return cached.some((preset) => preset.id === id);
 	}
 
 	invalidate(): void {
@@ -71,23 +62,8 @@ export class ContentHubCatalog {
 		return this.withCurrentInstallState(remote);
 	}
 
-	async listPresetLibrary(forceRefresh = false): Promise<PresetMeta[]> {
-		const remote = await this.loadCatalog(
-			"presets",
-			forceRefresh,
-			() => listRemotePresets(this.getSource(), forceRefresh),
-		);
-		// A successful remote snapshot is authoritative. Only bundled presets are
-		// merged here; downloaded cache entries omitted by the hub must disappear
-		// from the online catalog instead of resurrecting as stale cards.
-		const merged = new Map(listBundledPresets(this.options.paths).map((preset) => [preset.id, preset]));
-		for (const preset of remote) merged.set(preset.id, preset);
-		return Array.from(merged.values()).sort((a, b) => a.name.localeCompare(b.name));
-	}
-
 	async warm(): Promise<void> {
 		for (const [category, load] of [
-			["presets", () => this.listPresetLibrary()] as const,
 			["skills", () => this.listSkillLibrary()] as const,
 		]) {
 			if (this.cachedItems(category)) continue;

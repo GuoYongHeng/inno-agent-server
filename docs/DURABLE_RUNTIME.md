@@ -102,8 +102,10 @@ The current durable slice supports:
   lock held for each open runtime's lifetime;
 - durable admission, submission reacquisition, and `resume()` on reopen;
 - concurrent independent sessions without the legacy global prompt queue;
-- preset instantiation into stable tenant-owned workspaces, including `agent.md`
-  and private skills, with repeated opens reusing the preset workspace;
+- preset open creates an empty tenant-owned workspace and records `presetId`.
+  Repeated opens reuse that workspace. Image `agent.md` is injected read-only;
+  `preset.json` `skills` are catalog ids materialized with the tenant's enabled
+  set. Workspace copies of `agent.md` / `.skills/` are ignored for preset sessions;
 - committed snapshots and existing Inno history/SSE event shapes;
 - tenant-local application SSE journals with exact numeric event replay and
   original-submission recovery after a process restart;
@@ -118,20 +120,20 @@ The current durable slice supports:
   ALS restored when durable work resumes outside the HTTP request;
 - the same workspace `agent.md` and `.skills/` prompt sections as legacy,
   reloaded whenever the durable runtime opens;
-- `ocr_image` with tenant credentials, canonical workspace file checks,
-  persisted job-ID checkpoints, and cached final markdown;
-- `send_file_to_channel` with a tenant-local persistent outbox, payload
-  snapshots, original-target recovery, and cached completion results;
+- `send_file_to_channel` with the intent in `recovery_records` and the file
+  snapshot in object storage (`tenants/<t>/outbox/…`), original-target recovery,
+  and a cached completion. The bytes are loaded for the channel upload;
 - `ask_user_question` with stable question identity, tenant-local persisted
   answers, SSE turn rebinding, and original-run recovery after restart;
 - scoped active-turn cancellation through the existing chat abort endpoint,
   including pending-question/permission cleanup and persisted pi-durable abort marks;
 - structured workspace attachments on streaming and non-streaming chat, with
   canonical path validation and request-ID-deduplicated UI sidecar metadata;
-- inline images persisted under `.chat-images/`, native image blocks for
-  vision-capable models, OCR path hints for explicitly text-only models, and
-  same-submission OCR fallback when a provider rejects a native payload;
-  workspace previews restore through the same deduplicated sidecar;
+- chat images uploaded to `.chat-images/` before the turn. The chat body and
+  the durable transcript store the workspace path, not image bytes. Vision
+  models receive the bytes only on the provider request; text-only models get
+  a path hint. A provider image rejection fails the turn. Previews use the
+  workspace raw URL;
 - first-message fallback topics, automatic richer upgrades after six messages,
   and explicit `POST /api/sessions/:id/generate-topic`, all using the durable
   session's pinned provider/model from the shared, server-managed catalog;

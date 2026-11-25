@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS recovery_records (
 );
 `;
 
-/** Payload snapshots for the channel outbox, written in the same transaction as their record. */
+/** Legacy bytea table (migration 4). Channel outbox payloads now live in ObjectStore; leave the table for older DBs. */
 const RECOVERY_BLOBS_SQL = `
 CREATE TABLE IF NOT EXISTS recovery_blobs (
 	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
@@ -523,6 +523,36 @@ CREATE TABLE IF NOT EXISTS tenant_state (
 	PRIMARY KEY (tenant_id, key)
 );
 `;
+
+/**
+ * Platform skill catalog (bodies in object storage) + per-tenant enablement.
+ * Catalog rows are global; tenants only toggle `tenant_skills`.
+ */
+const SKILL_CATALOG_SQL = `
+CREATE TABLE IF NOT EXISTS skill_catalog (
+	skill_id text PRIMARY KEY,
+	name text NOT NULL,
+	description text NOT NULL DEFAULT '',
+	version text NOT NULL,
+	object_prefix text NOT NULL,
+	disable_model_invocation boolean NOT NULL DEFAULT false,
+	published_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	published_by text NULL,
+	source text NULL
+);
+
+CREATE TABLE IF NOT EXISTS tenant_skills (
+	tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+	skill_id text NOT NULL REFERENCES skill_catalog (skill_id) ON DELETE CASCADE,
+	enabled boolean NOT NULL DEFAULT true,
+	installed_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (tenant_id, skill_id)
+);
+
+CREATE INDEX IF NOT EXISTS tenant_skills_tenant_enabled_idx
+	ON tenant_skills (tenant_id)
+	WHERE enabled;
+`;
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
@@ -539,6 +569,10 @@ export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 13, name: "tenant_jobs", sql: TENANT_JOBS_SQL },
 	{ version: 14, name: "tenant_checkins", sql: TENANT_CHECKINS_SQL },
 	{ version: 15, name: "tenant_state", sql: TENANT_STATE_SQL },
+	{ version: 16, name: "skill_catalog", sql: SKILL_CATALOG_SQL },
+	{ version: 17, name: "session_preset_id", sql: `
+ALTER TABLE durable_sessions ADD COLUMN IF NOT EXISTS preset_id text;
+` },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

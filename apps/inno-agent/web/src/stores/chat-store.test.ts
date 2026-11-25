@@ -509,7 +509,7 @@ describe("ChatStore stream ownership", () => {
 		mocks.streamChat.mockImplementation(async function* () {
 			await gate;
 		});
-		const images = [{ data: "aW1hZ2U=", mimeType: "image/png" }];
+		const images = [{ workspacePath: ".chat-images/a.png", mimeType: "image/png", previewUrl: "blob:preview" }];
 		const store = new ChatStoreImpl();
 		const sending = store.send("describe", images, "created-session.jsonl");
 

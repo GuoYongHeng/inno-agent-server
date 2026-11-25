@@ -1,11 +1,11 @@
-import { join } from "node:path";
 import { logger } from "../logger.js";
 import type { InnoSandboxConfig } from "../config.js";
 import { incCounter, observeMs } from "../utils/metrics.js";
 import { GuardedSandboxBackend, InMemorySandboxQuotaStore, quotaMessage, type SandboxQuotaStore } from "./sandbox-quota.js";
 import type { SandboxBackend, SandboxProvider } from "./sandbox-backend.js";
 import type { TenantContext } from "../tenants/store.js";
-import { WorkspaceSync } from "./workspace-sync.js";
+import type { TenantStateKv } from "../tenants/state-store.js";
+import { WorkspaceSync, type SyncStateStore } from "./workspace-sync.js";
 
 /** Where a session's workspace and the shared skills live inside its sandbox. */
 export const SANDBOX_WORKSPACE_ROOT = "/home/user/workspace";
@@ -36,7 +36,8 @@ export interface BindSandboxInput {
 	hostWorkspaceDir: string;
 	hostSkillsDir?: string;
 	/** Directory for per-session sync manifests. */
-	stateDir: string;
+	/** Per-session sync manifests (`tenant_state` in production). */
+	stateKv: TenantStateKv;
 	/** How many sandboxes the tenant owns now; checked before creating another. */
 	countTenantSandboxes?(): Promise<number>;
 	/** Persist a newly created sandbox's ID on the session. */
@@ -120,13 +121,13 @@ export class SandboxManager {
 				} else {
 					incCounter("inno_sandbox_resumed_total");
 				}
-				const workspaceSync = new WorkspaceSync(backend, hostWorkspace, SANDBOX_WORKSPACE_ROOT, join(input.stateDir, "sandbox-sync.json"));
+				const workspaceSync = new WorkspaceSync(backend, hostWorkspace, SANDBOX_WORKSPACE_ROOT, syncStateStore(input.stateKv, `sandbox-sync:${input.sessionId}`));
 				// A new sandbox is empty whatever the manifest says.
-				if (created) workspaceSync.reset();
+				if (created) await workspaceSync.reset();
 				await workspaceSync.pushHost();
 				if (hostSkills) {
-					const skills = new WorkspaceSync(backend, hostSkills, SANDBOX_SKILLS_ROOT, join(input.stateDir, "sandbox-sync-skills.json"));
-					if (created) skills.reset();
+					const skills = new WorkspaceSync(backend, hostSkills, SANDBOX_SKILLS_ROOT, syncStateStore(input.stateKv, `sandbox-sync-skills:${input.sessionId}`));
+					if (created) await skills.reset();
 					await skills.pushHost();
 				}
 				inner = backend;
@@ -218,4 +219,11 @@ export class SandboxManager {
 			logger.warn({ err: error, sandboxId }, "failed to destroy sandbox");
 		}
 	}
+}
+
+function syncStateStore(kv: TenantStateKv, key: string): SyncStateStore {
+	return {
+		load: () => kv.get<unknown>(key),
+		save: (state) => kv.set(key, state),
+	};
 }

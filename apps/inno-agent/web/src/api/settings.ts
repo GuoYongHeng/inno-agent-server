@@ -103,7 +103,6 @@ export interface ContentHubPayload {
 	repo?: string;
 	ref?: string;
 	skillsPath?: string;
-	presetsPath?: string;
 	baseUrl?: string;
 	token?: string;
 }

@@ -24,6 +24,7 @@ import { ensureDir } from "../../storage/file-store.js";
 import { isWithin } from "../../utils/path-safety.js";
 import { TEMP_WORKSPACE_ID, type WorkspaceMeta, type WorkspaceRegistry } from "../../workspace/workspace-registry.js";
 import type { TenantStore } from "../../tenants/store.js";
+import type { TenantStateKv } from "../../tenants/state-store.js";
 import { claimRequestResource, ownsRequestResource, releaseRequestResource, requireRequestTenant } from "../../tenants/http.js";
 import { resolveRequestWorkspace, resolveRequestWorkspaceForRead } from "../../tenants/workspaces.js";
 import type { WorkspaceReplica } from "../../workspace/workspace-replica.js";
@@ -65,7 +66,8 @@ import { decodeRouteParam, json, matchRoute, readBody } from "../http-helpers.js
  */
 export interface WorkspacesRouteContext {
 	workspaceRegistry: WorkspaceRegistry;
-	dataDir: string;
+	/** Per-tenant sidecar state (`tenant_state`); read per request. */
+	stateKv: TenantStateKv;
 	paths: RuntimePaths;
 	tenantStore: TenantStore;
 	installSkillZip: (fileName: string, data: Buffer, targetRoot?: string) => { name: string; filePath: string };
@@ -405,7 +407,6 @@ export async function handleWorkspacesRoutes(
 ): Promise<boolean> {
 	const {
 		workspaceRegistry,
-		dataDir,
 		paths,
 		installSkillZip,
 		installSkillMarkdown,
@@ -1413,18 +1414,12 @@ export async function handleWorkspacesRoutes(
 				tenantStore!.listResourceIds(tenant, "session"),
 			])
 			: [null, null];
-		const sessionDir = join(dataDir, "sessions");
-		const allSessionIds = existsSync(sessionDir)
-			? readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"))
-				.map((file) => basename(file, ".jsonl"))
-				.filter((id) => !ownedSessionIds || ownedSessionIds.has(id))
-			: [];
 		if (replica && tenant && ownedWorkspaceIds) {
 			for (const ownedId of ownedWorkspaceIds) {
 				if (!workspaceRegistry.getWorkspace(ownedId)) await replica.materializeWorkspace(tenant, ownedId);
 			}
 		}
-		const workspaces = workspaceRegistry.listWorkspaces(allSessionIds)
+		const workspaces = workspaceRegistry.listWorkspaces()
 			.filter((workspace) => !ownedWorkspaceIds || ownedWorkspaceIds.has(workspace.id))
 			.map((workspace) => ({
 				...workspace,
@@ -1538,8 +1533,8 @@ export async function handleWorkspacesRoutes(
 		}
 		if (!isAvailableSwitchTarget(targetWorkspaceId)) return true;
 		try {
-			const preview = buildWorkspaceSwitchPreview({
-				dataDir,
+			const preview = await buildWorkspaceSwitchPreview({
+				kv: ctx.stateKv,
 				sessionId,
 				hasSessionHistory: switchSession.hasHistory,
 				workspaceRegistry,
@@ -1597,8 +1592,8 @@ export async function handleWorkspacesRoutes(
 		}
 		let preview;
 		try {
-			preview = buildWorkspaceSwitchPreview({
-				dataDir,
+			preview = await buildWorkspaceSwitchPreview({
+				kv: ctx.stateKv,
 				sessionId,
 				hasSessionHistory: switchSession.hasHistory,
 				workspaceRegistry,

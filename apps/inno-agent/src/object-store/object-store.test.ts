@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MemoryObjectStore, tenantObjectKey, tenantObjectPrefix } from "./object-store.js";
+import { MemoryObjectStore, platformObjectKey, platformObjectPrefix, tenantObjectKey, tenantObjectPrefix } from "./object-store.js";
 import { createObjectStore, normalizeObjectStorageConfig } from "./index.js";
 import { S3ObjectStore } from "./s3-object-store.js";
 
@@ -20,6 +20,18 @@ describe("tenantObjectKey", () => {
 
 	it("does not let one tenant's prefix match another's", () => {
 		expect(tenantObjectKey("t10", "a").startsWith(tenantObjectPrefix("t1"))).toBe(false);
+	});
+});
+
+describe("platformObjectKey", () => {
+	it("builds keys under platform/ and rejects bad segments", () => {
+		expect(platformObjectKey("skills", "demo", "abc123", "file")).toBe("platform/skills/demo/abc123/file");
+		expect(platformObjectPrefix("skills", "demo")).toBe("platform/skills/demo/");
+		expect(platformObjectKey("skills", "demo").startsWith("tenants/")).toBe(false);
+		for (const bad of ["../x", "a/b", "..", ".", "", "a b"]) {
+			expect(() => platformObjectKey("skills", bad)).toThrow(/Invalid object key segment/);
+		}
+		expect(() => platformObjectKey()).toThrow(/at least one segment/);
 	});
 });
 

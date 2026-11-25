@@ -38,7 +38,7 @@ function setup(workspaceDir: string | null, fallbackDir: string) {
 		parse: async () => null,
 		reply: async () => {},
 		push: async () => {},
-		sendFile: async (target, filePath) => { sends.push({ target, filePath }); },
+		sendFile: async (target, file) => { sends.push({ target, filePath: typeof file === "string" ? file : "<bytes>" }); },
 	});
 	registry.setDefaultTarget({ channel: "feishu", chatId: "tenant-chat" });
 	const workspaceRegistry = {
@@ -100,7 +100,7 @@ describe("tenant-safe channel file tools", () => {
 			parse: async () => null,
 			reply: async () => {},
 			push: async () => {},
-			sendFile: async (_target, filePath, fileName) => { sends.push({ filePath, fileName }); },
+			sendFile: async (_target, file, fileName) => { sends.push({ filePath: typeof file === "string" ? file : "<bytes>", fileName }); },
 		});
 		registry.setDefaultTarget({ channel: "feishu", chatId: "tenant-chat" });
 		const tool = createChannelTools({

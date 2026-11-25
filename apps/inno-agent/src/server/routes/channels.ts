@@ -1,5 +1,4 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
-import { join } from "node:path";
 import { BridgeChannel } from "../../channels/bridge/bridge-channel.js";
 import { handleBridgeMessage } from "../../channels/bridge/bridge-server.js";
 import type { BridgeMessageResponse } from "../../channels/bridge/types.js";
@@ -23,7 +22,6 @@ import { json, matchRoute, readBody } from "../http-helpers.js";
  */
 export interface ChannelsRouteContext {
 	channelRegistry: ChannelRegistry;
-	dataDir: string;
 	configPath: string;
 	getConfig: () => InnoConfig;
 	setConfig: (config: InnoConfig) => void;
@@ -243,8 +241,8 @@ export async function handleChannelsRoutes(
 		// Lazily create the WeChat channel if not yet instantiated
 		let wechatChannel = await ctx.getWechatChannel();
 		if (!wechatChannel) {
-			const persistence = ctx.wechatTokenPersistence?.()
-				?? join(ctx.dataDir, "tenants", tenant.tenantId);
+			const persistence = ctx.wechatTokenPersistence?.();
+			if (!persistence) throw new Error("WeChat token persistence is not available");
 			wechatChannel = new WeChatChannel(persistence, (await getEffectiveConfig()).channels?.wechat);
 			channelRegistry.register(wechatChannel);
 			await ctx.setWechatChannel(wechatChannel);

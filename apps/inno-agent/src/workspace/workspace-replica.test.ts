@@ -60,11 +60,11 @@ describe("WorkspaceReplica", () => {
 
 	beforeEach(() => {
 		root = mkdtempSync(join(tmpdir(), "inno-replica-"));
-		registry = new WorkspaceRegistry(join(root, "ws"), join(root, "data"));
+		registry = new WorkspaceRegistry(join(root, "ws"));
 		registry.ensureBootstrapped();
 		objects = new MemoryObjectStore();
 		store = new FakeStore();
-		replica = new WorkspaceReplica(objects, store as never, registry, join(root, "state"));
+		replica = new WorkspaceReplica(objects, store as never, registry);
 	});
 
 	afterEach(() => rmSync(root, { recursive: true, force: true }));
@@ -91,9 +91,9 @@ describe("WorkspaceReplica", () => {
 		// Simulate takeover on a fresh worker: new registry/state, same store+objects.
 		const freshRoot = mkdtempSync(join(tmpdir(), "inno-replica-b-"));
 		try {
-			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"), join(freshRoot, "data"));
+			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"));
 			registryB.ensureBootstrapped();
-			const replicaB = new WorkspaceReplica(objects, store as never, registryB, join(freshRoot, "state"));
+			const replicaB = new WorkspaceReplica(objects, store as never, registryB);
 
 			const meta = await replicaB.materializeWorkspace(ctx, ws.id);
 			expect(meta?.relPath).toBe(ws.relPath);
@@ -146,9 +146,9 @@ describe("WorkspaceReplica", () => {
 
 		const freshRoot = mkdtempSync(join(tmpdir(), "inno-replica-d-"));
 		try {
-			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"), join(freshRoot, "data"));
+			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"));
 			registryB.ensureBootstrapped();
-			const replicaB = new WorkspaceReplica(objects, store as never, registryB, join(freshRoot, "state"));
+			const replicaB = new WorkspaceReplica(objects, store as never, registryB);
 			await replicaB.materializeWorkspace(ctx, ws.id);
 			const dirB = registryB.resolveWorkspaceDir(ws.id)!;
 			expect(existsSync(join(dirB, "empty", "nested"))).toBe(true);
@@ -178,9 +178,9 @@ describe("WorkspaceReplica", () => {
 
 		const freshRoot = mkdtempSync(join(tmpdir(), "inno-replica-c-"));
 		try {
-			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"), join(freshRoot, "data"));
+			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"));
 			registryB.ensureBootstrapped();
-			const replicaB = new WorkspaceReplica(objects, store as never, registryB, join(freshRoot, "state"));
+			const replicaB = new WorkspaceReplica(objects, store as never, registryB);
 			const wsId = await replicaB.materializeSessionWorkspace(ctx, "sess-1", null);
 			expect(wsId).toBe(ws.id);
 			expect(registryB.getSessionWorkspaceId("sess-1")).toBe(ws.id);
@@ -196,9 +196,9 @@ describe("WorkspaceReplica", () => {
 
 		const freshRoot = mkdtempSync(join(tmpdir(), "inno-replica-lazy-"));
 		try {
-			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"), join(freshRoot, "data"));
+			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"));
 			registryB.ensureBootstrapped();
-			const replicaB = new WorkspaceReplica(objects, store as never, registryB, join(freshRoot, "state"));
+			const replicaB = new WorkspaceReplica(objects, store as never, registryB);
 			const dirB = join(freshRoot, "out");
 			const report = await replicaB.pull(ctx, ws.id, dirB, { download: (rel) => rel === "agent.md" });
 			expect(report.downloaded).toBe(1);
@@ -229,9 +229,9 @@ describe("WorkspaceReplica", () => {
 
 		const freshRoot = mkdtempSync(join(tmpdir(), "inno-replica-mat-"));
 		try {
-			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"), join(freshRoot, "data"));
+			const registryB = new WorkspaceRegistry(join(freshRoot, "ws"));
 			registryB.ensureBootstrapped();
-			const replicaB = new WorkspaceReplica(objects, store as never, registryB, join(freshRoot, "state"));
+			const replicaB = new WorkspaceReplica(objects, store as never, registryB);
 			const dirB = join(freshRoot, "out");
 
 			expect(await replicaB.materializeFile(ctx, ws.id, dirB, "missing.txt")).toBe(false);

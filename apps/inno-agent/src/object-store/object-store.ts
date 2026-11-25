@@ -55,6 +55,14 @@ export function sha256Hex(body: Uint8Array): string {
 
 const SEGMENT = /^[A-Za-z0-9._-]+$/;
 
+function assertKeySegments(parts: string[]): void {
+	for (const part of parts) {
+		if (!SEGMENT.test(part) || part === "." || part === "..") {
+			throw new Error(`Invalid object key segment: ${JSON.stringify(part)}`);
+		}
+	}
+}
+
 /**
  * Build a tenant-scoped object key. Every segment must be a plain name: no
  * separators, no `.` / `..`, so a tenant can never address another tenant's
@@ -62,16 +70,26 @@ const SEGMENT = /^[A-Za-z0-9._-]+$/;
  */
 export function tenantObjectKey(tenantId: string, ...segments: string[]): string {
 	const parts = [tenantId, ...segments];
-	for (const part of parts) {
-		if (!SEGMENT.test(part) || part === "." || part === "..") {
-			throw new Error(`Invalid object key segment: ${JSON.stringify(part)}`);
-		}
-	}
+	assertKeySegments(parts);
 	return `tenants/${parts.join("/")}`;
 }
 
 export function tenantObjectPrefix(tenantId: string, ...segments: string[]): string {
 	return `${tenantObjectKey(tenantId, ...segments)}/`;
+}
+
+/**
+ * Platform-scoped object key (not under `tenants/`). Used for shared assets
+ * such as the published skill catalog.
+ */
+export function platformObjectKey(...segments: string[]): string {
+	if (segments.length === 0) throw new Error("platformObjectKey needs at least one segment");
+	assertKeySegments(segments);
+	return `platform/${segments.join("/")}`;
+}
+
+export function platformObjectPrefix(...segments: string[]): string {
+	return `${platformObjectKey(...segments)}/`;
 }
 
 /** In-process store for tests and for deployments that have not configured object storage. */

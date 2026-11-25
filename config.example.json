@@ -48,7 +48,6 @@
 		"repo": "inno-agent-hub",
 		"ref": "main",
 		"skillsPath": "skill-library",
-		"presetsPath": "workspace-templates",
 		"baseUrl": "",
 		"token": ""
 	},
@@ -77,5 +76,11 @@
 			"maxSandboxes": 20,
 			"maxActiveMinutesPerDay": 480
 		}
+	},
+	"logging": {
+		"dir": ""
+	},
+	"presets": {
+		"dir": ""
 	}
 }

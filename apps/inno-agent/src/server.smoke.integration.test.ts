@@ -35,7 +35,7 @@ let providerServer: Server;
 let providerRequests = 0;
 
 function requestLogs(requestId: string): Array<Record<string, unknown>> {
-	const dir = join(home, "data", "log");
+	const dir = join(home, "logs");
 	if (!existsSync(dir)) return [];
 	return readdirSync(dir)
 		.filter((name) => /^server-.*\.log$/.test(name))
@@ -100,6 +100,7 @@ beforeAll(async () => {
 	writeFileSync(
 		join(home, "config", "config.json"),
 		JSON.stringify({
+			logging: { dir: join(home, "logs") },
 			defaultProvider: "dummy",
 			defaultModel: "dummy-model",
 			providers: {
@@ -136,7 +137,7 @@ ServerResponse.prototype.end = function (...args) {
 	}));
 	child = spawn(
 		process.execPath,
-		["--import", errorHook, "--import", "tsx", SERVER_ENTRY, "--home", home, "--data-dir", join(home, "data"), "--workspace", workspace, "--port", String(port)],
+		["--import", errorHook, "--import", "tsx", SERVER_ENTRY, "--home", home, "--workspace", workspace, "--port", String(port)],
 		{
 			cwd: REPO_ROOT,
 			stdio: ["ignore", "pipe", "pipe"],

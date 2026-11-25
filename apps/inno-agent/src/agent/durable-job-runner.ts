@@ -1,6 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import type { UserInput } from "@earendil-works/pi-durable";
+import { buildDurableUserInput } from "./durable-user-input.js";
 import { DurableSseProjector } from "./durable-projection.js";
 import { DurableSessionBusyError, type DurableSessionService } from "./durable-session-service.js";
 
@@ -85,15 +85,12 @@ export async function runDurableJobPrompt(
 				}
 			});
 		}
-		const input: UserInput = images || recallContext
-			? [
-				{ type: "text", text: prompt },
-				...(images?.nativeImages ?? []),
-				...(images?.fallbackContext ? [{ type: "text" as const, text: images.fallbackContext }] : []),
-				...(recallContext ? [{ type: "text" as const, text: recallContext }] : []),
-			]
-			: prompt;
-		service.recordTurnMetadata(req, sessionId, null, images, prompt, options.requestId);
+		const input = buildDurableUserInput(prompt, {
+			...(images?.vision ? { nativeImages: images.images } : {}),
+			...(images?.fallbackContext ? { fallbackContext: images.fallbackContext } : {}),
+			...(recallContext ? { recallContext } : {}),
+		});
+		await service.recordTurnMetadata(req, sessionId, null, images, prompt, options.requestId);
 		const submission = await lease.runtime.submit(input, options.requestId);
 		await service.noteSubmission(req, sessionId, prompt);
 		const result = await lease.runtime.waitForSubmission(submission.id);

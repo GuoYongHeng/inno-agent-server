@@ -9,8 +9,6 @@ export interface MessageAttachment {
 	mimeType?: string;
 	/** Base64 encoded data (for images) */
 	data?: string;
-	/** Local file path (for downloaded files) */
-	filePath?: string;
 }
 
 export interface IncomingMessage {

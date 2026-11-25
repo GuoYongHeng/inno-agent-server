@@ -2,7 +2,6 @@ import type { RawObjectStorageConfig } from "./object-store/index.js";
 import { DEFAULT_SANDBOX_LIMITS, type SandboxLimits } from "./sandbox/sandbox-quota.js";
 import { chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { RuntimePaths } from "./runtime.js";
 import { DEFAULT_SCHEDULER_TIMEZONE } from "./scheduler/cron-utils.js";
 import { writeJson } from "./storage/file-store.js";
 
@@ -127,18 +126,17 @@ export interface InnoUiConfig {
 
 /**
  * Content Hub. The single source for remotely-fetched, ready-to-use content:
- * the global skill library and the Simple Mode preset workspaces. Both used to
- * be either hardcoded (skill library → a fixed GitHub repo) or bundled with the
- * app (presets → `<codeDir>/presets/`). Centralizing them here lets a single
- * config block point the whole hub at a different source — including a private
+ * the global skill library. (Preset workspaces are not fetched from here: they
+ * ship in the image under `presets.dir`.) Centralizing it here lets a single
+ * config block point the hub at a different source — including a private
  * self-hosted bundle service — without touching code.
  *
  * Two transport types:
  *   - "github": a public/private GitHub repo. `owner`/`repo`/`ref` locate it;
- *     `skillsPath`/`presetsPath` are the top-level directories within it.
+ *     `skillsPath` is the top-level directory within it.
  *     `token` raises the API rate limit / unlocks private repos.
  *   - "bundle": a self-hosted service exposing `GET {baseUrl}/index.json` and
- *     `GET {baseUrl}/{presets|skills}/{id}.tar.gz`. `token` (if set) is sent as
+ *     `GET {baseUrl}/skills/{id}.tar.gz`. `token` (if set) is sent as
  *     a Bearer credential. Avoids GitHub rate limits for private deployments.
  */
 export interface InnoContentHubConfig {
@@ -151,8 +149,6 @@ export interface InnoContentHubConfig {
 	ref: string;
 	/** Top-level directory holding the skill library. */
 	skillsPath: string;
-	/** Top-level directory holding the preset workspaces. */
-	presetsPath: string;
 	/** Base URL of the self-hosted bundle service (type: "bundle"). */
 	baseUrl: string;
 	/** Auth token: GitHub PAT (type "github") or Bearer credential (type "bundle"). */
@@ -166,7 +162,6 @@ export const DEFAULT_CONTENT_HUB: InnoContentHubConfig = {
 	repo: "inno-agent-hub",
 	ref: "main",
 	skillsPath: "skill-library",
-	presetsPath: "workspace-templates",
 	baseUrl: "",
 	token: "",
 };
@@ -226,6 +221,32 @@ export interface InnoConfig {
 	sandbox?: Omit<Partial<InnoSandboxConfig>, "limits"> & { limits?: Partial<SandboxLimits> };
 	/** Platform-level blob storage (Alibaba Cloud OSS, MinIO or S3); never read from a tenant config. */
 	objectStorage?: RawObjectStorageConfig;
+	/** Platform-level logging; never read from a tenant config. */
+	logging?: InnoLoggingConfig;
+	/**
+	 * Platform-level preset workspace templates (baked into the image). Never
+	 * read from a tenant config.
+	 */
+	presets?: InnoPresetsConfig;
+}
+
+export interface InnoLoggingConfig {
+	/**
+	 * Directory for daily-rotated `server-YYYY-MM-DD.log` files. Unset (the
+	 * default) writes logs to stdout only. A relative path is resolved against
+	 * the process working directory.
+	 */
+	dir?: string;
+}
+
+export interface InnoPresetsConfig {
+	/**
+	 * Directory of baked-in preset workspace templates (each subdirectory is
+	 * one preset with `preset.json` + `agent.md`). Unset defaults to
+	 * `<codeDir>/presets`. A relative path is resolved against the process
+	 * working directory.
+	 */
+	dir?: string;
 }
 
 /**
@@ -475,7 +496,6 @@ export function normalizeContentHubConfig(
 		repo: trimmed(hub?.repo, DEFAULT_CONTENT_HUB.repo),
 		ref: trimmed(hub?.ref, DEFAULT_CONTENT_HUB.ref),
 		skillsPath: trimmed(hub?.skillsPath, DEFAULT_CONTENT_HUB.skillsPath),
-		presetsPath: trimmed(hub?.presetsPath, DEFAULT_CONTENT_HUB.presetsPath),
 		baseUrl: hub?.baseUrl?.trim() ?? "",
 		// Prefer an explicit hub token; otherwise inherit the legacy github token.
 		token: (hub?.token?.trim() || legacyGithubToken?.trim()) ?? "",
@@ -535,6 +555,8 @@ export function normalizeConfig(
 		tavily: config.tavily,
 		...(config.sandbox ? { sandbox: config.sandbox } : {}),
 		...(config.objectStorage ? { objectStorage: config.objectStorage } : {}),
+		...(config.logging ? { logging: config.logging } : {}),
+		...(config.presets ? { presets: config.presets } : {}),
 	} as InnoConfig;
 }
 
@@ -671,40 +693,31 @@ export function getConfiguredPort(config: InnoConfig, override?: number): number
 
 
 /**
- * Get the data directory path for the project.
+ * Read only `logging.dir` from the config file. The logger must be configured
+ * at process start, before the lazily-loaded full config is validated, and a
+ * broken config must never prevent logging from working.
  */
-export function getDataDir(projectDir: string): string {
-	return join(projectDir, "data");
-}
-
-export function getRuntimeDataDir(paths: RuntimePaths): string {
-	return paths.dataDir;
-}
-
-/**
- * Get the session directory path.
- */
-export function getSessionDir(projectDir: string): string {
-	return join(projectDir, "data", "sessions");
+export function readLoggingDir(configPath: string): string | undefined {
+	try {
+		const raw = JSON.parse(readFileSync(configPath, "utf-8")) as { logging?: { dir?: unknown } };
+		const dir = raw.logging?.dir;
+		return typeof dir === "string" && dir.trim() ? dir.trim() : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /**
- * Get the jobs directory path.
+ * Read only `presets.dir` from the config file. Path resolution happens before
+ * the full config is validated, and a missing/broken config must fall back to
+ * the baked-in `<codeDir>/presets` default rather than aborting startup.
  */
-export function getJobsDir(projectDir: string): string {
-	return join(projectDir, "data", "jobs");
-}
-
-/**
- * Get the Inno Agent skills directory loaded by the PI resource loader.
- */
-export function getSkillsDir(projectDir: string): string {
-	return join(projectDir, ".inno", "skills");
-}
-
-/**
- * Get the L2 Wiki memory data directory path.
- */
-export function getL2DataDir(projectDir: string): string {
-	return join(projectDir, "data", "l2");
+export function readPresetsDir(configPath: string): string | undefined {
+	try {
+		const raw = JSON.parse(readFileSync(configPath, "utf-8")) as { presets?: { dir?: unknown } };
+		const dir = raw.presets?.dir;
+		return typeof dir === "string" && dir.trim() ? dir.trim() : undefined;
+	} catch {
+		return undefined;
+	}
 }

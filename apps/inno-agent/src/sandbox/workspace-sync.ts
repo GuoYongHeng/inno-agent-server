@@ -25,6 +25,20 @@ interface SyncState {
 	files: Record<string, SyncRecord>;
 }
 
+/** Where the per-session sync manifest lives (production: `tenant_state` in PostgreSQL). */
+export interface SyncStateStore {
+	load(): Promise<unknown | undefined>;
+	save(state: unknown): Promise<void>;
+}
+
+/** File-backed manifest (unit tests / local fake). */
+function fileSyncState(path: string): SyncStateStore {
+	return {
+		load: async () => readJson<unknown>(path, undefined),
+		save: async (state) => writeJson(path, state),
+	};
+}
+
 export interface SyncReport {
 	uploaded: number;
 	downloaded: number;
@@ -49,28 +63,41 @@ function ignored(rel: string): boolean {
  * Symlinks, oversized files and ignored directories are skipped and counted.
  */
 export class WorkspaceSync {
-	private state: SyncState;
+	private state: SyncState = { files: {} };
 	private chain: Promise<unknown> = Promise.resolve();
+	private readonly store: SyncStateStore;
+	private loaded: Promise<void> | null = null;
 
 	constructor(
 		private readonly backend: SandboxBackend,
 		private readonly hostDir: string,
 		private readonly remoteRoot: string,
-		private readonly statePath: string,
+		state: string | SyncStateStore,
 	) {
-		this.state = readJson<SyncState>(statePath, { files: {} });
-		if (!this.state.files || typeof this.state.files !== "object") this.state = { files: {} };
+		this.store = typeof state === "string" ? fileSyncState(state) : state;
+	}
+
+	private ensureLoaded(): Promise<void> {
+		this.loaded ??= this.store.load().then((raw) => {
+			const files = (raw as SyncState | undefined)?.files;
+			this.state = files && typeof files === "object" ? { files } : { files: {} };
+		});
+		return this.loaded;
 	}
 
 	/** Serialise syncs: they read and write one manifest. */
 	private serial<T>(operation: () => Promise<T>): Promise<T> {
-		const next = this.chain.then(operation, operation);
+		const guarded = async () => {
+			await this.ensureLoaded();
+			return operation();
+		};
+		const next = this.chain.then(guarded, guarded);
 		this.chain = next.catch(() => undefined);
 		return next;
 	}
 
-	private save(): void {
-		writeJson(this.statePath, this.state);
+	private save(): Promise<void> {
+		return this.store.save(this.state);
 	}
 
 	private hostFiles(): Map<string, { size: number; mtimeMs: number }> {
@@ -130,7 +157,7 @@ export class WorkspaceSync {
 				this.state.files[rel] = { hostSize: stamp.size, hostMtimeMs: stamp.mtimeMs, remoteSize: remote.size, remoteMtimeMs: remote.mtimeMs };
 				report.uploaded++;
 			}
-			this.save();
+			await this.save();
 			incCounter("inno_sandbox_sync_uploaded_total", report.uploaded);
 			return report;
 		});
@@ -170,7 +197,7 @@ export class WorkspaceSync {
 				} catch { /* already gone */ }
 				delete this.state.files[rel];
 			}
-			this.save();
+			await this.save();
 			incCounter("inno_sandbox_sync_downloaded_total", report.downloaded);
 			if (report.deletedHost || report.skipped) logger.debug({ report }, "sandbox workspace pull");
 			return report;
@@ -178,8 +205,10 @@ export class WorkspaceSync {
 	}
 
 	/** Forget the manifest, so the next push re-uploads everything. */
-	reset(): void {
-		this.state = { files: {} };
-		this.save();
+	reset(): Promise<void> {
+		return this.serial(async () => {
+			this.state = { files: {} };
+			await this.save();
+		});
 	}
 }

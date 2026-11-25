@@ -17,7 +17,6 @@ function ContentHubSettings({ settings }: { settings: InnoSettings }) {
 	const [repo, setRepo] = useState(hub?.repo ?? "");
 	const [ref, setRef] = useState(hub?.ref ?? "");
 	const [skillsPath, setSkillsPath] = useState(hub?.skillsPath ?? "");
-	const [presetsPath, setPresetsPath] = useState(hub?.presetsPath ?? "");
 	const [baseUrl, setBaseUrl] = useState(hub?.baseUrl ?? "");
 	const [token, setToken] = useState(hub?.token ?? "");
 	const [saving, setSaving] = useState(false);
@@ -29,12 +28,11 @@ function ContentHubSettings({ settings }: { settings: InnoSettings }) {
 		setRepo(hub?.repo ?? "");
 		setRef(hub?.ref ?? "");
 		setSkillsPath(hub?.skillsPath ?? "");
-		setPresetsPath(hub?.presetsPath ?? "");
 		setBaseUrl(hub?.baseUrl ?? "");
 		setToken(hub?.token ?? "");
 		setSaved(false);
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [hub?.type, hub?.owner, hub?.repo, hub?.ref, hub?.skillsPath, hub?.presetsPath, hub?.baseUrl, hub?.token]);
+	}, [hub?.type, hub?.owner, hub?.repo, hub?.ref, hub?.skillsPath, hub?.baseUrl, hub?.token]);
 
 	async function handleSave() {
 		setSaving(true);
@@ -46,7 +44,6 @@ function ContentHubSettings({ settings }: { settings: InnoSettings }) {
 				repo: repo.trim(),
 				ref: ref.trim(),
 				skillsPath: skillsPath.trim(),
-				presetsPath: presetsPath.trim(),
 				baseUrl: baseUrl.trim(),
 				token: token.trim(),
 			});
@@ -103,7 +100,6 @@ function ContentHubSettings({ settings }: { settings: InnoSettings }) {
 							</div>
 							<div className="grid min-w-0 grid-cols-[repeat(auto-fit,minmax(9rem,1fr))] gap-2">
 								<input className={inputCls} value={skillsPath} onChange={(e) => { setSkillsPath(e.target.value); setSaved(false); }} placeholder="skill-library" autoComplete="off" />
-								<input className={inputCls} value={presetsPath} onChange={(e) => { setPresetsPath(e.target.value); setSaved(false); }} placeholder="workspace-templates" autoComplete="off" />
 							</div>
 						</>
 					) : (

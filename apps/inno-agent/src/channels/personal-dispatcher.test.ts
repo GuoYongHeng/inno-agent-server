@@ -290,17 +290,17 @@ describe("PersonalChannelDispatcher routing", () => {
 		expect(probe.inSession[0].prompt.length).toBeLessThanOrEqual(20_000);
 	});
 
-	it("appends downloaded file attachments to the prompt", async () => {
+	it("announces file attachments in the prompt without reading them", async () => {
 		const probe = makeOpts();
 		const dispatcher = new PersonalChannelDispatcher(probe.opts);
 		const { channel } = fakeChannel();
 
 		await dispatcher.handle(
 			channel,
-			msg({ attachments: [{ type: "file", filePath: "/tmp/report.pdf", fileName: "report.pdf" }] }),
+			msg({ attachments: [{ type: "file", fileName: "report.pdf" }] }),
 		);
 
-		expect(probe.inSession[0].prompt).toContain("[附件已下载到: /tmp/report.pdf]");
+		expect(probe.inSession[0].prompt).toContain("[用户发送了文件「report.pdf」，通道暂不支持读取文件内容]");
 	});
 });
 

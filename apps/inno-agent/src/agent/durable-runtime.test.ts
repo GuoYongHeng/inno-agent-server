@@ -425,8 +425,8 @@ describe("DurableSessionRuntime", () => {
 			parse: async () => null,
 			reply: async () => {},
 			push: async () => {},
-			sendFile: async (target, filePath, fileName) => {
-				sends.push({ chatId: target.chatId, fileName, contents: readFileSync(filePath, "utf-8") });
+			sendFile: async (target, file, fileName) => {
+				sends.push({ chatId: target.chatId, fileName, contents: typeof file === "string" ? readFileSync(file, "utf-8") : Buffer.from(file.bytes).toString("utf-8") });
 			},
 		});
 		channelRegistry.setDefaultTarget({ channel: "feishu", chatId: "changed-default-chat" });

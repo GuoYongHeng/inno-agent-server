@@ -6,6 +6,7 @@ import { normalizeSandboxConfig } from "../config.js";
 import { LocalDirSandboxProvider } from "./local-backend.js";
 import { GuardedSandboxBackend, InMemorySandboxQuotaStore, SANDBOX_LEASE_STALE_MS, type SandboxLimits } from "./sandbox-quota.js";
 import { SandboxManager } from "./sandbox-session.js";
+import { FileStateKv } from "../tenants/state-store.js";
 
 const limits = (over: Partial<SandboxLimits> = {}): SandboxLimits => ({ maxConcurrent: 2, maxSandboxes: 5, maxActiveMinutesPerDay: 60, ...over });
 const MIN = 60_000;
@@ -101,7 +102,7 @@ describe("SandboxManager limits", () => {
 			let persisted: string | undefined;
 			return {
 				persisted: () => persisted,
-				input: { sessionId: session, tenantId: tenant, hostWorkspaceDir: host, stateDir: base, persistSandboxId: async (id: string) => { persisted = id; }, ...extra },
+				input: { sessionId: session, tenantId: tenant, hostWorkspaceDir: host, stateKv: new FileStateKv(base), persistSandboxId: async (id: string) => { persisted = id; }, ...extra },
 			};
 		};
 		return { provider, manager, quota, input, host: (i: ReturnType<typeof input>) => i.input.hostWorkspaceDir };
