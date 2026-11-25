@@ -4,7 +4,6 @@ import { themeStore, THEME_IDS, THEME_PREVIEW_COLORS } from "../../stores/theme-
 import { settingsStore } from "../../stores/settings-store.js";
 import { setLocale } from "../../i18n/index.js";
 import { useStoreSnapshot } from "../hooks.js";
-import type { WindowCloseBehavior } from "../../types/settings.js";
 import { SettingsSection, SettingsCard, SettingsRow } from "./primitives.js";
 import { Switch } from "../ui/Switch.js";
 
@@ -55,33 +54,6 @@ function LanguageSelect() {
 	);
 }
 
-function CloseBehaviorSelect() {
-	const { t } = useTranslation();
-	const state = useStoreSnapshot(settingsStore, () => ({
-		behavior: settingsStore.settings?.ui?.closeBehavior ?? "ask",
-		isSaving: settingsStore.isSavingCloseBehavior,
-		isReady: settingsStore.settings !== null,
-	}));
-
-	function handleChange(value: string) {
-		if (value !== "ask" && value !== "hide" && value !== "quit") return;
-		void settingsStore.saveCloseBehavior(value as WindowCloseBehavior).catch(() => undefined);
-	}
-
-	return (
-		<select
-			className="rounded-md border border-[var(--inno-border)] bg-[var(--inno-surface)] px-2 py-1 text-xs"
-			value={state.behavior}
-			disabled={!state.isReady || state.isSaving}
-			onChange={(e) => handleChange(e.target.value)}
-		>
-			<option value="ask">{t("settings.closeBehavior.options.ask")}</option>
-			<option value="hide">{t("settings.closeBehavior.options.hide")}</option>
-			<option value="quit">{t("settings.closeBehavior.options.quit")}</option>
-		</select>
-	);
-}
-
 function MarkdownMathToggle() {
 	const { t } = useTranslation();
 	const state = useStoreSnapshot(settingsStore, () => ({
@@ -96,72 +68,6 @@ function MarkdownMathToggle() {
 			aria-label={t("settings.markdownMath.title")}
 			onChange={(enabled) => void settingsStore.saveMathSingleDollar(enabled).catch(() => undefined)}
 		/>
-	);
-}
-
-function ComputerUseToggle() {
-	const { t } = useTranslation();
-	const [changed, setChanged] = useState(false);
-	const state = useStoreSnapshot(settingsStore, () => ({
-		enabled: settingsStore.settings?.computerUse?.enabled === true,
-		isSaving: settingsStore.isSavingComputerUse,
-		isReady: settingsStore.settings !== null,
-	}));
-
-	function handleChange(enabled: boolean) {
-		settingsStore
-			.saveComputerUse(enabled)
-			.then(() => setChanged(true))
-			.catch(() => undefined);
-	}
-
-	return (
-		<div className="flex flex-col items-end gap-1">
-			<Switch
-				checked={state.enabled}
-				disabled={!state.isReady || state.isSaving}
-				aria-label={t("settings.computerUse.title")}
-				onChange={handleChange}
-			/>
-			{changed && (
-				<span className="text-[11px] text-[var(--inno-text-muted)]">
-					{t("settings.computerUse.restartHint")}
-				</span>
-			)}
-		</div>
-	);
-}
-
-function CodemodeToggle() {
-	const { t } = useTranslation();
-	const [changed, setChanged] = useState(false);
-	const state = useStoreSnapshot(settingsStore, () => ({
-		enabled: settingsStore.settings?.codemode?.enabled === true,
-		isSaving: settingsStore.isSavingCodemode,
-		isReady: settingsStore.settings !== null,
-	}));
-
-	function handleChange(enabled: boolean) {
-		settingsStore
-			.saveCodemode(enabled)
-			.then(() => setChanged(true))
-			.catch(() => undefined);
-	}
-
-	return (
-		<div className="flex flex-col items-end gap-1">
-			<Switch
-				checked={state.enabled}
-				disabled={!state.isReady || state.isSaving}
-				aria-label={t("settings.codemode.title")}
-				onChange={handleChange}
-			/>
-			{changed && (
-				<span className="text-[11px] text-[var(--inno-text-muted)]">
-					{t("settings.codemode.restartHint")}
-				</span>
-			)}
-		</div>
 	);
 }
 
@@ -186,30 +92,9 @@ export function GeneralSettings() {
 			</SettingsCard>
 			<SettingsCard>
 				<SettingsRow
-					label={t("settings.closeBehavior.title")}
-					description={t("settings.sections.general.closeBehaviorDesc", "设置点击窗口关闭按钮时的处理方式；选择后会在所有平台记住。")}
-					control={<CloseBehaviorSelect />}
-				/>
-			</SettingsCard>
-			<SettingsCard>
-				<SettingsRow
 					label={t("settings.markdownMath.title")}
 					description={t("settings.markdownMath.description")}
 					control={<MarkdownMathToggle />}
-				/>
-			</SettingsCard>
-			<SettingsCard>
-				<SettingsRow
-					label={t("settings.computerUse.title")}
-					description={t("settings.computerUse.description")}
-					control={<ComputerUseToggle />}
-				/>
-			</SettingsCard>
-			<SettingsCard>
-				<SettingsRow
-					label={t("settings.codemode.title")}
-					description={t("settings.codemode.description")}
-					control={<CodemodeToggle />}
 				/>
 			</SettingsCard>
 			</SettingsSection>

@@ -1,9 +1,7 @@
 import {
 	copyFileSync,
-	existsSync,
 	lstatSync,
 	mkdirSync,
-	statSync,
 	unlinkSync,
 	constants,
 } from "node:fs";
@@ -15,6 +13,7 @@ import {
 	normalizeWorkspaceRelativePath,
 	safeJoinReal,
 } from "./file-helpers.js";
+import type { TenantStateKv } from "../tenants/state-store.js";
 import { getWorkspaceFileActivities } from "./workspace-activity-store.js";
 
 export type WorkspaceFileAccess = "read" | "write" | "read_write";
@@ -101,22 +100,14 @@ function inspectSourceFile(rootDir: string, path: string): InspectedSourceFile {
 	}
 }
 
-function sourceHistoryExists(sessionPath: string | null): boolean {
-	if (!sessionPath || !existsSync(sessionPath)) return false;
-	try {
-		return statSync(sessionPath).size > 0;
-	} catch {
-		return false;
-	}
-}
-
-export function buildWorkspaceSwitchPreview(input: {
-	dataDir: string;
+export async function buildWorkspaceSwitchPreview(input: {
+	kv: TenantStateKv;
 	sessionId: string;
-	sessionPath: string | null;
+	/** Whether the conversation already has messages. */
+	hasSessionHistory: boolean;
 	workspaceRegistry: WorkspaceRegistry;
 	targetWorkspaceId: string;
-}): WorkspaceSwitchPreview {
+}): Promise<WorkspaceSwitchPreview> {
 	const sourceWorkspaceId = input.workspaceRegistry.getSessionWorkspaceId(input.sessionId);
 	const sourceWorkspace = input.workspaceRegistry.getWorkspace(sourceWorkspaceId);
 	const targetWorkspace = input.workspaceRegistry.getWorkspace(input.targetWorkspaceId);
@@ -127,11 +118,11 @@ export function buildWorkspaceSwitchPreview(input: {
 	if (!sourceRoot || !targetRoot || !isSafeWorkspaceRoot(sourceRoot) || !isSafeWorkspaceRoot(targetRoot)) {
 		throw new Error("Workspace path is not available or safe");
 	}
-	const activity = getWorkspaceFileActivities(input.dataDir, {
+	const activity = await getWorkspaceFileActivities(input.kv, {
 		sessionId: input.sessionId,
 		workspaceId: sourceWorkspace.id,
 		workspaceRoot: sourceRoot,
-		hasSessionHistory: sourceHistoryExists(input.sessionPath),
+		hasSessionHistory: input.hasSessionHistory,
 	});
 	const files = activity.files
 		.map((entry) => {

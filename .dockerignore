@@ -1,6 +1,5 @@
 node_modules
 dist
-dist-electron
 apps/*/dist
 apps/*/node_modules
 runtime
@@ -8,13 +7,13 @@ workspace
 .git
 .gitignore
 *.md
-!Dockerfile
-docker-compose.yml
+deploy/Dockerfile*
+deploy/docker-compose.yml
 .env
 .DS_Store
-electron/loading.html
-electron/main.js
-build
 # Root-only: keep apps/inno-agent/scripts (vendored pptx→svg Python converter)
 /scripts
 docs
+# Bundled global skills ship inside the backend image — never exclude them,
+# even if a broad pattern (e.g. *.md) is widened later.
+!skills/**

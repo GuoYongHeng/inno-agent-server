@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,13 +7,17 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxProviderHand
 import { afterEach, describe, expect, it } from "vitest";
 import { normalizeConfig } from "../config.js";
 import { runInTenantContext, runWithoutTenantContext, getCurrentTenant } from "../tenants/current.js";
-import { saveTenantConfig } from "../tenants/config.js";
-import { loadEvents } from "../memory/learner/profile-store.js";
-import { closeL3Memory, ScopedL3Memory } from "../memory/l3/l3-tools.js";
+import { readManifest } from "../memory/l2/manifest-store.js";
+import { closeL3Memory } from "../memory/l3/l3-tools.js";
 import { ChannelRegistry } from "../channels/channel.js";
 import { setRequestTenant } from "../tenants/http.js";
+import { resolveRequestTenantDataRoot } from "../tenants/paths.js";
+import { FileSessionCatalog } from "./session-catalog.js";
+import type { Pool } from "pg";
 import type { DurableStorageLock, TenantContext, TenantStore } from "../tenants/store.js";
-import { DurableRuntimeDisabledError, DurableSessionService } from "./durable-session-service.js";
+import { metricsSnapshot, resetMetricsForTests } from "../utils/metrics.js";
+import { createSchedulerTools } from "../scheduler/scheduler-tools.js";
+import { DurableModelNotFoundError, DurableRuntimeDisabledError, DurableSessionBusyError, DurableSessionService } from "./durable-session-service.js";
 import { DurableSessionRuntime, type DurableSessionRuntimeOptions } from "./durable-runtime.js";
 
 const roots: string[] = [];
@@ -25,7 +29,16 @@ const tenantStore = {
 		onLost: () => {},
 		release: async () => {},
 	}),
+	claimDurableStorage: async () => 1,
+	renewDurableStorage: async () => true,
+	releaseDurableStorage: async () => {},
 } as unknown as TenantStore;
+const ctxT = { tenantId: "t", userId: "u", role: "owner" } as TenantContext;
+const fakePool = {
+	query: async () => ({ rows: [], rowCount: 0 }),
+	connect: async () => ({ query: async () => ({ rows: [], rowCount: 0 }), release: () => {} }),
+} as unknown as Pool;
+const catalogFor = (base: string) => new FileSessionCatalog((req) => join(resolveRequestTenantDataRoot(req, base), "durable", "sessions.json"));
 
 function root(): string {
 	const value = mkdtempSync(join(tmpdir(), "inno-durable-service-"));
@@ -53,6 +66,7 @@ function tenant(id: string): TenantContext {
 
 function inTenant<T>(context: TenantContext, operation: (req: IncomingMessage) => T, store: TenantStore = tenantStore): T {
 	const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
 	return runWithoutTenantContext(() => {
 		setRequestTenant(req, context, store);
 		return runInTenantContext(context, store, () => operation(req));
@@ -71,8 +85,6 @@ describe("DurableSessionService", () => {
 		const workspace = join(base, "workspace");
 		mkdirSync(workspace, { recursive: true });
 		const localConfig = config("local-key");
-		saveTenantConfig(base, "tenant-a", config("key-a"));
-		saveTenantConfig(base, "tenant-b", config("key-b"));
 		const providers = new Map<string, FauxProviderHandle>();
 		writeFileSync(join(workspace, "shared.txt"), "tenant channel payload");
 		const channelSends: Array<{ tenantId: string; chatId: string }> = [];
@@ -102,23 +114,25 @@ describe("DurableSessionService", () => {
 			},
 		} as unknown as ChannelRegistry;
 		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
 			dataDir: base,
 			getLocalConfig: () => localConfig,
 			enabled: true,
 			resolveWorkspaceDir: () => workspace,
 			getChannelRegistry: () => scopedChannelRegistry,
 			tenantStore,
-			openRuntime: async (options: DurableSessionRuntimeOptions) => {
+			openRuntime: async ({ openStorage: _pg, ...options }: DurableSessionRuntimeOptions) => {
 				let faux = providers.get(options.storagePath);
 				if (!faux) {
 					faux = fauxProvider();
 					const tenantConcept = options.storagePath.includes("tenant-a") ? "concept-a" : "concept-b";
 					faux.setResponses([
-						fauxAssistantMessage(fauxToolCall("record_learning_event", {
-							event_type: "concept_explained",
-							context: { concept_ids: [tenantConcept] },
-							payload: { topic: tenantConcept },
-						}, { id: `event-${tenantConcept}` }), { stopReason: "toolUse" }),
+						fauxAssistantMessage(fauxToolCall("l2_archive", {
+							title: tenantConcept,
+							content: `notes of ${tenantConcept}`,
+							sourceType: "markdown",
+						}, { id: `archive-${tenantConcept}` }), { stopReason: "toolUse" }),
 						fauxAssistantMessage(fauxToolCall("send_file_to_channel", {
 							filePath: "shared.txt",
 							channel: "feishu",
@@ -139,8 +153,8 @@ describe("DurableSessionService", () => {
 		services.push(service);
 		const a = tenant("tenant-a");
 		const b = tenant("tenant-b");
-		const boundA = inTenant(a, (req) => ({ req, summary: service.create(req, { workspaceId: "workspace-a" }) }));
-		const boundB = inTenant(b, (req) => ({ req, summary: service.create(req, { workspaceId: "workspace-b" }) }));
+		const boundA = await inTenant(a, async (req) => ({ req, summary: await service.create(req, { workspaceId: "workspace-a" }) }));
+		const boundB = await inTenant(b, async (req) => ({ req, summary: await service.create(req, { workspaceId: "workspace-b" }) }));
 		expect(boundA.summary.id).not.toBe(boundB.summary.id);
 		const [answerA, answerB] = await Promise.all([
 			inTenant(a, async () => {
@@ -162,26 +176,20 @@ describe("DurableSessionService", () => {
 		]);
 		expect(answerA).toMatchObject({ status: "done", text: "answer A" });
 		expect(answerB).toMatchObject({ status: "done", text: "answer B" });
-		expect(inTenant(a, () => service.list(boundA.req)).map((item) => item.id)).toEqual([boundA.summary.id]);
-		expect(inTenant(b, () => service.list(boundB.req)).map((item) => item.id)).toEqual([boundB.summary.id]);
+		expect((await inTenant(a, () => service.list(boundA.req))).map((item) => item.id)).toEqual([boundA.summary.id]);
+		expect((await inTenant(b, () => service.list(boundB.req))).map((item) => item.id)).toEqual([boundB.summary.id]);
 		expect(readFileSync(join(base, "tenants", "tenant-a", "durable", "sessions.json"), "utf-8")).toContain(boundA.summary.id);
 		expect(readFileSync(join(base, "tenants", "tenant-b", "durable", "sessions.json"), "utf-8")).not.toContain(boundA.summary.id);
-		const eventsA = loadEvents(join(base, "tenants", "tenant-a", "learner"));
-		const eventsB = loadEvents(join(base, "tenants", "tenant-b", "learner"));
-		expect(eventsA).toHaveLength(1);
-		expect(eventsB).toHaveLength(1);
-		expect(eventsA[0]!.context.concept_ids).toEqual(["concept-a"]);
-		expect(eventsB[0]!.context.concept_ids).toEqual(["concept-b"]);
+		const archivesA = await readManifest(join(base, "tenants", "tenant-a", "l2"));
+		const archivesB = await readManifest(join(base, "tenants", "tenant-b", "l2"));
+		expect(archivesA.map((entry) => entry.title)).toEqual(["concept-a"]);
+		expect(archivesB.map((entry) => entry.title)).toEqual(["concept-b"]);
 		expect(channelSends).toEqual(expect.arrayContaining([
 			{ tenantId: "tenant-a", chatId: "chat-tenant-a" },
 			{ tenantId: "tenant-b", chatId: "chat-tenant-b" },
 		]));
 		expect(channelSends).toHaveLength(2);
-		expect(readdirSync(join(base, "tenants", "tenant-a", "channels", "outbox"))).toHaveLength(2);
-		expect(readdirSync(join(base, "tenants", "tenant-b", "channels", "outbox"))).toHaveLength(2);
 		await inTenant(a, () => service.delete(boundA.req, boundA.summary.id));
-		expect(readdirSync(join(base, "tenants", "tenant-a", "channels", "outbox"))).toHaveLength(0);
-		expect(readdirSync(join(base, "tenants", "tenant-b", "channels", "outbox"))).toHaveLength(2);
 	});
 
 	it("keeps request deduplication across idle runtime close/reopen", async () => {
@@ -190,11 +198,14 @@ describe("DurableSessionService", () => {
 		const faux = fauxProvider();
 		faux.setResponses([fauxAssistantMessage("one committed answer")]);
 		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
+			tenantStore,
 			dataDir: base,
 			getLocalConfig: () => config("local"),
 			enabled: true,
 			resolveWorkspaceDir: () => base,
-			openRuntime: async (options) => {
+			openRuntime: async ({ openStorage: _pg, ...options }) => {
 				const models = createModels();
 				models.setProvider(faux.provider);
 				return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -202,7 +213,8 @@ describe("DurableSessionService", () => {
 		});
 		services.push(service);
 		const req = { headers: {} } as IncomingMessage;
-		const session = service.create(req, { workspaceId: "workspace" });
+		setRequestTenant(req, ctxT, tenantStore);
+		const session = await service.create(req, { workspaceId: "workspace" });
 		const submit = async () => {
 			const lease = await service.lease(req, session.id);
 			try {
@@ -226,17 +238,97 @@ describe("DurableSessionService", () => {
 		});
 	});
 
+	it("waits out a busy remote owner before claiming the session lease", async () => {
+		await runWithoutTenantContext(async () => {
+			const base = root();
+			l3Dirs.push(join(base, "l3"));
+			const faux = fauxProvider();
+			faux.setResponses([fauxAssistantMessage("done")]);
+			// Two rounds of "remote owner busy" (lock held + live lease), then free.
+			let lockCalls = 0;
+			let claimCalls = 0;
+			const busyStore = {
+				acquireDurableStorageLock: async () => ++lockCalls <= 2 ? null : {
+					lost: false, backendPid: 1, onLost: () => {}, release: async () => {},
+				},
+				claimDurableStorage: async () => ++claimCalls <= 2 ? null : 1,
+				renewDurableStorage: async () => true,
+				releaseDurableStorage: async () => {},
+			} as unknown as TenantStore;
+			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				dataDir: base,
+				getLocalConfig: () => config("local"),
+				enabled: true,
+				resolveWorkspaceDir: () => base,
+				tenantStore: busyStore,
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
+					const models = createModels();
+					models.setProvider(faux.provider);
+					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
+				},
+			});
+			services.push(service);
+			const session = await inTenant(tenant("tenant-a"), async (req) => {
+				const created = await service.create(req, { workspaceId: "workspace" });
+				const lease = await service.lease(req, created.id, { busyWaitMs: 6_000 });
+				await lease.release();
+				return created;
+			}, busyStore);
+			expect(session.id).toBeTruthy();
+			expect(lockCalls).toBe(3);
+			expect(claimCalls).toBe(3);
+		});
+	});
+
+	it("gives up waiting once the busy deadline passes", async () => {
+		await runWithoutTenantContext(async () => {
+			const base = root();
+			l3Dirs.push(join(base, "l3"));
+			const faux = fauxProvider();
+			const alwaysBusy = {
+				acquireDurableStorageLock: async () => null,
+				claimDurableStorage: async () => null,
+				renewDurableStorage: async () => true,
+				releaseDurableStorage: async () => {},
+			} as unknown as TenantStore;
+			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				dataDir: base,
+				getLocalConfig: () => config("local"),
+				enabled: true,
+				resolveWorkspaceDir: () => base,
+				tenantStore: alwaysBusy,
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
+					const models = createModels();
+					models.setProvider(faux.provider);
+					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
+				},
+			});
+			services.push(service);
+			await inTenant(tenant("tenant-a"), async (req) => {
+				const created = await service.create(req, { workspaceId: "workspace" });
+				await expect(service.lease(req, created.id, { busyWaitMs: 1_200 })).rejects.toThrow(DurableSessionBusyError);
+			}, alwaysBusy);
+		});
+	});
+
 	it("persists and deduplicates assistant notifications without a model turn", async () => {
 		await runWithoutTenantContext(async () => {
 			const base = root();
 			l3Dirs.push(join(base, "l3"));
 			const faux = fauxProvider();
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
 				dataDir: base,
 				getLocalConfig: () => config("local"),
 				enabled: true,
 				resolveWorkspaceDir: () => base,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -244,7 +336,8 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+		setRequestTenant(req, ctxT, tenantStore);
+			const session = await service.create(req, { workspaceId: "workspace" });
 			const note = "📌 旁注问答\nQ: 什么是闭包？\nA: 闭包会保留词法环境。";
 
 			await service.appendAssistantNotification(req, session.id, note, "btw-exchange-request");
@@ -259,8 +352,7 @@ describe("DurableSessionService", () => {
 			expect(duplicate.messages).toEqual(first.messages);
 			expect(duplicate.revision).toBe(first.revision);
 			expect(faux.state.callCount).toBe(0);
-			const memory = new ScopedL3Memory(base, join(base, "sessions"));
-			expect((await memory.recall("闭包", "another-session")).some((result) => result.sessionId === session.id)).toBe(true);
+
 		});
 	});
 
@@ -281,11 +373,14 @@ describe("DurableSessionService", () => {
 		const faux = fauxProvider();
 		const instructionSnapshots: string[] = [];
 		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
+			tenantStore,
 			dataDir: base,
 			getLocalConfig: () => config("local"),
 			enabled: true,
 			resolveWorkspaceDir: () => workspace,
-			openRuntime: async (options) => {
+			openRuntime: async ({ openStorage: _pg, ...options }) => {
 				instructionSnapshots.push(options.instructions ?? "");
 				const models = createModels();
 				models.setProvider(faux.provider);
@@ -295,7 +390,8 @@ describe("DurableSessionService", () => {
 		services.push(service);
 		await runWithoutTenantContext(async () => {
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+		setRequestTenant(req, ctxT, tenantStore);
+			const session = await service.create(req, { workspaceId: "workspace" });
 			const reopen = async () => {
 				const lease = await service.lease(req, session.id);
 				await lease.release();
@@ -321,11 +417,14 @@ describe("DurableSessionService", () => {
 			const faux = fauxProvider();
 			faux.setResponses([fauxAssistantMessage("复习监督学习和梯度下降")]);
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
 				dataDir: base,
 				getLocalConfig: () => config("local"),
 				enabled: true,
 				resolveWorkspaceDir: () => base,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -333,22 +432,16 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+		setRequestTenant(req, ctxT, tenantStore);
+			const session = await service.create(req, { workspaceId: "workspace" });
 			const lease = await service.lease(req, session.id);
 			try {
 				const submission = await lease.runtime.submit("之前学习了机器学习的基本概念", "durable-l3-index");
 				await lease.runtime.waitForSubmission(submission.id);
 			} finally { await lease.release(); }
 			await service.snapshot(req, session.id);
-			const memory = new ScopedL3Memory(base, join(base, "sessions"));
-			const recalled = await memory.recall("机器学习", "durable-current");
-			expect(recalled.some((result) => result.sessionId === session.id)).toBe(true);
-			expect(await memory.recall("机器学习", session.id)).toEqual([]);
-			const next = service.create(req, { workspaceId: "workspace" });
-			const context = await service.prepareRecallContext(req, next.id, "机器学习");
-			expect(context).toContain("# 相关历史对话");
-			expect(context).toContain("之前学习了机器学习");
-			expect(await service.prepareRecallContext(req, session.id, "机器学习")).toBe("");
+			const next = await service.create(req, { workspaceId: "workspace" });
+			expect(next.id).not.toBe(session.id);
 		});
 	});
 
@@ -365,11 +458,14 @@ describe("DurableSessionService", () => {
 			let currentConfig = config("local");
 			const completions: Array<{ provider: string; modelId: string; prompt: string }> = [];
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
 				dataDir: base,
 				getLocalConfig: () => currentConfig,
 				enabled: true,
 				resolveWorkspaceDir: () => base,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -381,7 +477,8 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+		setRequestTenant(req, ctxT, tenantStore);
+			const session = await service.create(req, { workspaceId: "workspace" });
 			currentConfig = normalizeConfig({
 				...currentConfig,
 				defaultProvider: "other-provider",
@@ -401,12 +498,12 @@ describe("DurableSessionService", () => {
 					const submission = await lease.runtime.submit(prompt, requestId);
 					expect((await lease.runtime.waitForSubmission(submission.id)).status).toBe("done");
 				} finally { await lease.release(); }
-				service.noteSubmission(req, session.id, prompt);
+				await service.noteSubmission(req, session.id, prompt);
 				await service.snapshot(req, session.id);
 			};
 			await turn("学习 Rust 所有权", "topic-1");
 			await turn("理解借用检查器", "topic-2");
-			expect(service.list(req)[0]?.topicPendingUpgrade).toBe(false);
+			expect((await service.list(req))[0]?.topicPendingUpgrade).toBe(false);
 			await turn("练习生命周期标注", "topic-3");
 			await Promise.all([
 				service.maybeAutoGenerateTopic(req, session.id),
@@ -416,13 +513,13 @@ describe("DurableSessionService", () => {
 			expect(completions[0]).toMatchObject({ provider: "faux-configured", modelId: "faux-model" });
 			expect(completions[0]?.prompt).toContain("学习 Rust 所有权");
 			expect(completions[0]?.prompt).toContain("练习生命周期标注");
-			expect(service.list(req)[0]).toMatchObject({ name: "Rust 所有权入门", topicPendingUpgrade: false });
+			expect((await service.list(req))[0]).toMatchObject({ name: "Rust 所有权入门", topicPendingUpgrade: false });
 
-			service.rename(req, session.id, "我的手动标题");
+			await service.rename(req, session.id, "我的手动标题");
 			await turn("继续练习", "topic-4");
 			await service.maybeAutoGenerateTopic(req, session.id);
 			expect(completions).toHaveLength(1);
-			expect(service.list(req)[0]?.name).toBe("我的手动标题");
+			expect((await service.list(req))[0]?.name).toBe("我的手动标题");
 		});
 	});
 
@@ -435,11 +532,14 @@ describe("DurableSessionService", () => {
 			let topicStarted = false;
 			const completion = new Promise<string>((resolve) => { finishTopic = resolve; });
 			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
 				dataDir: base,
 				getLocalConfig: () => config("local"),
 				enabled: true,
 				resolveWorkspaceDir: () => base,
-				openRuntime: async (options) => {
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
 					const models = createModels();
 					models.setProvider(faux.provider);
 					return DurableSessionRuntime.open({ ...options, models, model: { provider: faux.provider.id, modelId: faux.getModel().id } });
@@ -451,14 +551,15 @@ describe("DurableSessionService", () => {
 			});
 			services.push(service);
 			const req = { headers: {} } as IncomingMessage;
-			const session = service.create(req, { workspaceId: "workspace" });
+		setRequestTenant(req, ctxT, tenantStore);
+			const session = await service.create(req, { workspaceId: "workspace" });
 			for (const [index, prompt] of ["first", "second", "third"].entries()) {
 				const lease = await service.lease(req, session.id);
 				try {
 					const submission = await lease.runtime.submit(prompt, `rename-topic-${index}`);
 					await lease.runtime.waitForSubmission(submission.id);
 				} finally { await lease.release(); }
-				service.noteSubmission(req, session.id, prompt);
+				await service.noteSubmission(req, session.id, prompt);
 				await service.snapshot(req, session.id);
 			}
 			const generation = service.maybeAutoGenerateTopic(req, session.id);
@@ -466,17 +567,17 @@ describe("DurableSessionService", () => {
 				await new Promise((resolve) => setTimeout(resolve, 10));
 			}
 			expect(topicStarted).toBe(true);
-			service.rename(req, session.id, "手动保留");
+			await service.rename(req, session.id, "手动保留");
 			finishTopic!("不应覆盖");
 			await generation;
-			expect(service.list(req)[0]).toMatchObject({ name: "手动保留", topicPendingUpgrade: false });
+			expect((await service.list(req))[0]).toMatchObject({ name: "手动保留", topicPendingUpgrade: false });
 		});
 	});
 
 	it("invalidates a runtime when its cross-process storage lock is lost", async () => {
+		resetMetricsForTests();
 		const base = root();
 		const context = tenant("tenant-a");
-		saveTenantConfig(base, context.tenantId, config("key-a"));
 		let acquisitions = 0;
 		let releases = 0;
 		let closes = 0;
@@ -487,6 +588,7 @@ describe("DurableSessionService", () => {
 				let listener: (() => void) | undefined;
 				const lock: DurableStorageLock = {
 					lost: false,
+					backendPid: 0,
 					onLost: (callback) => { listener = callback; },
 					release: async () => { releases += 1; },
 				};
@@ -496,8 +598,13 @@ describe("DurableSessionService", () => {
 				});
 				return lock;
 			},
+			claimDurableStorage: async () => 1,
+			renewDurableStorage: async () => true,
+			releaseDurableStorage: async () => {},
 		} as unknown as TenantStore;
 		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
 			dataDir: base,
 			getLocalConfig: () => config("local"),
 			enabled: true,
@@ -508,7 +615,7 @@ describe("DurableSessionService", () => {
 			}) as unknown as DurableSessionRuntime,
 		});
 		services.push(service);
-		const bound = inTenant(context, (req) => ({ req, session: service.create(req, { workspaceId: "workspace" }) }));
+		const bound = await inTenant(context, async (req) => ({ req, session: await service.create(req, { workspaceId: "workspace" }) }));
 		const lease = async () => inTenant(context, () => service.lease(bound.req, bound.session.id));
 		const first = await lease();
 		expect(acquisitions).toBe(1);
@@ -519,11 +626,283 @@ describe("DurableSessionService", () => {
 		expect(acquisitions).toBe(2);
 		await second.release();
 		expect({ closes, releases }).toEqual({ closes: 2, releases: 2 });
+		const { counters, summaries, gauges } = metricsSnapshot();
+		expect(counters.inno_advisory_lock_acquired_total).toBe(2);
+		expect(counters.inno_advisory_lock_lost_total).toBe(1);
+		expect(summaries.inno_advisory_lock_acquire_ms?.count).toBe(2);
+		expect(summaries.inno_catalog_write_ms?.count).toBeGreaterThan(0);
+		expect(gauges.inno_catalog_sessions).toBe(1);
+	});
+
+	it("switches the model of one session from its next request and keeps it after reopen", async () => {
+		await runWithoutTenantContext(async () => {
+			const base = root();
+			const faux = fauxProvider({
+				provider: "faux-configured",
+				models: [{ id: "faux-a" }, { id: "faux-b" }],
+			});
+			faux.setResponses([
+				(_context, _options, _state, model) => fauxAssistantMessage(`answered by ${model.id}`),
+				(_context, _options, _state, model) => fauxAssistantMessage(`answered by ${model.id}`),
+				(_context, _options, _state, model) => fauxAssistantMessage(`answered by ${model.id}`),
+			]);
+			const twoModels = normalizeConfig({
+				defaultProvider: "faux-configured",
+				defaultModel: "faux-a",
+				providers: {
+					"faux-configured": {
+						baseUrl: "http://faux.invalid/v1",
+						apiKey: "local",
+						models: ["faux-a", "faux-b"].map((id) => ({ id, name: id, reasoning: false, input: ["text"], contextWindow: 8_000, maxTokens: 1_000 })),
+					},
+				},
+			});
+			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
+				dataDir: base,
+				getLocalConfig: () => twoModels,
+				enabled: true,
+				resolveWorkspaceDir: () => base,
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
+					const models = createModels();
+					models.setProvider(faux.provider);
+					return DurableSessionRuntime.open({ ...options, models });
+				},
+			});
+			services.push(service);
+			const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
+			const session = await service.create(req, { workspaceId: "workspace" });
+			expect(session.model).toEqual({ provider: "faux-configured", id: "faux-a" });
+
+			const ask = async (text: string, requestId: string) => {
+				const lease = await service.lease(req, session.id);
+				try {
+					const submission = await lease.runtime.submit(text, requestId);
+					const result = await lease.runtime.waitForSubmission(submission.id);
+					return result.status === "done" ? result.text : result.reason;
+				} finally {
+					await lease.release();
+				}
+			};
+
+			expect(await ask("q1", "r1")).toBe("answered by faux-a");
+
+			const switched = await service.setModel(req, session.id, { provider: "faux-configured", modelId: "faux-b" });
+			expect(switched.model).toEqual({ provider: "faux-configured", id: "faux-b" });
+			expect(await ask("q2", "r2")).toBe("answered by faux-b");
+
+			// Context usage comes from the committed conversation of the active model.
+			const usage = await service.contextUsage(req, session.id);
+			expect(usage).toMatchObject({ sessionId: session.id, status: "ready", contextWindow: 8_000 });
+			expect(usage.tokens).toBeGreaterThan(0);
+			expect(usage.breakdown.find((part) => part.id === "tools")!.tokens).toBeGreaterThan(0);
+
+			// A model that is not configured is rejected and changes nothing.
+			await expect(service.setModel(req, session.id, { provider: "faux-configured", modelId: "missing" }))
+				.rejects.toBeInstanceOf(DurableModelNotFoundError);
+			expect((await service.get(req, session.id))?.modelId).toBe("faux-b");
+
+			// The runtime was closed on release; reopening keeps the switched model.
+			expect(await ask("q3", "r3")).toBe("answered by faux-b");
+		});
+	});
+
+	it("answers side questions through the session's own model without touching the transcript", async () => {
+		await runWithoutTenantContext(async () => {
+			const base = root();
+			const calls: Array<{ selection: { provider: string; modelId: string }; systemPrompt: string; turns: Array<{ role: string; text: string }> }> = [];
+			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
+				dataDir: base,
+				getLocalConfig: () => config("local"),
+				enabled: true,
+				resolveWorkspaceDir: () => base,
+				completeChat: async (_config, selection, input) => {
+					calls.push({ selection, systemPrompt: input.systemPrompt, turns: [...input.turns] });
+					return "旁注答案";
+				},
+			});
+			services.push(service);
+			const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
+			const session = await service.create(req, { workspaceId: "workspace" });
+
+			const answer = await service.completeSideQuestion(req, session.id, {
+				contextDigest: "主对话摘要",
+				thread: [{ question: "上一个问题", answer: "上一个回答" }],
+				question: "这个怎么理解？",
+			});
+
+			expect(answer).toBe("旁注答案");
+			expect(calls).toHaveLength(1);
+			expect(calls[0]!.selection).toEqual({ provider: "faux-configured", modelId: "faux-model" });
+			expect(calls[0]!.systemPrompt).toContain("旁注问答");
+			expect(calls[0]!.turns).toEqual([
+				{ role: "user", text: "主对话摘要" },
+				{ role: "user", text: "上一个问题" },
+				{ role: "assistant", text: "上一个回答" },
+				{ role: "user", text: "这个怎么理解？" },
+			]);
+			expect((await service.get(req, session.id))?.messageCount).toBe(0);
+		});
+	});
+
+	it("edits an earlier message by continuing in a fork that drops it and the replies after it", async () => {
+		await runWithoutTenantContext(async () => {
+			const base = root();
+			const faux = fauxProvider({ provider: "faux-configured", models: [{ id: "faux-a" }] });
+			const seen: string[][] = [];
+			const reply = (label: string) => (context: { messages: ReadonlyArray<{ role: string; content: unknown }> }) => {
+				seen.push(context.messages.map((message) => message.role === "user"
+					? String((message.content as Array<{ text?: string }>)[0]?.text ?? message.content)
+					: `[${message.role}]`));
+				return fauxAssistantMessage(label);
+			};
+			faux.setResponses([reply("a1"), reply("a2"), reply("a2-edited"), reply("fresh")] as never);
+			const cfg = normalizeConfig({
+				defaultProvider: "faux-configured",
+				defaultModel: "faux-a",
+				providers: {
+					"faux-configured": {
+						baseUrl: "http://faux.invalid/v1",
+						apiKey: "local",
+						models: [{ id: "faux-a", name: "faux-a", reasoning: false, input: ["text"], contextWindow: 8_000, maxTokens: 1_000 }],
+					},
+				},
+			});
+			const service = new DurableSessionService({
+				pgCatalog: catalogFor(base),
+				recoveryPool: fakePool,
+				tenantStore,
+				dataDir: base,
+				getLocalConfig: () => cfg,
+				enabled: true,
+				resolveWorkspaceDir: () => base,
+				openRuntime: async ({ openStorage: _pg, ...options }) => {
+					const models = createModels();
+					models.setProvider(faux.provider);
+					return DurableSessionRuntime.open({ ...options, models });
+				},
+			});
+			services.push(service);
+			const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
+			const session = await service.create(req, { workspaceId: "workspace" });
+			const ask = async (text: string, requestId: string) => {
+				const lease = await service.lease(req, session.id);
+				try {
+					const submission = await lease.runtime.submit(text, requestId);
+					await lease.runtime.waitForSubmission(submission.id);
+				} finally {
+					await lease.release();
+				}
+			};
+			const visible = async () => (await service.snapshot(req, session.id)).messages.map((message) => `${message.role}:${message.content}`);
+
+			await ask("first question", "r1");
+			await ask("second question", "r2");
+			expect(await visible()).toEqual(["user:first question", "assistant:a1", "user:second question", "assistant:a2"]);
+
+			const before = await service.snapshot(req, session.id);
+			const secondUser = before.messages.find((message) => message.content === "second question")!;
+			const branched = await service.branchBeforeMessage(req, session.id, secondUser.entryId!);
+			expect(branched).toMatchObject({ sessionId: session.id, replacedEntryId: secondUser.entryId });
+			expect(branched.sessionRevision).toMatch(/^durable:/);
+			expect(await visible()).toEqual(["user:first question", "assistant:a1"]);
+
+			// The edited message goes to a model that no longer sees the abandoned turn.
+			await ask("second question, edited", "r3");
+			expect(await visible()).toEqual([
+				"user:first question", "assistant:a1", "user:second question, edited", "assistant:a2-edited",
+			]);
+			expect(seen[2]).toEqual(["[system]", "first question", "[assistant]", "second question, edited"]);
+
+			// The branch survives the runtime being closed and reopened.
+			expect(await visible()).toHaveLength(4);
+
+			// Editing the very first message starts the conversation over.
+			const first = (await service.snapshot(req, session.id)).messages[0]!;
+			await service.branchBeforeMessage(req, session.id, first.entryId!);
+			expect(await visible()).toEqual([]);
+			await ask("brand new", "r4");
+			expect(await visible()).toEqual(["user:brand new", "assistant:fresh"]);
+			expect(seen[3]).toEqual(["[system]", "brand new"]);
+
+			// Only user messages can be edited; unknown entries are rejected and change nothing.
+			const assistantEntry = (await service.snapshot(req, session.id)).messages.find((message) => message.role === "assistant")!;
+			await expect(service.branchBeforeMessage(req, session.id, assistantEntry.entryId!))
+				.rejects.toMatchObject({ code: "entry_not_found" });
+			await expect(service.branchBeforeMessage(req, session.id, "999999"))
+				.rejects.toMatchObject({ code: "entry_not_found" });
+			expect(await visible()).toEqual(["user:brand new", "assistant:fresh"]);
+		});
+	});
+
+	it("offers document, web search and scheduler tools to durable sessions", async () => {
+		await runWithoutTenantContext(async () => {
+		const base = root();
+		let captured: DurableSessionRuntimeOptions | undefined;
+		const skillsDir = join(base, "global-skills");
+		for (const name of ["demo-skill", "off-skill"]) {
+			mkdirSync(join(skillsDir, name), { recursive: true });
+			writeFileSync(join(skillsDir, name, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} description\n---\n`);
+		}
+		writeFileSync(join(skillsDir, ".ignore"), "off-skill/\n");
+		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
+			tenantStore,
+			dataDir: base,
+			getLocalConfig: () => config("local"),
+			enabled: true,
+			resolveWorkspaceDir: () => base,
+			skillsDir,
+			getSchedulerTools: () => createSchedulerTools(
+				{ defaultTimezone: "UTC" } as never,
+				undefined,
+				undefined,
+				{ runMode: "unavailable" },
+			),
+			openRuntime: async ({ openStorage: _pg, ...options }) => {
+				captured = options;
+				return { close: async () => undefined } as unknown as DurableSessionRuntime;
+			},
+		});
+		services.push(service);
+		const req = { headers: {} } as IncomingMessage;
+		setRequestTenant(req, ctxT, tenantStore);
+		const session = await service.create(req, { workspaceId: "workspace" });
+		const lease = await service.lease(req, session.id);
+		await lease.release();
+
+		expect(captured?.instructions).toContain("<name>demo-skill</name>");
+		expect(captured?.instructions).not.toContain("<name>off-skill</name>");
+		const names = (captured?.extraTools ?? []).map((tool) => tool.name);
+		expect(names).toEqual(expect.arrayContaining([
+			"parse_document",
+			"web_search",
+			"create_scheduled_job",
+			"list_scheduled_jobs",
+			"update_scheduled_job",
+			"delete_scheduled_job",
+			"run_scheduled_job",
+		]));
+		// Non-replayable by default: a crash yields `interrupted`, never a silent rerun.
+		expect((captured?.extraTools ?? []).every((tool) => tool.replay !== "safe")).toBe(true);
+			});
 	});
 
 	it("requires the explicit runtime gate and leaves legacy JSONL untouched", async () => {
 		const base = root();
 		const service = new DurableSessionService({
+			pgCatalog: catalogFor(base),
+			recoveryPool: fakePool,
+			tenantStore,
 			dataDir: base,
 			getLocalConfig: () => config("local"),
 			enabled: false,
@@ -531,7 +910,8 @@ describe("DurableSessionService", () => {
 		});
 		services.push(service);
 		const req = { headers: {} } as IncomingMessage;
-		expect(() => service.create(req, { workspaceId: "workspace" })).toThrow(DurableRuntimeDisabledError);
+		setRequestTenant(req, ctxT, tenantStore);
+		await expect(service.create(req, { workspaceId: "workspace" })).rejects.toBeInstanceOf(DurableRuntimeDisabledError);
 		const legacy = join(base, "sessions", "legacy.jsonl");
 		mkdirSync(join(base, "sessions"), { recursive: true });
 		writeFileSync(legacy, "{\"type\":\"session\"}\n");

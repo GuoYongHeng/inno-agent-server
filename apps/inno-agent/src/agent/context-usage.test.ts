@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildContextUsage } from "./context-usage.js";
+import { buildContextUsage, buildDurableContextUsage } from "./context-usage.js";
 
 type Input = Parameters<typeof buildContextUsage>[1];
 function fixture(overrides: Partial<Input> = {}): Input {
@@ -8,9 +8,9 @@ function fixture(overrides: Partial<Input> = {}): Input {
 		systemPrompt: "System instructions. <available_skills>skill list</available_skills>",
 		getActiveToolNames: () => ["read", "docs_search"],
 		getAllTools: () => [
-			{ name: "read", description: "Read a file", parameters: {}, sourceInfo: { path: "builtin" } },
-			{ name: "docs_search", description: "Search docs", parameters: {}, sourceInfo: { path: "/node_modules/pi-mcp-adapter/index.ts" } },
-			{ name: "disabled", description: "x".repeat(10000), parameters: {}, sourceInfo: { path: "builtin" } },
+			{ name: "read", description: "Read a file", parameters: {} },
+			{ name: "docs_search", description: "Search docs", parameters: {} },
+			{ name: "disabled", description: "x".repeat(10000), parameters: {} },
 		] as never,
 		messages: [{ role: "assistant", content: [{ type: "text", text: "Hello" }], stopReason: "stop",
 			usage: { input: 64000, output: 1700, cacheRead: 0, cacheWrite: 0 } }] as never,
@@ -25,7 +25,7 @@ describe("buildContextUsage", () => {
 		expect(result.percent).toBeCloseTo(25.0625, 2);
 		expect(result.source).toBe("sdk");
 		expect(result.breakdown.reduce((sum, p) => sum + p.tokens, 0)).toBe(result.tokens);
-		expect(result.breakdown.find((p) => p.id === "mcp")!.tokens).toBeGreaterThan(0);
+		expect(result.breakdown.find((p) => p.id === "tools")!.tokens).toBeGreaterThan(0);
 		expect(result.breakdown.find((p) => p.id === "skills")!.tokens).toBeGreaterThan(0);
 		expect(JSON.stringify(result)).not.toContain("System instructions");
 		expect(JSON.stringify(result)).not.toContain("docs_search");
@@ -53,5 +53,50 @@ describe("buildContextUsage", () => {
 	it("handles no model and invalid totals", () => {
 		expect(buildContextUsage("s", fixture({ getContextUsage: () => undefined })).status).toBe("unavailable");
 		expect(buildContextUsage("s", fixture({ getContextUsage: () => ({ tokens: NaN, percent: NaN, contextWindow: 1000 }) })).status).toBe("unavailable");
+	});
+});
+
+describe("buildDurableContextUsage", () => {
+	const tools = [{ name: "read", description: "Read a file", parameters: {} }];
+	const assistant = (input: number, output: number, text = "ok") => ({
+		role: "assistant", content: [{ type: "text", text }], stopReason: "stop",
+		usage: { input, output, cacheRead: 0, cacheWrite: 0 },
+	});
+
+	it("follows the provider's last reported usage and adds what came after it", () => {
+		const trailing = { role: "user", content: "x".repeat(400) };
+		const result = buildDurableContextUsage("s", {
+			contextWindow: 10_000,
+			instructions: "System. <available_skills>skills</available_skills>",
+			tools,
+			messages: [{ role: "user", content: "hi" }, assistant(900, 100), trailing],
+		});
+		expect(result).toMatchObject({ status: "ready", source: "sdk", contextWindow: 10_000 });
+		// 900 + 100 reported, plus ceil(400 / 4) for the trailing user message.
+		expect(result.tokens).toBe(1100);
+		expect(result.breakdown.reduce((sum, part) => sum + part.tokens, 0)).toBe(1100);
+		expect(result.breakdown.find((part) => part.id === "skills")!.tokens).toBeGreaterThan(0);
+	});
+
+	it("estimates from instructions, tools and messages before any response", () => {
+		const result = buildDurableContextUsage("s", {
+			contextWindow: 10_000,
+			instructions: "x".repeat(800),
+			tools,
+			messages: [{ role: "user", content: "y".repeat(400) }],
+		});
+		expect(result).toMatchObject({ status: "ready", source: "estimated" });
+		expect(result.tokens).toBeGreaterThan(300);
+	});
+
+	it("ignores failed or aborted responses when looking for reported usage", () => {
+		const failed = { ...assistant(5000, 5000), stopReason: "error" };
+		const result = buildDurableContextUsage("s", {
+			contextWindow: 10_000,
+			instructions: "s",
+			tools: [],
+			messages: [{ role: "user", content: "hi" }, failed],
+		});
+		expect(result.source).toBe("estimated");
 	});
 });

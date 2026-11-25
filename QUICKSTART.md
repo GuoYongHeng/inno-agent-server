@@ -6,6 +6,8 @@
 
 - Node.js **>= 22.19.0**（`node -v` 检查；pi-durable 的最低版本要求）
 - npm（随 Node 自带）
+- **PostgreSQL**（ParadeDB pg17 镜像，`vector`/`pg_trgm`/`pg_search`）— 多用户登录与全部租户状态都在库里，见 [docs/AUTHENTICATION.md](./docs/AUTHENTICATION.md)
+- **对象存储**（必填，无 memory 模式）— 本地开发最简方式是 `fs` provider：`INNO_OBJECT_STORAGE_PROVIDER=fs` + `INNO_OBJECT_STORAGE_DIR=<某个目录>`；生产用 s3/OSS/MinIO
 - 一个 LLM provider 的 API key
   - Anthropic / OpenAI / DeepSeek / 任意 OpenAI-compatible 端点 / Ollama 本地都可以
 
@@ -22,11 +24,11 @@ npm run build    # 编译 backend + 前端，约 10s
 ## 3. 配置 API key
 
 ```bash
-mkdir -p runtime/config runtime/data runtime/skills workspace
+mkdir -p runtime/config workspace
 cp config.example.json runtime/config/config.json
 ```
 
-编辑 `runtime/config/config.json`，把 `apiKey` 换成你自己的。下面三个例子任选一个：
+编辑 `runtime/config/config.json`，把 `apiKey` 换成你自己的。下面三个例子任选一个（providers、渠道、Tavily 等托管配置全部声明在这个文件里——它是平台配置的唯一事实源，只能随部署变更）：
 
 **Anthropic 官方**
 
@@ -71,6 +73,13 @@ cp config.example.json runtime/config/config.json
 ## 4. 启动
 
 ```bash
+# 对象存储必填：本地开发用 fs provider 即可
+export INNO_OBJECT_STORAGE_PROVIDER=fs
+export INNO_OBJECT_STORAGE_DIR=./runtime/objects
+# PostgreSQL 连接（见 docs/AUTHENTICATION.md）
+export DATABASE_URL=postgres://...
+
+npm run auth:migrate   # 首次启动前跑迁移
 npm run server -- --home ./runtime --workspace ./workspace --port 3000
 ```
 
@@ -88,12 +97,6 @@ curl http://localhost:3000/health
 ---
 
 ## 其它常用命令
-
-**CLI 模式**（终端里直接对话，不开 HTTP）：
-
-```bash
-npm run start -- --home ./runtime --workspace ./workspace
-```
 
 **开发模式**（前端 Vite HMR，需要两个终端）：
 
@@ -126,7 +129,7 @@ npm run web:dev        # 终端 2 — Vite :5173（代理 /api 到 :3000）
 
 **修改了 backend 代码不生效？** backend 跑的是编译后的 `dist/`，需要重新 `npm run build` 再重启。前端在 `web:dev` 下走 Vite HMR，改完直接刷新即可。
 
-**想换 provider？** 改 `runtime/config/config.json` 的 `defaultProvider` 和 `defaultModel`，或者在 Web UI 顶部模型选择器里切——切换会自动写回 config 文件。
+**想换 provider？** 服务端部署的模型目录在 `config.json` 里由运维声明（普通账号不能在设置页改 provider）。用户在 Web UI 顶部模型选择器或设置页里挑默认模型——选择写入 PostgreSQL 里的租户配置，不回写 config 文件。
 
 **想看 backend 日志？** `tail -f runtime/logs/server.log`（用 `restart-dev.sh` 启动的话日志在这里）。
 
@@ -135,9 +138,9 @@ npm run web:dev        # 终端 2 — Vite :5173（代理 /api 到 :3000）
 ## 下一步
 
 - 多用户 Durable 架构、真实服务验收与部署边界：[docs/MULTI_USER_DURABLE.md](./docs/MULTI_USER_DURABLE.md)
-- Better Auth + PostgreSQL 多用户启动与 legacy-owner 迁移：[docs/AUTHENTICATION.md](./docs/AUTHENTICATION.md)
+- Better Auth + PostgreSQL 多用户启动：[docs/AUTHENTICATION.md](./docs/AUTHENTICATION.md)
 - 完整文档见 [README.md](./README.md)
-- 权限审批与 OS 沙箱(三档权限模式、`--sandbox` 启动、deny 底线与配置细节):[docs/PERMISSIONS_AND_SANDBOX.md](./docs/PERMISSIONS_AND_SANDBOX.md)
-- 自定义 skill：把 `<skill-name>.zip` 通过 Web UI 的 Skills 页面上传，或直接放进 `runtime/skills/<name>/`
+- 写入审批与文件访问边界:[docs/PERMISSIONS.md](./docs/PERMISSIONS.md)
+- 自定义 skill：把 `<skill-name>.zip` 通过 Web UI 的 Skills 页面上传（存对象存储 `tenants/<t>/skills/`）；放进 `runtime/skills/` 的目录只在启动时作为平台 seed 发布进 catalog
 - 配 Feishu / WeChat 渠道：编辑 `runtime/config/config.json` 的 `channels` 块
-- 部署到生产：参考 README 的 Production Shape 一节，或用 `Dockerfile` / `docker-compose.yml`
+- 部署到生产：参考 README 的 Production Shape 一节，或用 `deploy/` 目录下的 `Dockerfile` / `docker-compose.yml`

@@ -10,10 +10,8 @@ import { Spinner } from "../ui/Spinner.js";
 import { MessageBubble } from "./MessageBubble.js";
 import { JobStreamBubbles } from "./JobStreamBubbles.js";
 import { StreamingBubbles } from "./StreamingBubbles.js";
-import { TodoWidget, extractTodoTasks } from "./TodoWidget.js";
 import { answeredQuestionnaireFromTool } from "../../utils/questionnaire.js";
 import type { AnsweredQuestionnaireView } from "../../utils/questionnaire.js";
-import { TerminalDrawer } from "../terminal/TerminalDrawer.js";
 
 function traceContainsAssistantText(message: ChatMessage): boolean {
 	if (message.trace?.some((step) => (step.kind === "progress" || step.kind === "answer") && Boolean(step.text?.trim()))) return true;
@@ -82,7 +80,7 @@ interface ChatConversationProps {
 	sessionOpening?: boolean;
 	/** Existing-workspace switcher rendered next to the title. */
 	workspaceControl?: ReactNode;
-	/** Reserve room for the desktop chrome's workspace button when collapsed. */
+	/** Reserve room for the floating workspace toggle when collapsed. */
 	workspaceCollapsed?: boolean;
 	/** When the session sidebar is collapsed its floating expand button overlaps the header's left edge. */
 	sidebarCollapsed?: boolean;
@@ -223,11 +221,6 @@ export function ChatConversation({
 		// the user message itself.
 		return chat.messages[lastTurn.startMessageIndex]?.role === "user" ? lastTurn.startMessageIndex : -1;
 	}, [chat.messages, conversationTurns, traceTurnPresentation]);
-	const todoTasks = useMemo(
-		() => extractTodoTasks(chat),
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-		[chat.messages, chat.activeTools, chat.completedTools],
-	);
 	const activeWorkspaceId = useStoreSnapshot(workspaceStore, () => workspaceStore.activeWorkspaceId);
 	const resolveAttachmentUrl = useCallback(
 		(file: AttachmentRef) => workspaceFileUrl(file.path, activeWorkspaceId ?? undefined),
@@ -336,7 +329,6 @@ export function ChatConversation({
 								<div className="inno-conversation-status-gap-mask" aria-hidden="true" />
 							</div>
 						) : null}
-						{todoTasks ? <TodoWidget tasks={todoTasks} /> : null}
 						{wsError ? <p className="mb-2 text-xs text-[var(--inno-danger)]">{wsError}</p> : null}
 						<div className="inno-conversation-composer-wrap">
 							<div className="inno-conversation-composer-mask" aria-hidden="true" />
@@ -346,7 +338,6 @@ export function ChatConversation({
 				</div>
 				{btwPanel ? <div className="inno-conversation-btw-layer">{btwPanel}</div> : null}
 			</div>
-			<TerminalDrawer />
 		</section>
 	);
 }

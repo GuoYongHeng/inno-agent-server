@@ -1,21 +1,9 @@
 import type { Context, JsonValue } from "@earendil-works/chord";
-import type { Api, Model, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
+import type { ToolResultMessage, Usage } from "@earendil-works/pi-ai";
 import { defineTool, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import type { Static, TSchema } from "typebox";
 
-/** Optional services available only when a native Inno tool runs through the
- * legacy extension adapter. Durable execution never supplies this context. */
-export interface InnoLegacyToolContext {
-	cwd: string;
-	model?: Model<Api>;
-	// The legacy registry remains opaque at this neutral execution boundary.
-	modelRegistry?: any;
-	sessionId?: string;
-}
-
-export type InnoToolExecutionApi = ToolExecutionApi & {
-	readonly innoLegacy?: InnoLegacyToolContext;
-};
+export type InnoToolExecutionApi = ToolExecutionApi;
 
 export type InnoToolRegistration<TParameters extends TSchema = TSchema> = ToolRegistration<TParameters> & {
 	readonly label?: string;

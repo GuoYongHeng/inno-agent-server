@@ -1,338 +1,30 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import {
-	abortPromptForTurnToken,
-	getCurrentSessionId,
-	getLoadedSkills,
-	persistCancelledQueuedTurn,
-	persistPendingUserTurn,
-	runPromptInSession,
-	runPromptSerialized,
-	runPromptStreamingInSession,
-	type PromptRunOutcome,
-} from "../../agent/pi-runner.js";
-import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
-import { expandInnoSlashCommand } from "../../agent/inno-extension.js";
-import { questionBridge, type QuestionBridgeResult } from "../../agent/question-bridge.js";
-import { permissionBridge, type PermissionDecision } from "../../agent/permission-bridge.js";
-import {
-	hasCompleteTurnAfterBaseline,
-	streamRegistry,
-	type SessionStreamState,
-	type StreamPersistence,
-} from "../../chat/stream-registry.js";
+import { streamRegistry } from "../../chat/stream-registry.js";
 import { logger } from "../../logger.js";
-import type { RuntimePaths } from "../../runtime.js";
 import type { WorkspaceRegistry } from "../../workspace/workspace-registry.js";
 import type { TenantStore } from "../../tenants/store.js";
-import { getRequestTenant, ownsRequestResource } from "../../tenants/http.js";
-import { resolveRequestWorkspace } from "../../tenants/workspaces.js";
-import {
-	buildAttachmentContext,
-	parseChatAttachments,
-	validateChatAttachments,
-} from "../attachments.js";
-import { recordSessionAttachments } from "../attachments-store.js";
-import { recordSessionAgentCommand } from "../agent-command-store.js";
-import { recordSessionTrace } from "../trace-store.js";
-import {
-	markWorkspaceTrackingIncomplete,
-	recordWorkspaceAttachmentActivity,
-	recordWorkspaceFileAccess,
-} from "../workspace-activity-store.js";
-import { createWorkspaceChangeMonitor } from "../workspace-change-monitor.js";
+import { ownsRequestResource } from "../../tenants/http.js";
 import {
 	ensureDurableStreamProjection,
 	handleDurableChatRoutes,
 	restoreDurableStream,
 	type DurableHttpContext,
 } from "../durable-routes.js";
-import { parseInlineImages, persistInlineImages, prependImagePathsHint } from "../inline-images.js";
 import { json, matchRoute, readBody } from "../http-helpers.js";
-import type {
-	SessionChannel,
-	SessionMessageSummary,
-	SessionQuestionMetadata,
-	SessionSummary,
-} from "../session-model.js";
 
 /**
- * Server-owned dependencies the chat routes touch: session-metadata helpers
- * and queue/persistence utilities shared with the channel wiring that stays
- * in server.ts. Injected so the route bodies stay verbatim.
+ * Server-owned dependencies of the chat routes. Every conversation is a durable
+ * session, so these routes validate the request and hand it to the durable
+ * handlers; there is no other execution path.
  */
 export interface ChatRouteContext {
 	workspaceRegistry: WorkspaceRegistry;
-	dataDir: string;
-	paths: RuntimePaths;
-	tenantStore?: TenantStore | null;
-	durableSessions?: DurableHttpContext["service"];
-	/** Reject legacy prompt execution while retaining status/history reads. */
-	durableRequired?: boolean;
-	sessionFileFromId: (sessionDir: string, id: string) => string | null;
-	releaseQueueFromQuestionBlockedTurn: (sessionId: string) => void;
-	readSessionQuestionMetadata: () => SessionQuestionMetadata;
-	writeSessionQuestionMetadata: (meta: SessionQuestionMetadata) => void;
-	recordCurrentSessionChannel: (channel: SessionChannel, explicitSessionId?: string, options?: { setOriginIfEmpty?: boolean }) => void;
-	maybeAutoGenerateTopic: (sessionId: string) => void;
-	parseSessionFile: (filePath: string) => { summary: SessionSummary; messages: SessionMessageSummary[] } | null;
-	sessionRevision: (filePath: string) => string;
+	tenantStore: TenantStore;
+	durableSessions: DurableHttpContext["service"];
+	workspaceReplica?: DurableHttpContext["workspaceReplica"];
 }
 
-// ---------------------------------------------------------------------------
-// Helpers moved verbatim from server.ts (P2 route split)
-// ---------------------------------------------------------------------------
-
-function phaseForPiEvent(type: string): "start" | "update" | "end" | undefined {
-	if (type.endsWith("_start")) return "start";
-	if (type.endsWith("_end")) return "end";
-	if (type.endsWith("_update")) return "update";
-	return undefined;
-}
-
-function piEventSummary(event: any): string | undefined {
-	if (!event || typeof event !== "object") return undefined;
-	if (event.type === "agent_settled" && typeof event.aborted === "boolean") {
-		return event.aborted ? "aborted" : "settled";
-	}
-	if (typeof event.errorMessage === "string") return event.errorMessage;
-	if (typeof event.message === "string") return event.message;
-	if (typeof event.reason === "string") return event.reason;
-	if (typeof event.toolName === "string") return event.toolName;
-	if (typeof event.stopReason === "string") return `stopReason: ${event.stopReason}`;
-	if (typeof event.status === "string") return event.status;
-	return undefined;
-}
-
-function piEventDetail(event: any): Record<string, unknown> | undefined {
-	if (!event || typeof event !== "object") return undefined;
-	const detail: Record<string, unknown> = {};
-	for (const key of [
-		"attempt", "maxAttempts", "delayMs", "errorMessage", "finalError", "stopReason",
-		"toolCallId", "toolName", "reason", "status", "command", "cwd", "output",
-		"entryId", "parentId", "filePath", "compactionId", "aborted",
-	]) {
-		if (event[key] !== undefined) detail[key] = event[key];
-	}
-	return Object.keys(detail).length > 0 ? detail : undefined;
-}
-
-function systemEventFromPi(event: any, eventType = typeof event?.type === "string" ? event.type : "pi_event"): unknown {
-	const attempt = typeof event?.attempt === "number" ? event.attempt : undefined;
-	return {
-		type: "system_event",
-		eventType,
-		phase: phaseForPiEvent(eventType),
-		summary: piEventSummary(event),
-		detail: piEventDetail(event),
-		...(attempt !== undefined ? { attempt } : {}),
-		...(typeof event?.success === "boolean" ? { success: event.success } : {}),
-	};
-}
-
-function piEventToSseEvent(event: any): unknown | null {
-	if (!event || typeof event.type !== "string") return null;
-	switch (event.type) {
-		case "message_update": {
-			const ev = event.assistantMessageEvent;
-			if (!ev || typeof ev.type !== "string") return systemEventFromPi(event, "message_update");
-			if (ev.type === "text_start") return { type: "text_start", contentIndex: ev.contentIndex };
-			if (ev.type === "text_delta") return { type: "text_delta", delta: ev.delta, contentIndex: ev.contentIndex };
-			if (ev.type === "text_end") return { type: "text_end", contentIndex: ev.contentIndex };
-			if (ev.type === "thinking_start") return { type: "thinking_start", contentIndex: ev.contentIndex };
-			if (ev.type === "thinking_delta") return { type: "thinking_delta", delta: ev.delta, contentIndex: ev.contentIndex };
-			if (ev.type === "thinking_end") return { type: "thinking_end", contentIndex: ev.contentIndex };
-			if (ev.type === "toolcall_start" || ev.type === "toolcall_delta" || ev.type === "toolcall_end") {
-				return toolCallStreamEventFromAssistantEvent(ev);
-			}
-			// Mid-stream model errors must not be published as "error" events:
-			// "error" is a terminal type reserved for finishTurn(), and the
-			// publishStreamEvent guard throws "terminal event error must use
-			// finishTurn()", masking the real provider error. The terminal error
-			// event published from onFinish carries this same message.
-			if (ev.type === "error") return null;
-			return systemEventFromPi(ev, `message_update:${ev.type}`);
-		}
-		case "message_end": {
-			const msg = event.message;
-			if (msg && typeof msg === "object" && "stopReason" in msg && msg.stopReason === "error") {
-				// See the message_update error case above — the terminal event
-				// from onFinish surfaces this error; publishing it here throws.
-				return null;
-			}
-			return systemEventFromPi(msg ?? event, "message_end");
-		}
-		case "tool_execution_start":
-			return { type: "tool_start", toolCallId: event.toolCallId, toolName: event.toolName, args: event.args };
-		case "tool_execution_update":
-			return {
-				type: "tool_update",
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				args: event.args,
-				partialResult: event.partialResult,
-			};
-		case "tool_execution_end":
-			return { type: "tool_end", toolCallId: event.toolCallId, toolName: event.toolName, result: event.result, isError: event.isError };
-      default:
-        return systemEventFromPi(event);
-	}
-}
-
-function toolCallStreamEventFromAssistantEvent(ev: any): unknown | null {
-	const content = Array.isArray(ev.partial?.content) ? ev.partial.content : [];
-	const block = typeof ev.contentIndex === "number" ? content[ev.contentIndex] : undefined;
-	if (!block || typeof block !== "object" || block.type !== "toolCall") return null;
-	const toolCallId = typeof block.id === "string" && block.id ? block.id : `content-${ev.contentIndex}`;
-	const toolName = typeof block.name === "string" ? block.name : "";
-	if (!toolName) return null;
-	const args = ev.type === "toolcall_end"
-		? ev.toolCall?.arguments ?? block.arguments
-		: undefined;
-	return {
-		type: ev.type === "toolcall_start" ? "tool_call_start" : ev.type === "toolcall_end" ? "tool_call_end" : "tool_call_delta",
-		toolCallId,
-		toolName,
-		contentIndex: ev.contentIndex,
-		...(args !== undefined ? { args } : {}),
-		...(ev.type === "toolcall_delta" && typeof ev.delta === "string" ? { argsDelta: ev.delta } : {}),
-	};
-}
-
-function recordAgentCommandIfPresent(dataDir: string, sessionId: string, prompt: string): void {
-	const expandedContent = expandInnoSlashCommand(prompt);
-	if (!expandedContent) return;
-	recordSessionAgentCommand(dataDir, sessionId, {
-		commandContent: prompt,
-		expandedContent,
-	});
-}
-
-interface TraceSkillInfo {
-	name: string;
-	description?: string;
-	path?: string;
-	source?: string;
-}
-
-function traceSkillInfo(value: unknown, sourceFallback?: string): TraceSkillInfo | null {
-	if (!value || typeof value !== "object") return null;
-	const skill = value as Record<string, unknown>;
-	const sourceInfo = skill.sourceInfo && typeof skill.sourceInfo === "object"
-		? skill.sourceInfo as Record<string, unknown>
-		: undefined;
-	if (typeof skill.name !== "string" || !skill.name) return null;
-	return {
-		name: skill.name,
-		description: typeof skill.description === "string" ? skill.description : undefined,
-		path: typeof skill.filePath === "string"
-			? skill.filePath
-			: typeof skill.path === "string"
-				? skill.path
-				: typeof skill.location === "string" ? skill.location : undefined,
-		source: typeof skill.source === "string"
-			? skill.source
-			: typeof sourceInfo?.source === "string" ? sourceInfo.source : sourceFallback,
-	};
-}
-
-function loadedSkillsForTrace(workspaceRoot: string): TraceSkillInfo[] {
-	const skills: TraceSkillInfo[] = [];
-	try {
-		const loaded = getLoadedSkills().skills;
-		if (Array.isArray(loaded)) {
-			for (const skill of loaded) {
-				const info = traceSkillInfo(skill, "global");
-				if (info) skills.push(info);
-			}
-		}
-	} catch {
-		// Skill diagnostics are optional UI metadata and must not block a turn.
-	}
-	try {
-		const privateSkillsDir = join(workspaceRoot, ".skills");
-		if (existsSync(privateSkillsDir)) {
-			const privateSkills = loadSkillsFromDir({ dir: privateSkillsDir, source: "workspace" }).skills;
-			for (const skill of privateSkills) {
-				const info = traceSkillInfo(skill, "workspace");
-				if (info) skills.push(info);
-			}
-		}
-	} catch {
-		// Private skill discovery is best-effort, matching prompt construction.
-	}
-	const byName = new Map<string, TraceSkillInfo>();
-	for (const skill of skills) byName.set(skill.name, skill);
-	return Array.from(byName.values());
-}
-
-function explicitSkillEvent(prompt: string, skills: TraceSkillInfo[]): unknown | null {
-	const match = prompt.trim().match(/^\/skill:([^\s]+)(?:\s+([\s\S]+))?$/);
-	if (!match) return null;
-	const skillName = match[1]!;
-	const loaded = skills.find((skill) => skill.name === skillName);
-	return {
-		type: "skill_invoked",
-		skillName,
-		args: match[2]?.trim() || undefined,
-		source: loaded?.source,
-		path: loaded?.path,
-		description: loaded?.description,
-	};
-}
-
-function readSessionBaseline(
-	parseSessionFile: ChatRouteContext["parseSessionFile"],
-	sessionRevision: ChatRouteContext["sessionRevision"],
-	filePath: string,
-): { messageCount: number; revision: string } {
-	return {
-		messageCount: parseSessionFile(filePath)?.messages.length ?? 0,
-		revision: sessionRevision(filePath),
-	};
-}
-
-function confirmTurnPersistence(
-	parseSessionFile: ChatRouteContext["parseSessionFile"],
-	sessionRevision: ChatRouteContext["sessionRevision"],
-	state: SessionStreamState,
-	sessionPath: string,
-	outcome: PromptRunOutcome,
-): StreamPersistence {
-	const parsed = parseSessionFile(sessionPath);
-	const revision = sessionRevision(sessionPath);
-	if (!parsed) return { persisted: false, finalSessionRevision: revision };
-	const structurallyComplete = hasCompleteTurnAfterBaseline(
-		parsed.messages,
-		state.baselineMessageCount,
-	);
-	const revisionChanged = revision !== state.baselineSessionRevision;
-	const persisted = structurallyComplete && revisionChanged && parsed.messages.length > state.baselineMessageCount;
-	if (!persisted) {
-		logger.error({
-			sessionId: state.sessionId,
-			turnId: state.turnId,
-			outcome: outcome.type,
-			baselineMessageCount: state.baselineMessageCount,
-			finalMessageCount: parsed.messages.length,
-			baselineSessionRevision: state.baselineSessionRevision,
-			finalSessionRevision: revision,
-		}, "chat turn persistence confirmation failed");
-	}
-	return {
-		persisted,
-		finalMessageCount: parsed.messages.length,
-		finalSessionRevision: revision,
-	};
-}
-
-/**
- * /api/chat* route domain: non-streaming chat, question-response, abort,
- * status, SSE event replay, and the SSE streaming turn. Returns true when
- * the request was handled. Extracted verbatim from server.ts during the P2
- * route split — behavior unchanged.
- */
+/** /api/chat* route domain. Returns true when the request was handled. */
 export async function handleChatRoutes(
 	req: HttpReq,
 	res: ServerResponse,
@@ -340,123 +32,38 @@ export async function handleChatRoutes(
 	url: string,
 	ctx: ChatRouteContext,
 ): Promise<boolean> {
-	const {
-		workspaceRegistry,
-		dataDir,
-		sessionFileFromId,
-		releaseQueueFromQuestionBlockedTurn,
-		readSessionQuestionMetadata,
-		writeSessionQuestionMetadata,
-		recordCurrentSessionChannel,
-		maybeAutoGenerateTopic,
-		parseSessionFile,
-		sessionRevision,
-		tenantStore,
-		durableSessions,
-	} = ctx;
+	const { workspaceRegistry, tenantStore, durableSessions } = ctx;
+	const durableContext: DurableHttpContext = {
+		service: durableSessions, workspaceRegistry, tenantStore,
+		workspaceReplica: ctx.workspaceReplica ?? null,
+	};
 
 	const ownsSession = (sessionId: string) => ownsRequestResource(req, tenantStore, "session", sessionId);
 	const denySession = () => { json(res, 404, { error: "Session not found" }); return true; };
-	const durableContext = durableSessions ? { service: durableSessions, workspaceRegistry, tenantStore } : null;
-	const rejectLegacyExecution = () => {
-		if (!ctx.durableRequired) return false;
-		json(res, 409, {
-			error: "Legacy sessions are read-only in multi-user mode; create a durable session instead",
-			code: "durable_required",
-		});
-		return true;
+	/** Hand the request to the durable handlers, or 404 for an unknown session. */
+	const toDurable = async (sessionId: string, body?: Record<string, unknown>): Promise<boolean> => {
+		if (!await ownsSession(sessionId) || !await durableSessions.get(req, sessionId)) return denySession();
+		return handleDurableChatRoutes(req, res, method, url, durableContext, body);
 	};
+
 	const pathSessionId = matchRoute("GET", method, url, "/api/chat/status/:sessionId")?.sessionId
 		?? matchRoute("GET", method, url, "/api/chat/events/:id")?.id
 		?? matchRoute("POST", method, url, "/api/chat/:sessionId/:turnId/abort")?.sessionId;
 	if (pathSessionId && !await ownsSession(pathSessionId)) return denySession();
-	const resolveSessionWorkspace = async (sessionId: string) => {
-		const currentId = workspaceRegistry.getSessionWorkspaceId(sessionId);
-		const workspace = await resolveRequestWorkspace(req, workspaceRegistry, tenantStore, currentId);
-		if (workspace && workspace.id !== currentId) workspaceRegistry.bindSession(sessionId, workspace.id);
-		return workspace;
-	};
 
-	// --- Chat API ---
+	// --- Non-streaming chat ---
 	if (method === "POST" && url === "/api/chat") {
 		const body = (await readBody(req)) as Record<string, unknown>;
-		const prompt = body.prompt as string | undefined;
-		if (!prompt) {
+		if (!body.prompt) {
 			json(res, 400, { error: "Missing prompt" });
 			return true;
 		}
-		const images = parseInlineImages(body.images);
-		const requestedSessionId = typeof body.sessionId === "string" ? body.sessionId : null;
-		if (getRequestTenant(req) && !requestedSessionId) {
+		const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+		if (!sessionId) {
 			json(res, 400, { error: "Missing sessionId" });
 			return true;
 		}
-		if (requestedSessionId && !await ownsSession(requestedSessionId)) return denySession();
-		if (requestedSessionId && durableContext?.service.get(req, requestedSessionId)) {
-			return handleDurableChatRoutes(req, res, method, url, durableContext, body);
-		}
-		if (rejectLegacyExecution()) return true;
-		const imageSessionId = requestedSessionId || getCurrentSessionId();
-		const imageWorkspace = await resolveSessionWorkspace(imageSessionId);
-		if (!imageWorkspace) { json(res, 404, { error: "Session workspace not found" }); return true; }
-		const imageWorkspaceId = imageWorkspace.id;
-		const imageWorkspaceRoot = workspaceRegistry.resolveWorkspaceDir(imageWorkspaceId)!;
-		const imagePaths = persistInlineImages(images, imageWorkspaceRoot);
-						recordWorkspaceFileAccess(dataDir, {
-			sessionId: imageSessionId,
-			workspaceId: imageWorkspaceId,
-			workspaceRoot: imageWorkspaceRoot,
-			paths: imagePaths,
-			access: "write",
-		});
-		// Sent only when the images can't reach the model natively (text-only
-		// model or provider rejection); vision turns get the raw prompt so
-		// they aren't steered toward ocr_image.
-		const imageFallbackPrompt = prependImagePathsHint(prompt, imagePaths);
-		recordAgentCommandIfPresent(dataDir, imageSessionId, prompt);
-		// Structured attachments: validate every referenced path against the
-		// target workspace and prepare the model-visible context block. The
-		// persisted prompt text stays untouched (pi-runner appends the block
-		// via transformContext only).
-		const parsedAttachments = parseChatAttachments(body.attachments);
-		const attachments = parsedAttachments ? validateChatAttachments(parsedAttachments, imageWorkspaceRoot) : null;
-		const attachmentContext = attachments ? buildAttachmentContext(attachments) : "";
-		if (attachments) {
-			recordSessionAttachments(dataDir, imageSessionId, {
-				promptContent: prompt,
-				attachments,
-				timestamp: Date.now(),
-				workspaceId: imageWorkspaceId,
-			});
-			recordWorkspaceAttachmentActivity(dataDir, {
-				sessionId: imageSessionId,
-				workspaceId: imageWorkspaceId,
-				workspaceRoot: imageWorkspaceRoot,
-				attachments,
-			});
-		}
-		// Use atomic switch+prompt when a specific session is requested.
-		let output: string;
-		try {
-			if (requestedSessionId) {
-				const sessionPath = sessionFileFromId(join(dataDir, "sessions"), requestedSessionId);
-				if (sessionPath && existsSync(sessionPath)) {
-					output = await runPromptInSession(sessionPath, prompt, images.length ? images : undefined, imageFallbackPrompt, attachmentContext || undefined);
-				} else {
-					output = await runPromptSerialized(prompt, images.length ? images : undefined, imageFallbackPrompt, attachmentContext || undefined);
-				}
-			} else {
-				output = await runPromptSerialized(prompt, images.length ? images : undefined, imageFallbackPrompt, attachmentContext || undefined);
-			}
-		} catch (err) {
-			logger.error({ err, sessionId: requestedSessionId }, "Non-streaming chat LLM call failed");
-			json(res, 500, { error: err instanceof Error ? err.message : "LLM API call failed" });
-			return true;
-		}
-		recordCurrentSessionChannel("web", requestedSessionId || undefined, { setOriginIfEmpty: true });
-		maybeAutoGenerateTopic(requestedSessionId || getCurrentSessionId());
-		json(res, 200, { response: output });
-		return true;
+		return toDurable(sessionId, body);
 	}
 
 	// --- Question response (from web UI) ---
@@ -465,60 +72,26 @@ export async function handleChatRoutes(
 		const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
 		const turnId = typeof body.turnId === "string" ? body.turnId : "";
 		const questionId = typeof body.questionId === "string" ? body.questionId : "";
-		const result = body.result as QuestionBridgeResult | undefined;
-		if (!sessionId || !turnId || !questionId || !result) {
+		if (!sessionId || !turnId || !questionId || !body.result) {
 			json(res, 400, { error: "Missing sessionId, turnId, questionId or result" });
 			return true;
 		}
-		if (!await ownsSession(sessionId)) return denySession();
-		if (durableContext?.service.get(req, sessionId)) {
-			return handleDurableChatRoutes(req, res, method, url, durableContext, body);
-		}
-		if (rejectLegacyExecution()) return true;
-		const status = questionBridge.respond({ sessionId, turnId, questionId, result });
-		if (status === "not_found") {
-			// The live turn is gone (process restarted, or the turn ended while
-			// the card was parked). If a persisted card matches, consume it and
-			// tell the client to resubmit the answer as a fresh chat turn — the
-			// agent then picks the answer up from the session history.
-			const questionMeta = readSessionQuestionMetadata();
-			const persisted = questionMeta[sessionId];
-			if (persisted?.sessionId === sessionId && persisted.questionId === questionId && persisted.turnId === turnId) {
-				delete questionMeta[sessionId];
-				writeSessionQuestionMetadata(questionMeta);
-				json(res, 200, { accepted: true, expired: true, sessionId });
-				return true;
-			}
-		}
-		json(res, status === "accepted" ? 200 : status === "scope_mismatch" || status === "already_resolved" ? 409 : 404, { accepted: status === "accepted" });
-		return true;
+		return toDurable(sessionId, body);
 	}
 
 	// --- Permission response (from web UI) ---
-	// Answers a parked pi-permission-system `ask` (see permission-bridge.ts).
-	// Unlike question-response there is no resubmit-as-turn fallback: a denied
-	// ask simply returns a teaching reason to the agent.
 	if (method === "POST" && url === "/api/chat/permission-response") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
 		const turnId = typeof body.turnId === "string" ? body.turnId : "";
 		const requestId = typeof body.requestId === "string" ? body.requestId : "";
 		const decision = body.decision;
-		const reason = typeof body.reason === "string" ? body.reason : undefined;
-		const validDecision: PermissionDecision | null =
-			decision === "allow_once" || decision === "allow_session" || decision === "deny" ? decision : null;
+		const validDecision = decision === "allow_once" || decision === "allow_session" || decision === "deny";
 		if (!sessionId || !turnId || !requestId || !validDecision) {
 			json(res, 400, { error: "Missing sessionId, turnId, requestId or a valid decision (allow_once|allow_session|deny)" });
 			return true;
 		}
-		if (!await ownsSession(sessionId)) return denySession();
-		if (durableContext?.service.get(req, sessionId)) {
-			return handleDurableChatRoutes(req, res, method, url, durableContext, body);
-		}
-		if (rejectLegacyExecution()) return true;
-		const status = permissionBridge.respond({ sessionId, turnId, requestId, decision: validDecision, reason });
-		json(res, status === "accepted" ? 200 : status === "scope_mismatch" || status === "already_resolved" ? 409 : 404, { accepted: status === "accepted" });
-		return true;
+		return toDurable(sessionId, body);
 	}
 
 	if (method === "POST" && url === "/api/chat/abort") {
@@ -528,11 +101,9 @@ export async function handleChatRoutes(
 
 	const chatAbortMatch = matchRoute("POST", method, url, "/api/chat/:sessionId/:turnId/abort");
 	if (chatAbortMatch) {
-		if (!await ownsSession(chatAbortMatch.sessionId)) return denySession();
-		const restoredDurable = durableContext?.service.get(req, chatAbortMatch.sessionId)
-			? restoreDurableStream(req, durableContext.service, chatAbortMatch.sessionId, chatAbortMatch.turnId)
-			: undefined;
-		const state = restoredDurable?.state ?? streamRegistry.getByTurn(chatAbortMatch.turnId);
+		if (!await ownsSession(chatAbortMatch.sessionId) || !await durableSessions.get(req, chatAbortMatch.sessionId)) return denySession();
+		const restored = await restoreDurableStream(req, durableSessions, chatAbortMatch.sessionId, chatAbortMatch.turnId);
+		const state = restored?.state ?? streamRegistry.getByTurn(chatAbortMatch.turnId);
 		if (!state || state.sessionId !== chatAbortMatch.sessionId) {
 			json(res, 404, { error: "Chat turn not found" });
 			return true;
@@ -541,30 +112,16 @@ export async function handleChatRoutes(
 			json(res, 200, { status: state.status, cancelRequested: state.cancelRequested });
 			return true;
 		}
-		if (durableContext?.service.get(req, state.sessionId)) {
-			streamRegistry.requestCancel(state);
-			try {
-				restoredDurable?.store.markCancelled(state.sessionId, state.turnId);
-				await durableContext.service.abort(req, state.sessionId, state.turnId);
-				if (restoredDurable) void ensureDurableStreamProjection(req, durableContext.service, restoredDurable);
-			} catch (error) {
-				logger.error({ err: error, sessionId: state.sessionId, turnId: state.turnId }, "durable chat abort failed");
-				json(res, 500, { error: error instanceof Error ? error.message : String(error) });
-				return true;
-			}
-			json(res, 202, { status: state.status, cancelRequested: true });
+		streamRegistry.requestCancel(state);
+		try {
+			await restored?.store.markCancelled(state.sessionId, state.turnId);
+			await durableSessions.abort(req, state.sessionId, state.turnId);
+			if (restored) void ensureDurableStreamProjection(req, durableSessions, restored, durableContext);
+		} catch (error) {
+			logger.error({ err: error, sessionId: state.sessionId, turnId: state.turnId }, "durable chat abort failed");
+			json(res, 500, { error: error instanceof Error ? error.message : String(error) });
 			return true;
 		}
-		streamRegistry.requestCancel(state);
-		// Resolve a parked ask_user_question before aborting: session.abort()
-		// alone cannot wake the agent loop while it awaits the question
-		// promise, so the turn (and its queue slot) would stay stuck until
-		// the 30-minute question timeout. unbindTurn is idempotent — the
-		// onFinish unbind becomes a no-op once the binding is cleared here.
-		questionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: "cancelled" });
-		// Same for a parked permission ask — it blocks the agent loop identically.
-		permissionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: "cancelled" });
-		if (state.status === "running") await abortPromptForTurnToken(state.turnId);
 		json(res, 202, { status: state.status, cancelRequested: true });
 		return true;
 	}
@@ -572,8 +129,8 @@ export async function handleChatRoutes(
 	const chatStatusMatch = matchRoute("GET", method, url, "/api/chat/status/:sessionId");
 	if (chatStatusMatch) {
 		streamRegistry.cleanupExpiredTurns();
-		if (durableContext?.service.get(req, chatStatusMatch.sessionId)) {
-			restoreDurableStream(req, durableContext.service, chatStatusMatch.sessionId);
+		if (await durableSessions.get(req, chatStatusMatch.sessionId)) {
+			await restoreDurableStream(req, durableSessions, chatStatusMatch.sessionId);
 		}
 		const state = streamRegistry.getLatest(chatStatusMatch.sessionId);
 		json(res, 200, state
@@ -592,10 +149,10 @@ export async function handleChatRoutes(
 			json(res, 400, { error: "turnId and a non-negative after value are required" });
 			return true;
 		}
-		const restoredDurable = durableContext?.service.get(req, sessionId)
-			? restoreDurableStream(req, durableContext.service, sessionId, turnId)
+		const restored = await durableSessions.get(req, sessionId)
+			? await restoreDurableStream(req, durableSessions, sessionId, turnId)
 			: undefined;
-		const state = restoredDurable?.state ?? streamRegistry.getByTurn(turnId);
+		const state = restored?.state ?? streamRegistry.getByTurn(turnId);
 		if (!state || state.sessionId !== sessionId) {
 			json(res, 404, { error: "Chat turn not found" });
 			return true;
@@ -629,378 +186,25 @@ export async function handleChatRoutes(
 			res.write(`data: ${JSON.stringify(envelope)}\n\n`);
 			if (["done", "error", "aborted"].includes(envelope.event.type)) finishResponse();
 		});
-		if (restoredDurable && !state.terminalEventPublished) {
-			void ensureDurableStreamProjection(req, durableContext!.service, restoredDurable);
+		if (restored && !state.terminalEventPublished) {
+			void ensureDurableStreamProjection(req, durableSessions, restored, durableContext);
 		}
 		if (state.terminalEventPublished && !ended) finishResponse();
 		res.on("close", () => { clearInterval(eventsHeartbeat); unsub(); });
 		return true;
 	}
 
-	// --- Chat Streaming (SSE) ---
+	// --- Chat streaming (SSE) ---
 	if (method === "POST" && url === "/api/chat/stream") {
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const prompt = body.prompt as string | undefined;
-		const requestedSessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+		const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
 		const clientRequestId = typeof body.clientRequestId === "string" ? body.clientRequestId : "";
-		if (!prompt || !requestedSessionId || !clientRequestId) {
+		if (!prompt || !sessionId || !clientRequestId) {
 			json(res, 400, { error: "Missing prompt, sessionId or clientRequestId" });
 			return true;
 		}
-		if (!await ownsSession(requestedSessionId)) return denySession();
-		if (durableContext?.service.get(req, requestedSessionId)) {
-			return handleDurableChatRoutes(req, res, method, url, durableContext, body);
-		}
-		if (rejectLegacyExecution()) return true;
-		if (streamRegistry.getActiveForSession(requestedSessionId)) {
-			json(res, 409, { error: "Session already has an active chat turn" });
-			return true;
-		}
-		// Sending in a different session implicitly abandons another
-		// session's unanswered question card — release the queue (issue #124).
-		releaseQueueFromQuestionBlockedTurn(requestedSessionId);
-		const targetSessionPath = sessionFileFromId(join(dataDir, "sessions"), requestedSessionId);
-		if (!targetSessionPath || !existsSync(targetSessionPath)) {
-			json(res, 404, { error: "Session not found" });
-			return true;
-		}
-		const streamWorkspace = await resolveSessionWorkspace(requestedSessionId);
-		if (!streamWorkspace) {
-			json(res, 404, { error: "Session workspace not found" });
-			return true;
-		}
-		const streamWorkspaceId = streamWorkspace.id;
-		const streamWorkspaceRoot = workspaceRegistry.resolveWorkspaceDir(streamWorkspaceId);
-		if (!streamWorkspaceRoot) {
-			json(res, 404, { error: "Session workspace not found" });
-			return true;
-		}
-		const images = parseInlineImages(body.images);
-		// Persist inline images to the workspace so file-path tools (ocr_image,
-		// parse_document) can read them when the chat model can't see images.
-		const imagePaths = persistInlineImages(images, streamWorkspaceRoot);
-		recordWorkspaceFileAccess(dataDir, {
-			sessionId: requestedSessionId,
-			workspaceId: streamWorkspaceId,
-			workspaceRoot: streamWorkspaceRoot,
-			paths: imagePaths,
-			access: "write",
-		});
-		// Sent only when the images can't reach the model natively (text-only
-		// model or provider rejection); vision turns get the raw prompt so
-		// they aren't steered toward ocr_image.
-		const imageFallbackPrompt = prependImagePathsHint(prompt, imagePaths);
-		const imageArgs = images.length ? images : undefined;
-		// Structured attachments (bubble bindings + loose files): validated
-		// against the session workspace; the model sees them as a context block
-		// appended via transformContext while the persisted prompt stays raw.
-		const parsedStreamAttachments = parseChatAttachments(body.attachments);
-		const streamAttachments = parsedStreamAttachments
-			? validateChatAttachments(parsedStreamAttachments, streamWorkspaceRoot)
-			: null;
-		const attachmentContext = streamAttachments ? buildAttachmentContext(streamAttachments) : "";
-		const baseline = readSessionBaseline(parseSessionFile, sessionRevision, targetSessionPath);
-		let state: SessionStreamState;
-		try {
-			state = streamRegistry.createTurn({
-				sessionId: requestedSessionId,
-				clientRequestId,
-				workspaceId: streamWorkspaceId,
-				workspaceRoot: streamWorkspaceRoot,
-				inputSnapshot: {
-					prompt,
-					submittedAt: new Date().toISOString(),
-					images: imagePaths.map((workspacePath, index) => ({ mimeType: images[index]?.mimeType ?? "image/png", workspacePath })),
-					attachments: streamAttachments ?? undefined,
-				},
-				baselineMessageCount: baseline.messageCount,
-				baselineSessionRevision: baseline.revision,
-			});
-		} catch {
-			json(res, 409, { error: "Session already has an active chat turn" });
-			return true;
-		}
-		// Accepted — record sidecar metadata for the session-detail merge. Even
-		// if this turn later fails, an unmatched entry is inert.
-		recordAgentCommandIfPresent(dataDir, requestedSessionId, prompt);
-		if (streamAttachments) {
-			recordSessionAttachments(dataDir, requestedSessionId, {
-				promptContent: prompt,
-				attachments: streamAttachments,
-				timestamp: Date.now(),
-				workspaceId: streamWorkspaceId,
-			});
-			recordWorkspaceAttachmentActivity(dataDir, {
-				sessionId: requestedSessionId,
-				workspaceId: streamWorkspaceId,
-				workspaceRoot: streamWorkspaceRoot,
-				attachments: streamAttachments,
-			});
-		}
-		streamRegistry.publishStreamEvent(state, { type: "stream_state", status: "queued" });
-
-		res.writeHead(200, {
-			"Content-Type": "text/event-stream",
-			"Cache-Control": "no-cache",
-			"Connection": "keep-alive",
-			"X-Accel-Buffering": "no",
-		});
-
-		let disconnected = false;
-		let responseEnded = false;
-
-		const heartbeatInterval = setInterval(() => {
-			if (!disconnected && !responseEnded) {
-				try {
-					res.write(": heartbeat\n\n");
-					logger.debug({ sessionId: requestedSessionId, turnId: state.turnId }, "SSE heartbeat sent");
-				} catch (err) {
-					logger.warn({ sessionId: requestedSessionId, turnId: state.turnId, err }, "SSE heartbeat write failed");
-				}
-			}
-		}, 15_000);
-		const finishResponse = () => {
-			if (responseEnded || disconnected) return;
-			responseEnded = true;
-			clearInterval(heartbeatInterval);
-			res.write("data: [DONE]\n\n");
-			res.end();
-		};
-		const unsubscribeResponse = streamRegistry.subscribe(state, 0, (envelope) => {
-			if (disconnected || responseEnded) return;
-			res.write(`data: ${JSON.stringify(envelope)}\n\n`);
-			if (["done", "error", "aborted"].includes(envelope.event.type)) finishResponse();
-		});
-		res.on("close", () => {
-			disconnected = true;
-			clearInterval(heartbeatInterval);
-			unsubscribeResponse();
-		});
-
-		let workspaceChangeMonitor: ReturnType<typeof createWorkspaceChangeMonitor> = null;
-		const closeWorkspaceChangeMonitor = () => workspaceChangeMonitor?.close();
-
-		// Track whether the model API surfaced an error this turn. The PI SDK
-		// does NOT throw on model API errors (e.g. HTTP 413 from an over-long
-		// context) — it converts them into a terminal assistant message with
-		// stopReason "error" + errorMessage, delivered via message_end. If we
-		// don't forward that, runPromptStreaming resolves with empty text and
-		// the UI shows nothing. So we detect it here and emit an error event.
-		let promptStartTime = 0;
-		const onEvent = (event: import("@earendil-works/pi-coding-agent").AgentSessionEvent) => {
-			// Logging regardless of aborted state
-			switch (event.type) {
-				case "message_update": {
-					const ev = event.assistantMessageEvent;
-					if (ev.type === "error") {
-						const errorMsg = ev.error.errorMessage || `LLM API error (stopReason: ${ev.error.stopReason})`;
-						logger.error({ errorMessage: errorMsg, stopReason: ev.error.stopReason, elapsedMs: Date.now() - promptStartTime }, "LLM API stream error event");
-					}
-					break;
-				}
-				case "message_end": {
-					const msg = event.message;
-					if (
-						msg && typeof msg === "object" && "stopReason" in msg &&
-						(msg as { stopReason?: string }).stopReason === "error"
-					) {
-						const detail = (msg as { errorMessage?: string }).errorMessage;
-						const errorMsg = detail || "The model request failed.";
-						logger.error({ stopReason: "error", errorMessage: errorMsg, message: msg, elapsedMs: Date.now() - promptStartTime }, "Model request failed (message_end stopReason=error)");
-					}
-					break;
-				}
-				case "tool_execution_start":
-					logger.info(
-						{ toolName: event.toolName, toolCallId: event.toolCallId },
-						"tool call started: %s", event.toolName,
-					);
-					break;
-				case "tool_execution_update":
-					// Partial tool output is forwarded to the stream registry below.
-					// Do not report these normal progress events as unhandled.
-					break;
-				case "tool_execution_end":
-					workspaceChangeMonitor?.noteToolEnd(event.toolCallId, event.toolName);
-					if (event.isError) {
-						const errText = Array.isArray(event.result?.content)
-							? event.result.content.map((c: { text?: string }) => c.text ?? "").join(" ").slice(0, 500)
-							: String(event.result?.content ?? "").slice(0, 500);
-						logger.warn(
-							{ toolName: event.toolName, toolCallId: event.toolCallId, result: event.result },
-							"tool call failed: %s — %s",
-							event.toolName,
-							errText || "(no error text)",
-						);
-					} else {
-						logger.info(
-							{ toolName: event.toolName, toolCallId: event.toolCallId },
-							"tool call completed: %s", event.toolName,
-						);
-					}
-					break;
-				case "auto_retry_start":
-					logger.warn({ attempt: event.attempt, maxAttempts: event.maxAttempts, delayMs: event.delayMs, errorMessage: event.errorMessage, elapsedMs: Date.now() - promptStartTime }, "LLM API call failed, auto-retrying...");
-					break;
-				case "auto_retry_end":
-					if (!event.success) {
-						logger.error({ finalError: event.finalError, elapsedMs: Date.now() - promptStartTime }, "LLM API auto-retry failed");
-					}
-					break;
-				default:
-					logger.info({ eventType: (event as { type?: string }).type }, "unhandled SSE event type: %s", (event as { type?: string }).type);
-					break;
-			}
-
-			// Convert to an SSE event and publish to broadcaster + live client.
-			const sseEvent = piEventToSseEvent(event);
-			if (sseEvent) {
-				const piEventType = event.type === "message_update" && event.assistantMessageEvent?.type
-					? event.assistantMessageEvent.type
-					: event.type;
-				const normalizedEvent = sseEvent as { type: string; [key: string]: unknown };
-				streamRegistry.publishStreamEvent(state, { ...normalizedEvent, piEventType });
-			}
-		};
-
-		promptStartTime = Date.now();
-		try {
-			await runPromptStreamingInSession(targetSessionPath, prompt, onEvent, imageArgs, {
-				token: state.turnId,
-				shouldStart: () => !state.cancelRequested,
-				isCancellationRequested: () => state.cancelRequested,
-				onStart: () => {
-					streamRegistry.publishStreamEvent(state, { type: "stream_state", status: "running" });
-					const traceSkills = loadedSkillsForTrace(streamWorkspaceRoot);
-					streamRegistry.publishStreamEvent(state, {
-						type: "skill_loaded",
-						count: traceSkills.length,
-						skills: traceSkills,
-					});
-					const skillEvent = explicitSkillEvent(prompt, traceSkills);
-					if (skillEvent) streamRegistry.publishStreamEvent(state, skillEvent as { type: string });
-					questionBridge.bindTurn({
-						sessionId: state.sessionId,
-						turnId: state.turnId,
-						emit: (event) => streamRegistry.publishStreamEvent(state, event),
-						timeoutMs: 30 * 60_000,
-					});
-					permissionBridge.bindTurn({
-						sessionId: state.sessionId,
-						turnId: state.turnId,
-						tenantId: getRequestTenant(req)?.tenantId,
-						runId: targetSessionPath,
-						emit: (event) => streamRegistry.publishStreamEvent(state, event),
-						timeoutMs: 30 * 60_000,
-					});
-					workspaceChangeMonitor = createWorkspaceChangeMonitor(streamWorkspaceRoot, (event) => {
-						const changeEvent = event as { type?: string; changes?: Array<{ path?: unknown }> };
-						if ((event as { truncated?: unknown }).truncated === true) {
-							markWorkspaceTrackingIncomplete(dataDir, state.sessionId);
-						}
-						const paths = (changeEvent.changes ?? [])
-							.map((change) => typeof change.path === "string" ? change.path : "")
-							.filter(Boolean);
-						if (paths.length > 0) {
-							recordWorkspaceFileAccess(dataDir, {
-								sessionId: state.sessionId,
-								workspaceId: state.workspaceId,
-								workspaceRoot: state.workspaceRoot,
-								paths,
-								access: "write",
-							});
-						}
-						streamRegistry.publishStreamEvent(state, { ...event as { type: string }, workspaceId: state.workspaceId });
-					});
-				},
-				onFinish: async (outcome) => {
-					if (outcome.type === "aborted" && outcome.reason === "cancelled_before_start") {
-						persistCancelledQueuedTurn(prompt, state.sessionId, imageArgs);
-					} else if (outcome.type !== "completed") {
-						persistPendingUserTurn(state.sessionId);
-					}
-					const persistence = confirmTurnPersistence(parseSessionFile, sessionRevision, state, targetSessionPath, outcome);
-					questionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: outcome.type });
-					permissionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: outcome.type });
-					closeWorkspaceChangeMonitor();
-					workspaceChangeMonitor = null;
-					recordCurrentSessionChannel("web", state.sessionId, { setOriginIfEmpty: true });
-					if (outcome.type === "completed" && persistence.persisted) {
-						streamRegistry.finishTurn(state, "completed", { type: "done", fullText: outcome.fullText }, persistence);
-						maybeAutoGenerateTopic(state.sessionId);
-					} else if (outcome.type === "completed") {
-						streamRegistry.finishTurn(state, "error", { type: "error", message: "Final chat history could not be confirmed.", code: "persistence_confirmation_failed" }, persistence);
-					} else if (outcome.type === "aborted") {
-						const message = outcome.reason === "cancelled"
-							? "Stopped by user"
-							: `Prompt aborted: ${outcome.reason}`;
-						streamRegistry.finishTurn(state, "aborted", { type: "aborted", message }, persistence);
-					} else {
-						const message = outcome.error instanceof Error ? outcome.error.message : "Unknown error";
-						if (state.status === "queued") {
-							streamRegistry.finishTurn(state, "aborted", { type: "aborted", message: `Prompt failed before start: ${message}` }, persistence);
-						} else {
-							streamRegistry.finishTurn(state, "error", { type: "error", message }, persistence);
-						}
-					}
-					// Record the trace after the terminal event is published so historical
-					// messages can distinguish a normal completion from an abort or error.
-					if (persistence.persisted && state.history.length > 0) {
-						try {
-							const persistedMessages = parseSessionFile(targetSessionPath)?.messages ?? [];
-							const assistantMessage = persistedMessages[state.baselineMessageCount + 1];
-							recordSessionTrace(dataDir, state.sessionId, {
-								assistantIndex: state.baselineMessageCount + 1,
-								assistantMessageId: assistantMessage?.role === "assistant" ? assistantMessage.entryId : undefined,
-								startedAt: state.startedAt,
-								finishedAt: state.finishedAt ?? new Date().toISOString(),
-								workspaceId: state.workspaceId,
-								events: state.history,
-							});
-						} catch (err) {
-							// Trace is observability metadata. Never turn a successful PI
-							// response into a failed chat turn because the sidecar is unwritable.
-							logger.warn({ err, sessionId: state.sessionId, turnId: state.turnId }, "chat trace sidecar write failed");
-						}
-					}
-				},
-				onFinalizeFailure: async (outcome, error) => {
-					try {
-						logger.error({ error, outcome: outcome.type, sessionId: state.sessionId, turnId: state.turnId }, "chat turn finalization failed");
-					} catch {
-						// Observability must not block the forced terminal path.
-					}
-					try {
-						questionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: "finalization_failed" });
-					} catch {
-						// Continue to the unique terminal event even if question cleanup fails.
-					}
-					try {
-						closeWorkspaceChangeMonitor();
-					} catch {
-						// Continue to the unique terminal event even if monitor cleanup fails.
-					}
-					workspaceChangeMonitor = null;
-					if (!state.terminalEventPublished) {
-						const message = error instanceof Error ? error.message : "Finalization failed";
-						if (state.status === "queued") {
-							streamRegistry.finishTurn(state, "aborted", { type: "aborted", message: `Prompt failed before start: ${message}` }, { persisted: false });
-						} else {
-							streamRegistry.finishTurn(state, "error", { type: "error", message, code: "finalization_failed" }, { persisted: false });
-						}
-					}
-				},
-			}, streamWorkspaceRoot, imageFallbackPrompt, attachmentContext || undefined);
-		} catch (err) {
-			logger.error({ err, sessionId: state.sessionId, turnId: state.turnId }, "SSE chat turn failed");
-		} finally {
-			clearInterval(heartbeatInterval);
-			closeWorkspaceChangeMonitor();
-			unsubscribeResponse();
-			streamRegistry.cleanupExpiredTurns();
-		}
-		finishResponse();
-		return true;
+		return toDurable(sessionId, body);
 	}
 
 	return false;

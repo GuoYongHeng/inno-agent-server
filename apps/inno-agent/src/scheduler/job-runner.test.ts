@@ -3,31 +3,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChannelRegistry } from "../channels/channel.js";
-import {
-	appendAssistantNotification,
-	runPromptInSession,
-	runPromptSerialized,
-	runPromptStreamingInSession,
-} from "../agent/pi-runner.js";
 import { executeJob } from "./job-runner.js";
-import { JobStore } from "./job-store.js";
+import { FileJobStore, JobStore } from "./job-store.js";
 import type { ScheduledJob } from "./types.js";
-
-vi.mock("../agent/pi-runner.js", () => ({
-	appendAssistantNotification: vi.fn(),
-	appendAssistantNotificationInSession: vi.fn(async () => undefined),
-	getCurrentSessionChannelHint: vi.fn(() => undefined),
-	runPromptInSession: vi.fn(async () => "legacy session output"),
-	runPromptStreamingInSession: vi.fn(async () => "legacy stream output"),
-	runPromptSerialized: vi.fn(async () => "legacy global output"),
-}));
 
 const dirs: string[] = [];
 let store: JobStore;
 let channels: ChannelRegistry;
 
-function createJob(patch: Partial<ScheduledJob> = {}): ScheduledJob {
-	return store.create({
+async function createJob(patch: Partial<ScheduledJob> = {}): Promise<ScheduledJob> {
+	return await store.create({
 		name: "runtime test", cron: "0 9 * * *", timezone: "UTC", enabled: true,
 		taskType: "custom_prompt", prompt: "job prompt", ...patch,
 	});
@@ -36,7 +21,7 @@ function createJob(patch: Partial<ScheduledJob> = {}): ScheduledJob {
 beforeEach(() => {
 	const dir = mkdtempSync(join(tmpdir(), "inno-job-runner-"));
 	dirs.push(dir);
-	store = new JobStore(dir, "UTC");
+	store = new FileJobStore(dir, "UTC");
 	channels = new ChannelRegistry();
 });
 
@@ -45,25 +30,9 @@ afterEach(() => {
 	vi.clearAllMocks();
 });
 
-describe("job execution runtime routing", () => {
-	it("keeps legacy global and explicit-session defaults unchanged", async () => {
-		const globalJob = createJob();
-		await expect(executeJob(globalJob, store, channels)).resolves.toMatchObject({
-			success: true, output: "legacy global output",
-		});
-		expect(runPromptSerialized).toHaveBeenCalledWith("job prompt");
-
-		const sessionJob = createJob();
-		const onEvent = vi.fn();
-		await expect(executeJob(sessionJob, store, channels, "api", undefined, {
-			sessionPath: "/tmp/legacy.jsonl", onEvent,
-		})).resolves.toMatchObject({ success: true, output: "legacy stream output" });
-		expect(runPromptStreamingInSession).toHaveBeenCalledWith("/tmp/legacy.jsonl", "job prompt", onEvent);
-		expect(runPromptInSession).not.toHaveBeenCalled();
-	});
-
-	it("uses the injected durable executor with scoped request and turn IDs", async () => {
-		const job = createJob({ runtime: "durable" });
+describe("job execution", () => {
+	it("runs agent jobs through the injected durable executor with scoped request and turn IDs", async () => {
+		const job = await createJob({ runtime: "durable" });
 		const onEvent = vi.fn();
 		const durableExecutor = vi.fn(async () => "durable output");
 		const result = await executeJob(job, store, channels, "api", undefined, {
@@ -79,28 +48,33 @@ describe("job execution runtime routing", () => {
 			sessionId: "durable-session", prompt: "job prompt", requestId: "job-request",
 			turnId: "job-turn", onEvent,
 		});
-		expect(runPromptSerialized).not.toHaveBeenCalled();
-		expect(runPromptInSession).not.toHaveBeenCalled();
-		expect(runPromptStreamingInSession).not.toHaveBeenCalled();
-		expect(store.listRuns(job.id)[0]).toMatchObject({ status: "success", outputPreview: "durable output" });
+		expect((await store.listRuns(job.id))[0]).toMatchObject({ status: "success", outputPreview: "durable output" });
 	});
 
-	it("fails closed instead of falling back when durable execution is unwired", async () => {
-		const job = createJob({ runtime: "durable" });
+	it("fails closed when no durable session or executor is provided", async () => {
+		const job = await createJob({ runtime: "durable" });
 		const result = await executeJob(job, store, channels);
 		expect(result).toMatchObject({ success: false });
 		expect(result.error).toContain("owned durable session and executor");
-		expect(runPromptSerialized).not.toHaveBeenCalled();
-		expect(store.listRuns(job.id)[0]).toMatchObject({ status: "error" });
+		expect((await store.listRuns(job.id))[0]).toMatchObject({ status: "error" });
 	});
 
-	it("never writes a durable reminder through the legacy notification path", async () => {
-		const job = createJob({ runtime: "durable", taskType: "push_reminder" });
+	it("records a reminder in the run's durable session without asking the model", async () => {
+		const job = await createJob({ taskType: "push_reminder", prompt: "该复习了" });
+		const durableExecutor = vi.fn(async () => "");
 		const result = await executeJob(job, store, channels, "manual", undefined, {
-			sessionId: "durable-session", sessionRuntime: "durable", durableExecutor: vi.fn(),
+			sessionId: "durable-session", sessionRuntime: "durable", durableExecutor,
 		});
-		expect(result.success).toBe(false);
-		expect(result.error).toContain("does not support reminder tasks");
-		expect(appendAssistantNotification).not.toHaveBeenCalled();
+		expect(result.success).toBe(true);
+		expect(durableExecutor).toHaveBeenCalledTimes(1);
+		expect(durableExecutor).toHaveBeenCalledWith(expect.objectContaining({
+			sessionId: "durable-session", prompt: "该复习了", notifyOnly: true,
+		}));
+	});
+
+	it("runs a reminder without a session when none is available", async () => {
+		const job = await createJob({ taskType: "push_reminder", prompt: "该复习了" });
+		const result = await executeJob(job, store, channels, "manual");
+		expect(result).toMatchObject({ success: true, output: "该复习了" });
 	});
 });

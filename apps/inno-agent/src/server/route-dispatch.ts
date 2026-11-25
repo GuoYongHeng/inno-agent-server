@@ -3,8 +3,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 type RouteHandler = (req: IncomingMessage, res: ServerResponse, method: string, url: string) => Promise<boolean>;
 
 export type RouteHandlers = Record<
-	| "checkins" | "jobs" | "channels" | "skills" | "sessions" | "wiki" | "learner"
-	| "workspaces" | "presets" | "practice" | "settings" | "commands" | "btw" | "chat",
+	| "checkins" | "jobs" | "channels" | "skills" | "sessions" | "wiki"
+	| "workspaces" | "presets" | "settings" | "btw" | "chat",
 	RouteHandler
 >;
 
@@ -15,11 +15,9 @@ export function createRouteDispatcher(handlers: RouteHandlers) {
 		{ prefix: "/api/channels", handler: handlers.channels },
 		{ prefix: "/api/bridge", handler: handlers.channels },
 		{ prefix: "/api/skills", handler: handlers.skills },
-		{ prefix: "/api/skill-library", handler: handlers.skills },
 		{ prefix: "/api/sessions", handler: handlers.sessions },
 		{ prefix: "/api/wiki", handler: handlers.wiki },
 		{ prefix: "/api/l2", handler: handlers.wiki },
-		{ prefix: "/api/learner", handler: handlers.learner },
 		{ prefix: "/api/workspace", handler: handlers.workspaces },
 		{ prefix: "/api/workspaces", handler: handlers.workspaces },
 		// Preserve the old chain's sessions -> workspaces order. Sessions must
@@ -27,11 +25,7 @@ export function createRouteDispatcher(handlers: RouteHandlers) {
 		{ prefix: "/api/sessions", handler: handlers.workspaces },
 		{ prefix: "/api/presets", handler: handlers.presets },
 		{ prefix: "/api/preset-library", handler: handlers.presets },
-		{ prefix: "/api/terminal", handler: handlers.practice },
-		{ prefix: "/api/runs", handler: handlers.practice },
 		{ prefix: "/api/settings", handler: handlers.settings },
-		{ prefix: "/api/mcp", handler: handlers.settings },
-		{ prefix: "/api/commands", handler: handlers.commands },
 		{ prefix: "/api/btw", handler: handlers.btw },
 		{ prefix: "/api/chat", handler: handlers.chat },
 	];

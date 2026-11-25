@@ -2,6 +2,12 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { dirname } from "node:path";
 import { logger } from "../logger.js";
 
+let tempCounter = 0;
+/** Per-process, per-call temp name so concurrent writers never share a file. */
+function tempPathFor(filePath: string): string {
+	return `${filePath}.${process.pid}.${++tempCounter}.tmp`;
+}
+
 /**
  * Ensure a directory exists, creating it recursively if needed.
  */
@@ -34,7 +40,7 @@ export function readJson<T>(filePath: string, defaultValue: T): T {
  */
 export function writeJson<T>(filePath: string, data: T, options?: { mode?: number }): void {
 	ensureDir(dirname(filePath));
-	const tmp = filePath + ".tmp";
+	const tmp = tempPathFor(filePath);
 	writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", { encoding: "utf-8", ...(options?.mode !== undefined ? { mode: options.mode } : {}) });
 	renameSync(tmp, filePath);
 	if (options?.mode !== undefined) {
@@ -55,7 +61,7 @@ export function writeJson<T>(filePath: string, data: T, options?: { mode?: numbe
  */
 export function writeJsonl<T>(filePath: string, records: T[]): void {
 	ensureDir(dirname(filePath));
-	const tmp = filePath + ".tmp";
+	const tmp = tempPathFor(filePath);
 	writeFileSync(tmp, records.map((r) => JSON.stringify(r)).join("\n") + (records.length > 0 ? "\n" : ""), "utf-8");
 	renameSync(tmp, filePath);
 }
@@ -141,7 +147,7 @@ export function readJsonlTail<T>(filePath: string, maxBytes: number): T[] {
  */
 export function writeText(filePath: string, content: string): void {
 	ensureDir(dirname(filePath));
-	const tmp = filePath + ".tmp";
+	const tmp = tempPathFor(filePath);
 	writeFileSync(tmp, content, "utf-8");
 	renameSync(tmp, filePath);
 }

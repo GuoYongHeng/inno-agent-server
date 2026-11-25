@@ -1,6 +1,7 @@
+import type { RawObjectStorageConfig } from "./object-store/index.js";
+import { DEFAULT_SANDBOX_LIMITS, type SandboxLimits } from "./sandbox/sandbox-quota.js";
 import { chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { RuntimePaths } from "./runtime.js";
 import { DEFAULT_SCHEDULER_TIMEZONE } from "./scheduler/cron-utils.js";
 import { writeJson } from "./storage/file-store.js";
 
@@ -26,18 +27,7 @@ export interface InnoProviderConfig {
 	models: InnoModelConfig[];
 }
 
-export interface InnoSubagentsConfig {
-	enabled: boolean;
-}
-
 export interface InnoMemoryConfig {
-	/**
-	 * When true (default), the L1 learner profile is active: the per-turn
-	 * context pack (profile + recent events) is injected into the system prompt
-	 * and the learner tools record/update the profile. When false, the profile
-	 * is neither read into the prompt nor written by tools.
-	 */
-	l1Enabled: boolean;
 	/**
 	 * When true (default), L2 Wiki memory is active: the `l2_archive` /
 	 * `l2_query` tools can write and read the knowledge base. When false, those
@@ -120,18 +110,6 @@ export const DEFAULT_SMART_INPUT_RULES: InnoSmartInputRule[] = [
 const DEFAULT_SMART_INPUT_RULE_IDS = new Set(DEFAULT_SMART_INPUT_RULES.map((rule) => rule.id));
 
 /**
- * MCP (Model Context Protocol) support via the pi-mcp-adapter extension.
- * Master switch (default OFF, opt-in). Server definitions live in the standard
- * MCP config file `<configDir>/mcp-adapter.json` (managed through the web UI or
- * edited by hand); the adapter also merges the usual shared locations (`.mcp.json` in
- * the workspace, `~/.config/mcp/mcp.json`, …). Changing `enabled` takes effect
- * on the next process start because the extension set is fixed at boot.
- */
-export interface InnoMcpConfig {
-	enabled: boolean;
-}
-
-/**
  * Scheduler defaults. `timezone` is the fallback IANA timezone for scheduled
  * jobs that don't pin their own — previously hardcoded to Asia/Shanghai in
  * several spots; now configurable for users in other regions.
@@ -140,39 +118,25 @@ export interface InnoSchedulerConfig {
 	timezone: string;
 }
 
-/** What should happen when the desktop window's close button is clicked. */
-export type InnoCloseBehavior = "ask" | "hide" | "quit";
-
-/**
- * Permission policy template selected via the settings UI. "default" asks on
- * bash commands outside the read-only allowlist; "auto" auto-approves all
- * bash; "yolo" auto-approves every surface (the plugin's yoloMode rewrites
- * ask → allow). All three keep the hard-deny floor (destructive commands,
- * credential paths) — yoloMode cannot rewrite a deny.
- */
-export type PermissionPolicyMode = "default" | "auto" | "yolo";
-
 export interface InnoUiConfig {
 	theme: string;
-	closeBehavior: InnoCloseBehavior;
 	/** Allow $...$ inline math. Disabled by default so currency stays plain text. */
 	mathSingleDollar: boolean;
 }
 
 /**
  * Content Hub. The single source for remotely-fetched, ready-to-use content:
- * the global skill library and the Simple Mode preset workspaces. Both used to
- * be either hardcoded (skill library → a fixed GitHub repo) or bundled with the
- * app (presets → `<codeDir>/presets/`). Centralizing them here lets a single
- * config block point the whole hub at a different source — including a private
+ * the global skill library. (Preset workspaces are not fetched from here: they
+ * ship in the image under `presets.dir`.) Centralizing it here lets a single
+ * config block point the hub at a different source — including a private
  * self-hosted bundle service — without touching code.
  *
  * Two transport types:
  *   - "github": a public/private GitHub repo. `owner`/`repo`/`ref` locate it;
- *     `skillsPath`/`presetsPath` are the top-level directories within it.
+ *     `skillsPath` is the top-level directory within it.
  *     `token` raises the API rate limit / unlocks private repos.
  *   - "bundle": a self-hosted service exposing `GET {baseUrl}/index.json` and
- *     `GET {baseUrl}/{presets|skills}/{id}.tar.gz`. `token` (if set) is sent as
+ *     `GET {baseUrl}/skills/{id}.tar.gz`. `token` (if set) is sent as
  *     a Bearer credential. Avoids GitHub rate limits for private deployments.
  */
 export interface InnoContentHubConfig {
@@ -185,8 +149,6 @@ export interface InnoContentHubConfig {
 	ref: string;
 	/** Top-level directory holding the skill library. */
 	skillsPath: string;
-	/** Top-level directory holding the preset workspaces. */
-	presetsPath: string;
 	/** Base URL of the self-hosted bundle service (type: "bundle"). */
 	baseUrl: string;
 	/** Auth token: GitHub PAT (type "github") or Bearer credential (type "bundle"). */
@@ -200,7 +162,6 @@ export const DEFAULT_CONTENT_HUB: InnoContentHubConfig = {
 	repo: "inno-agent-hub",
 	ref: "main",
 	skillsPath: "skill-library",
-	presetsPath: "workspace-templates",
 	baseUrl: "",
 	token: "",
 };
@@ -240,29 +201,12 @@ export interface InnoConfig {
 	bridge?: {
 		token: string;
 	};
-	github?: {
-		/** Personal access token to raise GitHub API rate limits for the skill library. */
-		token: string;
-	};
 	/** Remote source for the skill library + preset workspaces. */
 	contentHub?: InnoContentHubConfig;
-	subagents?: InnoSubagentsConfig;
 	memory?: InnoMemoryConfig;
 	smartInput?: InnoSmartInputConfig;
-	mcp?: InnoMcpConfig;
 	ui?: InnoUiConfig;
 	scheduler?: InnoSchedulerConfig;
-	/**
-	 * Optional OCR API config (Baidu PaddleOCR-VL). When the configured model
-	 * cannot recognize images, the agent calls the `ocr_image` tool which uses
-	 * these credentials to submit an async OCR job and poll for the markdown
-	 * result. Unconfigured → the tool returns a "not configured" hint.
-	 */
-	ocrApi?: {
-		token: string;
-		model?: string;
-		baseUrl?: string;
-	};
 	/**
 	 * Optional Tavily config. The `web_search` tool uses this API key for
 	 * internet search. Unconfigured → the tool returns a "not configured" hint.
@@ -270,57 +214,77 @@ export interface InnoConfig {
 	tavily?: {
 		apiKey: string;
 	};
+	sandbox?: Omit<Partial<InnoSandboxConfig>, "limits"> & { limits?: Partial<SandboxLimits> };
+	/** Platform-level blob storage (Alibaba Cloud OSS, MinIO or S3); never read from a tenant config. */
+	objectStorage?: RawObjectStorageConfig;
 	/**
-	 * Third-party PI extensions bundled with inno-agent. All default to
-	 * enabled; set `enabled: false` to opt out without uninstalling.
-	 *
-	 * - `todo` (@juicesharp/rpiv-todo): registers the `todo` task-list tool.
-	 *   TUI overlay/shortcuts activate only in CLI mode (ctx.hasUI).
-	 * - `webAccess` (pi-web-access): registers `fetch_content` +
-	 *   `get_search_content` (URL/GitHub/PDF/YouTube extraction). Its own
-	 *   `web_search`/`source_check` tools stay disabled via the managed
-	 *   `<configDir>/web-search.json` default so the built-in Tavily
-	 *   `web_search` remains the single search tool.
-	 * - `permissionSystem` (@gotgenes/pi-permission-system): allow/ask/deny
-	 *   policy gate for tool calls, bash commands, MCP, skills and file paths.
-	 *   Policy lives in `<configDir>/extensions/pi-permission-system/config.json`
-	 *   (managed default on first run). In server mode `ask` verdicts are
-	 *   answered by the web approval card via the `inno-web` authorizer link
-	 *   (permission-bridge.ts); no answer → deny (fail-closed). `mode` selects
-	 *   the managed policy template ("default" asks on non-allowlisted bash,
-	 *   "auto" auto-approves bash, "yolo" auto-approves every surface); the
-	 *   hard-deny floor (destructive commands, credential paths) applies in all
-	 *   three. Switching modes rewrites the plugin config file from the
-	 *   template — hand edits to that file are lost on a mode switch.
-	 * - `computerUse` (@injaneity/pi-computer-use): desktop GUI control
-	 *   tools (find_roots / observe_ui / search_ui / act_ui / browser tools).
-	 *   Drives the local screen, so unlike the other plugins it is NOT on by
-	 *   default everywhere: unset `enabled` means on only when INNO_DESKTOP=1
-	 *   (set by electron/main.js for the desktop app); `enabled: true` opts
-	 *   in anywhere (e.g. a local CLI run); `enabled: false` always wins.
-	 *   Online deployments (no INNO_DESKTOP) stay off unless explicitly
-	 *   enabled. On macOS the helper app (~/Applications/pi-computer-use.app)
-	 *   needs Accessibility + Screen Recording grants; headless sessions
-	 *   cannot prompt, so a missing grant surfaces as a tool error with
-	 *   grant instructions.
-	 * - `codemode` (PI built-in `codemode` tool): lets the model write JS
-	 *   scripts (QuickJS sandbox) that call the session's other tools, so
-	 *   batch work happens in one call and only the script's output reaches
-	 *   the model. Nested calls run through the normal tool pipeline, so
-	 *   permission checks and observability events still apply. Default OFF:
-	 *   the web trace timeline shows a codemode call as a single step (its
-	 *   nested calls are only visible in logs), which trades away some of the
-	 *   per-tool transparency inno's teaching loop relies on. Activation is
-	 *   managed via the `defaultTools` entry in PI's settings.json
-	 *   (`syncCodemodeDefaultTools` in pi-runner.ts) and takes effect on
-	 *   restart, like computer use.
+	 * Platform-level preset workspace templates (baked into the image). Never
+	 * read from a tenant config.
 	 */
-	plugins?: {
-		todo?: { enabled?: boolean };
-		webAccess?: { enabled?: boolean };
-		permissionSystem?: { enabled?: boolean; mode?: PermissionPolicyMode };
-		computerUse?: { enabled?: boolean };
-		codemode?: { enabled?: boolean };
+	presets?: InnoPresetsConfig;
+}
+
+export interface InnoPresetsConfig {
+	/**
+	 * Directory of baked-in preset workspace templates (each subdirectory is
+	 * one preset with `preset.json` + `agent.md`). Unset defaults to
+	 * `<codeDir>/presets`. A relative path is resolved against the process
+	 * working directory.
+	 */
+	dir?: string;
+}
+
+/**
+ * Remote sandbox for shell and file tools (E2B-compatible). Platform-level: it is
+ * read from the server's own config and environment, never from a tenant's
+ * config, so a tenant cannot point the server at a sandbox endpoint of its choosing.
+ */
+export interface InnoSandboxConfig {
+	enabled: boolean;
+	provider: "e2b";
+	/** Falls back to the E2B_API_KEY environment variable. */
+	apiKey?: string;
+	/** Self-hosted or regional E2B domain; the E2B cloud when omitted. */
+	domain?: string;
+	/** Template (image) to boot; the provider default when omitted. */
+	template?: string;
+	/** Sandbox lifetime between uses, in minutes. */
+	timeoutMinutes: number;
+	/** Upper bound for one shell command, in seconds. */
+	commandTimeoutSeconds: number;
+	allowInternetAccess: boolean;
+	/**
+	 * When non-empty (and internet access is on), outbound traffic is limited to these
+	 * hosts, wildcards or CIDR blocks and everything else is denied.
+	 */
+	allowedDomains: string[];
+	/** Ask the user before each shell command. Headless runs cannot ask, so they are denied. */
+	requireApproval: "always" | "never";
+	/** Per-tenant limits; 0 means unlimited. */
+	limits: SandboxLimits;
+}
+
+export function normalizeSandboxConfig(raw: (Omit<Partial<InnoSandboxConfig>, "limits"> & { limits?: Partial<SandboxLimits> }) | undefined, env: NodeJS.ProcessEnv = process.env): InnoSandboxConfig {
+	const nonNegative = (value: unknown, fallback: number) => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback);
+	const positive = (value: unknown, fallback: number) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback);
+	return {
+		enabled: raw?.enabled ?? env.INNO_SANDBOX_ENABLED === "true",
+		provider: "e2b",
+		...(raw?.apiKey?.trim() || env.E2B_API_KEY?.trim() ? { apiKey: raw?.apiKey?.trim() || env.E2B_API_KEY!.trim() } : {}),
+		...(raw?.domain?.trim() || env.E2B_DOMAIN?.trim() ? { domain: (raw?.domain?.trim() || env.E2B_DOMAIN!.trim()) } : {}),
+		...(raw?.template?.trim() || env.E2B_TEMPLATE?.trim() ? { template: (raw?.template?.trim() || env.E2B_TEMPLATE!.trim()) } : {}),
+		timeoutMinutes: positive(raw?.timeoutMinutes, 30),
+		commandTimeoutSeconds: positive(raw?.commandTimeoutSeconds, 600),
+		allowInternetAccess: raw?.allowInternetAccess !== false,
+		allowedDomains: Array.isArray(raw?.allowedDomains)
+			? [...new Set(raw.allowedDomains.filter((entry): entry is string => typeof entry === "string").map((entry) => entry.trim()).filter(Boolean))]
+			: [],
+		requireApproval: raw?.requireApproval === "never" ? "never" : "always",
+		limits: {
+			maxConcurrent: nonNegative(raw?.limits?.maxConcurrent, DEFAULT_SANDBOX_LIMITS.maxConcurrent),
+			maxSandboxes: nonNegative(raw?.limits?.maxSandboxes, DEFAULT_SANDBOX_LIMITS.maxSandboxes),
+			maxActiveMinutesPerDay: nonNegative(raw?.limits?.maxActiveMinutesPerDay, DEFAULT_SANDBOX_LIMITS.maxActiveMinutesPerDay),
+		},
 	};
 }
 
@@ -392,7 +356,6 @@ export function normalizeProviderConfig(provider: Partial<InnoProviderConfig>): 
 export function normalizeMemoryConfig(memory: Partial<InnoMemoryConfig> | undefined): InnoMemoryConfig {
 	// All three memory layers default to ON; only an explicit `false` disables one.
 	return {
-		l1Enabled: memory?.l1Enabled !== false,
 		l2Enabled: memory?.l2Enabled !== false,
 		l3Enabled: memory?.l3Enabled !== false,
 	};
@@ -488,13 +451,6 @@ export function normalizeSmartInputConfig(
 	};
 }
 
-export function normalizeMcpConfig(mcp: Partial<InnoMcpConfig> | undefined): InnoMcpConfig {
-	// MCP defaults OFF; only an explicit `true` enables it.
-	return {
-		enabled: mcp?.enabled === true,
-	};
-}
-
 export function normalizeSchedulerConfig(scheduler: Partial<InnoSchedulerConfig> | undefined): InnoSchedulerConfig {
 	const timezone = typeof scheduler?.timezone === "string" && scheduler.timezone.trim()
 		? scheduler.timezone.trim()
@@ -504,21 +460,15 @@ export function normalizeSchedulerConfig(scheduler: Partial<InnoSchedulerConfig>
 
 export function normalizeUiConfig(ui: Partial<InnoUiConfig> | undefined): InnoUiConfig {
 	const theme = typeof ui?.theme === "string" && ui.theme.trim() ? ui.theme.trim() : "light";
-	const closeBehavior: InnoCloseBehavior = ui?.closeBehavior === "hide" || ui?.closeBehavior === "quit"
-		? ui.closeBehavior
-		: "ask";
-	return { theme, closeBehavior, mathSingleDollar: ui?.mathSingleDollar === true };
+	return { theme, mathSingleDollar: ui?.mathSingleDollar === true };
 }
 
 /**
  * Normalize the Content Hub config, filling missing fields from the built-in
- * public-hub defaults. `legacyGithubToken` lets us migrate the older
- * `config.github.token` (which only fed the skill library) into the hub token
- * so existing users keep their rate-limit credential with zero changes.
+ * public-hub defaults.
  */
 export function normalizeContentHubConfig(
 	hub: Partial<InnoContentHubConfig> | undefined,
-	legacyGithubToken?: string,
 ): InnoContentHubConfig {
 	const type = hub?.type === "bundle" ? "bundle" : "github";
 	const trimmed = (v: string | undefined, fallback: string) => (v?.trim() ? v.trim() : fallback);
@@ -528,10 +478,8 @@ export function normalizeContentHubConfig(
 		repo: trimmed(hub?.repo, DEFAULT_CONTENT_HUB.repo),
 		ref: trimmed(hub?.ref, DEFAULT_CONTENT_HUB.ref),
 		skillsPath: trimmed(hub?.skillsPath, DEFAULT_CONTENT_HUB.skillsPath),
-		presetsPath: trimmed(hub?.presetsPath, DEFAULT_CONTENT_HUB.presetsPath),
 		baseUrl: hub?.baseUrl?.trim() ?? "",
-		// Prefer an explicit hub token; otherwise inherit the legacy github token.
-		token: (hub?.token?.trim() || legacyGithubToken?.trim()) ?? "",
+		token: hub?.token?.trim() ?? "",
 	};
 }
 
@@ -566,26 +514,28 @@ export function normalizeConfig(
 	const defaultModel = config.defaultModel?.trim() || fallback?.model || "";
 	const defaultProviderConfig = providers[defaultProvider];
 	const hasDefaultModel = defaultProviderConfig?.models.some((model) => model.id === defaultModel);
+	// A tenant record carries no providers — the catalog lives in the
+	// deployment config, so the stored selection cannot be validated here and
+	// must be kept verbatim instead of being reset to the empty fallback.
+	const unverifiable = Object.keys(providers).length === 0;
 
 	return {
-		defaultProvider: hasDefaultModel ? defaultProvider : fallback?.provider || "",
-		defaultModel: hasDefaultModel ? defaultModel : fallback?.model || "",
+		defaultProvider: hasDefaultModel || unverifiable ? defaultProvider : fallback?.provider || "",
+		defaultModel: hasDefaultModel || unverifiable ? defaultModel : fallback?.model || "",
 		providers,
 		server: config.server,
 		feishu: config.feishu,
 		channels: config.channels,
 		bridge: config.bridge,
-		github: config.github,
-		contentHub: normalizeContentHubConfig(config.contentHub, config.github?.token),
-		subagents: config.subagents,
+		contentHub: normalizeContentHubConfig(config.contentHub),
 		memory: normalizeMemoryConfig(config.memory),
 		smartInput: normalizeSmartInputConfig(config.smartInput),
-		mcp: normalizeMcpConfig(config.mcp),
 		ui: normalizeUiConfig(config.ui),
 		scheduler: normalizeSchedulerConfig(config.scheduler),
-		ocrApi: config.ocrApi,
 		tavily: config.tavily,
-		plugins: config.plugins,
+		...(config.sandbox ? { sandbox: config.sandbox } : {}),
+		...(config.objectStorage ? { objectStorage: config.objectStorage } : {}),
+		...(config.presets ? { presets: config.presets } : {}),
 	} as InnoConfig;
 }
 
@@ -617,6 +567,11 @@ export function loadConfig(
 	}
 }
 
+/**
+ * Write a normalized config.json. Only used by tooling/tests today: the
+ * server keeps mutable platform settings in `platform_config` and never
+ * writes this file at runtime.
+ */
 export function saveConfig(
 	configPathOrDir: string,
 	config: InnoConfig,
@@ -627,8 +582,8 @@ export function saveConfig(
 		: join(configPathOrDir, "config.json");
 	const normalized = normalizeConfig(config, options);
 	// Atomic write (tmp + rename): a crash mid-write must not leave a truncated
-	// config.json — the server hot-rewrites this file on every model switch.
-	// 0o600: the file carries plaintext provider API keys and the bridge token.
+	// config.json. 0o600: the file can carry plaintext provider API keys and
+	// the bridge token when used as a seed.
 	writeJson(configPath, normalized, { mode: 0o600 });
 	return normalized;
 }
@@ -720,70 +675,18 @@ export function getConfiguredPort(config: InnoConfig, override?: number): number
 	return config.server?.port ?? 3000;
 }
 
-/**
- * Computer-use gate. Desktop GUI control only makes sense on a local install:
- * default-on under the Electron desktop app (INNO_DESKTOP=1, set by
- * electron/main.js), default-off everywhere else (online deployments, plain
- * server/CLI). `plugins.computerUse.enabled` overrides in both directions.
- */
-export function isComputerUseEnabled(config: InnoConfig): boolean {
-	const explicit = config.plugins?.computerUse?.enabled;
-	if (typeof explicit === "boolean") return explicit;
-	return process.env.INNO_DESKTOP === "1";
-}
 
 /**
- * Codemode gate. Unlike todo/webAccess this is default-OFF everywhere
- * (including the desktop app): it changes how tool work appears in the web
- * trace timeline, so it is an explicit opt-in. `plugins.codemode.enabled`
- * is the only switch.
+ * Read only `presets.dir` from the config file. Path resolution happens before
+ * the full config is validated, and a missing/broken config must fall back to
+ * the baked-in `<codeDir>/presets` default rather than aborting startup.
  */
-export function isCodemodeEnabled(config: InnoConfig): boolean {
-	return config.plugins?.codemode?.enabled === true;
-}
-
-/**
- * Get the data directory path for the project.
- */
-export function getDataDir(projectDir: string): string {
-	return join(projectDir, "data");
-}
-
-export function getRuntimeDataDir(paths: RuntimePaths): string {
-	return paths.dataDir;
-}
-
-/**
- * Get the learner data directory path.
- */
-export function getLearnerDataDir(projectDir: string): string {
-	return join(projectDir, "data", "learner");
-}
-
-/**
- * Get the session directory path.
- */
-export function getSessionDir(projectDir: string): string {
-	return join(projectDir, "data", "sessions");
-}
-
-/**
- * Get the jobs directory path.
- */
-export function getJobsDir(projectDir: string): string {
-	return join(projectDir, "data", "jobs");
-}
-
-/**
- * Get the Inno Agent skills directory loaded by the PI resource loader.
- */
-export function getSkillsDir(projectDir: string): string {
-	return join(projectDir, ".inno", "skills");
-}
-
-/**
- * Get the L2 Wiki memory data directory path.
- */
-export function getL2DataDir(projectDir: string): string {
-	return join(projectDir, "data", "l2");
+export function readPresetsDir(configPath: string): string | undefined {
+	try {
+		const raw = JSON.parse(readFileSync(configPath, "utf-8")) as { presets?: { dir?: unknown } };
+		const dir = raw.presets?.dir;
+		return typeof dir === "string" && dir.trim() ? dir.trim() : undefined;
+	} catch {
+		return undefined;
+	}
 }

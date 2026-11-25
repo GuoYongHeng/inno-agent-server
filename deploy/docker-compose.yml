@@ -1,0 +1,207 @@
+# Fix the project name so containers are inno-agent-* regardless of the
+# directory this file is launched from (otherwise it takes the dir name).
+name: inno-agent
+
+services:
+  # Better Auth + PostgreSQL is the only runtime mode: every API request is
+  # tenant-scoped and tenant state lives in postgres-data / minio-data.
+  # Keep exactly one replica unless you wire up INNO_DURABLE_SHARD_* worker
+  # routing (see .env.example).
+  inno-agent:
+    image: inno-agent-backend:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    restart: unless-stopped
+    expose:
+      - "3000"
+    # Repo-root .env (copy from .env.example); optional so the stack still starts without it.
+    # Values under `environment:` below take precedence over the file.
+    env_file:
+      - path: ../.env
+        required: false
+    # INNO_SKILLS_DIR / INNO_WORKSPACE_DIR come from the image ENV
+    # (/app/skills, /srv/inno-workspace). Presets live at the package default
+    # /app/apps/inno-agent/presets (override with presets.dir in config.json).
+    # Workspace is pure scratch on the container writable layer. Logs go to
+    # stdout (docker logs).
+    environment:
+      INNO_CONFIG_DIR: /etc/inno-agent
+      INNO_PORT: 3000
+      INNO_HOST: 0.0.0.0
+      # local exec: bash/file tools run inside this container (the container
+      # is the isolation boundary; there is no remote sandbox in compose).
+      # Unset for the persistent backend — file tools only, no bash.
+      INNO_EXEC_BACKEND: local
+      # Required — the server refuses to boot without Better Auth + Postgres.
+      # Sign-up is open by default (INNO_AUTH_ALLOW_SIGNUP=false to close it);
+      # change BETTER_AUTH_SECRET before any real deployment.
+      DATABASE_URL: postgresql://inno:inno@postgres:5432/inno
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-replace-with-at-least-32-random-characters}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      # Needed only when the browser reaches the API on a different origin
+      # than BETTER_AUTH_URL (the compose frontend proxies /api same-origin).
+      # INNO_TRUSTED_ORIGINS: http://localhost:3000
+      # Workspace files live in the stack's MinIO (manifest rows stay in
+      # PostgreSQL). SDK calls use the internal endpoint; presigned
+      # upload/download URLs are issued against the host-published port so the
+      # browser can reach them — on a remote host set
+      # INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT to the reachable MinIO URL.
+      INNO_OBJECT_STORAGE_PROVIDER: s3
+      INNO_OBJECT_STORAGE_ENDPOINT: http://minio:9000
+      INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT: ${INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT:-http://localhost:9000}
+      INNO_OBJECT_STORAGE_REGION: us-east-1
+      INNO_OBJECT_STORAGE_BUCKET: inno
+      INNO_OBJECT_STORAGE_ACCESS_KEY_ID: inno
+      INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-inno-minio-secret-change-me}
+      INNO_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+      # 直连 GitHub 失败时回退的代理（容器内访问宿主机代理用 host.docker.internal）
+      INNO_HUB_PROXY: ${INNO_HUB_PROXY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      # /etc/inno-agent/config.json is the SINGLE SOURCE OF TRUTH for all
+      # platform config: deployment fields, default model, and the
+      # server-managed catalog (providers/apiKeys, tavily, channel
+      # endpoints, bridge token, content hub) — it only changes on redeploy.
+      # Tenants only pick a model and flip channel/memory toggles; their
+      # choices live in tenant_configs. Keep the volume persistent because
+      # the file holds real credentials.
+      - inno-agent-config:/etc/inno-agent
+      # Everything else the agent writes — workspace copies in
+      # INNO_WORKSPACE_DIR (including its .inno-scratch caches) — is
+      # scratch on the container writable layer by design: the source of
+      # truth is postgres-data + minio-data. For skill development, mount a
+      # live dir over the image's /app/skills, e.g.
+      #   ../runtime/skills:/app/skills
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+  # Web UI + reverse proxy: the only service published to the host.
+  frontend:
+    image: inno-agent-frontend:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    environment:
+      BACKEND_URL: http://inno-agent:3000
+    depends_on:
+      inno-agent:
+        condition: service_healthy
+
+  # ParadeDB (PostgreSQL 17 + vector/pg_trgm/pg_search): the tenant schema and
+  # L2/L3 memory layers require BM25 search, which stock postgres lacks.
+  postgres:
+    image: paradedb/paradedb:v0.22.2-pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: inno
+      POSTGRES_PASSWORD: inno
+      POSTGRES_DB: inno
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inno -d inno"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  # S3-compatible object store for workspace files. Docker Hub's minio/minio
+  # images are gone since upstream went source-only; pgsty/minio is the
+  # Pigsty-maintained community build of the same AGPL MinIO.
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: inno
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-inno-minio-secret-change-me}
+    # The API port is published on localhost so browser presigned URLs
+    # (INNO_OBJECT_STORAGE_PUBLIC_ENDPOINT) resolve. Keep it loopback-only.
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  # One-shot bucket bootstrap. Reuses the backend image — its node_modules
+  # already carry @aws-sdk/client-s3, so no mc image is needed.
+  minio-init:
+    image: inno-agent-backend:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    working_dir: /app/apps/inno-agent
+    entrypoint:
+      - node
+      - -e
+      - |
+        const { S3Client, CreateBucketCommand } = require("@aws-sdk/client-s3");
+        const s3 = new S3Client({ endpoint: "http://minio:9000", region: "us-east-1", forcePathStyle: true,
+          credentials: { accessKeyId: "inno", secretAccessKey: process.env.MINIO_ROOT_PASSWORD } });
+        s3.send(new CreateBucketCommand({ Bucket: "inno" }))
+          .catch((e) => { if (!/AlreadyOwnedByYou|AlreadyExists/.test(e && e.name || "")) throw e; })
+          .then(() => console.log("minio bucket ready"));
+    environment:
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-inno-minio-secret-change-me}
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # One-shot skill import: pull every skill from the content hub (config.json
+  # `contentHub`) and publish it into the object store + skill_catalog. The
+  # hub is a DEPLOY-TIME distribution channel only — the running server never
+  # talks to it. Re-run manually after bumping the hub repo:
+  #   docker compose run --rm skills-init
+  skills-init:
+    image: inno-agent-backend:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    working_dir: /app/apps/inno-agent
+    entrypoint: [node, dist/skills/import-hub-cli.js]
+    volumes:
+      - inno-agent-config:/etc/inno-agent
+    environment:
+      INNO_CONFIG_DIR: /etc/inno-agent
+      DATABASE_URL: postgresql://inno:inno@postgres:5432/inno
+      INNO_OBJECT_STORAGE_PROVIDER: s3
+      INNO_OBJECT_STORAGE_ENDPOINT: http://minio:9000
+      INNO_OBJECT_STORAGE_REGION: us-east-1
+      INNO_OBJECT_STORAGE_BUCKET: inno
+      INNO_OBJECT_STORAGE_ACCESS_KEY_ID: inno
+      INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-inno-minio-secret-change-me}
+      INNO_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+      # 直连 GitHub 失败时回退的代理（容器内访问宿主机代理用 host.docker.internal）
+      INNO_HUB_PROXY: ${INNO_HUB_PROXY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  minio-data:
+  inno-agent-config:

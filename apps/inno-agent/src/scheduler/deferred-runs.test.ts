@@ -41,7 +41,7 @@ beforeEach(() => {
 		jobStore: {} as JobStore,
 		channelRegistry: new ChannelRegistry(),
 		checkInStore,
-		createSession: async () => "/tmp/owned-session.jsonl",
+		createSession: async () => ({ id: "durable-owned-session", runtime: "durable" as const }),
 		durableClaims: true,
 	});
 	vi.mocked(executeJob).mockImplementation(async (current) => ({
@@ -82,7 +82,7 @@ describe("tenant deferred runs", () => {
 			checkInStore,
 			createSession: async () => {
 				sessions.push(getCurrentTenant()?.tenantId ?? null);
-				return "/tmp/owned-session.jsonl";
+				return { id: "durable-owned-session", runtime: "durable" as const };
 			},
 			durableClaims: true,
 		});
@@ -95,8 +95,8 @@ describe("tenant deferred runs", () => {
 		expect(sessions).toEqual(["tenant-a"]);
 		expect(executionTenants).toEqual(["tenant-a"]);
 		expect(vi.mocked(executeJob).mock.calls[0][5]).toMatchObject({
-			sessionPath: "/tmp/owned-session.jsonl",
-			allowSessionChannelInference: false,
+			sessionId: "durable-owned-session",
+			sessionRuntime: "durable",
 		});
 		expect(vi.mocked(claims[0].claim.release)).toHaveBeenCalledOnce();
 	});

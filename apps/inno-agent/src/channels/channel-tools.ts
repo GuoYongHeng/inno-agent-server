@@ -5,13 +5,7 @@ import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { defineInnoTool } from "../agent/inno-tool.js";
 import { ChannelRegistry, FileSendNotSupportedError } from "./channel.js";
-import {
-	channelOutboxPayloadPath,
-	completeChannelOutbox,
-	loadChannelOutbox,
-	prepareChannelOutbox,
-	type ChannelOutboxRecord,
-} from "./channel-outbox.js";
+import type { ChannelOutbox, ChannelOutboxRecord, OutboxPayload } from "./channel-outbox.js";
 import type { ChannelName } from "./types.js";
 import type { WorkspaceRegistry } from "../workspace/workspace-registry.js";
 import { logger } from "../logger.js";
@@ -30,10 +24,13 @@ export interface ChannelToolsDeps {
 	 * successful file send so the session picks up the channel badge in the UI.
 	 */
 	recordChannelInteraction?: (channel: ChannelName) => void;
+	/** Workspace file access seam. When present, file resolution/materialization
+	 * goes through it instead of resolving paths on the local filesystem. */
+	files?: import("../workspace/workspace-files.js").WorkspaceFileAccess;
 	/** Durable sends persist a payload snapshot and completion marker. External
 	 * delivery remains at-least-once across the send/completion crash window. */
 	durable?: {
-		outboxDir: string;
+		outbox: ChannelOutbox;
 		getOperationId: (toolCallId: string) => string;
 	};
 }
@@ -114,7 +111,7 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 			let outbox: ChannelOutboxRecord | undefined;
 			if (durable && operationId) {
 				try {
-					outbox = loadChannelOutbox(durable.outboxDir, operationId);
+					outbox = await durable.outbox.load(operationId);
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					return {
@@ -192,35 +189,167 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 				};
 			}
 
-			let resolved: string;
+			let resolved: string | { bytes: Uint8Array };
+			// A snapshot materialised from the outbox is a temporary file in some backends.
+			let snapshot: OutboxPayload | undefined;
+			let filesRelPath: string | undefined;
 			if (outbox && durable && operationId) {
-				resolved = channelOutboxPayloadPath(durable.outboxDir, operationId);
-				if (!existsSync(resolved) || !statSync(resolved).isFile()) {
+				snapshot = await durable.outbox.payload(outbox);
+				if (!snapshot) {
 					return {
 						content: [{ type: "text" as const, text: "渠道 outbox 的文件快照丢失，已停止恢复发送。" }],
 						details: { error: "outbox_payload_missing", filePath: outbox.filePath } as Record<string, unknown>,
 					};
 				}
+				resolved = snapshot.bytes ? { bytes: snapshot.bytes } : snapshot.path!;
 			} else {
 				// Resolve and validate the file path within the workspace.
-				const workspaceDir = resolveWorkspaceDir(deps);
-				if (!workspaceDir) {
+				const files = deps.files;
+				if (files) {
+					const rel = files.toRelative(params.filePath);
+					if (!rel) {
+						return {
+							content: [{
+								type: "text" as const,
+								text: `文件路径不合法或超出了工作区范围：${params.filePath}`,
+							}],
+							details: { error: "invalid_path", filePath: params.filePath } as Record<string, unknown>,
+						};
+					}
+					const entry = await files.stat(rel);
+					if (!entry || entry.kind !== "file") {
+						return {
+							content: [{
+								type: "text" as const,
+								text: `工作区里找不到这个文件：${params.filePath}`,
+							}],
+							details: { error: "file_not_found", filePath: params.filePath } as Record<string, unknown>,
+						};
+					}
+					// The materialized path only exists inside the callback below.
+					filesRelPath = rel;
+					resolved = "";
+				} else {
+					const workspaceDir = resolveWorkspaceDir(deps);
+					if (!workspaceDir) {
+						return {
+							content: [{ type: "text" as const, text: "无法确定当前会话的工作区，已停止发送文件。" }],
+							details: { error: "workspace_unavailable" } as Record<string, unknown>,
+						};
+					}
+					const workspaceFile = safeResolveInWorkspace(workspaceDir, params.filePath);
+					if (!workspaceFile) {
+						return {
+							content: [{
+								type: "text" as const,
+								text: `文件路径不合法或超出了工作区范围：${params.filePath}`,
+							}],
+							details: { error: "invalid_path", filePath: params.filePath } as Record<string, unknown>,
+						};
+					}
+					if (!existsSync(workspaceFile) || !statSync(workspaceFile).isFile()) {
+						return {
+							content: [{
+								type: "text" as const,
+								text: `工作区里找不到这个文件：${params.filePath}`,
+							}],
+							details: { error: "file_not_found", filePath: params.filePath } as Record<string, unknown>,
+						};
+					}
+					resolved = workspaceFile;
+				}
+			}
+
+			const prepareOutbox = async (localFile: string) => {
+				outbox = {
+					operationId: operationId!,
+					channel: channelName,
+					chatId,
+					filePath: params.filePath,
+					fileName: params.fileName,
+				};
+				try {
+					snapshot = await durable!.outbox.prepare(outbox, localFile);
+					resolved = snapshot.bytes ? { bytes: snapshot.bytes } : snapshot.path!;
+					return undefined;
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
 					return {
-						content: [{ type: "text" as const, text: "无法确定当前会话的工作区，已停止发送文件。" }],
-						details: { error: "workspace_unavailable" } as Record<string, unknown>,
+						content: [{ type: "text" as const, text: `渠道 outbox 写入失败：${msg}` }],
+						details: { error: "outbox_failed", filePath: params.filePath, message: msg } as Record<string, unknown>,
 					};
 				}
-				const workspaceFile = safeResolveInWorkspace(workspaceDir, params.filePath);
-				if (!workspaceFile) {
+			};
+
+			const doSend = async (): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }> => {
+				try {
+					await channel.sendFile!(
+						{ channel: channelName, chatId },
+						resolved,
+						outbox ? outbox.fileName ?? basename(outbox.filePath) : params.fileName,
+					);
+				} catch (err) {
+					logger.warn({ err, channel: channelName, filePath: params.filePath }, "send_file_to_channel tool failed");
+					if (err instanceof FileSendNotSupportedError) {
+						return {
+							content: [{ type: "text" as const, text: err.message }],
+							details: { error: "file_send_not_supported", channel: channelName } as Record<string, unknown>,
+						};
+					}
+					const msg = err instanceof Error ? err.message : String(err);
 					return {
 						content: [{
 							type: "text" as const,
-							text: `文件路径不合法或超出了工作区范围：${params.filePath}`,
+							text: `发送文件到「${channelName}」失败：${msg}`,
 						}],
-						details: { error: "invalid_path", filePath: params.filePath } as Record<string, unknown>,
+						details: { error: "send_failed", channel: channelName, message: msg } as Record<string, unknown>,
 					};
+				} finally {
+					snapshot?.cleanup();
 				}
-				if (!existsSync(workspaceFile) || !statSync(workspaceFile).isFile()) {
+
+				const completion = {
+					text: `已把文件 ${params.fileName ?? params.filePath} 发送到「${channelName}」。`,
+					details: { channel: channelName, chatId, filePath: params.filePath } as Record<string, unknown>,
+				};
+				if (durable && outbox) {
+					try {
+						await durable.outbox.complete(outbox, completion);
+					} catch (err) {
+						const msg = err instanceof Error ? err.message : String(err);
+						return {
+							content: [{ type: "text" as const, text: `文件已发送，但渠道 outbox 完成标记写入失败：${msg}` }],
+							details: { error: "outbox_completion_failed", channel: channelName, message: msg } as Record<string, unknown>,
+						};
+					}
+				}
+
+				// Tag the active session as having interacted with this channel so the
+				// UI shows the channel badge (best-effort — never fail the send on this).
+				try {
+					deps.recordChannelInteraction?.(channelName);
+				} catch (err) {
+					logger.warn({ err }, "failed to tag session channel interaction");
+					// ignore tagging failures
+				}
+
+				return {
+					content: [{ type: "text" as const, text: completion.text }],
+					details: completion.details,
+				};
+			};
+
+			if (filesRelPath !== undefined) {
+				// Snapshot + send must complete while the materialized file exists.
+				const outcome = await deps.files!.withLocalFile(filesRelPath, async (localFile) => {
+					resolved = localFile;
+					if (durable && operationId) {
+						const failed = await prepareOutbox(localFile);
+						if (failed) return failed;
+					}
+					return doSend();
+				});
+				if (outcome === null) {
 					return {
 						content: [{
 							type: "text" as const,
@@ -229,80 +358,14 @@ export function createChannelTools(deps: ChannelToolsDeps): ToolRegistration[] {
 						details: { error: "file_not_found", filePath: params.filePath } as Record<string, unknown>,
 					};
 				}
-				resolved = workspaceFile;
-				if (durable && operationId) {
-					outbox = {
-						operationId,
-						channel: channelName,
-						chatId,
-						filePath: params.filePath,
-						fileName: params.fileName,
-					};
-					try {
-						resolved = prepareChannelOutbox(durable.outboxDir, outbox, workspaceFile);
-					} catch (err) {
-						const msg = err instanceof Error ? err.message : String(err);
-						return {
-							content: [{ type: "text" as const, text: `渠道 outbox 写入失败：${msg}` }],
-							details: { error: "outbox_failed", filePath: params.filePath, message: msg } as Record<string, unknown>,
-						};
-					}
-				}
+				return outcome;
 			}
 
-			try {
-				await channel.sendFile(
-					{ channel: channelName, chatId },
-					resolved,
-					outbox ? outbox.fileName ?? basename(outbox.filePath) : params.fileName,
-				);
-			} catch (err) {
-				logger.warn({ err, channel: channelName, filePath: params.filePath }, "send_file_to_channel tool failed");
-				if (err instanceof FileSendNotSupportedError) {
-					return {
-						content: [{ type: "text" as const, text: err.message }],
-						details: { error: "file_send_not_supported", channel: channelName } as Record<string, unknown>,
-					};
-				}
-				const msg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{
-						type: "text" as const,
-						text: `发送文件到「${channelName}」失败：${msg}`,
-					}],
-					details: { error: "send_failed", channel: channelName, message: msg } as Record<string, unknown>,
-				};
+			if (!outbox && durable && operationId) {
+				const failed = await prepareOutbox(resolved as string);
+				if (failed) return failed;
 			}
-
-			const completion = {
-				text: `已把文件 ${params.fileName ?? params.filePath} 发送到「${channelName}」。`,
-				details: { channel: channelName, chatId, filePath: params.filePath } as Record<string, unknown>,
-			};
-			if (durable && outbox) {
-				try {
-					completeChannelOutbox(durable.outboxDir, outbox, completion);
-				} catch (err) {
-					const msg = err instanceof Error ? err.message : String(err);
-					return {
-						content: [{ type: "text" as const, text: `文件已发送，但渠道 outbox 完成标记写入失败：${msg}` }],
-						details: { error: "outbox_completion_failed", channel: channelName, message: msg } as Record<string, unknown>,
-					};
-				}
-			}
-
-			// Tag the active session as having interacted with this channel so the
-			// UI shows the channel badge (best-effort — never fail the send on this).
-			try {
-				deps.recordChannelInteraction?.(channelName);
-			} catch (err) {
-				logger.warn({ err }, "failed to tag session channel interaction");
-				// ignore tagging failures
-			}
-
-			return {
-				content: [{ type: "text" as const, text: completion.text }],
-				details: completion.details,
-			};
+			return doSend();
 		},
 	});
 

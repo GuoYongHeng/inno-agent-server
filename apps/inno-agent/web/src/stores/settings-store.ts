@@ -1,6 +1,5 @@
 import { EventEmitter } from "./event-emitter.js";
-import { getSettings, switchBackendModel, upsertProvider, deleteProviderApi, deleteModelApi, saveChannelsSettings, saveMemorySettings, savePermissionMode as savePermissionModeApi, saveComputerUseSettings, saveCodemodeSettings, saveSmartInputSettings, saveMcpSettings, saveCloseBehavior, saveMarkdownSettings, saveGithubSettings, saveOcrSettings, saveTavilySettings, saveContentHubSettings, type MemorySettingsPatch, type ContentHubPayload, type OcrSettingsPayload } from "../api/settings.js";
-import type { WindowCloseBehavior, PermissionPolicyMode } from "../types/settings.js";
+import { getSettings, switchBackendModel, upsertProvider, deleteProviderApi, deleteModelApi, saveChannelsSettings, saveMemorySettings, saveSmartInputSettings, saveMarkdownSettings, saveGithubSettings, saveTavilySettings, saveSandboxSettings, type MemorySettingsPatch, type SandboxSettingsPayload } from "../api/settings.js";
 import type { InnoSettings, SmartInputSettings, UpsertProviderRequest, ChannelsSettingsPayload } from "../types/settings.js";
 
 interface SettingsStoreEvents {
@@ -15,15 +14,9 @@ class SettingsStoreImpl extends EventEmitter<SettingsStoreEvents> {
 	isSavingChannels = false;
 	isSavingMemory = false;
 	isSavingGithub = false;
-	isSavingOcr = false;
 	isSavingTavily = false;
-	isSavingContentHub = false;
-	isSavingPermissionMode = false;
-	isSavingComputerUse = false;
-	isSavingCodemode = false;
+	isSavingSandbox = false;
 	isSavingSmartInput = false;
-	isSavingMcp = false;
-	isSavingCloseBehavior = false;
 	isSavingMarkdown = false;
 	error: string | null = null;
 
@@ -147,54 +140,6 @@ class SettingsStoreImpl extends EventEmitter<SettingsStoreEvents> {
 		}
 	}
 
-	async saveComputerUse(enabled: boolean): Promise<void> {
-		this.isSavingComputerUse = true;
-		this.error = null;
-		this.emit("change", undefined);
-		try {
-			this.settings = await saveComputerUseSettings(enabled);
-		} catch (err) {
-			this.error = err instanceof Error ? err.message : "Failed to save computer-use setting";
-			this.emit("change", undefined);
-			throw err;
-		} finally {
-			this.isSavingComputerUse = false;
-			this.emit("change", undefined);
-		}
-	}
-
-	async saveCodemode(enabled: boolean): Promise<void> {
-		this.isSavingCodemode = true;
-		this.error = null;
-		this.emit("change", undefined);
-		try {
-			this.settings = await saveCodemodeSettings(enabled);
-		} catch (err) {
-			this.error = err instanceof Error ? err.message : "Failed to save codemode setting";
-			this.emit("change", undefined);
-			throw err;
-		} finally {
-			this.isSavingCodemode = false;
-			this.emit("change", undefined);
-		}
-	}
-
-	async savePermissionMode(mode: PermissionPolicyMode): Promise<void> {
-		this.isSavingPermissionMode = true;
-		this.error = null;
-		this.emit("change", undefined);
-		try {
-			this.settings = await savePermissionModeApi(mode);
-		} catch (err) {
-			this.error = err instanceof Error ? err.message : "Failed to save permission mode";
-			this.emit("change", undefined);
-			throw err;
-		} finally {
-			this.isSavingPermissionMode = false;
-			this.emit("change", undefined);
-		}
-	}
-
 	async saveSmartInput(payload: SmartInputSettings): Promise<void> {
 		this.isSavingSmartInput = true;
 		this.error = null;
@@ -207,38 +152,6 @@ class SettingsStoreImpl extends EventEmitter<SettingsStoreEvents> {
 			throw err;
 		} finally {
 			this.isSavingSmartInput = false;
-			this.emit("change", undefined);
-		}
-	}
-
-	async saveMcp(enabled: boolean): Promise<void> {
-		this.isSavingMcp = true;
-		this.error = null;
-		this.emit("change", undefined);
-		try {
-			this.settings = await saveMcpSettings(enabled);
-		} catch (err) {
-			this.error = err instanceof Error ? err.message : "Failed to save MCP setting";
-			this.emit("change", undefined);
-			throw err;
-		} finally {
-			this.isSavingMcp = false;
-			this.emit("change", undefined);
-		}
-	}
-
-	async saveCloseBehavior(closeBehavior: WindowCloseBehavior): Promise<void> {
-		this.isSavingCloseBehavior = true;
-		this.error = null;
-		this.emit("change", undefined);
-		try {
-			this.settings = await saveCloseBehavior(closeBehavior);
-		} catch (err) {
-			this.error = err instanceof Error ? err.message : "Failed to save close behavior";
-			this.emit("change", undefined);
-			throw err;
-		} finally {
-			this.isSavingCloseBehavior = false;
 			this.emit("change", undefined);
 		}
 	}
@@ -275,21 +188,6 @@ class SettingsStoreImpl extends EventEmitter<SettingsStoreEvents> {
 		}
 	}
 
-	async saveOcr(payload: OcrSettingsPayload): Promise<void> {
-		this.isSavingOcr = true;
-		this.error = null;
-		this.emit("change", undefined);
-		try {
-			this.settings = await saveOcrSettings(payload);
-		} catch (err) {
-			this.error = err instanceof Error ? err.message : "Failed to save OCR settings";
-			this.emit("change", undefined);
-			throw err;
-		} finally {
-			this.isSavingOcr = false;
-			this.emit("change", undefined);
-		}
-	}
 
 	async saveTavily(apiKey: string): Promise<void> {
 		this.isSavingTavily = true;
@@ -307,21 +205,22 @@ class SettingsStoreImpl extends EventEmitter<SettingsStoreEvents> {
 		}
 	}
 
-	async saveContentHub(payload: ContentHubPayload): Promise<void> {
-		this.isSavingContentHub = true;
+	async saveSandbox(payload: SandboxSettingsPayload): Promise<void> {
+		this.isSavingSandbox = true;
 		this.error = null;
 		this.emit("change", undefined);
 		try {
-			this.settings = await saveContentHubSettings(payload);
+			this.settings = await saveSandboxSettings(payload);
 		} catch (err) {
-			this.error = err instanceof Error ? err.message : "Failed to save content hub settings";
+			this.error = err instanceof Error ? err.message : "Failed to save sandbox settings";
 			this.emit("change", undefined);
 			throw err;
 		} finally {
-			this.isSavingContentHub = false;
+			this.isSavingSandbox = false;
 			this.emit("change", undefined);
 		}
 	}
+
 }
 
 export const settingsStore = new SettingsStoreImpl();

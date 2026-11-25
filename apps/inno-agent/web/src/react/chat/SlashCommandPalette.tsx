@@ -1,5 +1,5 @@
 import { useEffect, useRef, type ReactNode } from "react";
-import { FilePlus2, Cpu, TerminalSquare, Zap, GraduationCap, BookOpen, CalendarClock, Puzzle, Settings, History, BookmarkPlus } from "lucide-react";
+import { FilePlus2, Cpu, TerminalSquare, Zap, BookOpen, CalendarClock, Puzzle, Settings, History, BookmarkPlus } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { SlashPaletteEntry } from "./slash-palette-utils.js";
 
@@ -14,7 +14,6 @@ export interface SlashCommandPaletteProps {
 const APP_ACTION_ICONS = {
 	"new-chat": <FilePlus2 size={15} />,
 	model: <Cpu size={15} />,
-	profile: <GraduationCap size={15} />,
 	jobs: <CalendarClock size={15} />,
 	skills: <Puzzle size={15} />,
 	settings: <Settings size={15} />,

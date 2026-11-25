@@ -1,23 +1,23 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { PassThrough } from "node:stream";
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RuntimePaths } from "../../runtime.js";
 import { streamRegistry } from "../../chat/stream-registry.js";
 import { WorkspaceRegistry } from "../../workspace/workspace-registry.js";
-import { recordWorkspaceFileAccess, resetWorkspaceActivityStoreForTests } from "../workspace-activity-store.js";
+import { recordWorkspaceFileAccess } from "../workspace-activity-store.js";
+import { FileStateKv } from "../../tenants/state-store.js";
+import { FakeTenantStore, ctxA } from "../../workspace/fake-tenant-store.js";
+import { setRequestTenant } from "../../tenants/http.js";
+import type { TenantStore } from "../../tenants/store.js";
 import { handleWorkspacesRoutes, type WorkspacesRouteContext } from "./workspaces.js";
-
-vi.mock("../../agent/pi-runner.js", async (importOriginal) => {
-	const original = await importOriginal<typeof import("../../agent/pi-runner.js")>();
-	return { ...original, getCurrentSessionId: () => "other-session.jsonl" };
-});
 
 function fakeReq(payload: unknown): HttpReq & PassThrough {
 	const stream = new PassThrough() as HttpReq & PassThrough;
 	stream.headers = {};
 	stream.end(JSON.stringify(payload));
+	setRequestTenant(stream, ctxA, ctx.tenantStore);
 	return stream;
 }
 
@@ -41,7 +41,6 @@ function fakeRes(): ServerResponse & { statusCode: number; body: () => unknown }
 let dir: string;
 let dataDir: string;
 let sessionId: string;
-let sessionPath: string;
 let registry: WorkspaceRegistry;
 let sourceRoot: string;
 let targetId: string;
@@ -51,34 +50,30 @@ beforeEach(() => {
 	dir = mkdtempSync(`${tmpdir()}/workspace-route-`);
 	dataDir = `${dir}/data`;
 	const workspaceDir = `${dir}/workspaces`;
-	registry = new WorkspaceRegistry(workspaceDir, dataDir);
+	registry = new WorkspaceRegistry(workspaceDir);
 	registry.ensureBootstrapped();
 	const source = registry.createWorkspace({ name: "源工作区" });
 	const target = registry.createWorkspace({ name: "目标工作区" });
 	targetId = target.id;
-	sessionId = "route-session.jsonl";
+	sessionId = "durable-route-session";
 	registry.bindSession(sessionId, source.id);
 	sourceRoot = registry.resolveWorkspaceDir(source.id)!;
-	sessionPath = `${dataDir}/sessions/${sessionId}`;
-	mkdirSync(`${dataDir}/sessions`, { recursive: true });
-	writeFileSync(sessionPath, "history\n");
-	resetWorkspaceActivityStoreForTests();
 	ctx = {
+		tenantStore: new FakeTenantStore() as unknown as TenantStore,
 		workspaceRegistry: registry,
-		dataDir,
+		stateKv: new FileStateKv(dataDir),
 		paths: {} as RuntimePaths,
 		installSkillZip: () => { throw new Error("not used"); },
 		installSkillMarkdown: () => { throw new Error("not used"); },
 		importWorkspaceZip: () => { throw new Error("not used"); },
 		scheduleSkillsReload: () => undefined,
-		sessionFileFromId: (_sessionDir, id) => id === sessionId ? sessionPath : null,
-		releaseQueueFromQuestionBlockedTurn: () => undefined,
-		runQueueOpWithTimeout: async () => null,
+		durableSessions: {
+			get: (_req: unknown, id: string) => id === sessionId ? { id, messageCount: 2 } : undefined,
+		} as never,
 	};
 });
 
 afterEach(() => {
-	resetWorkspaceActivityStoreForTests();
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -86,7 +81,7 @@ describe("session workspace switch routes", () => {
 	it("previews tracked files and binds only after the confirmed switch", async () => {
 		writeFileSync(`${sourceRoot}/notes.md`, "keep me");
 		writeFileSync(`${sourceRoot}/move.md`, "move me");
-		recordWorkspaceFileAccess(dataDir, {
+		await recordWorkspaceFileAccess(new FileStateKv(dataDir), {
 			sessionId,
 			workspaceId: registry.getSessionWorkspaceId(sessionId),
 			workspaceRoot: sourceRoot,

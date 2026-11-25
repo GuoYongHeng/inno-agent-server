@@ -1,5 +1,4 @@
-import { readdirSync, type Dirent } from "node:fs";
-import { join } from "node:path";
+import { l2Store, type L2Target } from "./l2-backend.js";
 
 const ROOT_NON_PAGE_FILES = new Set([
 	"wiki/index.md",
@@ -14,25 +13,9 @@ const ROOT_NON_PAGE_FILES = new Set([
  * built-in folders. Schema-defined page types may live in arbitrary safe
  * subdirectories beneath `wiki/`.
  */
-export function listWikiPagePaths(l2DataDir: string): string[] {
-	const root = join(l2DataDir, "wiki");
-	const paths: string[] = [];
-	const visit = (absoluteDir: string, relativeDir: string): void => {
-		let entries: Dirent[];
-		try {
-			entries = readdirSync(absoluteDir, { withFileTypes: true }) as Dirent[];
-		} catch {
-			return;
-		}
-		for (const entry of entries) {
-			const relativePath = `${relativeDir}/${entry.name}`.replaceAll("\\", "/");
-			if (entry.isDirectory()) {
-				visit(join(absoluteDir, entry.name), relativePath);
-			} else if (entry.isFile() && entry.name.endsWith(".md") && !ROOT_NON_PAGE_FILES.has(relativePath)) {
-				paths.push(relativePath);
-			}
-		}
-	};
-	visit(root, "wiki");
-	return paths.sort((a, b) => a.localeCompare(b, "zh-CN"));
+export async function listWikiPagePaths(target: L2Target): Promise<string[]> {
+	const paths = await l2Store(target).listPaths("wiki");
+	return paths
+		.filter((path) => path.endsWith(".md") && !ROOT_NON_PAGE_FILES.has(path))
+		.sort((a, b) => a.localeCompare(b, "zh-CN"));
 }

@@ -16,8 +16,8 @@ channelRegistry.register({
 	parse: async () => null,
 	reply: async () => {},
 	push: async () => {},
-	sendFile: async (_target, filePath) => {
-		console.log(`file-sent-before-outbox-commit:${readFileSync(filePath, "utf-8")}`);
+	sendFile: async (_target, file) => {
+		console.log(`file-sent-before-outbox-commit:${typeof file === "string" ? readFileSync(file, "utf-8") : Buffer.from(file.bytes).toString("utf-8")}`);
 		process.kill(process.pid, "SIGKILL");
 	},
 });

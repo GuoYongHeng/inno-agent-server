@@ -20,9 +20,10 @@ afterEach(() => {
 });
 
 describe("AuthGate", () => {
-	it("renders local mode without requiring an account", async () => {
+	it("renders the app for a signed-in session", async () => {
 		vi.stubGlobal("fetch", vi.fn().mockResolvedValue(sessionResponse({
-			mode: "local", allowSignUp: false, durableEnabled: true, user: null,
+			mode: "better-auth", allowSignUp: false, durableEnabled: true,
+			user: { userId: "u1", email: "a@example.com", name: "A" },
 		})));
 		render(<AuthGate><div>protected app</div></AuthGate>);
 		expect(await screen.findByText("protected app")).toBeTruthy();

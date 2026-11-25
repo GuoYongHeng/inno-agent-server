@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChannelRegistry } from "../channels/channel.js";
 import { CronScheduler } from "./cron-scheduler.js";
 import { executeJob } from "./job-runner.js";
-import { JobStore } from "./job-store.js";
+import { FileJobStore } from "./job-store.js";
 import type { ScheduledJob } from "./types.js";
 
 vi.mock("./job-runner.js", () => ({
@@ -23,33 +23,31 @@ afterEach(() => {
 });
 
 describe("CronScheduler runtime targets", () => {
-	it("preserves local legacy execution while passing durable targets and executor", async () => {
+	it("gives every run a durable session and passes the executor", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "inno-cron-runtime-"));
 		dirs.push(dir);
-		const store = new JobStore(dir, "UTC");
-		const legacy = store.create({
-			name: "legacy", cron: "* * * * *", timezone: "UTC", enabled: true,
-			taskType: "custom_prompt", prompt: "legacy prompt",
+		const store = new FileJobStore(dir, "UTC");
+		const first = await store.create({
+			name: "first", cron: "* * * * *", timezone: "UTC", enabled: true,
+			taskType: "custom_prompt", prompt: "first prompt",
 		});
-		const durable = store.create({
-			name: "durable", cron: "* * * * *", timezone: "UTC", enabled: true,
-			taskType: "custom_prompt", prompt: "durable prompt", runtime: "durable",
+		const second = await store.create({
+			name: "second", cron: "* * * * *", timezone: "UTC", enabled: true,
+			taskType: "custom_prompt", prompt: "second prompt", runtime: "durable",
 		});
 		const durableExecutor = vi.fn(async () => "durable done");
 		const scheduler = new CronScheduler(store, new ChannelRegistry(), undefined, {
-			createSession: async (job) => job.runtime === "durable"
-				? { id: "durable-scheduled", runtime: "durable" }
-				: null,
+			createSession: async (job) => ({ id: `durable-${job.id}`, runtime: "durable" as const }),
 			durableExecutor,
 		});
 		schedulers.push(scheduler);
 		await scheduler.tick();
 		await vi.waitFor(() => expect(vi.mocked(executeJob)).toHaveBeenCalledTimes(2));
-		const legacyCall = vi.mocked(executeJob).mock.calls.find((call) => call[0].id === legacy.id);
-		const durableCall = vi.mocked(executeJob).mock.calls.find((call) => call[0].id === durable.id);
-		expect(legacyCall?.[5]).toMatchObject({ sessionPath: undefined, sessionId: undefined, sessionRuntime: undefined });
-		expect(durableCall?.[5]).toMatchObject({
-			sessionPath: undefined, sessionId: "durable-scheduled", sessionRuntime: "durable", durableExecutor,
-		});
+		for (const job of [first, second]) {
+			const call = vi.mocked(executeJob).mock.calls.find((entry) => entry[0].id === job.id);
+			expect(call?.[5]).toMatchObject({
+				sessionId: `durable-${job.id}`, sessionRuntime: "durable", durableExecutor,
+			});
+		}
 	});
 });

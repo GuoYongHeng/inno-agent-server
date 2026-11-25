@@ -2,7 +2,6 @@
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MarkdownArtifact } from "./MarkdownArtifact.js";
-import { terminalStore } from "../stores/terminal-store.js";
 
 vi.mock("react-i18next", () => ({
 	useTranslation: () => ({
@@ -12,7 +11,6 @@ vi.mock("react-i18next", () => ({
 
 afterEach(() => {
 	cleanup();
-	terminalStore.setHostTerminalDisabled(false);
 });
 
 if (typeof Element !== "undefined" && !Element.prototype.scrollTo) {
@@ -73,8 +71,7 @@ describe("code block header actions", () => {
 		expect(block?.querySelector('[data-streamdown="code-block-copy-button"]')).not.toBeNull();
 	});
 
-	it("hides Python run actions when authenticated host execution is disabled", async () => {
-		terminalStore.setHostTerminalDisabled(true);
+	it("never offers a Python run action", async () => {
 		const content = ["```python", "print(1)", "```"].join("\n");
 		const { container, getByRole, queryByRole } = render(<MarkdownArtifact content={content} />);
 

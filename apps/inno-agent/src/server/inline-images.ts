@@ -5,6 +5,32 @@ import type { ImageContent } from "@earendil-works/pi-ai";
 import { logger } from "../logger.js";
 import { resolveContainedPath } from "../utils/path-safety.js";
 
+export interface ChatImageRef {
+	workspacePath: string;
+	mimeType: string;
+}
+
+/** Browser uploads land in object storage first. The chat body may only name those files. */
+export function parseChatImageRefs(raw: unknown): ChatImageRef[] | null {
+	if (!Array.isArray(raw) || raw.length === 0) return null;
+	const first = raw[0];
+	if (!first || typeof first !== "object" || !("workspacePath" in first)) return null;
+	const refs: ChatImageRef[] = [];
+	for (const item of raw) {
+		if (!item || typeof item !== "object") throw new Error("Invalid chat image reference");
+		const record = item as { data?: unknown; workspacePath?: unknown; mimeType?: unknown };
+		if (typeof record.data === "string") throw new Error("Chat images must be workspace file references");
+		const workspacePath = typeof record.workspacePath === "string" ? record.workspacePath.trim() : "";
+		const mimeType = typeof record.mimeType === "string" ? record.mimeType.trim() : "";
+		if (!workspacePath.startsWith(".chat-images/") || workspacePath.includes("..") || workspacePath.includes("\\")) {
+			throw new Error(`Chat image path is not under .chat-images: ${workspacePath}`);
+		}
+		if (!mimeType.startsWith("image/")) throw new Error(`Chat image mime type is not an image: ${mimeType}`);
+		refs.push({ workspacePath, mimeType });
+	}
+	return refs;
+}
+
 export function parseInlineImages(raw: unknown): ImageContent[] {
 	if (!Array.isArray(raw)) return [];
 	return raw
@@ -61,11 +87,11 @@ export function persistInlineImages(images: ImageContent[], workspaceRoot: strin
 	return paths;
 }
 
-/** Text-only models receive workspace paths rather than native image blocks. */
+/** Workspace-path record of this turn's uploads, committed with the durable input. */
 export function buildImagePathsHint(imagePaths: string[]): string {
 	if (imagePaths.length === 0) return "";
 	const list = imagePaths.map((path) => `- ${path}`).join("\n");
-	return `[用户本轮上传了 ${imagePaths.length} 张图片，已保存到工作区：\n${list}\n如果需要识别图片中的文字（当前模型可能不支持图片识别），请调用 ocr_image 工具并传入上述路径。]`;
+	return `[用户本轮上传了 ${imagePaths.length} 张图片，已保存到工作区：\n${list}]`;
 }
 
 export function prependImagePathsHint(prompt: string, imagePaths: string[]): string {
@@ -75,4 +101,77 @@ export function prependImagePathsHint(prompt: string, imagePaths: string[]): str
 
 export function isImagePathsHint(text: string): boolean {
 	return text.startsWith("[用户本轮上传了 ");
+}
+
+const NATIVE_IMAGE_MARKER_START = "[inno-native-images]";
+const NATIVE_IMAGE_MARKER_END = "[/inno-native-images]";
+
+/** Path + mime list stored in the durable transcript instead of base64 image bytes. */
+export function formatNativeImageMarker(images: ReadonlyArray<{ workspacePath: string; mimeType: string }>): string {
+	const lines = images
+		.filter((image) => image.workspacePath.startsWith(".chat-images/") && !image.workspacePath.includes(".."))
+		.map((image) => `${image.workspacePath}\t${image.mimeType}`);
+	if (lines.length === 0) return "";
+	return `${NATIVE_IMAGE_MARKER_START}\n${lines.join("\n")}\n${NATIVE_IMAGE_MARKER_END}`;
+}
+
+export function isNativeImageMarker(text: string): boolean {
+	return text.startsWith(`${NATIVE_IMAGE_MARKER_START}\n`) && text.trimEnd().endsWith(NATIVE_IMAGE_MARKER_END);
+}
+
+export function parseNativeImageMarker(text: string): Array<{ workspacePath: string; mimeType: string }> {
+	if (!isNativeImageMarker(text)) return [];
+	const body = text.trimEnd().slice(NATIVE_IMAGE_MARKER_START.length, -NATIVE_IMAGE_MARKER_END.length).trim();
+	const images: Array<{ workspacePath: string; mimeType: string }> = [];
+	for (const line of body.split("\n")) {
+		const tab = line.indexOf("\t");
+		if (tab <= 0) continue;
+		const workspacePath = line.slice(0, tab);
+		const mimeType = line.slice(tab + 1);
+		if (!workspacePath.startsWith(".chat-images/") || workspacePath.includes("..") || workspacePath.includes("\\")) continue;
+		if (!mimeType.startsWith("image/")) continue;
+		images.push({ workspacePath, mimeType });
+	}
+	return images;
+}
+
+type ContentMessage = { role: string; content: unknown };
+
+/**
+ * Replace native-image markers with image blocks for one provider request.
+ * Returns undefined when nothing changed so callers keep the stored transcript.
+ */
+export async function expandNativeImageMarkers<T extends ContentMessage>(
+	messages: readonly T[],
+	load: (workspacePath: string, mimeType: string) => Promise<string | undefined>,
+): Promise<T[] | undefined> {
+	let changed = false;
+	const next: T[] = [];
+	for (const message of messages) {
+		if ((message.role !== "user" && message.role !== "toolResult") || !Array.isArray(message.content)) {
+			next.push(message);
+			continue;
+		}
+		const blocks: unknown[] = [];
+		let messageChanged = false;
+		for (const block of message.content as Array<{ type?: string; text?: string }>) {
+			if (block?.type === "text" && typeof block.text === "string" && isNativeImageMarker(block.text)) {
+				messageChanged = true;
+				for (const image of parseNativeImageMarker(block.text)) {
+					const data = await load(image.workspacePath, image.mimeType);
+					if (!data) continue;
+					blocks.push({ type: "image", data, mimeType: image.mimeType });
+				}
+				continue;
+			}
+			blocks.push(block);
+		}
+		if (!messageChanged) {
+			next.push(message);
+			continue;
+		}
+		changed = true;
+		next.push({ ...message, content: blocks });
+	}
+	return changed ? next : undefined;
 }

@@ -8,12 +8,11 @@
  * callers so a failure never breaks an archive.
  */
 
-import { join } from "node:path";
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ModelAuthProvider } from "./model-auth.js";
 
-import { ensureDir, writeText } from "../../storage/file-store.js";
+import { l2Store, type L2Target } from "./l2-backend.js";
 import { serializeFrontmatter, rebuildIndex } from "./wiki-maintainer.js";
 import { readManifest } from "./manifest-store.js";
 import { buildWikiGraph, computeWikiGraphStats, OVERVIEW_PATH, type WikiGraphStats } from "./wiki-graph.js";
@@ -96,7 +95,7 @@ const NARRATIVE_PROMPT = `你是学习 Wiki 知识库的总览撰写助手。根
 
 async function generateNarrative(
 	model: Model<any>,
-	modelRegistry: ModelRegistry,
+	modelRegistry: ModelAuthProvider,
 	statsText: string,
 ): Promise<string> {
 	try {
@@ -133,12 +132,13 @@ async function generateNarrative(
  * the overview is listed under 分析.
  */
 export async function regenerateOverview(
-	l2DataDir: string,
+	target: L2Target,
 	model?: Model<any>,
-	modelRegistry?: ModelRegistry,
+	modelRegistry?: ModelAuthProvider,
 ): Promise<string | null> {
 	try {
-		const stats = computeWikiGraphStats(buildWikiGraph(l2DataDir));
+		const store = l2Store(target);
+		const stats = computeWikiGraphStats(await buildWikiGraph(store));
 		if (stats.totalPages === 0) return null;
 
 		const deterministic = renderDeterministic(stats);
@@ -160,9 +160,8 @@ export async function regenerateOverview(
 			confidence: "medium",
 		});
 		const body = `\n# ${OVERVIEW_TITLE}\n\n${narrative ? `${narrative}\n\n` : ""}${deterministic}\n`;
-		ensureDir(join(l2DataDir, "wiki", "analysis"));
-		writeText(join(l2DataDir, OVERVIEW_PATH), fm + body);
-		rebuildIndex(l2DataDir, readManifest(l2DataDir));
+		await store.writeText(OVERVIEW_PATH, fm + body);
+		await rebuildIndex(store, await readManifest(store));
 		return OVERVIEW_PATH;
 	} catch (err) {
 		logger.warn({ err }, `[L2 overview] regeneration failed: ${err instanceof Error ? err.message : String(err)}`);

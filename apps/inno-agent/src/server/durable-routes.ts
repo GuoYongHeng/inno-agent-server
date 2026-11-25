@@ -1,11 +1,13 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
-import { unavailableContextUsage } from "../agent/context-usage.js";
-import type { UserInput } from "@earendil-works/pi-durable";
-import { DurableRuntimeDisabledError, DurableSessionBusyError, type DurableSessionService, type PreparedDurableAttachments, type PreparedDurableImages } from "../agent/durable-session-service.js";
+import { buildDurableUserInput } from "../agent/durable-user-input.js";
+import { contentDispositionAttachment } from "./file-helpers.js";
+import { sessionToMarkdown } from "./session-markdown.js";
+import { DurableBranchError } from "../agent/durable-runtime.js";
+import { DurableModelNotFoundError, DurableRuntimeDisabledError, DurableSessionBusyError, type DurableSessionService, type DurableSessionSummary, type PreparedDurableAttachments, type PreparedDurableImages } from "../agent/durable-session-service.js";
 import { DurableSseProjector } from "../agent/durable-projection.js";
-import type { DurableStreamStore } from "../agent/durable-stream-store.js";
-import type { QuestionBridgeResult } from "../agent/question-bridge.js";
-import type { PermissionDecision } from "../agent/permission-bridge.js";
+import type { StreamJournal } from "../agent/durable-stream-store.js";
+import type { QuestionBridgeResult } from "../agent/question-types.js";
+import type { PermissionDecision } from "../agent/permission-types.js";
 import {
 	hasCompleteTurnAfterBaseline,
 	streamRegistry,
@@ -14,16 +16,19 @@ import {
 	type StreamEventEnvelope,
 } from "../chat/stream-registry.js";
 import { logger } from "../logger.js";
-import { releaseRequestResource } from "../tenants/http.js";
+import { releaseRequestResource, requireRequestTenant } from "../tenants/http.js";
 import type { TenantStore } from "../tenants/store.js";
 import type { WorkspaceRegistry } from "../workspace/workspace-registry.js";
+import type { WorkspaceReplica } from "../workspace/workspace-replica.js";
 import { json, matchRoute, readBody } from "./http-helpers.js";
+import { createReplicaPushGate, workspaceChangePublisher } from "./replica-push.js";
 import { createWorkspaceChangeMonitor } from "./workspace-change-monitor.js";
 
 export interface DurableHttpContext {
 	service: DurableSessionService;
 	workspaceRegistry: WorkspaceRegistry;
-	tenantStore?: TenantStore | null;
+	tenantStore: TenantStore;
+	workspaceReplica?: WorkspaceReplica | null;
 }
 
 function errorStatus(error: unknown): number {
@@ -34,7 +39,7 @@ function errorStatus(error: unknown): number {
 
 interface DurableStreamContext {
 	state: SessionStreamState;
-	store: DurableStreamStore;
+	store: StreamJournal;
 }
 
 const durableProjections = new Map<string, Promise<void>>();
@@ -57,14 +62,14 @@ function finishDurableTurn(
 }
 
 /** Restore before any registry lookup that follows a process restart. */
-export function restoreDurableStream(
+export async function restoreDurableStream(
 	req: HttpReq,
 	service: DurableSessionService,
 	sessionId: string,
 	turnId?: string,
-): DurableStreamContext | undefined {
+): Promise<DurableStreamContext | undefined> {
 	const store = service.streamStore(req);
-	const restored = turnId ? store.load(sessionId, turnId) : store.latest(sessionId);
+	const restored = turnId ? await store.load(sessionId, turnId) : await store.latest(sessionId);
 	if (!restored) return undefined;
 	try {
 		const state = streamRegistry.restoreTurn(restored.snapshot, restored.history, restored.cancelRequested);
@@ -81,11 +86,12 @@ export function ensureDurableStreamProjection(
 	req: HttpReq,
 	service: DurableSessionService,
 	context: DurableStreamContext,
+	httpCtx?: DurableHttpContext,
 ): Promise<void> {
 	if (context.state.terminalEventPublished) return Promise.resolve();
 	const existing = durableProjections.get(context.state.turnId);
 	if (existing) return existing;
-	const operation = streamDurableTurn(req, context, service).finally(() => {
+	const operation = streamDurableTurn(req, context, service, httpCtx).finally(() => {
 		durableProjections.delete(context.state.turnId);
 	});
 	durableProjections.set(context.state.turnId, operation);
@@ -104,7 +110,7 @@ export async function handleDurableSessionResourceRoutes(
 ): Promise<boolean> {
 	if (url.includes("/workspace")) return false;
 	if (matchRoute("GET", method, url, "/api/sessions/:id/context-usage")) {
-		json(res, 200, unavailableContextUsage(id, "unavailable"));
+		json(res, 200, await ctx.service.contextUsage(req, id));
 		return true;
 	}
 	if (matchRoute("GET", method, url, "/api/sessions/:id")) {
@@ -134,8 +140,55 @@ export async function handleDurableSessionResourceRoutes(
 	if (matchRoute("PATCH", method, url, "/api/sessions/:id")) {
 		const body = await readBody(req) as Record<string, unknown>;
 		const name = typeof body.name === "string" ? body.name.trim() : "";
-		if (!name) { json(res, 400, { error: "Missing session topic" }); return true; }
-		json(res, 200, ctx.service.rename(req, id, name.slice(0, 120)));
+		const provider = typeof body.provider === "string" ? body.provider.trim() : "";
+		const modelId = typeof body.modelId === "string" ? body.modelId.trim() : "";
+		if ((provider && !modelId) || (!provider && modelId)) {
+			json(res, 400, { error: "provider and modelId must be given together" });
+			return true;
+		}
+		if (!name && !provider) { json(res, 400, { error: "Missing session topic or model" }); return true; }
+		let summary: DurableSessionSummary | undefined;
+		if (provider) {
+			try {
+				summary = await ctx.service.setModel(req, id, { provider, modelId });
+			} catch (error) {
+				if (error instanceof DurableModelNotFoundError) { json(res, 400, { error: error.message }); return true; }
+				throw error;
+			}
+		}
+		if (name) summary = await ctx.service.rename(req, id, name.slice(0, 120));
+		json(res, 200, summary);
+		return true;
+	}
+	if (matchRoute("GET", method, url, "/api/sessions/:id/export.md")) {
+		const detail = await ctx.service.snapshot(req, id);
+		const baseName = (detail.summary.name?.trim() || id).replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+		res.writeHead(200, {
+			"Content-Type": "text/markdown; charset=utf-8",
+			"Content-Disposition": contentDispositionAttachment(`${baseName}.md`),
+			"Cache-Control": "no-store",
+		});
+		res.end(sessionToMarkdown(detail.summary, detail.messages));
+		return true;
+	}
+	if (matchRoute("POST", method, url, "/api/sessions/:id/branch-before-message")) {
+		await restoreDurableStream(req, ctx.service, id);
+		if (streamRegistry.getActiveForSession(id)) {
+			json(res, 409, { error: "Cannot edit a message while the session is generating" });
+			return true;
+		}
+		const body = await readBody(req) as Record<string, unknown>;
+		const entryId = typeof body.entryId === "string" ? body.entryId.trim() : "";
+		if (!entryId) { json(res, 400, { error: "Missing message entryId" }); return true; }
+		try {
+			json(res, 200, await ctx.service.branchBeforeMessage(req, id, entryId));
+		} catch (error) {
+			if (error instanceof DurableBranchError) {
+				json(res, error.code === "entry_not_found" ? 404 : 409, { error: error.message, code: error.code });
+				return true;
+			}
+			throw error;
+		}
 		return true;
 	}
 	if (matchRoute("POST", method, url, "/api/sessions/:id/activate")) {
@@ -144,7 +197,7 @@ export async function handleDurableSessionResourceRoutes(
 		return true;
 	}
 	if (matchRoute("DELETE", method, url, "/api/sessions/:id")) {
-		restoreDurableStream(req, ctx.service, id);
+		await restoreDurableStream(req, ctx.service, id);
 		if (streamRegistry.getActiveForSession(id)) {
 			json(res, 409, { error: "Cannot delete a session with an active chat turn" });
 			return true;
@@ -164,11 +217,11 @@ export async function handleDurableSessionResourceRoutes(
 		return true;
 	}
 	if (matchRoute("POST", method, url, "/api/sessions/:id/archive")) {
-		json(res, 200, ctx.service.setArchived(req, id, true));
+		json(res, 200, await ctx.service.setArchived(req, id, true));
 		return true;
 	}
 	if (matchRoute("POST", method, url, "/api/sessions/:id/unarchive")) {
-		json(res, 200, ctx.service.setArchived(req, id, false));
+		json(res, 200, await ctx.service.setArchived(req, id, false));
 		return true;
 	}
 	json(res, 400, { error: "This legacy session operation is not supported for durable sessions" });
@@ -184,25 +237,29 @@ function startSse(res: ServerResponse): void {
 	});
 }
 
+function chatImagesAreEmbedded(raw: unknown): boolean {
+	return Array.isArray(raw) && raw.some((item) => item && typeof item === "object" && typeof (item as { data?: unknown }).data === "string");
+}
+
 function durableUserInput(
 	prompt: string,
 	attachments: PreparedDurableAttachments | null,
 	images: PreparedDurableImages | null,
 	recallContext: string,
-): UserInput {
-	if (!attachments && !images && !recallContext) return prompt;
-	const content: Exclude<UserInput, string> = [{ type: "text", text: prompt }];
-	content.push(...(images?.nativeImages ?? []));
-	if (images?.fallbackContext) content.push({ type: "text", text: images.fallbackContext });
-	if (attachments) content.push({ type: "text", text: attachments.context });
-	if (recallContext) content.push({ type: "text", text: recallContext });
-	return content;
+) {
+	return buildDurableUserInput(prompt, {
+		...(images?.vision ? { nativeImages: images.images } : {}),
+		...(images?.fallbackContext ? { fallbackContext: images.fallbackContext } : {}),
+		...(attachments ? { attachmentContext: attachments.context } : {}),
+		...(recallContext ? { recallContext } : {}),
+	});
 }
 
 async function streamDurableTurn(
 	req: HttpReq,
 	context: DurableStreamContext,
 	service: DurableSessionService,
+	httpCtx?: DurableHttpContext,
 ): Promise<void> {
 	const { state, store } = context;
 	const projector = new DurableSseProjector();
@@ -214,17 +271,31 @@ async function streamDurableTurn(
 		workspaceMonitor = null;
 	};
 	try {
-		const journal = store.load(state.sessionId, state.turnId);
+		const journal = await store.load(state.sessionId, state.turnId);
 		if (!journal) throw new Error("Durable stream journal not found");
 		lease = await service.lease(req, state.sessionId);
-		lease.runtime.bindQuestionTurn({
+		await lease.runtime.bindQuestionTurn({
 			turnId: state.turnId,
 			emit: (event) => publishDurableEvent(context, event),
 		});
-		lease.runtime.bindPermissionTurn({
+		await lease.runtime.bindPermissionTurn({
 			turnId: state.turnId,
 			emit: (event) => publishDurableEvent(context, event),
 		});
+		// Panel reads come from the manifest + object store in authenticated
+		// mode: push the local writes BEFORE publishing workspace_change so the
+		// browser's refetch never sees a missing file. Coalesced and bounded —
+		// a burst produces at most two pushes and a stalled push never blocks
+		// the stream. Only with a durable object provider + replica + tenant.
+		const requestTenant = requireRequestTenant(req);
+		const replica = httpCtx?.workspaceReplica ?? null;
+		const pushGate = replica && requestTenant && state.workspaceRoot
+			? createReplicaPushGate(async () => { await replica.push(requestTenant, state.workspaceId, state.workspaceRoot!); })
+			: null;
+		const publishChange = workspaceChangePublisher(
+			(event) => publishDurableEvent(context, event as ChatStreamEvent),
+			pushGate,
+		);
 		workspaceMonitor = createWorkspaceChangeMonitor(state.workspaceRoot, (event) => {
 			const changeEvent = event as {
 				type: string;
@@ -234,20 +305,18 @@ async function streamDurableTurn(
 			const paths = (changeEvent.changes ?? [])
 				.map((change) => typeof change.path === "string" ? change.path : "")
 				.filter(Boolean);
-			try {
-				service.recordWorkspaceWriteActivity(
-					req,
-					state.sessionId,
-					state.workspaceId,
-					state.workspaceRoot,
-					paths,
-					changeEvent.truncated === true,
-				);
-			} catch (error) {
+			void service.recordWorkspaceWriteActivity(
+				req,
+				state.sessionId,
+				state.workspaceId,
+				state.workspaceRoot,
+				paths,
+				changeEvent.truncated === true,
+			).catch((error: unknown) => {
 				logger.warn({ err: error, sessionId: state.sessionId, turnId: state.turnId }, "durable workspace activity write failed");
-			}
+			});
 			if (!state.terminalEventPublished) {
-				publishDurableEvent(context, { ...changeEvent, workspaceId: state.workspaceId } as ChatStreamEvent);
+				publishChange({ ...changeEvent, workspaceId: state.workspaceId });
 			}
 		});
 		const activeStream = await lease.runtime.watch(async (events) => {
@@ -279,9 +348,9 @@ async function streamDurableTurn(
 		if (submissionId === undefined) {
 			const submission = await lease.runtime.submit(journal.input, state.clientRequestId);
 			submissionId = submission.id;
-			store.markAdmitted(state.sessionId, state.turnId, submissionId);
+			await store.markAdmitted(state.sessionId, state.turnId, submissionId);
 		}
-		service.noteSubmission(req, state.sessionId, state.inputSnapshot.prompt);
+		await service.noteSubmission(req, state.sessionId, state.inputSnapshot.prompt);
 		// Cancellation can race durable admission. Re-apply the abort after the
 		// submission commits so an admitted queued input cannot escape it.
 		if (state.cancelRequested) await lease.runtime.abort();
@@ -289,6 +358,9 @@ async function streamDurableTurn(
 		await activeStream.stop();
 		stream = undefined;
 		await workspaceMonitor?.settle();
+		// Publish every pending workspace_change (replica push included) before the
+		// terminal event below, so `done` can never overtake a file refresh.
+		await publishChange.drain();
 		closeWorkspaceMonitor();
 		await lease.release();
 		lease = undefined;
@@ -380,15 +452,15 @@ export async function handleDurableChatRoutes(
 			json(res, 400, { error: "Missing or invalid sessionId, turnId, questionId or result" });
 			return true;
 		}
-		const status = ctx.service.respondQuestion(req, sessionId, { turnId, questionId, result });
+		const status = await ctx.service.respondQuestion(req, sessionId, { turnId, questionId, result });
 		let resumed = false;
 		if (status === "accepted") {
-			const restored = restoreDurableStream(req, ctx.service, sessionId, turnId);
+			const restored = await restoreDurableStream(req, ctx.service, sessionId, turnId);
 			const live = restored?.state ?? streamRegistry.getByTurn(turnId);
 			if (live?.sessionId === sessionId && (live.status === "queued" || live.status === "running")) {
 				// The original or recovered projection holds the runtime lease until
 				// the final response. Restart it if its previous owner disappeared.
-				if (restored) void ensureDurableStreamProjection(req, ctx.service, restored);
+				if (restored) void ensureDurableStreamProjection(req, ctx.service, restored, ctx);
 				resumed = true;
 			} else {
 				try {
@@ -421,15 +493,15 @@ export async function handleDurableChatRoutes(
 			json(res, 400, { error: "Missing sessionId, turnId, requestId or a valid decision" });
 			return true;
 		}
-		const status = ctx.service.respondPermission(req, sessionId, {
+		const status = await ctx.service.respondPermission(req, sessionId, {
 			turnId, requestId, decision: validDecision, ...(reason ? { reason } : {}),
 		});
 		let resumed = false;
 		if (status === "accepted") {
-			const restored = restoreDurableStream(req, ctx.service, sessionId, turnId);
+			const restored = await restoreDurableStream(req, ctx.service, sessionId, turnId);
 			const live = restored?.state ?? streamRegistry.getByTurn(turnId);
 			if (live?.sessionId === sessionId && (live.status === "queued" || live.status === "running")) {
-				if (restored) void ensureDurableStreamProjection(req, ctx.service, restored);
+				if (restored) void ensureDurableStreamProjection(req, ctx.service, restored, ctx);
 				resumed = true;
 			} else {
 				try {
@@ -454,33 +526,37 @@ export async function handleDurableChatRoutes(
 		const prompt = typeof body.prompt === "string" ? body.prompt : "";
 		const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
 		if (!prompt || !sessionId) { json(res, 400, { error: "Missing prompt or sessionId" }); return true; }
-		restoreDurableStream(req, ctx.service, sessionId);
+		if (chatImagesAreEmbedded(body.images)) {
+			json(res, 400, { error: "Chat images must be workspace file references" });
+			return true;
+		}
+		await restoreDurableStream(req, ctx.service, sessionId);
 		if (streamRegistry.getActiveForSession(sessionId)) {
 			json(res, 409, { error: "Session already has an active chat turn" });
 			return true;
 		}
-		if (ctx.service.pendingQuestion(req, sessionId)) {
+		if (await ctx.service.pendingQuestion(req, sessionId)) {
 			json(res, 409, { error: "This session has a pending question; answer it through the streaming UI" });
 			return true;
 		}
-		if (ctx.service.pendingPermission(req, sessionId)) {
+		if (await ctx.service.pendingPermission(req, sessionId)) {
 			json(res, 409, { error: "This session has a pending permission request; answer it through the streaming UI" });
 			return true;
 		}
 		const requestId = typeof body.clientRequestId === "string" && body.clientRequestId.trim()
 			? body.clientRequestId
 			: `http-${crypto.randomUUID()}`;
-		const attachments = ctx.service.prepareAttachments(req, sessionId, body.attachments);
-		const images = ctx.service.prepareImages(req, sessionId, body.images, requestId);
+		const attachments = await ctx.service.prepareAttachments(req, sessionId, body.attachments);
+		const images = await ctx.service.prepareImages(req, sessionId, body.images, requestId);
 		const recallContext = await ctx.service.prepareRecallContext(req, sessionId, prompt);
 		let lease: Awaited<ReturnType<DurableSessionService["lease"]>> | undefined;
 		try {
 			lease = await ctx.service.lease(req, sessionId);
-			lease.runtime.bindQuestionTurn({ turnId: requestId, noUi: true });
-			lease.runtime.bindPermissionTurn({ turnId: requestId, noUi: true });
-			ctx.service.recordTurnMetadata(req, sessionId, attachments, images, prompt, requestId);
+			await lease.runtime.bindQuestionTurn({ turnId: requestId, noUi: true });
+			await lease.runtime.bindPermissionTurn({ turnId: requestId, noUi: true });
+			await ctx.service.recordTurnMetadata(req, sessionId, attachments, images, prompt, requestId);
 			const submission = await lease.runtime.submit(durableUserInput(prompt, attachments, images, recallContext), requestId);
-			ctx.service.noteSubmission(req, sessionId, prompt);
+			await ctx.service.noteSubmission(req, sessionId, prompt);
 			const result = await lease.runtime.waitForSubmission(submission.id);
 			if (result.status !== "done") throw new Error(`Durable submission was unanswered: ${result.reason}`);
 			await ctx.service.snapshot(req, sessionId);
@@ -505,7 +581,11 @@ export async function handleDurableChatRoutes(
 		json(res, 400, { error: "Missing prompt, sessionId or clientRequestId" });
 		return true;
 	}
-	restoreDurableStream(req, ctx.service, sessionId);
+	if (chatImagesAreEmbedded(body.images)) {
+		json(res, 400, { error: "Chat images must be workspace file references" });
+		return true;
+	}
+	await restoreDurableStream(req, ctx.service, sessionId);
 	if (streamRegistry.getActiveForSession(sessionId)) {
 		json(res, 409, { error: "Session already has an active chat turn" });
 		return true;
@@ -513,8 +593,8 @@ export async function handleDurableChatRoutes(
 	const workspaceId = ctx.workspaceRegistry.getSessionWorkspaceId(sessionId);
 	const workspaceRoot = ctx.workspaceRegistry.resolveWorkspaceDir(workspaceId);
 	if (!workspaceRoot) { json(res, 404, { error: "Session workspace not found" }); return true; }
-	const attachments = ctx.service.prepareAttachments(req, sessionId, body.attachments);
-	const images = ctx.service.prepareImages(req, sessionId, body.images, clientRequestId);
+	const attachments = await ctx.service.prepareAttachments(req, sessionId, body.attachments);
+	const images = await ctx.service.prepareImages(req, sessionId, body.images, clientRequestId);
 	let baseline: Awaited<ReturnType<DurableSessionService["snapshot"]>>;
 	try {
 		baseline = await ctx.service.snapshot(req, sessionId);
@@ -544,13 +624,13 @@ export async function handleDurableChatRoutes(
 	try {
 		// Persist the exact model input before admission. If the process dies
 		// before the submission ID append, the same requestId reacquires it.
-		store.create(state, input);
+		await store.create(state, input);
 	} catch (error) {
 		streamRegistry.discardTurn(state);
 		json(res, 500, { error: error instanceof Error ? error.message : String(error) });
 		return true;
 	}
-	ctx.service.recordTurnMetadata(req, sessionId, attachments, images, prompt, clientRequestId);
+	await ctx.service.recordTurnMetadata(req, sessionId, attachments, images, prompt, clientRequestId);
 	publishDurableEvent(streamContext, { type: "stream_state", status: "queued" });
 	startSse(res);
 	let ended = false;
@@ -572,7 +652,7 @@ export async function handleDurableChatRoutes(
 		clearInterval(heartbeat);
 		unsubscribe();
 	});
-	await ensureDurableStreamProjection(req, ctx.service, streamContext);
+	await ensureDurableStreamProjection(req, ctx.service, streamContext, ctx);
 	finish();
 	streamRegistry.cleanupExpiredTurns();
 	return true;

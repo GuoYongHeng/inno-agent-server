@@ -1,6 +1,5 @@
 node_modules/
 dist/
-dist-electron/
 apps/*/dist/
 apps/*/web/dist/
 
@@ -37,3 +36,4 @@ apps/inno-agent/docs/
 *.key
 .env.*
 !.env.example
+.inno-scratch/

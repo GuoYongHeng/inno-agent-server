@@ -9,7 +9,6 @@ import { ModelsSettings } from "./ModelsSettings.js";
 import { MemorySettings } from "./MemorySettings.js";
 import { IntegrationsSettings } from "./IntegrationsSettings.js";
 import { ChannelsSettings } from "./ChannelsSettings.js";
-import { McpSettings } from "./McpSettings.js";
 import { AboutSettings } from "./AboutSettings.js";
 import { SmartInputSettings } from "./SmartInputSettings.js";
 
@@ -19,7 +18,6 @@ const TABS: { id: SettingsTab; icon: React.ReactNode }[] = [
 	{ id: "memory", icon: <Brain size={15} /> },
 	{ id: "integrations", icon: <Plug size={15} /> },
 	{ id: "channels", icon: <Radio size={15} /> },
-	{ id: "mcp", icon: <Blocks size={15} /> },
 	{ id: "lab", icon: <FlaskConical size={15} /> },
 	{ id: "about", icon: <Info size={15} /> },
 ];
@@ -113,7 +111,6 @@ export function SettingsOverlay() {
 							{activeSettingsTab === "memory" && settings && <MemorySettings settings={settings} />}
 							{activeSettingsTab === "integrations" && settings && <IntegrationsSettings settings={settings} />}
 							{activeSettingsTab === "channels" && settings && <ChannelsSettings settings={settings} />}
-							{activeSettingsTab === "mcp" && settings && <McpSettings settings={settings} />}
 							{activeSettingsTab === "about" && <AboutSettings />}
 						</>
 					)}

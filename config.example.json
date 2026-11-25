@@ -13,7 +13,10 @@
 					"id": "claude-sonnet-4-6",
 					"name": "Claude Sonnet 4.6 via InnoSpark",
 					"reasoning": true,
-					"input": ["text", "image"],
+					"input": [
+						"text",
+						"image"
+					],
 					"contextWindow": 200000,
 					"maxTokens": 16384
 				}
@@ -39,43 +42,34 @@
 	"bridge": {
 		"token": "replace-me-with-a-secret"
 	},
-	"subagents": {
-		"enabled": false
-	},
 	"contentHub": {
 		"type": "github",
 		"owner": "Chloris-Blaxk",
 		"repo": "inno-agent-hub",
 		"ref": "main",
 		"skillsPath": "skill-library",
-		"presetsPath": "workspace-templates",
 		"baseUrl": "",
 		"token": ""
 	},
-	"memory": {
-		"l1Enabled": true,
-		"l2Enabled": true,
-		"l3Enabled": true
+	"tavily": {
+		"apiKey": ""
 	},
-	"mcp": {
-		"enabled": false
+	"sandbox": {
+		"enabled": false,
+		"provider": "e2b",
+		"apiKey": "",
+		"requireApproval": "always",
+		"timeoutMinutes": 30,
+		"commandTimeoutSeconds": 600,
+		"allowInternetAccess": true,
+		"allowedDomains": [],
+		"limits": {
+			"maxConcurrent": 3,
+			"maxSandboxes": 20,
+			"maxActiveMinutesPerDay": 480
+		}
 	},
-	"ui": {
-		"theme": "light",
-		"closeBehavior": "ask",
-		"mathSingleDollar": false
-	},
-	"scheduler": {
-		"timezone": "Asia/Shanghai"
-	},
-	"ocrApi": {
-		"token": "",
-		"model": "PaddleOCR-VL-1.6",
-		"baseUrl": "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
-	},
-	"plugins": {
-		"todo": { "enabled": true },
-		"webAccess": { "enabled": true },
-		"codemode": { "enabled": false }
+	"presets": {
+		"dir": ""
 	}
 }

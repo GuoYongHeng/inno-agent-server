@@ -16,6 +16,8 @@ export interface SessionMeta {
 	origin?: SessionChannel;
 	runtime?: "legacy" | "durable";
 	archived?: boolean;
+	/** The model this session uses (durable sessions pin one per session). */
+	model?: { provider: string; id: string };
 	/** True once a topic (manual or auto-generated) has been recorded server-side. */
 	hasTopic?: boolean;
 	/** True while an auto-generated preview is waiting for its richer summary. */
@@ -105,22 +107,16 @@ export async function updateSessionName(id: string, name: string, generated = fa
 	});
 }
 
-export async function generateSessionName(id: string): Promise<SessionMeta> {
-	return apiFetch<SessionMeta>(`/api/sessions/${encodeURIComponent(id)}/generate-topic`, {
-		method: "POST",
+/** Switch the model of one session; it applies from the session's next message. */
+export async function updateSessionModel(id: string, provider: string, modelId: string): Promise<SessionMeta> {
+	return apiFetch<SessionMeta>(`/api/sessions/${encodeURIComponent(id)}`, {
+		method: "PATCH",
+		body: JSON.stringify({ provider, modelId }),
 	});
 }
 
-export interface ShowcaseExportResult {
-	ok: boolean;
-	caseId: string;
-	title: string;
-	/** Server-side dir the case JSON + assets + index.json were written to. */
-	casesDir: string;
-}
-
-export async function exportSessionShowcase(id: string): Promise<ShowcaseExportResult> {
-	return apiFetch<ShowcaseExportResult>(`/api/sessions/${encodeURIComponent(id)}/showcase-export`, {
+export async function generateSessionName(id: string): Promise<SessionMeta> {
+	return apiFetch<SessionMeta>(`/api/sessions/${encodeURIComponent(id)}/generate-topic`, {
 		method: "POST",
 	});
 }

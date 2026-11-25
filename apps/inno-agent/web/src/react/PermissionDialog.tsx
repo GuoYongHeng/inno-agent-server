@@ -12,7 +12,7 @@ function surfaceIcon(pending: PendingPermission) {
 	return <Wrench size={14} aria-hidden="true" />;
 }
 
-/** Approval card for a parked pi-permission-system `ask`. The agent loop is
+/** Approval card for a parked workspace write/edit approval. The agent loop is
  *  blocked until the user picks one of the three decisions; every dismissal
  *  path on the server (timeout, abort, turn end) resolves to a deny. */
 export function PermissionDialog({ pending }: { pending: PendingPermission }) {

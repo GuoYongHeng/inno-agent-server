@@ -43,7 +43,6 @@ vi.mock("./chat-store.js", () => ({
 }));
 vi.mock("./workspace-store.js", () => ({ workspaceStore: { setActiveWorkspace: vi.fn() } }));
 vi.mock("./workspaces-store.js", () => ({ workspacesStore: { load: vi.fn() } }));
-vi.mock("./terminal-store.js", () => ({ terminalStore: { disconnect: vi.fn() } }));
 vi.mock("../utils/mermaid-runtime.js", () => ({
 	hasMermaidFence: (content: string) => /```mermaid\b/i.test(content),
 	preloadMermaidMarkdownRuntime: mocks.preloadMermaidMarkdownRuntime,

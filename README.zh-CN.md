@@ -14,13 +14,12 @@
 
 ## 运行时边界
 
-当前有两条显式执行路径：
+所有对话只有一条执行路径——**pi-durable**：
 
-- **Legacy 兼容路径**——CLI、Desktop 和 local server 默认保留单例 `AgentSession`、JSONL 历史、宿主工具和串行 prompt queue，仍是最简单的个人运行方式。
-- **Durable 执行路径**——`INNO_DURABLE_ENABLED=true` 启用独立的 per-session SQLite runtime；多用户模式强制使用 Durable，不回退到 legacy 全局队列。支持独立会话并发、request-ID 去重、崩溃恢复、连续 SSE 回放、可恢复的问题卡/审批，以及 tenant-local memory/OCR/channel。
-- **经验证的租户隔离**——Better Auth + PostgreSQL 提供 personal tenant 和资源所有权。provider 凭证、记忆、工作区、频道和任务均使用 tenant 数据根；未认证返回 401，跨租户资源返回 404。authenticated 模式关闭宿主 shell/通用文件工具和 PTY。
+- **Durable 执行**——每个会话是独立的 PostgreSQL runtime（`ds_*`）。支持独立会话并发、request-ID 去重、崩溃恢复、连续 SSE 回放、可恢复的问题卡/审批、会话级换模型、编辑并重发历史消息，以及按租户隔离的记忆和渠道状态。早期的全局 `AgentSession` 运行时（CLI、bash 终端、MCP、子代理、系统级沙箱）已移除，旧的 JSONL 历史不再读取。
+- **经验证的租户隔离**——Better Auth + PostgreSQL 提供 personal tenant 和资源所有权。记忆、工作区、频道和任务均使用 tenant 数据根（provider 目录与凭据由服务端统一托管）；未认证返回 401，跨租户资源返回 404。任何模式下都没有宿主 shell 或终端，agent 只能在会话工作区内读写文件。
 - **单 owner 存储**——一个 durable storage 同时只有一个 owner。静态 tenant-owner 路由要求每个 worker 使用独立 RWO 数据根；不支持共享 SQLite/NFS active-active、自动 failover 或网络分区 fencing。
-- **明确的恢复语义**——已提交状态和应用 checkpoint 可以恢复，但模型调用、首次远端 OCR 提交、频道投递和部分文件 mutation 仍有 at-least-once crash window。
+- **明确的恢复语义**——已提交状态和应用 checkpoint 可以恢复，但模型调用、频道投递和部分文件 mutation 仍有 at-least-once crash window。
 
 架构、验证范围和剩余生产事项见[多用户 Durable 指南](./docs/MULTI_USER_DURABLE.md)与 [Durable 运行时契约](./docs/DURABLE_RUNTIME.md)。
 
@@ -28,20 +27,16 @@
 
 - 👥 **多用户 Durable 服务**——Better Auth + PostgreSQL personal tenant、独立会话并发、租户级凭证与存储、崩溃恢复、SSE 回放和可选静态 worker 路由。
 
-- 🧠 **三层记忆**
-  - **L1 学习者画像**——目标、知识状态、误解、偏好;每轮汇总为上下文包注入系统提示词。
+- 🧠 **两层记忆**
   - **L2 原生 wiki**——人类可读、agent 可查询的页面,混合检索(词法 BM25 + 知识图谱),LLM 辅助摘要,支持 PDF/Office/图片摄入。
   - **L3 会话检索**——会话历史索引进 SQLite(FTS5),按相关性阈值门控的跨对话召回。
 - ⏰ **主动调度器**——自然语言创建 cron 任务,可从 agent、UI 或守护进程触发。
 - 💬 **个人 IM 渠道**——飞书(原生)+ 微信(iLink 扫码登录或 bridge 模式),统一dispatcher 回推提醒。
-- 🧪 **练习实验室**——工作区级 Web 终端(xterm.js over WebSocket),运行记录可被 agent 读取。
 - 🎯 **简单模式 + 预设**——面向非技术用户的一键预设工作区(教案、PPT 制作、情景讲解)。
-- 🧩 **技能系统 + 内容中心**——从远程 hub(GitHub 仓库或自建 bundle 服务)浏览、导入技能与预设。
+- 🧩 **技能目录 + 内容中心**——平台技能在对象存储 + PostgreSQL（`tenant_skills` 启用）；远程 hub 仅作部署时导入源，用 `npm run skills:publish` 发布。预设随镜像打包（`presets.dir`）。
 - ✏️ **对话分支编辑**——重新编辑已发送的纯文本 Web 消息，并从该节点重新生成后续对话；旧分支不会进入当前模型上下文。
 - 🔌 **可插拔模型供应商**——任意 `openai-completions` 或 `anthropic-messages` 端点(Anthropic、OpenAI、DeepSeek、Ollama、本地模型),UI 内实时切换。
 - 🌍 **国际化与主题**——中/英文界面,四套主题。
-- 🛡️ **可选系统级沙箱**——通过 [pi-sandbox](https://github.com/carderne/pi-sandbox) 管控 bash/文件操作;可选 `pi-subagents` 子代理。
-- 🖥️ **电脑控制(桌面端)**——桌面应用可通过 [`pi-computer-use`](https://github.com/injaneity/pi-computer-use) 查看并操作本机屏幕(无障碍树优先);服务器部署默认关闭。见[电脑控制](#电脑控制-computer-use)。
 
 ## 快速开始
 
@@ -54,7 +49,7 @@ cd inno-agent-server
 npm install      # 从 npm 拉取 Pi SDK
 npm run build    # 编译后端 + 前端
 
-mkdir -p runtime/config runtime/data runtime/skills workspace
+mkdir -p runtime/config runtime/skills workspace
 cp config.example.json runtime/config/config.json
 # 编辑 runtime/config/config.json,填入 providers[*].apiKey
 
@@ -66,16 +61,13 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
 ### 方式 B —— Docker
 
 ```bash
-docker compose up -d   # 服务端口 3000,挂载 runtime/ 与 workspace/
+docker compose -f deploy/docker-compose.yml up -d   # 服务端口 3000,挂载 runtime/ 与 workspace/
 ```
 
 ## 运行模式
 
 ```bash
 npm run server          # Web UI(API + 已构建前端,端口 3000)
-npm run start           # CLI(纯终端 agent,无 HTTP)
-npm run electron        # 本地运行桌面应用
-npm run server:sandbox  # 带系统级沙箱的 Web UI(需要 ripgrep)
 
 # 开发模式:后端 :3000 + Vite 热更新 :5173
 npm run dev:server & npm run web:dev
@@ -86,18 +78,17 @@ npm run dev:server & npm run web:dev
 ### 多用户 Durable 服务
 
 ```bash
-export INNO_AUTH_MODE=better-auth
-export INNO_MULTI_USER_ENABLED=true
-export INNO_DURABLE_ENABLED=true
 export DATABASE_URL=postgresql://inno:inno@127.0.0.1:5432/inno
 export BETTER_AUTH_SECRET='replace-with-at-least-32-random-characters'
 export BETTER_AUTH_URL=http://127.0.0.1:3000
+# 多 worker / 重启后还要文件：INNO_OBJECT_STORAGE_PROVIDER=s3（或 fs）及对应 endpoint/bucket/key
+# 本机执行 bash：INNO_EXEC_BACKEND=local
 
 npm run auth:migrate --workspace inno-agent
 npm run server -- --home ./runtime --workspace ./workspace --port 3000
 ```
 
-每个账号在 Settings 中配置自己的 provider/model。该模式面向受控部署，不代表公网账号安全或生产容量已经验收。完整边界见[认证与租户隔离](./docs/AUTHENTICATION.md)和[多用户 Durable 指南](./docs/MULTI_USER_DURABLE.md)。
+Provider 目录由部署方在 `config.json` 中统一种子，账号只能在 Settings 中选择默认模型（provider 凭据、搜索 key、渠道端点均为服务端托管字段）。该模式面向受控部署，不代表公网账号安全或生产容量已经验收。完整边界见[认证与租户隔离](./docs/AUTHENTICATION.md)和[多用户 Durable 指南](./docs/MULTI_USER_DURABLE.md)。
 
 ## 配置
 
@@ -107,97 +98,68 @@ npm run server -- --home ./runtime --workspace ./workspace --port 3000
 {
   "defaultProvider": "innospark",
   "defaultModel": "claude-sonnet-4-6",
-  "providers": {
-    "innospark": {
-      "baseUrl": "https://api.example.com",
-      "api": "anthropic-messages",
-      "apiKey": "replace-me",
-      "models": [{ "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6" }]
-    }
-  },
   "server": { "port": 3000 },
-  "channels": {
-    "feishu": { "enabled": false },
-    "wechat": { "enabled": false, "mode": "ilink" }
-  },
-  "memory": { "l1Enabled": true, "l2Enabled": true, "l3Enabled": true },
-  "ui": { "theme": "light", "closeBehavior": "ask" }
+  "sandbox": { "enabled": false },
+  "presets": { "dir": "" }
 }
 ```
 
-每个供应商声明 `baseUrl`、`api`(`openai-completions` 或 `anthropic-messages`)、`apiKey` 和 `models[]` 列表。在 UI 中切换模型时,服务器会热更新此文件。
+`config.json` 是所有平台配置的唯一事实源：部署字段、固定默认模型、服务端托管目录（providers/apiKey、渠道端点与凭据、Tavily、内容中心）都在此声明。每个供应商声明 `baseUrl`、`api`(`openai-completions` 或 `anthropic-messages`)、`apiKey` 和 `models[]` 列表。运维将该文件注入容器；租户不可写——用户级默认值（memory、smartInput、UI 主题、scheduler 时区=Asia/Shanghai）硬编码在代码里，按租户在 `tenant_configs` 覆盖。此文件是服务端托管的模型目录——租户无法通过 API 或 UI 修改 provider，其默认模型选择按租户存于 PostgreSQL。
 
 ### 运行时路径
 
-CLI 与 server 都通过 `apps/inno-agent/src/runtime.ts` 解析路径。优先级:**CLI 参数 > 环境变量 > `~/.inno-agent/...`**。
+服务通过 `apps/inno-agent/src/runtime.ts` 解析路径。优先级:**命令行参数 > 环境变量 > `~/.inno-agent/...`**。
 
-| CLI 参数 | 环境变量 | 默认值 |
+| 参数 | 环境变量 | 默认值 |
 |---|---|---|
 | `--home` | `INNO_HOME` | `~/.inno-agent` |
 | `--config-dir` | `INNO_CONFIG_DIR` | `<home>/config` |
-| `--data` | `INNO_DATA_DIR` | `<home>/data` |
-| `--skills` | `INNO_SKILLS_DIR` | `<home>/skills` |
+| `--skills` | `INNO_SKILLS_DIR` | `<home>/skills`（镜像 seed / 本地兜底；正式目录在对象存储 `platform/skills/…`） |
 | `--workspace` | `INNO_WORKSPACE_DIR` | 调用时的工作目录 |
 | `--port` | `INNO_PORT` | `3000` |
 
-### 电脑控制(Computer Use)
+预设模板：`config.json` 的 `presets.dir`（默认 `<code>/presets`）。打开预设只建空工作区；`agent.md` 从镜像只读注入，`preset.json` 的 `skills` 绑定平台 catalog。  
+平台技能：`npm run skills:publish` 发布；租户通过 skills API 启用/禁用（`tenant_skills`）。  
+对象存储：**必填**（`fs` 或 `s3`），不写进 `config.example.json`，用 `INNO_OBJECT_STORAGE_*`（见 `.env.example`）。未配置时服务拒绝启动。
 
-桌面应用内置 GUI 电脑控制能力(基于 [`@injaneity/pi-computer-use`](https://github.com/injaneity/pi-computer-use)):agent 通过操作系统无障碍树观察窗口,并可执行点击、输入、滚动、浏览器操控。被动观察类工具始终放行;每个有副作用的动作(`act_ui`、浏览器启动/导航/页面内 JS)都会先弹出审批卡片。macOS 首次使用会安装已签名的 helper 到 `~/Applications/pi-computer-use.app`,需在 **系统设置 → 隐私与安全性** 中授予**辅助功能**与**屏幕录制**权限(授权后若未生效,执行 `pkill -f pi-computer-use.app` 重启 helper)。
+### 权限
 
-**开启 / 关闭:**
-
-- **桌面应用**——默认开启。在 **设置 → 通用 → 电脑控制** 中切换,然后重启应用(工具在会话启动时注册,更改在重启后生效)。
-- **本地服务器 / CLI**——默认关闭。带上桌面标记启动即可开启:
-
-  ```bash
-  INNO_DESKTOP=1 npm run server -- --home ./runtime --workspace ./workspace --port 3000
-  ```
-
-  要关闭,**不带 `INNO_DESKTOP` 重启服务**即可。
-- **显式覆盖**(优先级高于环境变量默认值,双向生效),在 `config.json` 中:
-
-  ```json
-  "plugins": { "computerUse": { "enabled": true } }
-  ```
-
-- **线上部署**——保持默认(不设置 `INNO_DESKTOP`)即为关闭。
+agent 没有 shell，也没有宿主机执行能力。文件工具（`read`、`write`、`edit`）被限制在会话工作区内——路径检查会解析符号链接，删除、重命名、追加都被拒绝。写入和编辑需要先审批：Web UI 弹出审批卡片（仅此次 / 本会话允许 / 拒绝），决定会被持久化，崩溃或重启后返回同一个答案而不会再弹卡；非流式或无头运行以 `no_ui` 拒绝。详见 [docs/PERMISSIONS.md](./docs/PERMISSIONS.md)。
 
 ### 内容中心(Content Hub)
 
-技能库与简单模式预设均从远程**内容中心**拉取——默认是公开 GitHub 仓库 [`Chloris-Blaxk/inno-agent-hub`](https://github.com/Chloris-Blaxk/inno-agent-hub)。在 `config.json` 的 `contentHub`(或 **设置 → 内容中心**)中可切换为私有 GitHub 仓库(`"type": "github"`)或自建 bundle 服务(`"type": "bundle"`)——零依赖的 bundle 服务器见 [`scripts/content-hub-server/`](./scripts/content-hub-server/)。预设下载后本地缓存,应用内置模板作为离线兜底。
+**平台技能**存放在对象存储 `platform/skills/<id>/<version>/`，元数据在 `skill_catalog`，租户启用关系在 `tenant_skills`；平台技能对租户只读+可启用。镜像内 `INNO_SKILLS_DIR` 会在启动时 seed 进目录；运维用 `npm run skills:publish` 发布更新（需 `DATABASE_URL` + 对象存储）。**租户自有技能**（Web 上传）存放在 `tenants/<tenantId>/skills/<id>/<version>/`，仅 owner 租户可见（`skill_catalog.owner_tenant_id`），可由 owner 编辑/删除——不会写入任何共享本地技能目录。远程**内容中心**（`contentHub`，默认 [`Chloris-Blaxk/inno-agent-hub`](https://github.com/Chloris-Blaxk/inno-agent-hub)）只是**部署时的分发渠道**：compose 的 `skills-init` 任务（或手动 `node dist/skills/import-hub-cli.js`）把 hub 里的技能一次性拉进平台 catalog；运行时不与 hub 通信，租户没有浏览/导入入口。简单模式预设不属于内容中心，由 `presets.dir` 配置。
 
 ## 架构
 
-四层结构：**用户界面 → 认证与租户应用层 → legacy 或 Durable agent 运行时 → 分层记忆。**
+四层结构：**用户界面 → 认证与租户应用层 → pi-durable agent 运行时 → 分层记忆。**
 
 ```text
-用户界面          CLI · Web UI (React) · 桌面应用 · 飞书 · 微信
+用户界面          Web UI (React) · 飞书 · 微信
         ↓
 应用层            Better Auth · personal tenant · ownership · HTTP/SSE
-                  渠道 · 调度器 · 工作区 · Practice Lab (local)
+                  渠道 · 调度器 · 工作区
         ↓
-Agent 运行时      Legacy PI AgentSession ──或── pi-durable session runtimes
-(PI SDK,未修改)   共享原生工具；legacy 独立反向适配器
+Agent 运行时      pi-durable（每个会话一份 PostgreSQL ds_* 存储）
+(PI SDK,未修改)   原生工具：记忆 · 文档 · 搜索 · 调度 · 渠道
         ↓
-分层记忆          L1 学习者画像 · L2 原生 wiki · L3 会话检索
-                  local 使用全局目录；多用户使用经验证的 tenant 数据根
+分层记忆          L2 wiki（文本在 PG，二进制在对象存储）· L3 会话检索（PG）
 ```
 
-- **Agent 核心**——legacy 使用 `@earendil-works/pi-coding-agent` 与 [`inno-extension.ts`](./apps/inno-agent/src/agent/inno-extension.ts)；Durable 使用独立的 `pi-durable` runtime，不经过 legacy 全局 prompt queue。memory/OCR/channel 工具使用原生 `(params, api, context)` ABI，legacy 仅通过独立反向适配器复用。PI SDK 内核不被修改。
-- **多用户与恢复**——Better Auth + PostgreSQL 验证身份和所有权。Durable 提供 per-session SQLite、request-ID 去重、应用 SSE journal、问题/审批恢复和独立会话并发。详见[多用户 Durable 指南](./docs/MULTI_USER_DURABLE.md)。
-- **记忆**——L1(`src/memory/learner/`):证据驱动的画像 + 事件日志。L2(`src/memory/l2/`):带图谱、摘要、文档摄入与混合检索的结构化 wiki,经 agent 工具和 `/api/wiki/*` 暴露。L3(`src/memory/l3/`):tenant-scoped SQLite FTS5 索引,覆盖 owned legacy JSONL 与已提交的 Durable 历史。
-- **调度器**(`src/scheduler/`)——cron 任务持久化到 `jobs.json` + `runs.jsonl`。
+- **Agent 核心**——独立的 `pi-durable` runtime；工具使用原生 `(params, api, context)` ABI。PI SDK 内核未修改。详见 [docs/DURABLE_RUNTIME.md](./docs/DURABLE_RUNTIME.md)。
+- **多用户与恢复**——Better Auth + PostgreSQL 验证身份和所有权。Durable 存储是 PostgreSQL（`ds_*`），带 request-ID 去重、SSE journal、问题/审批恢复。同一会话同一时刻只有一个 owner。详见[多用户 Durable 指南](./docs/MULTI_USER_DURABLE.md)。
+- **记忆**——L2（`src/memory/l2/`）：结构化 wiki，正文在 PostgreSQL，二进制原件在对象存储。L3（`src/memory/l3/`）：按租户的 PostgreSQL BM25 会话索引。
+- **调度器**（`src/scheduler/`）——cron 在 `tenant_jobs` / `tenant_job_runs`。延迟倒计时是进程内定时器。每次 agent 运行都在 durable 会话中执行。
 - **渠道**(`src/channels/`)——`ChannelRegistry`,支持飞书、微信(iLink / bridge)、QQ(bridge)。
-- **HTTP 服务**(`src/server.ts`)——原生 Node `http.createServer`,SSE 流式对话 + WebSocket 终端;路由表见 [`apps/inno-agent/README.md`](./apps/inno-agent/README.md)。
+- **HTTP 服务**(`src/server.ts`)——原生 Node `http.createServer`,SSE 流式对话;路由表见 [`apps/inno-agent/README.md`](./apps/inno-agent/README.md)。
 - **Web UI**(`web/src/`)——React 19 + Tailwind 4。状态在框架无关的 `EventEmitter` stores(`web/src/stores/`),REST/SSE 调用在 `web/src/api/`。
 
 ## 仓库结构
 
 ```text
-apps/inno-agent/           后端(CLI + HTTP 服务),TypeScript → dist/
+apps/inno-agent/           后端(HTTP 服务),TypeScript → dist/
 apps/inno-agent/web/       前端(React 19 + Tailwind 4 + Vite)
 apps/inno-agent/presets/   内置预设工作区(离线兜底)
-electron/                  Electron 主进程(桌面应用)
 scripts/content-hub-server/  自建内容中心 bundle 服务
 runtime/                   本地运行时状态(配置、数据、技能)—— gitignored
 workspace/                 默认 agent 工作目录 —— gitignored
@@ -209,20 +171,25 @@ workspace/                 默认 agent 工作目录 —— gitignored
 
 ```bash
 INNO_CONFIG_DIR=/etc/inno-agent \
-INNO_DATA_DIR=/var/lib/inno-agent/data \
 INNO_SKILLS_DIR=/var/lib/inno-agent/skills \
 INNO_WORKSPACE_DIR=/srv/inno-workspace \
 INNO_PORT=3000 \
+# 对象存储为必填（fs 或 s3——未配置时服务拒绝启动）：
+INNO_OBJECT_STORAGE_PROVIDER=s3 \
+INNO_OBJECT_STORAGE_ENDPOINT=... \
+INNO_OBJECT_STORAGE_BUCKET=... \
+INNO_OBJECT_STORAGE_ACCESS_KEY_ID=... \
+INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY=... \
 npm run server
 ```
 
-提供 [`Dockerfile`](./Dockerfile) 与 [`docker-compose.yml`](./docker-compose.yml) 作为起点；完整依赖说明见 [`docs/SYSTEM_DEPENDENCIES.md`](./docs/SYSTEM_DEPENDENCIES.md)。Better Auth + PostgreSQL、租户隔离和公网账号限制见 [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md)；Durable 架构、静态 worker 路由、验收结果和单 owner 部署边界见 [`docs/MULTI_USER_DURABLE.md`](./docs/MULTI_USER_DURABLE.md)。桌面打包说明见 [`ELECTRON_BUILD.md`](./ELECTRON_BUILD.md)。
+提供 [`deploy/Dockerfile.backend`](./deploy/Dockerfile.backend)（后端 API）、[`deploy/Dockerfile.frontend`](./deploy/Dockerfile.frontend)（nginx + 前端）与 [`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 作为起点；完整依赖说明见 [`docs/SYSTEM_DEPENDENCIES.md`](./docs/SYSTEM_DEPENDENCIES.md)。Better Auth + PostgreSQL、租户隔离和公网账号限制见 [`docs/AUTHENTICATION.md`](./docs/AUTHENTICATION.md)；Durable 架构、静态 worker 路由、验收结果和单 owner 部署边界见 [`docs/MULTI_USER_DURABLE.md`](./docs/MULTI_USER_DURABLE.md)。
 
 ## 使用案例与文档
 
 - [多用户 Durable 架构与验收](./docs/MULTI_USER_DURABLE.md)——重构目标、租户边界、恢复语义、真实服务验收和生产缺口。
 - [Durable 运行时契约](./docs/DURABLE_RUNTIME.md)——存储、重放、工具、调度和频道实现细节。
-- [认证与租户隔离](./docs/AUTHENTICATION.md)——Better Auth 配置、显式 legacy-owner 迁移和账号安全边界。
+- [认证与租户隔离](./docs/AUTHENTICATION.md)——Better Auth 配置和账号安全边界。
 - [技能教程 —— 构建工作区 Agent](./docs/use-cases/skill-tutorial.md)——用 `agent.md` 和 `.skills/` 构建工作区范围的自定义学习 agent。
 - [QUICKSTART.md](./QUICKSTART.md)——5 分钟上手指南。
 - [apps/inno-agent/README.md](./apps/inno-agent/README.md)——后端 API 路由表。

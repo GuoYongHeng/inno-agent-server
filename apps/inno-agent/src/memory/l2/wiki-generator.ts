@@ -4,13 +4,12 @@
  * prompts describe the desired page behavior without exposing storage fields
  * to the model.
  */
-import { basename, dirname, join, normalize } from "node:path";
-import { existsSync } from "node:fs";
+import { basename, normalize } from "node:path";
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ModelAuthProvider } from "./model-auth.js";
 
-import { ensureDir, readJsonl, readText, writeJsonl, writeText } from "../../storage/file-store.js";
+import { l2Store, type L2Backend, type L2Target } from "./l2-backend.js";
 import { logger } from "../../logger.js";
 import type { ManifestEntry } from "./types.js";
 import { getSourcePagePath, parseFrontmatter } from "./wiki-maintainer.js";
@@ -425,10 +424,18 @@ export function parseGeneratedReviewBlocks(text: string, entry: Pick<ManifestEnt
 	return reviews;
 }
 
-function replaceSourceReviews(l2DataDir: string, entry: ManifestEntry, reviews: WikiIngestReview[]): void {
-	const reviewPath = join(l2DataDir, "reviews.jsonl");
-	const retained = readJsonl<WikiIngestReview>(reviewPath).filter((review) => review.sourceId !== entry.id);
-	writeJsonl(reviewPath, [...retained, ...reviews]);
+async function replaceSourceReviews(store: L2Backend, entry: ManifestEntry, reviews: WikiIngestReview[]): Promise<void> {
+	const existing = await store.readText("reviews.jsonl");
+	const retained: WikiIngestReview[] = [];
+	for (const line of existing.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const review = JSON.parse(line) as WikiIngestReview;
+			if (review.sourceId !== entry.id) retained.push(review);
+		} catch { /* skip malformed lines */ }
+	}
+	const lines = [...retained, ...reviews].map((review) => JSON.stringify(review)).join("\n");
+	await store.writeText("reviews.jsonl", lines ? `${lines}\n` : "");
 }
 
 function countGeneratedFileBlocks(text: string): number {
@@ -586,14 +593,14 @@ function normalizedPathKey(path: string): string {
  * failure is accumulated and does not prevent other generated pages from being written.
  */
 async function writeGeneratedFileBlocks(
-	l2DataDir: string,
+	store: L2Backend,
 	blocks: ParsedFileBlock[],
 	entry: ManifestEntry,
 	sourceIdentity: string,
 	sourcePagePath: string,
 	routing: WikiSchemaRouting,
 	model: Model<any>,
-	modelRegistry: ModelRegistry,
+	modelRegistry: ModelAuthProvider,
 	signal?: AbortSignal,
 ): Promise<RichWriteResult> {
 	const created: string[] = [];
@@ -613,11 +620,9 @@ async function writeGeneratedFileBlocks(
 		const rel = canonicalizeGeneratedPagePath(requestedRel, block.content, sourcePagePath);
 		if (rel === "wiki/log.md") {
 			try {
-				const abs = join(l2DataDir, rel);
-				ensureDir(dirname(abs));
 				const content = stampGeneratedLogDate(block.content, currentWikiDate()).trim();
-				const existing = existsSync(abs) ? readText(abs).trim() : "";
-				writeText(abs, existing ? `${existing}\n\n${content}` : content);
+				const existing = (await store.exists(rel)) ? (await store.readText(rel)).trim() : "";
+				await store.writeText(rel, existing ? `${existing}\n\n${content}` : content);
 				aggregateWrites.push(rel);
 				completedInputPaths.push(block.path);
 			} catch (err) {
@@ -641,28 +646,26 @@ async function writeGeneratedFileBlocks(
 		}
 
 		try {
-			const abs = join(l2DataDir, rel);
-			ensureDir(dirname(abs));
-			if (existsSync(abs)) {
-				const existing = readText(abs);
+			if (await store.exists(rel)) {
+				const existing = await store.readText(rel);
 				const oldPage = parseFrontmatter(existing);
 				const ownedOnlyByCurrentSource = Boolean(
 					oldPage.frontmatter?.source_ids.length
 					&& oldPage.frontmatter.source_ids.every((sourceId) => sourceId === entry.id),
 				);
 				if (ownedOnlyByCurrentSource) {
-					backupExistingPage(l2DataDir, rel, existing);
-					writeText(abs, normalized);
+					await backupExistingPage(store, rel, existing);
+					await store.writeText(rel, normalized);
 				} else {
 					const merged = await mergeWikiPageContent(existing, normalized, sourceIdentity, model, modelRegistry, signal);
 					if (merged.usedFallback) {
-						backupExistingPage(l2DataDir, rel, existing);
+						await backupExistingPage(store, rel, existing);
 					}
-					writeText(abs, merged.content);
+					await store.writeText(rel, merged.content);
 				}
 				updated.push(rel);
 			} else {
-				writeText(abs, normalized);
+				await store.writeText(rel, normalized);
 				created.push(rel);
 			}
 			pages.push(rel);
@@ -678,12 +681,10 @@ async function writeGeneratedFileBlocks(
 	return { created, updated, pages, aggregateWrites, completedInputPaths, warnings, hardFailures };
 }
 
-function backupExistingPage(l2DataDir: string, wikiPath: string, content: string): void {
-	const historyDir = join(l2DataDir, "page-history");
-	ensureDir(historyDir);
+async function backupExistingPage(store: L2Backend, wikiPath: string, content: string): Promise<void> {
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 	const name = wikiPath.replaceAll("/", "_").replace(/\.md$/i, "");
-	writeText(join(historyDir, `${name}-${stamp}.md`), content);
+	await store.writeText(`page-history/${name}-${stamp}.md`, content);
 }
 
 function stampGeneratedLogDate(content: string, date: string): string {
@@ -693,13 +694,13 @@ function stampGeneratedLogDate(content: string, date: string): string {
 }
 
 export async function generateRichWikiPages(
-	l2DataDir: string,
+	target: L2Target,
 	entry: ManifestEntry,
 	analysis: string,
 	sourceContent: string,
 	context: { schema: string; purpose?: string; index: string; overview?: string; sourceIdentity?: string },
 	model: Model<any>,
-	modelRegistry: ModelRegistry,
+	modelRegistry: ModelAuthProvider,
 	signal?: AbortSignal,
 ): Promise<RichGenerationResult | null> {
 	try {
@@ -709,6 +710,7 @@ export async function generateRichWikiPages(
 		const maxTokens = computeWikiGenerationMaxTokens(maxContextSize);
 		const sourceIdentity = context.sourceIdentity ?? entry.rawPath;
 		const sourcePagePath = getSourcePagePath(entry, context.sourceIdentity);
+		const store = l2Store(target);
 		const routing = parseWikiSchemaRouting(context.schema);
 		const generationSourceContext = sourceContent;
 		const response = await complete(
@@ -738,7 +740,7 @@ export async function generateRichWikiPages(
 		}
 		const parsedOutput = parseGeneratedFileBlocks(generated);
 		const warnings = [...parsedOutput.warnings];
-		const initialWrite = await writeGeneratedFileBlocks(l2DataDir, parsedOutput.blocks, entry, sourceIdentity, sourcePagePath, routing, model, modelRegistry, signal);
+		const initialWrite = await writeGeneratedFileBlocks(store, parsedOutput.blocks, entry, sourceIdentity, sourcePagePath, routing, model, modelRegistry, signal);
 		warnings.push(...initialWrite.warnings);
 		const created = [...initialWrite.created];
 		const updated = [...initialWrite.updated];
@@ -761,7 +763,7 @@ export async function generateRichWikiPages(
 				const filteredRepair = filterTruncatedRepairOutput(outputText(repairResponse), unrecoveredTruncatedPaths);
 				warnings.push(...filteredRepair.warnings);
 				const repairBlocks = parseGeneratedFileBlocks(filteredRepair.text).blocks;
-					const repairWrite = await writeGeneratedFileBlocks(l2DataDir, repairBlocks, entry, sourceIdentity, sourcePagePath, routing, model, modelRegistry, signal);
+					const repairWrite = await writeGeneratedFileBlocks(store, repairBlocks, entry, sourceIdentity, sourcePagePath, routing, model, modelRegistry, signal);
 				warnings.push(...repairWrite.warnings);
 				created.push(...repairWrite.created);
 				updated.push(...repairWrite.updated);
@@ -791,9 +793,7 @@ export async function generateRichWikiPages(
 				`sources: [${JSON.stringify(sourceIdentity)}]`, `source_ids: [${JSON.stringify(entry.id)}]`, "---", `# Source: ${sourceIdentity}`, "", analysis || "(Analysis not available)",
 			].join("\n"), entry, sourceIdentity);
 			try {
-				const abs = join(l2DataDir, sourcePagePath);
-				ensureDir(dirname(abs));
-				writeText(abs, fallback);
+				await store.writeText(sourcePagePath, fallback);
 				created.push(sourcePagePath);
 				pages.push(sourcePagePath);
 			} catch (err) {
@@ -807,7 +807,7 @@ export async function generateRichWikiPages(
 			throwIfAborted(signal);
 			const reviewItems = parseGeneratedReviewBlocks(reviewText, entry);
 			try {
-				replaceSourceReviews(l2DataDir, entry, reviewItems);
+				await replaceSourceReviews(store, entry, reviewItems);
 				reviews = reviewItems.length;
 			} catch (err) {
 				warnings.push(`Review persistence failed: ${err instanceof Error ? err.message : String(err)}`);

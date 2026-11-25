@@ -6,10 +6,9 @@
 import { logger } from "../../logger.js";
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ModelAuthProvider } from "./model-auth.js";
 import { splitSourceIntoSemanticChunks } from "./structural-chunker.js";
 import { computeWikiSourceBudget } from "./wiki-generator.js";
-import { fileExists, readJson, writeJson } from "../../storage/file-store.js";
 import { buildWikiLanguageDirective } from "./wiki-output-language.js";
 import { isWikiLlmResponseAccepted, withWikiLlmPayloadAlignment } from "./wiki-llm-compat.js";
 
@@ -108,7 +107,7 @@ export function buildChunkUserPrompt(
 
 async function completeSummary(
 	model: Model<any>,
-	modelRegistry: ModelRegistry,
+	modelRegistry: ModelAuthProvider,
 	systemPrompt: string,
 	userPrompt: string,
 	maxTokens: number,
@@ -158,18 +157,30 @@ async function completeSummary(
 	}
 }
 
+/** Long-document ingest checkpoint — persisted through the caller-supplied store. */
+export interface SummarizerCheckpoint {
+	version: 1; sourceIdentity: string; sourceHash: string; sourceLength: number; sourceBudget: number; targetChars: number;
+	overlapChars: number; chunkTotal: number; completedThrough: number; globalDigest: string; analyses: string[]; updatedAt?: number;
+}
+
+/** Checkpoint persistence injected by the caller (L2 backend store in production, file shim in tests). */
+export interface SummarizerCheckpointStore {
+	load(): Promise<SummarizerCheckpoint | null>;
+	save(checkpoint: SummarizerCheckpoint): Promise<void>;
+}
+
 /**
  * Call the agent's configured LLM to generate a structured wiki summary.
  * Returns the generated markdown body, or null on failure.
  */
 export async function summarizeContent(
 	model: Model<any>,
-	modelRegistry: ModelRegistry,
+	modelRegistry: ModelAuthProvider,
 	title: string,
 	content: string,
 	wikiContext = "（知识库为空）",
 	options?: {
-		checkpointPath?: string;
+		checkpoint?: SummarizerCheckpointStore;
 		sourceIdentity?: string;
 		purpose?: string;
 		schema?: string;
@@ -204,19 +215,15 @@ export async function summarizeContent(
 		const analysis = await completeSummary(model, modelRegistry, systemPrompt, userPrompt, 4096, options?.signal);
 		return { analysis, sourceContext: content, chunked: false };
 	}
-	type Checkpoint = {
-		version: 1; sourceIdentity: string; sourceHash: string; sourceLength: number; sourceBudget: number; targetChars: number;
-		overlapChars: number; chunkTotal: number; completedThrough: number; globalDigest: string; analyses: string[]; updatedAt?: number;
-	};
 	const identity = options?.sourceIdentity ?? title;
 	const sourceHash = hashLongSourceText(content);
-	const emptyCheckpoint: Checkpoint = {
+	const emptyCheckpoint: SummarizerCheckpoint = {
 		version: 1, sourceIdentity: identity, sourceHash, sourceLength: content.length, sourceBudget, targetChars, overlapChars,
 		chunkTotal: chunks.length, completedThrough: 0, globalDigest: "", analyses: [],
 	};
 	let checkpoint = emptyCheckpoint;
-	if (options?.checkpointPath && fileExists(options.checkpointPath)) {
-		const candidate = readJson<Checkpoint | null>(options.checkpointPath, null);
+	if (options?.checkpoint) {
+		const candidate = await options.checkpoint.load();
 		if (candidate?.version === 1 && candidate.sourceIdentity === identity && candidate.sourceHash === sourceHash && candidate.sourceLength === content.length
 			&& candidate.sourceBudget === sourceBudget && candidate.targetChars === targetChars && candidate.overlapChars === overlapChars
 			&& candidate.chunkTotal === chunks.length && candidate.completedThrough >= 0 && candidate.completedThrough <= chunks.length
@@ -240,7 +247,7 @@ export async function summarizeContent(
 		analyses.push(`## Chunk ${chunk.index}/${chunk.total}${chunk.headingPath ? ` — ${chunk.headingPath}` : ""}\n${trimLongText(chunkAnalysis, LONG_SOURCE_CHUNK_ANALYSIS_MAX)}`);
 		globalDigest = trimLongText(nextDigest || [globalDigest, chunkAnalysis].filter(Boolean).join("\n\n"), LONG_SOURCE_DIGEST_MAX);
 		checkpoint = { ...checkpoint, completedThrough: chunk.index, globalDigest, analyses: [...analyses], updatedAt: Date.now() };
-		if (options?.checkpointPath) writeJson(options.checkpointPath, checkpoint);
+		if (options?.checkpoint) await options.checkpoint.save(checkpoint);
 	}
 	const analysis = [
 		"# Consolidated Long-Document Analysis", "", "## Final Global Digest", globalDigest || "(No digest produced.)", "",

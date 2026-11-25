@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { ArrowLeft, Check, ListChecks, Plus, RotateCcw, X, Zap } from "lucide-react";
 import type { EngineAttachmentItem, SmartInputEngine } from "./engine.js";
-import type { SlashCommandItem } from "../../../api/commands.js";
+import type { SlashCommandItem } from "../slash-command.js";
 import type { KwRange } from "./rules.js";
 import { KIND_LABEL_KEYS, kindFromName, kindFromRule, nameMatchesRule } from "./kinds.js";
 import type { PendingUpload } from "../composer-utils.js";

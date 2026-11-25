@@ -1,4 +1,4 @@
-import { readJson, writeJson } from "../storage/file-store.js";
+import { updateTenantState, type TenantStateKv } from "../tenants/state-store.js";
 import type { ChatAttachments } from "./attachments.js";
 import type { SessionMessageSummary } from "./session-model.js";
 
@@ -7,7 +7,7 @@ import type { SessionMessageSummary } from "./session-model.js";
  *
  * The PI SDK owns the session JSONL and only stores the user's raw prompt, so
  * bubble bindings / loose attachments are kept in a sidecar JSON keyed by
- * session file. Entries are recorded when a chat turn is accepted and merged
+ * session ID (per-session `tenant_state` rows). Entries are recorded when a chat turn is accepted and merged
  * back into the message list served by GET /api/sessions/:id, matched FIFO by
  * prompt content (the SDK persists the prompt verbatim, so content equality is
  * a stable join key; repeated identical prompts consume entries in order).
@@ -28,50 +28,31 @@ export interface SessionAttachmentEntry {
 
 export type SessionAttachmentsMetadata = Record<string, SessionAttachmentEntry[]>;
 
-// In-memory cache is scoped by tenant/local data root. Keeping only the
-// metadata would let one tenant's sidecar satisfy another tenant's reads.
-let cache: { dataDir: string; metadata: SessionAttachmentsMetadata } | null = null;
+const attachmentsKey = (sessionId: string) => `attachments:${sessionId}`;
 
-function read(dataDir: string): SessionAttachmentsMetadata {
-	if (!cache || cache.dataDir !== dataDir) {
-		cache = { dataDir, metadata: readJson<SessionAttachmentsMetadata>(attachmentsMetadataPath(dataDir), {}) };
-	}
-	return cache.metadata;
-}
-
-function write(dataDir: string, meta: SessionAttachmentsMetadata): void {
-	cache = { dataDir, metadata: meta };
-	writeJson(attachmentsMetadataPath(dataDir), meta);
-}
-
-export function attachmentsMetadataPath(dataDir: string): string {
-	return `${dataDir}/sessions/attachments.json`.replaceAll("\\", "/");
-}
-
-export function resetAttachmentsStoreForTests(): void {
-	cache = null;
+/** Read the recorded attachment entries of one session. */
+export async function readSessionAttachments(kv: TenantStateKv, sessionId: string): Promise<SessionAttachmentEntry[]> {
+	return (await kv.get<SessionAttachmentEntry[]>(attachmentsKey(sessionId))) ?? [];
 }
 
 /** Record the attachment metadata for one accepted chat turn. */
 export function recordSessionAttachments(
-	dataDir: string,
+	kv: TenantStateKv,
 	sessionId: string,
 	entry: SessionAttachmentEntry,
-): void {
-	const meta = { ...read(dataDir) };
-	const existing = meta[sessionId] ?? [];
-	if (entry.requestId && existing.some((candidate) => candidate.requestId === entry.requestId)) return;
-	meta[sessionId] = [...existing, entry];
-	write(dataDir, meta);
+): Promise<void> {
+	return updateTenantState<SessionAttachmentEntry[], void>(kv, attachmentsKey(sessionId), (current) => {
+		const existing = current ?? [];
+		if (entry.requestId && existing.some((candidate) => candidate.requestId === entry.requestId)) {
+			return { next: current, result: undefined };
+		}
+		return { next: [...existing, entry], result: undefined };
+	});
 }
 
 /** Drop all attachment metadata for a deleted session. */
-export function clearSessionAttachments(dataDir: string, sessionId: string): void {
-	const meta = read(dataDir);
-	if (!(sessionId in meta)) return;
-	const next = { ...meta };
-	delete next[sessionId];
-	write(dataDir, next);
+export function clearSessionAttachments(kv: TenantStateKv, sessionId: string): Promise<void> {
+	return kv.delete(attachmentsKey(sessionId));
 }
 
 /**
@@ -80,13 +61,13 @@ export function clearSessionAttachments(dataDir: string, sessionId: string): voi
  * content equals the recorded prompt. Messages without a match pass through
  * untouched, so sessions without attachments are zero-cost.
  */
-export function mergeSessionAttachments(
-	dataDir: string,
+export async function mergeSessionAttachments(
+	kv: TenantStateKv,
 	sessionId: string,
 	messages: SessionMessageSummary[],
-): SessionMessageSummary[] {
-	const entries = read(dataDir)[sessionId];
-	if (!entries || entries.length === 0) return messages;
+): Promise<SessionMessageSummary[]> {
+	const entries = await readSessionAttachments(kv, sessionId);
+	if (entries.length === 0) return messages;
 	const pending = [...entries];
 	return messages.map((message) => {
 		if (message.role !== "user" || pending.length === 0) return message;

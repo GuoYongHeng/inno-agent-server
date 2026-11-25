@@ -18,7 +18,8 @@
 
 import { buildAliasIndex, extractOutgoingLinks, pageStem } from "./wiki-links.js";
 import { OVERVIEW_PATH } from "./wiki-graph.js";
-import type { L2IndexStore, L2PageMeta } from "./l2-index-store.js";
+import type { L2Backend } from "./l2-backend.js";
+import type { L2PageMeta } from "./l2-index-store.js";
 
 /** Rank-decay constant for turning a lexical rank into a base score. */
 const RANK_DECAY_K = 60;
@@ -49,7 +50,7 @@ export interface L2SearchResult {
  * Run the search: BM25 lexical candidates seed a one-hop graph expansion.
  */
 export async function searchL2(
-	store: L2IndexStore,
+	store: L2Backend,
 	query: string,
 	opts: { limit?: number } = {},
 ): Promise<L2SearchResult[]> {
@@ -57,7 +58,7 @@ export async function searchL2(
 	if (!q) return [];
 	const limit = opts.limit ?? 5;
 
-	const pages = store.getAllPages();
+	const pages = await store.getAllPages();
 	if (pages.length === 0) return [];
 	const byPath = new Map<string, L2PageMeta>(pages.map((p) => [p.path, p]));
 
@@ -82,7 +83,7 @@ export async function searchL2(
 	const addVia = (path: string, sig: L2SearchSignal) =>
 		(via.get(path) ?? via.set(path, new Set()).get(path)!).add(sig);
 
-	store.searchLexical(q, LEX_CANDIDATES).forEach((hit, rank) => {
+	(await store.searchLexical(q, LEX_CANDIDATES)).forEach((hit, rank) => {
 		base.set(hit.path, (base.get(hit.path) ?? 0) + 1 / (RANK_DECAY_K + rank));
 		addVia(hit.path, "lexical");
 	});

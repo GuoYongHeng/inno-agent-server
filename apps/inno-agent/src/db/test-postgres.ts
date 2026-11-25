@@ -1,9 +1,6 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { Pool } from "pg";
 
 export interface TemporaryPostgres {
@@ -54,45 +51,36 @@ export async function startTemporaryPostgres(): Promise<TemporaryPostgres> {
 		}
 	}
 
-	const directory = await mkdtemp(join(tmpdir(), "inno-postgres-"));
+	// No external URL: start a disposable ParadeDB container. A plain PostgreSQL
+	// from initdb cannot be used because the schema needs pg_search.
+	const image = process.env.INNO_TEST_PARADEDB_IMAGE ?? "paradedb/paradedb:v0.25.11-pg17";
 	const port = await unusedPort();
-	let database: ChildProcess | undefined;
+	const name = `inno-it-${randomUUID().slice(0, 8)}`;
 	let pool: Pool | undefined;
 	try {
-		await run("initdb", ["--pgdata", directory, "--auth=trust", "--no-locale", "--username=postgres"]);
-		database = spawn("postgres", ["-D", directory, "-h", "127.0.0.1", "-p", String(port), "-k", directory], {
-			stdio: ["ignore", "ignore", "pipe"],
-		});
-		let databaseLog = "";
-		database.stderr?.on("data", (chunk) => { databaseLog += chunk; });
-		const databaseUrl = `postgresql://postgres@127.0.0.1:${port}/postgres`;
+		await run("docker", ["run", "-d", "--rm", "--name", name, "-e", "POSTGRES_USER=inno", "-e", "POSTGRES_PASSWORD=inno", "-p", `127.0.0.1:${port}:5432`, image]);
+		const databaseUrl = `postgresql://inno:inno@127.0.0.1:${port}/postgres`;
 		pool = new Pool({ connectionString: databaseUrl, connectionTimeoutMillis: 500 });
-		const deadline = Date.now() + 15_000;
+		const deadline = Date.now() + 60_000;
 		while (true) {
-			if (database.exitCode !== null) throw new Error(`PostgreSQL exited during startup: ${databaseLog}`);
 			try {
 				await pool.query("SELECT 1");
 				break;
 			} catch (err) {
 				if (Date.now() >= deadline) throw err;
-				await new Promise((resolve) => setTimeout(resolve, 100));
+				await new Promise((resolve) => setTimeout(resolve, 500));
 			}
 		}
 		return {
 			databaseUrl,
 			async close() {
 				await pool?.end();
-				if (database?.exitCode === null) {
-					database.kill("SIGTERM");
-					await new Promise<void>((resolve) => database!.once("exit", () => resolve()));
-				}
-				await rm(directory, { recursive: true, force: true });
+				await run("docker", ["rm", "-f", name]).catch(() => undefined);
 			},
 		};
 	} catch (err) {
 		await pool?.end();
-		database?.kill("SIGTERM");
-		await rm(directory, { recursive: true, force: true });
-		throw new Error(`A real PostgreSQL installation is required for integration tests: ${String(err)}`);
+		await run("docker", ["rm", "-f", name]).catch(() => undefined);
+		throw new Error(`Integration tests need a ParadeDB database: set INNO_TEST_DATABASE_URL or make docker and the ${image} image available: ${String(err)}`);
 	}
 }

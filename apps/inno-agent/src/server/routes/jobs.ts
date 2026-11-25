@@ -8,12 +8,10 @@ import { validateCron } from "../../scheduler/cron-utils.js";
 import { json, matchRoute, readBody } from "../http-helpers.js";
 import { isLearningJob, type CheckInStore } from "../../checkins/check-in-store.js";
 import { logger } from "../../logger.js";
-import { questionBridge } from "../../agent/question-bridge.js";
-import { permissionBridge } from "../../agent/permission-bridge.js";
 import { cancelDeferredRun, isDeferredExecuting } from "../../scheduler/deferred-runs.js";
 import { claimOccurrenceForExecution } from "../../scheduler/execution-claims.js";
 import type { JobRunClaim, TenantStore } from "../../tenants/store.js";
-import { claimRequestResource, getRequestTenant, ownsRequestResource, releaseRequestResource } from "../../tenants/http.js";
+import { claimRequestResource, ownsRequestResource, releaseRequestResource, requireRequestTenant } from "../../tenants/http.js";
 
 type JobRunStreamEvent =
 	| { type: "job_state"; status: "queued" | "running" }
@@ -172,19 +170,16 @@ export interface JobsRouteContext {
 	jobStore: JobStore;
 	channelRegistry: ChannelRegistry;
 	checkInStore?: CheckInStore;
-	resolveSessionPath?: (sessionId: string) => string | null;
-	resolveSession?: (sessionId: string) => JobSessionTarget | null;
+	resolveSession?: (sessionId: string) => Promise<JobSessionTarget | null>;
 	createSession?: (req: HttpReq, job: ScheduledJob) => Promise<CreatedJobSession | null>;
 	durableExecutor?: (req: HttpReq, execution: DurableJobExecution) => Promise<string>;
 	/** Tag the target session as scheduler-born so the sidebar badges it. */
-	recordJobRunSession?: (sessionId: string, req: HttpReq) => void;
+	recordJobRunSession?: (sessionId: string, req: HttpReq) => Promise<void>;
 	/** Abort the in-flight manual job run streaming into this session. */
 	abortJobRun?: (sessionId: string) => Promise<boolean>;
 	/** Release a durable question waiter when its only live view disconnects. */
 	disconnectJobRun?: (sessionId: string, turnId: string) => void;
-	/** Agent jobs always execute in durable sessions in multi-user mode. */
-	durableRequired?: boolean;
-	tenantStore: TenantStore | null;
+	tenantStore: TenantStore;
 }
 
 /**
@@ -202,41 +197,29 @@ export async function handleJobsRoutes(
 ): Promise<boolean> {
 	const { jobStore, channelRegistry, tenantStore } = ctx;
 	let occurrenceClaim: JobRunClaim | undefined;
-	const rejectLegacyExecution = () => {
-		if (!ctx.durableRequired) return false;
-		json(res, 409, {
-			error: "Legacy sessions are read-only in multi-user mode; select a durable session instead",
-			code: "durable_required",
-		});
-		return true;
-	};
 	const requireSessionOwnership = async (sessionId: string): Promise<boolean> => {
 		if (await ownsRequestResource(req, tenantStore, "session", sessionId)) return true;
 		json(res, 404, { error: "Session not found" });
 		return false;
 	};
-	const resolveSession = (sessionId: string): JobSessionTarget | null => {
-		if (ctx.resolveSession) return ctx.resolveSession(sessionId);
-		const path = ctx.resolveSessionPath?.(sessionId);
-		return path ? { id: sessionId, path, runtime: "legacy" } : null;
-	};
+	const resolveSession = async (sessionId: string): Promise<JobSessionTarget | null> => (await ctx.resolveSession?.(sessionId)) ?? null;
 	const durableExecutor = (execution: DurableJobExecution) => {
 		if (!ctx.durableExecutor) throw new Error("Durable job execution is unavailable");
 		return ctx.durableExecutor(req, execution);
 	};
 
 	if (method === "GET" && url === "/api/jobs") {
-		json(res, 200, jobStore.list());
+		json(res, 200, await jobStore.list());
 		return true;
 	}
 
 	if (method === "GET" && url === "/api/jobs/status") {
-		json(res, 200, jobStore.getStatus());
+		json(res, 200, await jobStore.getStatus());
 		return true;
 	}
 
 	if (method === "GET" && url === "/api/jobs/runs") {
-		json(res, 200, jobStore.listRuns());
+		json(res, 200, await jobStore.listRuns());
 		return true;
 	}
 
@@ -256,21 +239,24 @@ export async function handleJobsRoutes(
 			return true;
 		}
 		if (body.runtime !== undefined && body.runtime !== "legacy" && body.runtime !== "durable") {
-			json(res, 400, { error: "runtime must be legacy or durable" });
+			json(res, 400, { error: "runtime must be durable" });
 			return true;
 		}
-		if (ctx.durableRequired && body.runtime === "legacy") return rejectLegacyExecution();
+		if (body.runtime === "legacy") {
+			json(res, 400, { error: "The legacy runtime has been removed; jobs run in durable sessions" });
+			return true;
+		}
 		const isReminder = body.taskType === "push_reminder" || body.taskType === "check_in_reminder";
-		if (ctx.durableRequired && body.runtime === undefined && !isReminder) body.runtime = "durable";
+		if (body.runtime === undefined && !isReminder) body.runtime = "durable";
 		if (body.runtime === "durable" && isReminder) {
 			json(res, 400, { error: "Durable jobs support agent tasks, not reminder tasks" });
 			return true;
 		}
-		const job = jobStore.create(body);
+		const job = await jobStore.create(body);
 		try {
 			await claimRequestResource(req, tenantStore, "job", job.id);
 		} catch (err) {
-			jobStore.delete(job.id);
+			await jobStore.delete(job.id);
 			throw err;
 		}
 		json(res, 201, job);
@@ -279,11 +265,11 @@ export async function handleJobsRoutes(
 
 	const runsMatch = matchRoute("GET", method, url, "/api/jobs/:id/runs");
 	if (runsMatch) {
-		if (getRequestTenant(req) && !jobStore.get(runsMatch.id)) {
+		if (requireRequestTenant(req) && !(await jobStore.get(runsMatch.id))) {
 			json(res, 404, { error: "Job not found" });
 			return true;
 		}
-		json(res, 200, jobStore.listRuns(runsMatch.id));
+		json(res, 200, await jobStore.listRuns(runsMatch.id));
 		return true;
 	}
 
@@ -305,7 +291,7 @@ export async function handleJobsRoutes(
 
 	const runStreamMatch = matchRoute("POST", method, url, "/api/jobs/:id/run/stream");
 	if (runStreamMatch) {
-		const job = jobStore.get(runStreamMatch.id);
+		const job = await jobStore.get(runStreamMatch.id);
 		if (!job) {
 			json(res, 404, { error: "Job not found" });
 			return true;
@@ -321,13 +307,11 @@ export async function handleJobsRoutes(
 		// Resolve the target session BEFORE claiming the slot: a 404 here must
 		// not leak the claim, which would wedge the occurrence (auto-exec is
 		// blocked by isOccurrenceClaimed, manual retries 409) until restart.
-		const session = resolveSession(sessionId);
+		const session = await resolveSession(sessionId);
 		if (!session) {
 			json(res, 404, { error: "Session not found" });
 			return true;
 		}
-		if (session.runtime === "legacy" && rejectLegacyExecution()) return true;
-		const sessionPath = session.path;
 		if (occurrenceId) {
 			// A manual run takes over a fired-but-waiting slot: cancel its
 			// deferred auto-execution and reserve the slot so cron re-fires
@@ -338,7 +322,7 @@ export async function handleJobsRoutes(
 				return true;
 			}
 			if (isLearningJob(job) && ctx.checkInStore) {
-				const occurrence = ctx.checkInStore.resolveOccurrence(job.id, occurrenceId);
+				const occurrence = await ctx.checkInStore.resolveOccurrence(job.id, occurrenceId);
 				if (!occurrence) {
 					json(res, 409, { error: "Learning schedule slot is no longer pending." });
 					return true;
@@ -350,7 +334,7 @@ export async function handleJobsRoutes(
 				}
 			}
 		}
-		ctx.recordJobRunSession?.(sessionId, req);
+		await ctx.recordJobRunSession?.(sessionId, req);
 
 		res.writeHead(200, {
 			"Content-Type": "text/event-stream",
@@ -380,43 +364,14 @@ export async function handleJobsRoutes(
 		writeJobStreamEvent(res, { type: "job_state", status: "queued" });
 		writeJobStreamEvent(res, { type: "job_state", status: "running" });
 		logger.info({ jobId: job.id, sessionId }, "Manual job run stream opened");
-		// The run's agent may call ask_user_question; binding the bridge lets the
-		// tool park and wait for an answer instead of failing with "no_ui".
 		const runTurnId = randomUUID();
-		if (session.runtime === "legacy") {
-			questionBridge.bindTurn({
-				sessionId,
-				turnId: runTurnId,
-				timeoutMs: 30 * 60_000,
-				emit: (event) => {
-					const forwarded = event.type === "question" ? { ...event, turnId: runTurnId } : event;
-					writeJobStreamEvent(res, forwarded as JobRunStreamEvent);
-				},
-			});
-			permissionBridge.bindTurn({
-				sessionId,
-				turnId: runTurnId,
-				tenantId: getRequestTenant(req)?.tenantId,
-				runId: sessionPath,
-				timeoutMs: 30 * 60_000,
-				emit: (event) => {
-					const forwarded = event.type === "permission_request" ? { ...event, turnId: runTurnId } : event;
-					writeJobStreamEvent(res, forwarded as JobRunStreamEvent);
-				},
-			});
-		}
 		res.on("close", () => {
 			disconnected = true;
 			clearInterval(heartbeat);
 			// The run itself keeps going server-side; only the live view is lost.
 			logger.info({ jobId: job.id, sessionId }, "Manual job run stream disconnected");
 			// Nobody can answer a question with the stream gone — release the tool.
-			if (session.runtime === "durable") {
-				ctx.disconnectJobRun?.(sessionId, runTurnId);
-			} else {
-				questionBridge.unbindTurn({ sessionId, turnId: runTurnId, reason: "client_disconnected" });
-				permissionBridge.unbindTurn({ sessionId, turnId: runTurnId, reason: "client_disconnected" });
-			}
+			ctx.disconnectJobRun?.(sessionId, runTurnId);
 		});
 		try {
 			const result = await executeJob(
@@ -426,7 +381,6 @@ export async function handleJobsRoutes(
 				"api",
 				ctx.checkInStore,
 				{
-					sessionPath,
 					sessionId,
 					sessionRuntime: session.runtime,
 					durableExecutor,
@@ -440,7 +394,7 @@ export async function handleJobsRoutes(
 			);
 			logger.info({ jobId: job.id, sessionId, runId: result.runId, success: result.success }, "Manual job run stream finished");
 			// Tenant leases end with the attempt; local success retains its legacy claim.
-			if (occurrenceId && (!result.success || getRequestTenant(req))) await occurrenceClaim?.release();
+			if (occurrenceId && (!result.success || requireRequestTenant(req))) await occurrenceClaim?.release();
 			if (!disconnected) writeJobStreamEvent(res, { type: "job_result", result });
 		} catch (err) {
 			logger.error({ err, jobId: job.id, sessionId }, "Manual job run stream failed");
@@ -449,10 +403,6 @@ export async function handleJobsRoutes(
 				writeJobStreamEvent(res, { type: "error", message: err instanceof Error ? err.message : String(err) });
 			}
 		} finally {
-			if (session.runtime === "legacy") {
-				questionBridge.unbindTurn({ sessionId, turnId: runTurnId, reason: "finished" });
-				permissionBridge.unbindTurn({ sessionId, turnId: runTurnId, reason: "finished" });
-			}
 			finish();
 		}
 		return true;
@@ -460,7 +410,7 @@ export async function handleJobsRoutes(
 
 	const runMatch = matchRoute("POST", method, url, "/api/jobs/:id/run");
 	if (runMatch) {
-		const job = jobStore.get(runMatch.id);
+		const job = await jobStore.get(runMatch.id);
 		if (!job) {
 			json(res, 404, { error: "Job not found" });
 			return true;
@@ -468,32 +418,30 @@ export async function handleJobsRoutes(
 		const body = await readBody(req) as Record<string, unknown>;
 		const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
 		const occurrenceId = typeof body.occurrenceId === "string" ? body.occurrenceId.trim() : "";
-		if (getRequestTenant(req) && !sessionId) {
+		if (requireRequestTenant(req) && !sessionId) {
 			json(res, 400, { error: "sessionId is required for authenticated manual job runs" });
 			return true;
 		}
 		if (sessionId && !await requireSessionOwnership(sessionId)) return true;
-		let session = sessionId ? resolveSession(sessionId) : null;
+		let session = sessionId ? await resolveSession(sessionId) : null;
 		if (sessionId && !session) {
 			json(res, 404, { error: "Session not found" });
 			return true;
 		}
-		if (session?.runtime === "legacy" && rejectLegacyExecution()) return true;
-		if (!session && (job.runtime === "durable" || ctx.durableRequired)) {
+		if (!session) {
 			if (!ctx.createSession) {
 				json(res, 503, { error: "Durable job session creation is unavailable" });
 				return true;
 			}
 			const created = await ctx.createSession(req, job);
-			if (!created || typeof created === "string" || created.runtime !== "durable") {
+			if (!created || created.runtime !== "durable") {
 				json(res, 503, { error: "Durable job session creation failed" });
 				return true;
 			}
 			session = created;
 		}
-		const sessionPath = session?.path;
 		const targetSessionId = session?.id ?? "";
-		if (targetSessionId) ctx.recordJobRunSession?.(targetSessionId, req);
+		if (targetSessionId) await ctx.recordJobRunSession?.(targetSessionId, req);
 		if (occurrenceId) {
 			await cancelDeferredRun(occurrenceId);
 			if (isDeferredExecuting(occurrenceId)) {
@@ -502,7 +450,7 @@ export async function handleJobsRoutes(
 			}
 		}
 		if (occurrenceId && isLearningJob(job) && ctx.checkInStore) {
-			const occurrence = ctx.checkInStore.resolveOccurrence(job.id, occurrenceId);
+			const occurrence = await ctx.checkInStore.resolveOccurrence(job.id, occurrenceId);
 			if (!occurrence) {
 				json(res, 409, { error: "Learning schedule slot is no longer pending." });
 				return true;
@@ -521,14 +469,13 @@ export async function handleJobsRoutes(
 				"api",
 				ctx.checkInStore,
 				session || occurrenceId ? {
-					sessionPath,
 					sessionId: targetSessionId || undefined,
 					sessionRuntime: session?.runtime,
 					durableExecutor,
 					occurrenceId: occurrenceId || undefined,
 				} : undefined,
 			);
-			if (occurrenceId && (!result.success || getRequestTenant(req))) await occurrenceClaim?.release();
+			if (occurrenceId && (!result.success || requireRequestTenant(req))) await occurrenceClaim?.release();
 			json(res, 200, result);
 		} catch (error) {
 			if (occurrenceId) await occurrenceClaim?.release();
@@ -552,13 +499,16 @@ export async function handleJobsRoutes(
 			return true;
 		}
 		if (body.runtime !== undefined && body.runtime !== "legacy" && body.runtime !== "durable") {
-			json(res, 400, { error: "runtime must be legacy or durable" });
+			json(res, 400, { error: "runtime must be durable" });
 			return true;
 		}
-		if (ctx.durableRequired && body.runtime === "legacy") return rejectLegacyExecution();
-		const current = jobStore.get(patchMatch.id);
+		if (body.runtime === "legacy") {
+			json(res, 400, { error: "The legacy runtime has been removed; jobs run in durable sessions" });
+			return true;
+		}
+		const current = await jobStore.get(patchMatch.id);
 		const effectiveTaskType = body.taskType ?? current?.taskType;
-		if (ctx.durableRequired && body.runtime === undefined && effectiveTaskType !== "push_reminder" && effectiveTaskType !== "check_in_reminder") {
+		if (body.runtime === undefined && effectiveTaskType !== "push_reminder" && effectiveTaskType !== "check_in_reminder") {
 			body.runtime = "durable";
 		}
 		if (body.runtime === "durable" && (effectiveTaskType === "push_reminder" || effectiveTaskType === "check_in_reminder")) {
@@ -569,7 +519,7 @@ export async function handleJobsRoutes(
 			json(res, 400, { error: "Durable jobs support agent tasks, not reminder tasks" });
 			return true;
 		}
-		const updated = jobStore.update(patchMatch.id, body);
+		const updated = await jobStore.update(patchMatch.id, body);
 		if (!updated) {
 			json(res, 404, { error: "Job not found" });
 			return true;
@@ -580,7 +530,7 @@ export async function handleJobsRoutes(
 
 	const deleteMatch = matchRoute("DELETE", method, url, "/api/jobs/:id");
 	if (deleteMatch) {
-		const deleted = jobStore.delete(deleteMatch.id);
+		const deleted = await jobStore.delete(deleteMatch.id);
 		if (!deleted) {
 			json(res, 404, { error: "Job not found" });
 			return true;

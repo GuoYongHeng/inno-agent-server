@@ -37,32 +37,28 @@ describe("parse_document", () => {
 		writeFileSync(filePath, "placeholder");
 		parser.parseDocument.mockResolvedValue({ pageCount: 1, text: "parsed", pages: [{ pageNumber: 1, text: "parsed" }] });
 
-		const tool = createDocumentTools()[0];
+		const tool = createDocumentTools({ workspaceDir })[0];
 		const result = await tool.execute(
-			"test-call",
 			{ filePath: "paper.pdf" },
-			undefined,
-			undefined,
-			{ cwd: workspaceDir } as never,
+			{ callId: "test-call", output: () => undefined } as never,
+			{ abortSignal: undefined } as never,
 		);
 
 		expect(parser.parseDocument).toHaveBeenCalledWith(filePath);
 		expect(result.details).toMatchObject({ filePath });
-		expect(result.content[0]).toMatchObject({ type: "text" });
+		expect(result.output?.[0]).toMatchObject({ type: "text" });
 	});
 
 	it.each(["absolute", "parent"])("rejects authenticated %s paths outside the workspace", async (kind) => {
 		makeWorkspace();
 		const outsidePath = join(tempRoot, "outside.pdf");
 		writeFileSync(outsidePath, "secret");
-		const tool = createDocumentTools({ restrictToWorkspace: true })[0];
+		const tool = createDocumentTools({ restrictToWorkspace: true, workspaceDir })[0];
 
 		const result = await tool.execute(
-			"test-call",
 			{ filePath: kind === "absolute" ? outsidePath : "../outside.pdf" },
-			undefined,
-			undefined,
-			{ cwd: workspaceDir } as never,
+			{ callId: "test-call", output: () => undefined } as never,
+			{ abortSignal: undefined } as never,
 		);
 
 		expect(result.details).toMatchObject({ error: "outside_workspace" });
@@ -74,14 +70,12 @@ describe("parse_document", () => {
 		const outsidePath = join(tempRoot, "outside.pdf");
 		writeFileSync(outsidePath, "secret");
 		symlinkSync(outsidePath, join(workspaceDir, "linked.pdf"));
-		const tool = createDocumentTools({ restrictToWorkspace: true })[0];
+		const tool = createDocumentTools({ restrictToWorkspace: true, workspaceDir })[0];
 
 		const result = await tool.execute(
-			"test-call",
 			{ filePath: "linked.pdf" },
-			undefined,
-			undefined,
-			{ cwd: workspaceDir } as never,
+			{ callId: "test-call", output: () => undefined } as never,
+			{ abortSignal: undefined } as never,
 		);
 
 		expect(result.details).toMatchObject({ error: "outside_workspace" });
@@ -93,14 +87,12 @@ describe("parse_document", () => {
 		const outsidePath = join(tempRoot, "outside.pdf");
 		writeFileSync(outsidePath, "local");
 		parser.parseDocument.mockResolvedValue({ pageCount: 1, text: "parsed", pages: [] });
-		const tool = createDocumentTools()[0];
+		const tool = createDocumentTools({ workspaceDir })[0];
 
 		const result = await tool.execute(
-			"test-call",
 			{ filePath: outsidePath },
-			undefined,
-			undefined,
-			{ cwd: workspaceDir } as never,
+			{ callId: "test-call", output: () => undefined } as never,
+			{ abortSignal: undefined } as never,
 		);
 
 		expect(result.details).toMatchObject({ filePath: outsidePath, pageCount: 1 });

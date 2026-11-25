@@ -2,7 +2,6 @@ export type TaskType =
 	| "daily_review"
 	| "weekly_summary"
 	| "graphify_update"
-	| "learner_profile_reflection"
 	| "spaced_review"
 	| "check_in_reminder"
 	| "push_reminder"
@@ -64,7 +63,6 @@ export const TASK_TYPE_LABELS: Record<TaskType, string> = {
 	daily_review: "Daily Review",
 	weekly_summary: "Weekly Summary",
 	graphify_update: "Graph Update",
-	learner_profile_reflection: "Profile Reflection",
 	spaced_review: "Spaced Review",
 	check_in_reminder: "Check-in Reminder",
 	push_reminder: "Push Reminder",

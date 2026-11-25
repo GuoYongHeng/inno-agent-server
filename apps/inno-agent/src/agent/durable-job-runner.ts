@@ -1,8 +1,8 @@
 import type { IncomingMessage } from "node:http";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import type { UserInput } from "@earendil-works/pi-durable";
+import { buildDurableUserInput } from "./durable-user-input.js";
 import { DurableSseProjector } from "./durable-projection.js";
-import type { DurableSessionService } from "./durable-session-service.js";
+import { DurableSessionBusyError, type DurableSessionService } from "./durable-session-service.js";
 
 export interface DurableJobPromptOptions {
 	requestId: string;
@@ -11,7 +11,36 @@ export interface DurableJobPromptOptions {
 	/** Streaming output does not imply an interactive UI (for example, IM cards). */
 	noUi?: boolean;
 	images?: ImageContent[];
+	/**
+	 * How long to wait for a session that is busy on another worker (its owner
+	 * only holds the lease while a turn is active) before giving up. Defaults
+	 * to INNO_DURABLE_JOB_BUSY_WAIT_MS or two minutes; 0 disables waiting.
+	 */
+	busyWaitMs?: number;
+	/**
+	 * When the lease stays busy past `busyWaitMs`, hand the prompt to the
+	 * worker that owns the session (`POST /api/internal/durable-prompt`) and
+	 * return its result. Returns null when no forward is possible — the busy
+	 * error then propagates as before. Text-only: prompts carrying `images`
+	 * are never forwarded. Forwarded runs are event-less (`onEvent` cannot
+	 * stream across workers; the final text is still returned).
+	 */
+	forwardToOwner?: (execution: {
+		sessionId: string;
+		prompt: string;
+		requestId: string;
+		turnId: string;
+		notifyOnly?: boolean;
+	}) => Promise<string | null>;
 }
+
+/** Internal prompts (scheduler jobs, channel messages) wait briefly for an
+ * active turn on another worker to release the session lease instead of
+ * failing the run outright. */
+export const DURABLE_JOB_BUSY_WAIT_MS = Math.max(
+	0,
+	Number(process.env.INNO_DURABLE_JOB_BUSY_WAIT_MS) || 120_000,
+);
 
 /** Execute one scheduler prompt without passing through legacy JSONL or the
  * process-global prompt queue. Occurrence leases and run ledgers stay in the
@@ -23,25 +52,25 @@ export async function runDurableJobPrompt(
 	prompt: string,
 	options: DurableJobPromptOptions,
 ): Promise<string> {
-	if ((options.noUi || !options.onEvent) && service.pendingQuestion(req, sessionId)) {
+	if ((options.noUi || !options.onEvent) && await service.pendingQuestion(req, sessionId)) {
 		throw new Error("This session has a pending question; answer it through the streaming UI");
 	}
-	if ((options.noUi || !options.onEvent) && service.pendingPermission(req, sessionId)) {
+	if ((options.noUi || !options.onEvent) && await service.pendingPermission(req, sessionId)) {
 		throw new Error("This session has a pending permission request; answer it through the streaming UI");
 	}
-	const images = service.prepareImages(req, sessionId, options.images, options.requestId);
+	const images = await service.prepareImages(req, sessionId, options.images, options.requestId);
 	const recallContext = await service.prepareRecallContext(req, sessionId, prompt);
 	let lease: Awaited<ReturnType<DurableSessionService["lease"]>> | undefined;
 	let stream: { stop(): Promise<unknown> } | undefined;
 	try {
-		lease = await service.lease(req, sessionId);
+		lease = await service.lease(req, sessionId, { busyWaitMs: options.busyWaitMs ?? DURABLE_JOB_BUSY_WAIT_MS });
 		const noUi = options.noUi || !options.onEvent;
-		lease.runtime.bindQuestionTurn({
+		await lease.runtime.bindQuestionTurn({
 			turnId: options.turnId,
 			...(options.onEvent ? { emit: options.onEvent } : {}),
 			...(noUi ? { noUi: true } : {}),
 		});
-		lease.runtime.bindPermissionTurn({
+		await lease.runtime.bindPermissionTurn({
 			turnId: options.turnId,
 			...(options.onEvent ? { emit: options.onEvent } : {}),
 			...(noUi ? { noUi: true } : {}),
@@ -56,17 +85,14 @@ export async function runDurableJobPrompt(
 				}
 			});
 		}
-		const input: UserInput = images || recallContext
-			? [
-				{ type: "text", text: prompt },
-				...(images?.nativeImages ?? []),
-				...(images?.fallbackContext ? [{ type: "text" as const, text: images.fallbackContext }] : []),
-				...(recallContext ? [{ type: "text" as const, text: recallContext }] : []),
-			]
-			: prompt;
-		service.recordTurnMetadata(req, sessionId, null, images, prompt, options.requestId);
+		const input = buildDurableUserInput(prompt, {
+			...(images?.vision ? { nativeImages: images.images } : {}),
+			...(images?.fallbackContext ? { fallbackContext: images.fallbackContext } : {}),
+			...(recallContext ? { recallContext } : {}),
+		});
+		await service.recordTurnMetadata(req, sessionId, null, images, prompt, options.requestId);
 		const submission = await lease.runtime.submit(input, options.requestId);
-		service.noteSubmission(req, sessionId, prompt);
+		await service.noteSubmission(req, sessionId, prompt);
 		const result = await lease.runtime.waitForSubmission(submission.id);
 		if (result.status !== "done") throw new Error(`Durable submission was unanswered: ${result.reason}`);
 		if (stream) {
@@ -76,6 +102,14 @@ export async function runDurableJobPrompt(
 		await service.snapshot(req, sessionId);
 		void service.maybeAutoGenerateTopic(req, sessionId);
 		return result.text;
+	} catch (error) {
+		if (error instanceof DurableSessionBusyError && options.forwardToOwner && !options.images?.length) {
+			const forwarded = await options.forwardToOwner({
+				sessionId, prompt, requestId: options.requestId, turnId: options.turnId,
+			});
+			if (forwarded !== null) return forwarded;
+		}
+		throw error;
 	} finally {
 		if (stream) await stream.stop().catch(() => undefined);
 		if (lease) {

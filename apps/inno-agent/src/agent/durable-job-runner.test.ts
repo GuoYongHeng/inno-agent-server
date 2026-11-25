@@ -1,7 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import { describe, expect, it, vi } from "vitest";
-import { runDurableJobPrompt } from "./durable-job-runner.js";
-import type { DurableSessionService } from "./durable-session-service.js";
+import { DURABLE_JOB_BUSY_WAIT_MS, runDurableJobPrompt } from "./durable-job-runner.js";
+import { DurableSessionBusyError, type DurableSessionService } from "./durable-session-service.js";
 
 function fixture(overrides: { pending?: boolean } = {}) {
 	const binding = vi.fn();
@@ -81,13 +81,13 @@ describe("runDurableJobPrompt", () => {
 		const { service, submit } = fixture();
 		const image = { type: "image" as const, data: "aW1hZ2U=", mimeType: "image/png" };
 		const prepared = {
-			nativeImages: native ? [image] : [],
+			vision: native,
 			images: [{ mimeType: "image/png", workspacePath: ".chat-images/channel.png" }],
 			fallbackContext: "Image path hints",
 			workspaceId: "workspace-1",
 			workspaceRoot: "/tmp/workspace-1",
 		};
-		vi.mocked(service.prepareImages).mockReturnValue(prepared);
+		vi.mocked(service.prepareImages).mockResolvedValue(prepared);
 
 		await runDurableJobPrompt(req, service, "durable-session", "describe this", {
 			requestId: "channel-request", turnId: "channel-turn", images: [image], noUi: true,
@@ -97,10 +97,24 @@ describe("runDurableJobPrompt", () => {
 		expect(service.recordTurnMetadata).toHaveBeenCalledWith(req, "durable-session", null, prepared, "describe this", "channel-request");
 		expect(submit).toHaveBeenCalledWith([
 			{ type: "text", text: "describe this" },
-			...(native ? [image] : []),
+			...(native ? [{ type: "text", text: "[inno-native-images]\n.chat-images/channel.png\timage/png\n[/inno-native-images]" }] : []),
 			{ type: "text", text: "Image path hints" },
 			{ type: "text", text: "recalled context" },
 		], "channel-request");
+		const submitted = JSON.stringify(submit.mock.calls.at(-1));
+		expect(submitted).not.toContain(image.data);
+	});
+
+	it("leases with the default busy wait and honors a per-call override", async () => {
+		const { service } = fixture();
+		await runDurableJobPrompt(req, service, "durable-session", "prompt", {
+			requestId: "job-request", turnId: "job-turn",
+		});
+		expect(service.lease).toHaveBeenCalledWith(req, "durable-session", { busyWaitMs: DURABLE_JOB_BUSY_WAIT_MS });
+		await runDurableJobPrompt(req, service, "durable-session", "prompt", {
+			requestId: "job-request-2", turnId: "job-turn-2", busyWaitMs: 42,
+		});
+		expect(service.lease).toHaveBeenLastCalledWith(req, "durable-session", { busyWaitMs: 42 });
 	});
 
 	it("rejects a pending question before opening a headless run", async () => {
@@ -109,5 +123,32 @@ describe("runDurableJobPrompt", () => {
 			requestId: "job-request", turnId: "job-turn",
 		})).rejects.toThrow("pending question");
 		expect(service.lease).not.toHaveBeenCalled();
+	});
+
+	it("forwards to the owner worker when the lease stays busy", async () => {
+		const { service } = fixture();
+		service.lease = vi.fn(async () => { throw new DurableSessionBusyError(); });
+		const forwardToOwner = vi.fn(async () => "forwarded answer");
+		await expect(runDurableJobPrompt(req, service, "durable-session", "job prompt", {
+			requestId: "job-request", turnId: "job-turn", forwardToOwner,
+		})).resolves.toBe("forwarded answer");
+		expect(forwardToOwner).toHaveBeenCalledWith({
+			sessionId: "durable-session", prompt: "job prompt",
+			requestId: "job-request", turnId: "job-turn",
+		});
+	});
+
+	it("rethrows busy when forwarding is impossible and never forwards image prompts", async () => {
+		const { service } = fixture();
+		service.lease = vi.fn(async () => { throw new DurableSessionBusyError(); });
+		const forwardToOwner = vi.fn(async () => null);
+		await expect(runDurableJobPrompt(req, service, "durable-session", "job prompt", {
+			requestId: "job-request", turnId: "job-turn", forwardToOwner,
+		})).rejects.toThrow(DurableSessionBusyError);
+		await expect(runDurableJobPrompt(req, service, "durable-session", "image prompt", {
+			requestId: "job-request", turnId: "job-turn", forwardToOwner,
+			images: [{ type: "image", data: "a", mimeType: "image/png" } as never],
+		})).rejects.toThrow(DurableSessionBusyError);
+		expect(forwardToOwner).toHaveBeenCalledOnce();
 	});
 });

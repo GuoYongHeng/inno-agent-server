@@ -1,20 +1,34 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { JobStore } from "./job-store.js";
 import type { ScheduledJob } from "./types.js";
 import type { ChannelRegistry } from "../channels/channel.js";
-import { executeJob } from "./job-runner.js";
+import { executeJob, type JobRunResult } from "./job-runner.js";
 import { validateCron } from "./cron-utils.js";
 import type { CheckInStore } from "../checkins/check-in-store.js";
 import { getCurrentTenant, getCurrentTenantStore } from "../tenants/current.js";
+import { defineInnoTool } from "../agent/inno-tool.js";
+
+export interface SchedulerToolOptions {
+	/** Run a job in a session of its own. Durable sessions supply this so the job
+	 * executes through the durable executor; without it the legacy global runner
+	 * is used. */
+	runJob?: (job: ScheduledJob) => Promise<JobRunResult>;
+	/** Refuse to run jobs from the tool, e.g. where no executor exists. */
+	runMode?: "unavailable";
+}
 
 /**
  * Create scheduler tools that allow the agent to manage scheduled jobs.
- * Works in both CLI and server contexts.
  */
-export function createSchedulerTools(jobStore: JobStore, channelRegistry?: ChannelRegistry, checkInStore?: CheckInStore): ToolDefinition[] {
-	const createJobTool = defineTool({
+export function createSchedulerTools(
+	jobStore: JobStore,
+	channelRegistry?: ChannelRegistry,
+	checkInStore?: CheckInStore,
+	options: SchedulerToolOptions = {},
+): ToolRegistration[] {
+	const createJobTool = defineInnoTool({
 		name: "create_scheduled_job",
 		label: "Create Scheduled Job",
 		description:
@@ -25,7 +39,6 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 			taskType: StringEnum([
 				"daily_review",
 				"weekly_summary",
-				"learner_profile_reflection",
 				"spaced_review",
 				"check_in_reminder",
 				"push_reminder",
@@ -37,7 +50,7 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 			})),
 			chatId: Type.Optional(Type.String({ description: "推送目标的 chat_id（可选）" })),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(params) {
 			const cronCheck = validateCron(params.cron);
 			if (!cronCheck.ok) {
 				return {
@@ -45,7 +58,7 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 						type: "text" as const,
 						text: `Cron 表达式不合法：${cronCheck.error}。请改用形如 '30 14 28 2 *' 的 5 段表达式后重试。`,
 					}],
-					details: { error: "invalid_cron" } as Record<string, unknown>,
+					details: { error: "invalid_cron" },
 				};
 			}
 			if (params.channel && !channelRegistry?.get(params.channel)) {
@@ -54,11 +67,11 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 						type: "text" as const,
 						text: `频道「${params.channel}」尚未注册（用户未启用该 channel）。请提示用户先在设置里启用并配置 ${params.channel}，或者把任务改为不指定 channel（仅站内提醒）。`,
 					}],
-					details: { error: "channel_not_registered", channel: params.channel } as Record<string, unknown>,
+					details: { error: "channel_not_registered", channel: params.channel },
 				};
 			}
 			const defaultTarget = params.channel ? channelRegistry?.getDefaultTarget(params.channel) : undefined;
-			const job = jobStore.create({
+			const job = await jobStore.create({
 				name: params.name,
 				cron: params.cron,
 				timezone: jobStore.defaultTimezone,
@@ -74,13 +87,13 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 			if (tenant) {
 				const tenantStore = getCurrentTenantStore();
 				if (!tenantStore) {
-					jobStore.delete(job.id);
+					await jobStore.delete(job.id);
 					throw new Error("Tenant store is required to create a scheduled job");
 				}
 				try {
 					await tenantStore.claimResource(tenant, "job", job.id);
 				} catch (err) {
-					jobStore.delete(job.id);
+					await jobStore.delete(job.id);
 					throw err;
 				}
 			}
@@ -90,18 +103,18 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 					type: "text" as const,
 					text: `定时任务已创建：${job.name} (${job.id})\nCron: ${job.cron}\n类型: ${job.taskType}\n下次执行: ${job.nextRunAt ?? "无法计算，请检查 cron 表达式"}\n\n你可以说「执行这个任务」来立即运行，或等待后台调度器自动触发。`,
 				}],
-				details: { jobId: job.id } as Record<string, unknown>,
+				details: { jobId: job.id },
 			};
 		},
 	});
 
-	const listJobsTool = defineTool({
+	const listJobsTool = defineInnoTool({
 		name: "list_scheduled_jobs",
 		label: "List Scheduled Jobs",
 		description: "列出所有定时任务。用户问「我有哪些定时任务」或「查看定时任务」时调用。",
 		parameters: Type.Object({}),
 		async execute() {
-			const jobs = jobStore.list();
+			const jobs = await jobStore.list();
 			if (jobs.length === 0) {
 				return {
 					content: [{ type: "text" as const, text: "当前没有定时任务。" }],
@@ -120,7 +133,7 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 		},
 	});
 
-	const updateJobTool = defineTool({
+	const updateJobTool = defineInnoTool({
 		name: "update_scheduled_job",
 		label: "Update Scheduled Job",
 		description: "更新或禁用一个定时任务。可以修改名称、cron、启用状态、提示词等。",
@@ -131,7 +144,7 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 			enabled: Type.Optional(Type.Boolean({ description: "是否启用" })),
 			prompt: Type.Optional(Type.String({ description: "新提示词" })),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(params) {
 			const { id, ...patch } = params;
 			if (patch.cron !== undefined) {
 				const cronCheck = validateCron(patch.cron);
@@ -141,33 +154,33 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 							type: "text" as const,
 							text: `Cron 表达式不合法：${cronCheck.error}。任务未更新。`,
 						}],
-						details: { error: "invalid_cron" } as Record<string, unknown>,
+						details: { error: "invalid_cron" },
 					};
 				}
 			}
-			const updated = jobStore.update(id, patch);
+			const updated = await jobStore.update(id, patch);
 			if (!updated) {
 				return {
 					content: [{ type: "text" as const, text: `未找到任务 ${id}` }],
-					details: {} as Record<string, unknown>,
+					details: {},
 				};
 			}
 			return {
 				content: [{ type: "text" as const, text: `任务 ${updated.name} (${updated.id}) 已更新。` }],
-				details: {} as Record<string, unknown>,
+				details: {},
 			};
 		},
 	});
 
-	const deleteJobTool = defineTool({
+	const deleteJobTool = defineInnoTool({
 		name: "delete_scheduled_job",
 		label: "Delete Scheduled Job",
 		description: "删除一个定时任务。",
 		parameters: Type.Object({
 			id: Type.String({ description: "要删除的任务 ID" }),
 		}),
-		async execute(_toolCallId, params) {
-			const deleted = jobStore.delete(params.id);
+		async execute(params) {
+			const deleted = await jobStore.delete(params.id);
 			const tenant = getCurrentTenant();
 			const tenantStore = getCurrentTenantStore();
 			if (deleted && tenant) {
@@ -184,7 +197,7 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 		},
 	});
 
-	const runJobTool = defineTool({
+	const runJobTool = defineInnoTool({
 		name: "run_scheduled_job",
 		label: "Run Scheduled Job",
 		description:
@@ -192,21 +205,27 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 		parameters: Type.Object({
 			id: Type.String({ description: "要执行的任务 ID" }),
 		}),
-		async execute(_toolCallId, params) {
-			const job = jobStore.get(params.id);
+		async execute(params) {
+			const job = await jobStore.get(params.id);
 			if (!job) {
 				return {
 					content: [{ type: "text" as const, text: `未找到任务 ${params.id}` }],
 					details: {},
 				};
 			}
-			if (getCurrentTenant()) {
+			if (options.runMode === "unavailable") {
 				return {
-					content: [{ type: "text" as const, text: "多用户 singleton runtime 隔离尚未完成，暂不能通过 agent 工具无 session 执行任务；请从任务面板选择一个当前会话手动运行。" }],
-					details: { error: "scoped_runtime_unavailable" } as Record<string, unknown>,
+					content: [{ type: "text" as const, text: "当前会话暂不支持通过工具直接运行定时任务；请从任务面板选择一个会话手动运行。" }],
+					details: { error: "run_unavailable" },
 				};
 			}
-			if (!channelRegistry) {
+			if (!options.runJob && getCurrentTenant()) {
+				return {
+					content: [{ type: "text" as const, text: "多用户 singleton runtime 隔离尚未完成，暂不能通过 agent 工具无 session 执行任务；请从任务面板选择一个当前会话手动运行。" }],
+					details: { error: "scoped_runtime_unavailable" },
+				};
+			}
+			if (!options.runJob && !channelRegistry) {
 				return {
 					content: [{
 						type: "text" as const,
@@ -216,7 +235,9 @@ export function createSchedulerTools(jobStore: JobStore, channelRegistry?: Chann
 				};
 			}
 
-			const result = await executeJob(job, jobStore, channelRegistry, "manual", checkInStore);
+			const result = options.runJob
+				? await options.runJob(job)
+				: await executeJob(job, jobStore, channelRegistry!, "manual", checkInStore);
 			return {
 				content: [{
 					type: "text" as const,

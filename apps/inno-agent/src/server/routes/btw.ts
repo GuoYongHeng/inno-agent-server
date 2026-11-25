@@ -1,14 +1,11 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { appendAssistantNotificationInSession, completeSideQuestion } from "../../agent/pi-runner.js";
 import { json, matchRoute, readBody } from "../http-helpers.js";
 import { logger } from "../../logger.js";
 import type { SessionMessageSummary } from "../session-model.js";
 import type { TenantStore } from "../../tenants/store.js";
 import { ownsRequestResource } from "../../tenants/http.js";
 import type { DurableHttpContext } from "../durable-routes.js";
-import { resolveRequestTenantDataRoot } from "../../tenants/paths.js";
+import type { TenantStateKv } from "../../tenants/state-store.js";
 import {
 	readBtwState,
 	writeBtwState,
@@ -29,13 +26,10 @@ import {
  */
 
 export interface BtwRouteContext {
-	dataDir: string;
-	tenantStore?: TenantStore | null;
-	durableSessions?: DurableHttpContext["service"];
-	/** Legacy bring-back appends are disabled in multi-user mode. */
-	durableRequired?: boolean;
-	sessionFileFromId: (sessionDir: string, id: string) => string | null;
-	parseSessionFile: (filePath: string) => { messages: SessionMessageSummary[] } | null;
+	/** Per-tenant sidecar state (`tenant_state`). */
+	stateKv: TenantStateKv;
+	tenantStore: TenantStore;
+	durableSessions: DurableHttpContext["service"];
 }
 
 const MAX_QUESTION_LEN = 4000;
@@ -161,11 +155,6 @@ function parseStatePayload(raw: unknown): BtwStateResponse | null {
 	};
 }
 
-function sessionPathFor(ctx: BtwRouteContext, sessionId: string): string | null {
-	const sessionPath = ctx.sessionFileFromId(join(ctx.dataDir, "sessions"), sessionId);
-	return sessionPath && existsSync(sessionPath) ? sessionPath : null;
-}
-
 function attachAbortSignal(req: HttpReq, res: ServerResponse): { signal: AbortSignal; cleanup: () => void } {
 	const controller = new AbortController();
 	const abort = () => controller.abort();
@@ -203,13 +192,12 @@ export async function handleBtwRoutes(
 	if (stateMatch) {
 		const sessionId = stateMatch.sessionId;
 		if (!await ownsSession(sessionId)) { json(res, 404, { error: "Session not found" }); return true; }
-		if (!ctx.durableSessions?.get(req, sessionId) && !sessionPathFor(ctx, sessionId)) {
+		if (!await ctx.durableSessions.get(req, sessionId)) {
 			json(res, 404, { error: "Session not found" });
 			return true;
 		}
-		const stateDataRoot = resolveRequestTenantDataRoot(req, ctx.dataDir);
 		if (method === "GET") {
-			json(res, 200, readBtwState(stateDataRoot, sessionId));
+			json(res, 200, await readBtwState(ctx.stateKv, sessionId));
 			return true;
 		}
 		const body = await readBody(req);
@@ -218,7 +206,7 @@ export async function handleBtwRoutes(
 			json(res, 400, { error: "Malformed btw state" });
 			return true;
 		}
-		json(res, 200, writeBtwState(stateDataRoot, sessionId, parsed));
+		json(res, 200, await writeBtwState(ctx.stateKv, sessionId, parsed));
 		return true;
 	}
 
@@ -236,22 +224,17 @@ export async function handleBtwRoutes(
 			json(res, 400, { error: `question too long (max ${MAX_QUESTION_LEN} chars)` });
 			return true;
 		}
-		let digest = "";
-		if (ctx.durableSessions?.get(req, sessionId)) {
-			const snapshot = await ctx.durableSessions.snapshot(req, sessionId);
-			digest = buildBtwContextDigest(snapshot.messages);
-		} else {
-			const sessionPath = sessionPathFor(ctx, sessionId);
-			if (!sessionPath) {
-				json(res, 404, { error: "Session not found" });
-				return true;
-			}
-			const parsed = ctx.parseSessionFile(sessionPath);
-			digest = parsed ? buildBtwContextDigest(parsed.messages) : "";
+		if (!await ctx.durableSessions.get(req, sessionId)) {
+			json(res, 404, { error: "Session not found" });
+			return true;
 		}
+		const snapshot = await ctx.durableSessions.snapshot(req, sessionId);
+		const digest = buildBtwContextDigest(snapshot.messages);
 		const requestAbort = attachAbortSignal(req, res);
 		try {
-			const answer = await completeSideQuestion({ contextDigest: digest, thread, question, signal: requestAbort.signal });
+			const answer = await ctx.durableSessions.completeSideQuestion(req, sessionId, {
+				contextDigest: digest, thread, question, signal: requestAbort.signal,
+			});
 			if (requestAbort.signal.aborted) return true;
 			if (!answer) {
 				json(res, 502, { error: "Side question completion failed or timed out" });
@@ -274,36 +257,17 @@ export async function handleBtwRoutes(
 			json(res, 400, { error: "Missing sessionId, question or answer" });
 			return true;
 		}
-		if (ctx.durableSessions?.get(req, sessionId)) {
-			const clientRequestId = typeof body.clientRequestId === "string" ? body.clientRequestId.trim() : "";
-			if (!clientRequestId) {
-				json(res, 400, { error: "Missing clientRequestId for durable bring-back" });
-				return true;
-			}
-			try {
-				await ctx.durableSessions.appendAssistantNotification(req, sessionId, formatBtwForSession(question, answer), clientRequestId);
-			} catch (err) {
-				logger.warn({ err, sessionId }, "durable btw bring-back failed");
-				json(res, 500, { error: "Failed to append the note to the session" });
-				return true;
-			}
-			json(res, 200, { ok: true });
-			return true;
-		}
-		const sessionPath = sessionPathFor(ctx, sessionId);
-		if (!sessionPath) {
+		if (!await ctx.durableSessions.get(req, sessionId)) {
 			json(res, 404, { error: "Session not found" });
 			return true;
 		}
-		if (ctx.durableRequired) {
-			json(res, 409, {
-				error: "Legacy sessions are read-only in multi-user mode; create a durable session instead",
-				code: "durable_required",
-			});
+		const clientRequestId = typeof body.clientRequestId === "string" ? body.clientRequestId.trim() : "";
+		if (!clientRequestId) {
+			json(res, 400, { error: "Missing clientRequestId for durable bring-back" });
 			return true;
 		}
 		try {
-			await appendAssistantNotificationInSession(sessionPath, formatBtwForSession(question, answer));
+			await ctx.durableSessions.appendAssistantNotification(req, sessionId, formatBtwForSession(question, answer), clientRequestId);
 		} catch (err) {
 			logger.warn({ err, sessionId }, "btw bring-back failed");
 			json(res, 500, { error: "Failed to append the note to the session" });

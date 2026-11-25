@@ -8,6 +8,7 @@ import {
 	getSession,
 	listSessions,
 	unarchiveSession as apiUnarchiveSession,
+	updateSessionModel,
 	updateSessionName,
 	type CreateSessionInput,
 	type SessionChannel,
@@ -20,7 +21,6 @@ import { chatStore } from "./chat-store.js";
 import type { ChatMessage, PendingQuestion } from "../types/chat.js";
 import { workspaceStore } from "./workspace-store.js";
 import { workspacesStore } from "./workspaces-store.js";
-import { terminalStore } from "./terminal-store.js";
 import { hasMermaidFence, preloadMermaidMarkdownRuntime } from "../utils/mermaid-runtime.js";
 
 interface SessionsStoreEvents {
@@ -214,7 +214,6 @@ export class SessionsStoreImpl extends EventEmitter<SessionsStoreEvents> {
 		// Detach from the current stream without stopping the backend task.
 		chatStore.detach();
 		// Drop any terminal bound to the previous session.
-		void terminalStore.disconnect();
 
 		const cached = this._messageCache.get(id);
 		if (cached) {
@@ -323,7 +322,6 @@ export class SessionsStoreImpl extends EventEmitter<SessionsStoreEvents> {
 		this.preselectedWorkspaceId = null;
 		chatStore.detach();
 		chatStore.loadHistory([]);
-		void terminalStore.disconnect();
 		this.emit("change", undefined);
 	}
 
@@ -363,7 +361,6 @@ export class SessionsStoreImpl extends EventEmitter<SessionsStoreEvents> {
 		this.preselectedWorkspaceId = null;
 		chatStore.detach();
 		chatStore.clear();
-		void terminalStore.disconnect();
 		this.emit("change", undefined);
 	}
 
@@ -400,7 +397,6 @@ export class SessionsStoreImpl extends EventEmitter<SessionsStoreEvents> {
 			this._messageCache.set(this.currentSessionId, chatStore.messages);
 		}
 		chatStore.detach();
-		void terminalStore.disconnect();
 		this.emit("change", undefined);
 		try {
 			// Server answers 409 session_busy within ~8s when another session's
@@ -476,6 +472,12 @@ export class SessionsStoreImpl extends EventEmitter<SessionsStoreEvents> {
 	async renameSession(id: string, name: string, generated = false): Promise<void> {
 		const updated = await updateSessionName(id, name, generated);
 		this.sessions = this.sessions.map((session) => session.id === id ? updated : session);
+		this.emit("change", undefined);
+	}
+
+	async setSessionModel(id: string, provider: string, modelId: string): Promise<void> {
+		const updated = await updateSessionModel(id, provider, modelId);
+		this.sessions = this.sessions.map((session) => session.id === id ? { ...session, ...updated } : session);
 		this.emit("change", undefined);
 	}
 

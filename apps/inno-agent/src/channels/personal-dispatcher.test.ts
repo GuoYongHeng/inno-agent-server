@@ -40,7 +40,6 @@ interface OptsProbe {
 	inSession: { sessionPath: string; prompt: string }[];
 	streaming: { sessionPath: string; prompt: string; events: ChannelStreamEvent[] }[];
 	createdSessions: string[];
-	recordedChannels: { channel: string; sessionId?: string }[];
 	failNextPrompt: { current: boolean };
 	nextSessionId: { current: number };
 }
@@ -51,7 +50,6 @@ function makeOpts(): OptsProbe {
 		inSession: [],
 		streaming: [],
 		createdSessions: [],
-		recordedChannels: [],
 		failNextPrompt: { current: false },
 		nextSessionId: { current: 0 },
 		opts: undefined as unknown as PersonalChannelDispatcherOptions,
@@ -91,9 +89,6 @@ function makeOpts(): OptsProbe {
 			return id;
 		},
 		getCurrentSessionId: () => "current.jsonl",
-		recordSessionChannel: (channel, sessionId) => {
-			probe.recordedChannels.push({ channel, sessionId });
-		},
 		channelsDataDir,
 		sessionDir,
 	};
@@ -211,7 +206,7 @@ describe("PersonalChannelDispatcher routing", () => {
 
 		await dispatcher.handle(channel, msg());
 
-		expect(probe.recordedChannels.at(-1)).toEqual({ channel: "feishu", sessionId: "sess_1.jsonl" });
+		expect(probe.inSession.at(-1)?.sessionPath).toContain("sess_1.jsonl");
 	});
 
 	it("discards a persisted binding that fails session ownership validation", async () => {
@@ -295,17 +290,17 @@ describe("PersonalChannelDispatcher routing", () => {
 		expect(probe.inSession[0].prompt.length).toBeLessThanOrEqual(20_000);
 	});
 
-	it("appends downloaded file attachments to the prompt", async () => {
+	it("announces file attachments in the prompt without reading them", async () => {
 		const probe = makeOpts();
 		const dispatcher = new PersonalChannelDispatcher(probe.opts);
 		const { channel } = fakeChannel();
 
 		await dispatcher.handle(
 			channel,
-			msg({ attachments: [{ type: "file", filePath: "/tmp/report.pdf", fileName: "report.pdf" }] }),
+			msg({ attachments: [{ type: "file", fileName: "report.pdf" }] }),
 		);
 
-		expect(probe.inSession[0].prompt).toContain("[附件已下载到: /tmp/report.pdf]");
+		expect(probe.inSession[0].prompt).toContain("[用户发送了文件「report.pdf」，通道暂不支持读取文件内容]");
 	});
 });
 

@@ -63,15 +63,27 @@ export interface ChannelsSettingsPayload {
 	};
 	channels?: {
 		feishu?: PersonalChannelConfig;
-		qq?: PersonalBridgeChannelConfig;
-		wechat?: PersonalILinkChannelConfig | PersonalBridgeChannelConfig;
+		qq?: PersonalChannelConfig;
+		wechat?: PersonalChannelConfig;
 	};
 	bridge?: {
 		token: string;
 	};
 }
 
-export type WindowCloseBehavior = "ask" | "hide" | "quit";
+
+export interface SandboxSettings {
+	enabled?: boolean;
+	apiKey?: string; // masked
+	domain?: string;
+	template?: string;
+	timeoutMinutes?: number;
+	commandTimeoutSeconds?: number;
+	allowInternetAccess?: boolean;
+	allowedDomains?: string[];
+	requireApproval?: "always" | "never";
+	limits?: { maxConcurrent?: number; maxSandboxes?: number; maxActiveMinutesPerDay?: number };
+}
 
 export interface InnoSettings {
 	defaultProvider: string;
@@ -89,68 +101,20 @@ export interface InnoSettings {
 	};
 	bridge?: { token: string }; // masked
 	github?: { token: string }; // masked
-	ocrApi?: {
-		token: string; // masked
-		model?: string;
-		baseUrl?: string;
-	};
 	tavily?: {
 		apiKey: string; // masked
 	};
-	contentHub?: {
-		type: "github" | "bundle";
-		owner: string;
-		repo: string;
-		ref: string;
-		skillsPath: string;
-		presetsPath: string;
-		baseUrl: string;
-		token: string; // masked
-	};
-	memory?: { l1Enabled: boolean; l2Enabled: boolean; l3Enabled: boolean };
-	plugins?: {
-		todo?: { enabled?: boolean };
-		webAccess?: { enabled?: boolean };
-		permissionSystem?: { enabled?: boolean; mode?: PermissionPolicyMode };
-		computerUse?: { enabled?: boolean };
-		codemode?: { enabled?: boolean };
-	};
-	/** Effective computer-use state from the backend (resolves the
-	 *  INNO_DESKTOP default; `explicit` is the user's override, null = unset). */
-	computerUse?: { enabled: boolean; explicit: boolean | null; isDesktop: boolean };
-	/** Effective codemode state from the backend; restart-required like
-	 *  computer use (extension registers at session init). */
-	codemode?: { enabled: boolean };
+	/** Remote sandbox (platform-level). Absent for tenants. */
+	sandbox?: SandboxSettings;
+	/** False in authenticated mode: the operator manages the sandbox, tenants cannot. */
+	sandboxEditable?: boolean;
+	/** Server-managed surfaces: hide tenant edit affordances for these. */
+	serverManaged?: { providers?: boolean; tavily?: boolean; channelCredentials?: boolean };
+	/** True when the server has E2B_API_KEY in its environment. */
+	sandboxEnvKey?: boolean;
+	memory?: { l2Enabled: boolean; l3Enabled: boolean };
 	smartInput?: SmartInputSettings;
-	mcp?: { enabled: boolean };
-	ui?: { theme: string; closeBehavior: WindowCloseBehavior; mathSingleDollar: boolean };
-}
-
-/* ---------- Web research (pi-web-access: web_research / source_check / fetch_content) ---------- */
-
-/** Permission policy template: default asks on unlisted bash, auto approves
- * bash, yolo approves everything. Hard-deny floor applies in all three. */
-export type PermissionPolicyMode = "default" | "auto" | "yolo";
-
-export type WebAccessProviderKind = "key" | "url" | "none";
-
-export interface WebAccessProvider {
-	id: string;
-	kind: WebAccessProviderKind;
-	configured: boolean;
-	maskedValue: string; // "****abcd", empty when unconfigured or kind === "none"
-}
-
-/** Served by GET /api/settings/web-access (backed by <configDir>/web-search.json). */
-export interface WebAccessSettings {
-	defaultProvider: string;
-	providers: WebAccessProvider[];
-}
-
-export interface WebAccessSettingsPayload {
-	provider?: string;
-	/** Per-provider credential/URL updates; "****…" keeps existing, "" clears. */
-	values?: Record<string, string>;
+	ui?: { theme: string; mathSingleDollar: boolean };
 }
 
 /** One literal keyword → allowed file formats with optional exclusions. */

@@ -1,11 +1,11 @@
-import type { SlashCommandItem } from "../../api/commands.js";
+import type { SlashCommandItem } from "./slash-command.js";
 
 /**
  * Pure helpers for the composer slash-command palette. Kept free of React so
  * the filtering semantics are unit-testable (mirrors workspace.test.ts style).
  */
 
-export type SlashPaletteAction = "new-chat" | "model" | "profile" | "jobs" | "skills" | "settings";
+export type SlashPaletteAction = "new-chat" | "model" | "jobs" | "skills" | "settings";
 
 export interface SlashPaletteEntry {
 	key: string;
@@ -33,7 +33,7 @@ function matchesQuery(name: string, description: string | undefined, query: stri
  * Build the flat, display-ordered palette entries: app actions first
  * (Codex-style), then agent commands sorted by name within each source group
  * (extension → prompt → skill). Matches against both the command name and
- * its description, so localized queries (e.g. "画像") find English slugs.
+ * its description, so localized queries (e.g. "定时") find English slugs.
  */
 export function buildSlashPaletteEntries(
 	appActions: Array<{ action: SlashPaletteAction; name: string; description: string }>,

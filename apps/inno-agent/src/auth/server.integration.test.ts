@@ -1,12 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import WebSocket from "ws";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readAuthRuntimeConfig } from "./config.js";
@@ -22,14 +21,10 @@ let origin: string;
 let output = "";
 let providerServer: HttpServer;
 let providerOrigin = "";
-let ocrServer: HttpServer;
-let ocrOrigin = "";
-const ocrRequests: Array<{ authorization: string; body: string }> = [];
 const providerRequests: Array<{ authorization: string; body: string }> = [];
 const sidecarServers: HttpServer[] = [];
 const sidecarRequests: Array<{ sidecar: string; method: string; path: string; authorization: string; body: string }> = [];
 let sidecarOriginA = "";
-let sidecarOriginB = "";
 
 async function freePort(): Promise<number> {
 	const listener = createServer();
@@ -65,14 +60,12 @@ async function api(cookie: string, path: string, init: RequestInit = {}): Promis
 	});
 }
 
-async function configureTestProvider(cookie: string, apiKey = "integration-test-secret"): Promise<void> {
-	const response = await api(cookie, "/api/settings/providers", {
-		method: "PUT",
-		body: JSON.stringify({
-			providerId: "shared", baseUrl: providerOrigin, apiKey,
-			api: "openai-completions", makeDefault: true,
-			models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-		}),
+// Providers are server-managed; the tenant only picks a model from the
+// server catalog (this is the real user-facing selection path).
+async function configureTestProvider(cookie: string): Promise<void> {
+	const response = await api(cookie, "/api/settings/model", {
+		method: "POST",
+		body: JSON.stringify({ provider: "shared", model: "tenant-model" }),
 	});
 	expect(response.status).toBe(200);
 }
@@ -131,14 +124,10 @@ async function startServer(): Promise<void> {
 			...process.env,
 			INNO_HOME: home,
 			INNO_CONFIG_DIR: join(home, "config"),
-			INNO_DATA_DIR: join(home, "data"),
 			INNO_SKILLS_DIR: join(home, "skills"),
 			INNO_WORKSPACE_DIR: join(home, "workspace"),
 			INNO_PORT: port,
 			INNO_HOST: "127.0.0.1",
-			INNO_AUTH_MODE: "better-auth",
-			INNO_MULTI_USER_ENABLED: "true",
-			INNO_DURABLE_ENABLED: "true",
 			DATABASE_URL: postgres.databaseUrl,
 			BETTER_AUTH_SECRET: SECRET,
 			BETTER_AUTH_URL: origin,
@@ -183,6 +172,10 @@ async function startSidecar(sidecar: string): Promise<string> {
 beforeAll(async () => {
 	postgres = await startTemporaryPostgres();
 	home = await mkdtemp(join(tmpdir(), "inno-server-auth-"));
+	// Presets ship in the image; the test image carries one preset.
+	await mkdir(join(home, "presets", "durable-preset"), { recursive: true });
+	await writeFile(join(home, "presets", "durable-preset", "preset.json"), JSON.stringify({ id: "durable-preset", name: "Durable preset" }));
+	await writeFile(join(home, "presets", "durable-preset", "agent.md"), "durable preset workspace instructions");
 	providerServer = createHttpServer((req, res) => {
 		let body = "";
 		req.setEncoding("utf-8");
@@ -190,12 +183,12 @@ beforeAll(async () => {
 		req.on("end", async () => {
 			if (req.method === "GET" && req.url === "/index.json") {
 				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ presets: [{ id: "durable-preset", name: "Durable preset" }] }));
+				res.end(JSON.stringify({ skills: [] }));
 				return;
 			}
 			providerRequests.push({ authorization: req.headers.authorization ?? "", body });
 			if (body.includes("请用一句简短的中文短语概括")) {
-				const topic = req.headers.authorization === "Bearer durable-topic-a-secret"
+				const topic = body.includes("durable-topic-first-a") || body.includes("durable-topic-third-a")
 					? "租户 A 学习目标"
 					: "租户 B 学习目标";
 				res.writeHead(200, { "Content-Type": "text/event-stream" });
@@ -238,6 +231,32 @@ beforeAll(async () => {
 							choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{
 								index: 0, id: "durable-workspace-write-call", type: "function",
 								function: { name: "write", arguments: JSON.stringify({ path: "nested/durable-preview.txt", content: "durable preview content" }) },
+							}] }, finish_reason: null }],
+						})}`,
+						"",
+						`data: ${JSON.stringify({
+							id: "tenant-stub", object: "chat.completion.chunk", created: 0, model: "tenant-model",
+							choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+						})}`,
+						"",
+						"data: [DONE]",
+						"",
+						"",
+					].join("\n"));
+					return;
+				}
+			}
+			if (body.includes("durable-bash-write")) {
+				const request = JSON.parse(body) as { messages?: Array<{ role?: string }> };
+				const lastRole = request.messages?.[request.messages.length - 1]?.role;
+				if (lastRole === "user") {
+					res.writeHead(200, { "Content-Type": "text/event-stream" });
+					res.end([
+						`data: ${JSON.stringify({
+							id: "tenant-stub", object: "chat.completion.chunk", created: 0, model: "tenant-model",
+							choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{
+								index: 0, id: "durable-bash-write-call", type: "function",
+								function: { name: "bash", arguments: JSON.stringify({ command: "echo bash-content > bash-made.txt" }) },
 							}] }, finish_reason: null }],
 						})}`,
 						"",
@@ -314,17 +333,9 @@ beforeAll(async () => {
 			if (memoryPrompt) {
 				const request = JSON.parse(body) as { messages?: Array<{ role?: string }> };
 				const toolResults = request.messages?.filter((message) => message.role === "tool").length ?? 0;
-				if (toolResults < 6) {
+				if (toolResults < 2) {
 					const tenant = memoryPrompt[1];
 					const toolCalls = [{
-						id: `durable-memory-event-${tenant}`,
-						name: "record_learning_event",
-						arguments: {
-							event_type: "concept_explained",
-							context: { concept_ids: [`durable-concept-${tenant}`] },
-							payload: { topic: `durable-topic-${tenant}` },
-						},
-					}, {
 						id: `durable-memory-archive-${tenant}`,
 						name: "l2_archive",
 						arguments: {
@@ -332,18 +343,6 @@ beforeAll(async () => {
 							content: `durable-content-${tenant}`,
 							sourceType: "markdown",
 						},
-					}, {
-						id: `durable-profile-patch-${tenant}`,
-						name: "patch_learner_profile",
-						arguments: { profile_summary_append: `durable-patch-${tenant}` },
-					}, {
-						id: `durable-profile-update-${tenant}`,
-						name: "update_learner_profile",
-						arguments: { profile_summary: `durable-profile-${tenant}` },
-					}, {
-						id: `durable-ocr-call-${tenant}`,
-						name: "ocr_image",
-						arguments: { filePath: `https://images.local/durable-ocr-${tenant}.png` },
 					}, {
 						id: `durable-l3-recall-${tenant}`,
 						name: "l3_recall",
@@ -392,47 +391,13 @@ beforeAll(async () => {
 	});
 	await new Promise<void>((resolveListen) => providerServer.listen(0, "127.0.0.1", resolveListen));
 	providerOrigin = `http://127.0.0.1:${(providerServer.address() as AddressInfo).port}`;
-	ocrServer = createHttpServer((req, res) => {
-		let body = "";
-		req.setEncoding("utf-8");
-		req.on("data", (chunk) => { body += chunk; });
-		req.on("end", () => {
-			ocrRequests.push({ authorization: req.headers.authorization ?? "", body });
-			const path = new URL(req.url ?? "/", "http://ocr.local").pathname;
-			if (req.method === "POST" && path === "/jobs") {
-				const tenant = body.includes("durable-ocr-a") ? "a" : "b";
-				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ data: { jobId: `job-${tenant}` } }));
-				return;
-			}
-			const job = /^\/jobs\/job-(a|b)$/.exec(path);
-			if (req.method === "GET" && job) {
-				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ data: {
-					state: "done",
-					resultUrl: { jsonUrl: `${ocrOrigin}/result-${job[1]}` },
-				} }));
-				return;
-			}
-			const result = /^\/result-(a|b)$/.exec(path);
-			if (req.method === "GET" && result) {
-				res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-				res.end(`${JSON.stringify({ result: { layoutParsingResults: [{ markdown: { text: `durable-ocr-text-${result[1]}` } }] } })}\n`);
-				return;
-			}
-			res.writeHead(404);
-			res.end();
-		});
-	});
-	await new Promise<void>((resolveListen) => ocrServer.listen(0, "127.0.0.1", resolveListen));
-	ocrOrigin = `http://127.0.0.1:${(ocrServer.address() as AddressInfo).port}`;
-	[sidecarOriginA, sidecarOriginB] = await Promise.all([startSidecar("a"), startSidecar("b")]);
+	sidecarOriginA = await startSidecar("a");
 	const port = await freePort();
 	origin = `http://127.0.0.1:${port}`;
 	await mkdir(join(home, "config"), { recursive: true });
 	await writeFile(join(home, "config", "config.json"), JSON.stringify({
-		defaultProvider: "dummy",
-		defaultModel: "dummy-model",
+		defaultProvider: "shared",
+		defaultModel: "tenant-model",
 		providers: {
 			dummy: {
 				baseUrl: "http://127.0.0.1:9",
@@ -440,11 +405,31 @@ beforeAll(async () => {
 				api: "openai-completions",
 				models: [{ id: "dummy-model" }],
 			},
+			// Server-managed catalog: tenants can only select, never edit.
+			shared: {
+				baseUrl: providerOrigin,
+				apiKey: "integration-test-secret",
+				api: "openai-completions",
+				models: [
+					{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 },
+					{ id: "other-model", name: "Other model", contextWindow: 32_000, maxTokens: 2_000 },
+				],
+			},
+			"text-only": {
+				baseUrl: providerOrigin,
+				apiKey: "integration-test-secret",
+				api: "openai-completions",
+				models: [{ id: "text-model", name: "Text model", input: ["text"], contextWindow: 32_000, maxTokens: 2_000 }],
+			},
+		},
+		bridge: { token: "channel-token" },
+		channels: {
+			qq: { enabled: false, mode: "bridge", sidecarBaseUrl: sidecarOriginA },
 		},
 		contentHub: { type: "bundle", baseUrl: providerOrigin },
+		presets: { dir: join(home, "presets") },
 	}));
 	await migrateAuthDatabase(readAuthRuntimeConfig({
-		INNO_AUTH_MODE: "better-auth",
 		DATABASE_URL: postgres.databaseUrl,
 		BETTER_AUTH_SECRET: SECRET,
 		BETTER_AUTH_URL: origin,
@@ -461,10 +446,6 @@ afterAll(async () => {
 		providerServer.closeAllConnections();
 		await new Promise<void>((resolveClose) => providerServer.close(() => resolveClose()));
 	}
-	if (ocrServer) {
-		ocrServer.closeAllConnections();
-		await new Promise<void>((resolveClose) => ocrServer.close(() => resolveClose()));
-	}
 	for (const server of sidecarServers) {
 		server.closeAllConnections();
 		await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
@@ -474,7 +455,7 @@ afterAll(async () => {
 });
 
 describe("server authentication boundary", () => {
-	it("protects HTTP and terminal WebSocket without blocking health or bridge auth", async () => {
+	it("protects HTTP without blocking health or bridge auth", async () => {
 		expect((await fetch(`${origin}/health`)).status).toBe(200);
 		const sessionProbe = await (await fetch(`${origin}/api/session`)).json() as { durableEnabled?: boolean; durableRequired?: boolean };
 		expect(sessionProbe.durableEnabled).toBe(true);
@@ -490,58 +471,19 @@ describe("server authentication boundary", () => {
 		const cookie = registered.headers.get("set-cookie")?.split(";", 1)[0]!;
 		expect(cookie).toContain("session_token");
 		expect((await fetch(`${origin}/api/sessions`, { headers: { Cookie: cookie } })).status).toBe(200);
-		await configureTestProvider(cookie, "server-boundary-secret");
+		await configureTestProvider(cookie);
 		// Bridge has its own bearer-token/tenant-ownership check; it must not
 		// become a cookie-auth route or fall back to the legacy global channel.
 		expect((await fetch(`${origin}/api/bridge/messages`, { method: "POST" })).status).toBe(401);
 
-		const terminalSessionResponse = await api(cookie, "/api/sessions", {
-			method: "POST", body: JSON.stringify({ newWorkspace: { isTemp: true } }),
-		});
-		expect(terminalSessionResponse.status).toBe(201);
-		const terminalSession = await terminalSessionResponse.json() as { id: string };
-		const terminal = await fetch(`${origin}/api/terminal/sessions`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json", Cookie: cookie, Origin: origin },
-			body: JSON.stringify({ sessionId: terminalSession.id }),
-		});
-		expect(terminal.status).toBe(409);
-		const wsPath = "/api/terminal/sessions/host-terminal-disabled/ws";
-
-		const anonymousStatus = await new Promise<number>((resolveStatus, reject) => {
-			const ws = new WebSocket(`${origin.replace("http", "ws")}${wsPath}`, { headers: { Origin: origin } });
-			ws.once("unexpected-response", (_req, res) => resolveStatus(res.statusCode!));
-			ws.once("open", () => { ws.terminate(); reject(new Error("Anonymous WebSocket connected")); });
-			ws.once("error", () => {});
-		});
-		expect(anonymousStatus).toBe(401);
-
-		const authenticatedStatus = await new Promise<number>((resolveStatus, reject) => {
-			const ws = new WebSocket(`${origin.replace("http", "ws")}${wsPath}`, {
-				headers: { Cookie: cookie, Origin: origin },
-			});
-			ws.once("unexpected-response", (_req, res) => resolveStatus(res.statusCode!));
-			ws.once("open", () => { ws.terminate(); reject(new Error("Authenticated host WebSocket connected")); });
-			ws.once("error", () => {});
-		});
-		expect(authenticatedStatus).toBe(409);
-
-		const crossOriginStatus = await new Promise<number>((resolveStatus) => {
-			const ws = new WebSocket(`${origin.replace("http", "ws")}${wsPath}`, {
-				headers: { Cookie: cookie, Origin: "https://untrusted.example.com" },
-			});
-			ws.once("unexpected-response", (_req, res) => resolveStatus(res.statusCode!));
-			ws.once("error", () => {});
-		});
-		expect(crossOriginStatus).toBe(403);
 	});
 });
 
 describe("multi-user durable execution boundary", () => {
-	it("defaults new work to durable and keeps owned legacy history read-only", async () => {
+	it("defaults new work to durable and never executes a legacy-style session", async () => {
 		const cookie = await registerUser("durable-required@example.com");
 		expect((await api(cookie, "/api/sessions")).status).toBe(200);
-		await configureTestProvider(cookie, "durable-required-secret");
+		await configureTestProvider(cookie);
 		const created = await api(cookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ newWorkspace: { isTemp: true } }),
 		});
@@ -549,7 +491,7 @@ describe("multi-user durable execution boundary", () => {
 		expect(await created.json()).toMatchObject({ runtime: "durable" });
 		expect((await api(cookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "legacy" }),
-		})).status).toBe(409);
+		})).status).toBe(400);
 
 		const jobResponse = await api(cookie, "/api/jobs", {
 			method: "POST",
@@ -561,8 +503,9 @@ describe("multi-user durable execution boundary", () => {
 		expect((await api(cookie, "/api/jobs", {
 			method: "POST",
 			body: JSON.stringify({ name: "legacy job", cron: "0 9 * * *", taskType: "custom_prompt", prompt: "test", runtime: "legacy" }),
-		})).status).toBe(409);
+		})).status).toBe(400);
 
+		// A session id that is owned but has no durable record cannot be read or run.
 		const pool = new Pool({ connectionString: postgres.databaseUrl });
 		try {
 			const tenant = await pool.query<{ id: string }>(
@@ -576,35 +519,37 @@ describe("multi-user durable execution boundary", () => {
 		} finally {
 			await pool.end();
 		}
-		await writeFile(join(home, "data", "sessions", "legacy-read-only.jsonl"), `${JSON.stringify({
-			type: "session", version: 3, id: "legacy-read-only", timestamp: "2026-10-27T00:00:00.000Z", cwd: home,
-		})}\n`);
-		expect((await api(cookie, "/api/sessions/legacy-read-only.jsonl")).status).toBe(200);
+		expect((await api(cookie, "/api/sessions/legacy-read-only.jsonl")).status).toBe(404);
 		for (const [path, body] of [
 			["/api/chat", { sessionId: "legacy-read-only.jsonl", prompt: "must not run" }],
 			["/api/chat/stream", { sessionId: "legacy-read-only.jsonl", prompt: "must not run", clientRequestId: "legacy-read-only" }],
-			["/api/btw/bring-back", { sessionId: "legacy-read-only.jsonl", question: "q", answer: "a" }],
+			["/api/btw/bring-back", { sessionId: "legacy-read-only.jsonl", question: "q", answer: "a", clientRequestId: "legacy-btw" }],
 			[`/api/jobs/${job.id}/run`, { sessionId: "legacy-read-only.jsonl" }],
 			[`/api/jobs/${job.id}/run/stream`, { sessionId: "legacy-read-only.jsonl" }],
 		] as const) {
 			const response = await api(cookie, path, { method: "POST", body: JSON.stringify(body) });
-			expect(response.status, path).toBe(409);
-			expect(await response.json()).toMatchObject({ code: "durable_required" });
+			expect(response.status, path).toBe(404);
 		}
-		expect((await api(cookie, "/api/sessions/legacy-read-only.jsonl/activate", { method: "POST" })).status).toBe(409);
+		expect((await api(cookie, "/api/sessions/legacy-read-only.jsonl/activate", { method: "POST" })).status).toBe(404);
 	}, 30_000);
 });
 
-describe("session sidecar and showcase tenant isolation", () => {
-	it("scopes expired questions, BTW geometry and showcase exports without legacy profile leakage", async () => {
+describe("session sidecar tenant isolation", () => {
+	it("keeps BTW window state in each tenant's own data root", async () => {
 		const [cookieA, cookieB] = await Promise.all([
 			registerUser("sidecars-a@example.com"),
 			registerUser("sidecars-b@example.com"),
 		]);
-		const sessionA = "legacy-sidecar-a.jsonl";
-		const sessionB = "legacy-sidecar-b.jsonl";
-		expect((await api(cookieA, "/api/sessions")).status).toBe(200);
-		expect((await api(cookieB, "/api/sessions")).status).toBe(200);
+		const createSession = async (cookie: string): Promise<string> => {
+			const response = await api(cookie, "/api/sessions", {
+				method: "POST", body: JSON.stringify({ newWorkspace: { isTemp: true } }),
+			});
+			expect(response.status, await response.clone().text()).toBe(201);
+			return (await response.json() as { id: string }).id;
+		};
+		await Promise.all([configureTestProvider(cookieA), configureTestProvider(cookieB)]);
+		const sessionA = await createSession(cookieA);
+		const sessionB = await createSession(cookieB);
 		const pool = new Pool({ connectionString: postgres.databaseUrl });
 		let tenantA: string;
 		let tenantB: string;
@@ -615,16 +560,6 @@ describe("session sidecar and showcase tenant isolation", () => {
 			);
 			tenantA = tenantRows.rows.find((row) => row.email === "sidecars-a@example.com")!.id;
 			tenantB = tenantRows.rows.find((row) => row.email === "sidecars-b@example.com")!.id;
-			const timestamp = "2026-10-27T00:00:00.000Z";
-			for (const [sessionId, tenantId] of [[sessionA, tenantA], [sessionB, tenantB]] as const) {
-				await writeFile(join(home, "data", "sessions", sessionId), `${JSON.stringify({
-					type: "session", version: 3, id: sessionId, timestamp, cwd: home,
-				})}\n`);
-				await pool.query(
-					"INSERT INTO resource_ownership (tenant_id, resource_type, resource_id) VALUES ($1, 'session', $2)",
-					[tenantId, sessionId],
-				);
-			}
 		} finally {
 			await pool.end();
 		}
@@ -645,69 +580,24 @@ describe("session sidecar and showcase tenant isolation", () => {
 		expect(await (await api(cookieB, `/api/btw/state/${sessionB}`)).json()).toMatchObject({
 			window: { x: 21, y: 22, width: 620, height: 480 }, minimized: false,
 		});
-		expect(existsSync(join(home, "data", "sessions", "btw.json"))).toBe(false);
-		expect(existsSync(join(home, "data", "tenants", tenantA, "sessions", "btw.json"))).toBe(true);
-		expect(existsSync(join(home, "data", "tenants", tenantB, "sessions", "btw.json"))).toBe(true);
-
-		const questionsPath = join(home, "data", "sessions", "questions.json");
-		const questionFixture = {
-			[sessionA]: { questionId: "victim-question", sessionId: sessionA, turnId: "victim-turn", params: {}, createdAt: new Date().toISOString() },
-			[sessionB]: { questionId: "other-question", sessionId: sessionB, turnId: "other-turn", params: {}, createdAt: new Date().toISOString() },
-		};
-		await writeFile(questionsPath, JSON.stringify(questionFixture));
-		const expiredResponse = (sessionId: string, turnId: string, questionId: string) => api(cookieB, "/api/chat/question-response", {
-			method: "POST",
-			body: JSON.stringify({ sessionId, turnId, questionId, result: { answers: [], cancelled: true } }),
-		});
-		expect((await expiredResponse(sessionB, "victim-turn", "victim-question")).status).toBe(409);
-		expect(JSON.parse(await readFile(questionsPath, "utf-8"))).toEqual(questionFixture);
-		expect((await api(cookieA, "/api/chat/question-response", {
-			method: "POST",
-			body: JSON.stringify({ sessionId: sessionA, turnId: "victim-turn", questionId: "victim-question", result: { answers: [], cancelled: true } }),
-		})).status).toBe(409);
-		expect(JSON.parse(await readFile(questionsPath, "utf-8"))).toEqual(questionFixture);
-
-		const probePath = join(home, "data", "sessions", "gate-probe.json");
-		await writeFile(probePath, "do-not-overwrite");
-		expect((await api(cookieA, `/api/sessions/${sessionA}/showcase-export`, {
-			method: "POST", body: JSON.stringify({ id: "../../sessions/gate-probe" }),
-		})).status).toBe(400);
-		expect((await api(cookieA, `/api/sessions/${sessionA}/showcase-export`, {
-			method: "POST", body: JSON.stringify({ id: "index" }),
-		})).status).toBe(400);
-		expect(await readFile(probePath, "utf-8")).toBe("do-not-overwrite");
-
-		await mkdir(join(home, "data", "learner"), { recursive: true });
-		await mkdir(join(home, "data", "tenants", tenantA, "learner"), { recursive: true });
-		await writeFile(join(home, "data", "learner", "profile.json"), JSON.stringify({ profile_summary: "legacy-global-secret" }));
-		await writeFile(join(home, "data", "tenants", tenantA, "learner", "profile.json"), JSON.stringify({ profile_summary: "tenant-a-profile-secret" }));
-		await appendFile(join(home, "data", "sessions", sessionA), `${JSON.stringify({
-			type: "message",
-			timestamp: "2026-10-27T00:00:00.000Z",
-			message: {
-				role: "assistant",
-				content: [{ type: "toolCall", id: "learning-call", name: "record_learning_event", arguments: { payload: { topic: "private milestone" } } }],
-				stopReason: "stop",
-			},
-		})}\n`);
-		for (const [cookie, sessionId, title] of [[cookieA, sessionA, "Tenant A case"], [cookieB, sessionB, "Tenant B case"]] as const) {
-			const response = await api(cookie, `/api/sessions/${sessionId}/showcase-export`, {
-				method: "POST", body: JSON.stringify({ id: "shared-case", title }),
-			});
-			expect(response.status).toBe(200);
+		// One tenant cannot read or write the other's session state.
+		expect((await api(cookieB, `/api/btw/state/${sessionA}`)).status).toBe(404);
+		// The sidecar lives in PostgreSQL, one row per tenant and session, never on disk.
+		const statePool = new Pool({ connectionString: postgres.databaseUrl });
+		try {
+			const rows = await statePool.query<{ tenant_id: string; key: string }>(
+				"SELECT tenant_id, key FROM tenant_state WHERE key LIKE 'btw:%' AND tenant_id = ANY($1)",
+				[[tenantA, tenantB]],
+			);
+			const keys = rows.rows.map((row) => `${row.tenant_id}|${row.key}`);
+			expect(keys).toContain(`${tenantA}|btw:session:${sessionA}`);
+			expect(keys).toContain(`${tenantB}|btw:session:${sessionB}`);
+			expect(keys).not.toContain(`${tenantB}|btw:session:${sessionA}`);
+			expect(keys).toContain(`${tenantA}|btw:window`);
+			expect(keys).toContain(`${tenantB}|btw:window`);
+		} finally {
+			await statePool.end();
 		}
-		const casesA = join(home, "data", "tenants", tenantA, "showcase-exports", "cases");
-		const casesB = join(home, "data", "tenants", tenantB, "showcase-exports", "cases");
-		const exportedA = await readFile(join(casesA, "shared-case.json"), "utf-8");
-		const exportedB = await readFile(join(casesB, "shared-case.json"), "utf-8");
-		expect(exportedA).toContain("Tenant A case");
-		expect(exportedA).toContain("tenant-a-profile-secret");
-		expect(exportedA).not.toContain("legacy-global-secret");
-		expect(exportedB).toContain("Tenant B case");
-		expect(exportedB).not.toContain("Tenant A case");
-		expect(await readFile(join(casesA, "index.json"), "utf-8")).toContain("Tenant A case");
-		expect(await readFile(join(casesB, "index.json"), "utf-8")).toContain("Tenant B case");
-		expect(existsSync(join(home, "data", "showcase-exports", "cases"))).toBe(false);
 	}, 30_000);
 });
 
@@ -718,8 +608,8 @@ describe("session and workspace tenant isolation", () => {
 			registerUser("tenant-b@example.com"),
 		]);
 		await Promise.all([
-			configureTestProvider(cookieA, "tenant-a-secret"),
-			configureTestProvider(cookieB, "tenant-b-secret"),
+			configureTestProvider(cookieA),
+			configureTestProvider(cookieB),
 		]);
 		const workspaceResponse = await api(cookieA, "/api/workspaces", {
 			method: "POST", body: JSON.stringify({ name: "Tenant A private" }),
@@ -775,23 +665,6 @@ describe("session and workspace tenant isolation", () => {
 			body: JSON.stringify({ sessionId: sessionA.id, prompt: "no model call", clientRequestId: "cross-tenant-test" }),
 		})).status).toBe(404);
 
-		const terminalResponse = await api(cookieA, "/api/terminal/sessions", {
-			method: "POST", body: JSON.stringify({ sessionId: sessionA.id }),
-		});
-		expect(terminalResponse.status).toBe(409);
-		expect((await api(cookieB, "/api/terminal/sessions", {
-			method: "POST", body: JSON.stringify({ sessionId: sessionA.id }),
-		})).status).toBe(409);
-		expect((await api(cookieB, `/api/runs?sessionId=${sessionA.id}`)).status).toBe(404);
-		const authenticatedWsStatus = await new Promise<number>((resolveStatus, reject) => {
-			const ws = new WebSocket(`${origin.replace("http", "ws")}/api/terminal/sessions/host-terminal-disabled/ws`, {
-				headers: { Cookie: cookieB, Origin: origin },
-			});
-			ws.once("unexpected-response", (_req, res) => resolveStatus(res.statusCode!));
-			ws.once("open", () => { ws.terminate(); reject(new Error("Authenticated host WebSocket connected")); });
-			ws.once("error", () => {});
-		});
-		expect(authenticatedWsStatus).toBe(409);
 		expect((await api(cookieB, `/api/workspace/file?workspaceId=${workspaceA.id}&path=private.txt`)).status).toBe(404);
 		expect((await api(cookieB, "/api/workspace/file", {
 			method: "PUT", body: JSON.stringify({ workspaceId: workspaceA.id, path: "private.txt", content: "stolen" }),
@@ -807,9 +680,11 @@ describe("session and workspace tenant isolation", () => {
 			method: "POST", body: JSON.stringify({ isTemp: true }),
 		})).json() as { id: string };
 		expect(tempA.id).not.toBe(tempB.id);
-		const treeA = await (await api(cookieA, `/api/workspace/tree?workspaceId=${tempA.id}`)).json() as { root: string };
-		const treeB = await (await api(cookieB, `/api/workspace/tree?workspaceId=${tempB.id}`)).json() as { root: string };
-		expect(treeA.root).not.toBe(treeB.root);
+		// Authenticated reads are served from the object store, so `root` is ""
+		// for both; the per-tenant workspace ids still differ.
+		const treeA = await (await api(cookieA, `/api/workspace/tree?workspaceId=${tempA.id}`)).json() as { root: string; workspaceId: string };
+		const treeB = await (await api(cookieB, `/api/workspace/tree?workspaceId=${tempB.id}`)).json() as { root: string; workspaceId: string };
+		expect(treeA.workspaceId).not.toBe(treeB.workspaceId);
 
 		// An existing file without an explicit legacy-owner assignment is hidden
 		// even from the authenticated user who originally created it.
@@ -831,12 +706,7 @@ describe("job and check-in tenant isolation", () => {
 			registerUser("jobs-a@example.com"),
 			registerUser("jobs-b@example.com"),
 		]);
-		await configureTestProvider(cookieB, "jobs-b-secret");
-		await mkdir(join(home, "data", "jobs"), { recursive: true });
-		await writeFile(join(home, "data", "jobs", "jobs.json"), JSON.stringify([{
-			id: "job_legacy", name: "legacy global", cron: "0 9 * * *", timezone: "UTC", enabled: true,
-			taskType: "custom_prompt", prompt: "must stay hidden",
-		}]));
+		await configureTestProvider(cookieB);
 		const created = await api(cookieA, "/api/jobs", {
 			method: "POST", body: JSON.stringify({
 				name: "tenant a review", cron: "0 9 * * *", timezone: "Asia/Shanghai", enabled: true,
@@ -899,23 +769,12 @@ describe("job and check-in tenant isolation", () => {
 	});
 });
 
-describe("L1 and L2 tenant storage", () => {
-	it("uses separate profile and wiki roots and hides legacy global memory", async () => {
+describe("L2 tenant storage", () => {
+	it("uses separate wiki roots and hides legacy global memory", async () => {
 		const [cookieA, cookieB] = await Promise.all([
 			registerUser("memory-a@example.com"),
 			registerUser("memory-b@example.com"),
 		]);
-		await mkdir(join(home, "data", "l2"), { recursive: true });
-		await writeFile(join(home, "data", "l2", "legacy.md"), "legacy global memory");
-
-		expect((await api(cookieA, "/api/learner/profile", {
-			method: "PATCH", body: JSON.stringify({ profile_summary: "tenant-a-profile" }),
-		})).status).toBe(200);
-		const profileB = await (await api(cookieB, "/api/learner/profile")).json() as { profile_summary?: string };
-		expect(profileB.profile_summary).not.toBe("tenant-a-profile");
-		expect((await api(cookieB, "/api/learner/profile/goals/goal_missing", {
-			method: "PATCH", body: JSON.stringify({ title: "missing" }),
-		})).status).toBe(404);
 
 		expect((await api(cookieA, "/api/wiki/page", {
 			method: "PUT", body: JSON.stringify({ path: "private.md", content: "tenant-a-wiki" }),
@@ -944,48 +803,49 @@ describe("settings and model credential isolation", () => {
 		]);
 		const globalConfigBefore = await readFile(join(home, "config", "config.json"), "utf-8");
 
+		// The catalog is server-managed: a fresh tenant already sees the shared
+		// providers (keys masked) and the deployment default model.
 		const initial = await (await api(cookieA, "/api/settings")).json() as {
-			providers: Record<string, unknown>;
+			providers: Record<string, { apiKey?: string }>;
 			defaultProvider: string;
+			defaultModel: string;
 			availableModels: unknown[];
 		};
-		expect(initial.providers).toEqual({});
-		expect(initial.defaultProvider).toBe("");
-		expect(initial.availableModels).toEqual([]);
+		expect(initial.providers.shared.apiKey).toBe("****cret");
+		expect(initial.defaultProvider).toBe("shared");
+		expect(initial.defaultModel).toBe("tenant-model");
+		expect(initial.availableModels.length).toBeGreaterThan(0);
 
-		const configureProvider = async (cookie: string, apiKey: string, providerId = "shared", modelId = "tenant-model") => {
-			const response = await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId,
-					baseUrl: providerOrigin,
-					apiKey,
-					api: "openai-completions",
-					makeDefault: true,
-					models: [{ id: modelId, name: "Tenant stub" }],
-				}),
+		// Provider write endpoints are gone: tenants can only select a model.
+		expect((await api(cookieA, "/api/settings/providers", {
+			method: "PUT", body: JSON.stringify({ providerId: "shared", baseUrl: providerOrigin, apiKey: "x" }),
+		})).status).toBe(404);
+
+		const selectModel = async (cookie: string, modelId: string) => {
+			const response = await api(cookie, "/api/settings/model", {
+				method: "POST", body: JSON.stringify({ provider: "shared", model: modelId }),
 			});
 			expect(response.status).toBe(200);
-			return response.json() as Promise<{ providers: Record<string, { apiKey: string }> }>;
 		};
-		const settingsA = await configureProvider(cookieA, "tenant-a-secret");
-		expect(settingsA.providers.shared.apiKey).toBe("****cret");
-		expect((await (await api(cookieB, "/api/settings")).json() as { providers: Record<string, unknown> }).providers).toEqual({});
-		const settingsB = await configureProvider(cookieB, "tenant-b-secret");
-		expect(settingsB.providers.shared.apiKey).toBe("****cret");
+		await selectModel(cookieA, "tenant-model");
+		await selectModel(cookieB, "other-model");
+		// Tenant B's selection does not leak into A's view — the shared catalog
+		// stays identical but the default model differs per tenant.
+		expect((await (await api(cookieA, "/api/settings")).json() as { defaultModel: string }).defaultModel).toBe("tenant-model");
+		expect((await (await api(cookieB, "/api/settings")).json() as { defaultModel: string }).defaultModel).toBe("other-model");
 
 		expect((await api(cookieB, "/api/settings/memory", {
-			method: "PUT", body: JSON.stringify({ l1Enabled: false, l2Enabled: false }),
+			method: "PUT", body: JSON.stringify({ l2Enabled: false }),
 		})).status).toBe(200);
 		expect((await api(cookieB, "/api/settings/theme", {
 			method: "PUT", body: JSON.stringify({ theme: "ocean" }),
 		})).status).toBe(200);
 		const independentA = await (await api(cookieA, "/api/settings")).json() as {
-			memory: { l1Enabled: boolean; l2Enabled: boolean };
+			memory: { l2Enabled: boolean; l3Enabled: boolean };
 			ui: { theme: string };
 			providers: Record<string, { apiKey: string }>;
 		};
-		expect(independentA.memory).toMatchObject({ l1Enabled: true, l2Enabled: true });
+		expect(independentA.memory).toMatchObject({ l2Enabled: true, l3Enabled: true });
 		expect(independentA.ui.theme).toBe("light");
 		expect(independentA.providers.shared.apiKey).toBe("****cret");
 		expect(await readFile(join(home, "config", "config.json"), "utf-8")).toBe(globalConfigBefore);
@@ -999,11 +859,10 @@ describe("settings and model credential isolation", () => {
 		};
 		const [sessionA, sessionB] = await Promise.all([createSession(cookieA), createSession(cookieB)]);
 		const unconfiguredCookie = await registerUser("settings-unconfigured@example.com");
-		const requestsBeforeUnconfigured = providerRequests.length;
+		// No explicit selection needed: the server-managed default model applies.
 		expect((await api(unconfiguredCookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ newWorkspace: { isTemp: true } }),
-		})).status).toBe(500);
-		expect(providerRequests).toHaveLength(requestsBeforeUnconfigured);
+		})).status).toBe(201);
 
 		for (const [cookie, sessionId, prompt] of [
 			[cookieA, sessionA, "tenant-a-main-prompt"],
@@ -1016,8 +875,8 @@ describe("settings and model credential isolation", () => {
 			expect(response.status, JSON.stringify({ responseBody, serverLog: output.slice(-12_000) })).toBe(200);
 			expect(responseBody).toMatchObject({ response: "tenant stub response" });
 		}
-		expect(providerRequests.find((request) => request.body.includes("tenant-a-main-prompt"))?.authorization).toBe("Bearer tenant-a-secret");
-		expect(providerRequests.find((request) => request.body.includes("tenant-b-main-prompt"))?.authorization).toBe("Bearer tenant-b-secret");
+		expect(providerRequests.find((request) => request.body.includes("tenant-a-main-prompt"))?.authorization).toBe("Bearer integration-test-secret");
+		expect(providerRequests.find((request) => request.body.includes("tenant-b-main-prompt"))?.authorization).toBe("Bearer integration-test-secret");
 
 		const sideQuestions = await Promise.all([
 			api(cookieA, "/api/btw/ask", {
@@ -1031,32 +890,23 @@ describe("settings and model credential isolation", () => {
 			expect(response.status).toBe(200);
 			expect(await response.json()).toMatchObject({ answer: "tenant stub response" });
 		}
-		expect(providerRequests.find((request) => request.body.includes("tenant-a-side-question"))?.authorization).toBe("Bearer tenant-a-secret");
-		expect(providerRequests.find((request) => request.body.includes("tenant-b-side-question"))?.authorization).toBe("Bearer tenant-b-secret");
+		expect(providerRequests.find((request) => request.body.includes("tenant-a-side-question"))?.authorization).toBe("Bearer integration-test-secret");
+		expect(providerRequests.find((request) => request.body.includes("tenant-b-side-question"))?.authorization).toBe("Bearer integration-test-secret");
 
 		for (const [path, body] of [
-			["/api/settings/permissions", { mode: "yolo" }],
-			["/api/settings/mcp", { enabled: true }],
-			["/api/settings/computer-use", { enabled: true }],
-			["/api/settings/codemode", { enabled: true }],
-			["/api/settings/web-access", { values: { tavily: "must-not-be-shared" } }],
 			["/api/settings/content-hub", { token: "must-not-be-shared" }],
 			["/api/settings/github", { token: "must-not-be-shared" }],
-			["/api/mcp/servers/shared", { command: "node", args: ["server.js"] }],
 		] as const) {
 			const response = await api(cookieA, path, { method: "PUT", body: JSON.stringify(body) });
 			expect(response.status, path).toBe(409);
 		}
-		expect((await api(cookieA, "/api/mcp")).status).toBe(200);
-		expect(await (await api(cookieA, "/api/mcp")).json()).toMatchObject({ enabled: false, adapterLoaded: false, servers: [] });
 		expect((await api(cookieA, "/api/skills")).status).toBe(200);
 		expect((await api(cookieA, "/api/skills/reload", { method: "POST" })).status).toBe(409);
 		expect((await api(cookieA, "/api/skills/upload", {
 			method: "POST", body: JSON.stringify({ fileName: "tenant.md", dataBase64: Buffer.from("---\nname: tenant\n---\n").toString("base64") }),
 		})).status).toBe(409);
 
-		await configureProvider(cookieB, "tenant-b-secondary", "extra", "extra-model");
-		expect((await api(cookieB, "/api/settings/providers/shared", { method: "DELETE" })).status).toBe(200);
+		expect((await api(cookieB, "/api/settings/providers/shared", { method: "DELETE" })).status).toBe(404);
 		expect((await (await api(cookieA, "/api/settings")).json() as { defaultModel: string }).defaultModel).toBe("tenant-model");
 		expect(await readFile(join(home, "config", "config.json"), "utf-8")).toBe(globalConfigBefore);
 	}, 90_000);
@@ -1069,36 +919,25 @@ describe("channel runtime isolation", () => {
 			registerUser("channels-b@example.com"),
 		]);
 		const globalConfigBefore = await readFile(join(home, "config", "config.json"), "utf-8");
-		const configureProvider = async (cookie: string, apiKey: string) => {
-			const response = await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared",
-					baseUrl: providerOrigin,
-					apiKey,
-					api: "openai-completions",
-					makeDefault: true,
-					models: [{ id: "tenant-model", name: "Tenant stub", input: ["text", "image"] }],
-				}),
-			});
+		const configureProvider = async (cookie: string) => {
+			const response = await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) });
 			expect(response.status).toBe(200);
 		};
-		await Promise.all([
-			configureProvider(cookieA, "channel-a-secret"),
-			configureProvider(cookieB, "channel-b-secret"),
-		]);
-		const configureChannels = (cookie: string, token: string, sidecarBaseUrl: string) => api(cookie, "/api/settings/channels", {
+		await Promise.all([configureProvider(cookieA), configureProvider(cookieB)]);
+		// Channel credentials and endpoints are server-managed: the tenant only
+		// enables the preset channel. Credential fields are rejected outright.
+		const configureChannels = (cookie: string) => api(cookie, "/api/settings/channels", {
 			method: "PUT",
-			body: JSON.stringify({
-				bridge: { token },
-				channels: { qq: { enabled: true, mode: "bridge", sidecarBaseUrl } },
-			}),
+			body: JSON.stringify({ channels: { qq: { enabled: true } } }),
 		});
+		expect((await api(cookieA, "/api/settings/channels", {
+			method: "PUT",
+			body: JSON.stringify({ bridge: { token: "x" }, channels: { qq: { enabled: true } } }),
+		})).status).toBe(403);
 
-		expect((await configureChannels(cookieA, "channel-token-a", sidecarOriginA)).status).toBe(200);
-		expect((await configureChannels(cookieB, "channel-token-a", sidecarOriginB)).status).toBe(404);
-		expect(await (await api(cookieB, "/api/settings")).json() as { bridge?: unknown }).not.toHaveProperty("bridge");
-		expect((await configureChannels(cookieB, "channel-token-b", sidecarOriginB)).status).toBe(200);
+		expect((await configureChannels(cookieA)).status).toBe(200);
+		expect((await configureChannels(cookieB)).status).toBe(200);
+		expect((await (await api(cookieB, "/api/settings")).json() as { bridge?: { token: string } }).bridge?.token).toBe("****oken");
 		for (const cookie of [cookieA, cookieB]) {
 			const channels = await (await api(cookie, "/api/channels")).json() as Array<{ name: string; mode: string }>;
 			expect(channels).toEqual([{ name: "qq", mode: "bridge", enabled: true, hasDefaultTarget: false }]);
@@ -1114,7 +953,7 @@ describe("channel runtime isolation", () => {
 		})).status).toBe(200);
 		await waitFor(() => sidecarRequests.some((request) => request.path === "/push" && request.body.includes("push-only-a")), "tenant A test push");
 		const pushA = sidecarRequests.find((request) => request.path === "/push" && request.body.includes("push-only-a"));
-		expect(pushA).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token-a" });
+		expect(pushA).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token" });
 		expect(pushA?.body).toContain("chat-a");
 		expect(sidecarRequests.some((request) => request.sidecar === "b" && request.body.includes("push-only-a"))).toBe(false);
 
@@ -1124,7 +963,7 @@ describe("channel runtime isolation", () => {
 			body: JSON.stringify(body),
 		});
 		const providerCountBeforeRejected = providerRequests.length;
-		expect((await bridgeMessage("channel-token-a", {
+		expect((await bridgeMessage("channel-token", {
 			channel: "qq", messageId: "missing-chat", text: "must-not-run",
 		})).status).toBe(400);
 		expect((await bridgeMessage("wrong-token", {
@@ -1133,11 +972,11 @@ describe("channel runtime isolation", () => {
 		expect(providerRequests).toHaveLength(providerCountBeforeRejected);
 
 		const inboundResponses = await Promise.all([
-			bridgeMessage("channel-token-a", {
+			bridgeMessage("channel-token", {
 				channel: "qq", messageId: "inbound-a", chatId: "chat-a", text: "channel-a-inbound",
 				attachments: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
 			}),
-			bridgeMessage("channel-token-b", {
+			bridgeMessage("channel-token", {
 				channel: "qq", messageId: "inbound-b", chatId: "chat-b", text: "channel-b-inbound",
 			}),
 		]);
@@ -1151,12 +990,12 @@ describe("channel runtime isolation", () => {
 		const channelProviderBodyA = providerRequests.find((request) => request.body.includes("channel-a-inbound"))?.body ?? "";
 		expect(channelProviderBodyA).toContain("image_url");
 		expect(channelProviderBodyA).toContain("aW1hZ2U=");
-		expect(providerRequests.find((request) => request.body.includes("channel-a-inbound"))?.authorization).toBe("Bearer channel-a-secret");
-		expect(providerRequests.find((request) => request.body.includes("channel-b-inbound"))?.authorization).toBe("Bearer channel-b-secret");
+		expect(providerRequests.find((request) => request.body.includes("channel-a-inbound"))?.authorization).toBe("Bearer integration-test-secret");
+		expect(providerRequests.find((request) => request.body.includes("channel-b-inbound"))?.authorization).toBe("Bearer integration-test-secret");
 		const replyA = sidecarRequests.find((request) => request.path === "/reply" && request.body.includes("inbound-a"));
 		const replyB = sidecarRequests.find((request) => request.path === "/reply" && request.body.includes("inbound-b"));
-		expect(replyA).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token-a" });
-		expect(replyB).toMatchObject({ sidecar: "b", authorization: "Bearer channel-token-b" });
+		expect(replyA).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token" });
+		expect(replyB).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token" });
 		expect(replyA?.body).toContain("chat-a");
 		expect(replyB?.body).toContain("chat-b");
 		const runsA = await (await api(cookieA, "/api/channels/runs")).json() as Array<{ messageId: string; status: string }>;
@@ -1169,17 +1008,21 @@ describe("channel runtime isolation", () => {
 			`SELECT tenant.id, account.email FROM tenants tenant JOIN "user" account ON account.id = tenant.owner_user_id
 			 WHERE account.email IN ('channels-a@example.com', 'channels-b@example.com')`,
 		);
-		await pool.end();
 		const tenantA = tenantRows.rows.find((row) => row.email === "channels-a@example.com")!.id;
 		const tenantB = tenantRows.rows.find((row) => row.email === "channels-b@example.com")!.id;
-		const chatMapA = await readFile(join(home, "data", "tenants", tenantA, "channels", "chat-sessions.json"), "utf-8");
-		const chatMapB = await readFile(join(home, "data", "tenants", tenantB, "channels", "chat-sessions.json"), "utf-8");
-		expect(chatMapA).toContain("qq:chat-a");
-		expect(chatMapA).not.toContain("chat-b");
-		expect(chatMapB).toContain("qq:chat-b");
-		expect(chatMapB).not.toContain("chat-a");
-		const channelSessionA = JSON.parse(chatMapA)["qq:chat-a"] as string;
-		const channelSessionB = JSON.parse(chatMapB)["qq:chat-b"] as string;
+		const stateRows = await pool.query<{ tenant_id: string; value: Record<string, string> }>(
+			"SELECT tenant_id, value FROM tenant_state WHERE key = 'channels.chatSessions' AND tenant_id = ANY($1)",
+			[[tenantA, tenantB]],
+		);
+		await pool.end();
+		const chatMapA = stateRows.rows.find((row) => row.tenant_id === tenantA)?.value ?? {};
+		const chatMapB = stateRows.rows.find((row) => row.tenant_id === tenantB)?.value ?? {};
+		expect(Object.keys(chatMapA)).toContain("qq:chat-a");
+		expect(Object.keys(chatMapA)).not.toContain("chat-b");
+		expect(Object.keys(chatMapB)).toContain("qq:chat-b");
+		expect(Object.keys(chatMapB)).not.toContain("chat-a");
+		const channelSessionA = chatMapA["qq:chat-a"];
+		const channelSessionB = chatMapB["qq:chat-b"];
 		expect(channelSessionA).toMatch(/^durable-/);
 		expect(channelSessionB).toMatch(/^durable-/);
 		const channelDetailA = await (await api(cookieA, `/api/sessions/${channelSessionA}`)).json() as {
@@ -1193,7 +1036,6 @@ describe("channel runtime isolation", () => {
 		expect(channelImage, JSON.stringify(channelMessageA)).toBeDefined();
 		expect((await api(cookieA, channelImage!.previewUrl)).status).toBe(200);
 		expect(await (await api(cookieB, `/api/sessions/${channelSessionB}`)).json()).toMatchObject({ runtime: "durable" });
-		expect(existsSync(join(home, "data", "channels", "chat-sessions.json"))).toBe(false);
 		const workspacesA = await (await api(cookieA, "/api/workspaces")).json() as Array<{ id: string }>;
 		const workspacesB = await (await api(cookieB, "/api/workspaces")).json() as Array<{ id: string }>;
 		expect(workspacesA.map((workspace) => workspace.id)).toContain(`channel-qq-${tenantA}`);
@@ -1225,7 +1067,7 @@ describe("channel runtime isolation", () => {
 			runtime: "durable", origin: "scheduler",
 		});
 		await waitFor(() => sidecarRequests.some((request) => request.path === "/push" && request.body.includes("tenant stub response") && request.body.includes("chat-a")), "manual tenant job push");
-		expect(providerRequests.find((request) => request.body.includes("channel-job-a"))?.authorization).toBe("Bearer channel-a-secret");
+		expect(providerRequests.find((request) => request.body.includes("channel-job-a"))?.authorization).toBe("Bearer integration-test-secret");
 		expect(sidecarRequests.some((request) => request.sidecar === "b" && request.body.includes("channel-job-a"))).toBe(false);
 		expect(await readFile(join(home, "config", "config.json"), "utf-8")).toBe(globalConfigBefore);
 	}, 90_000);
@@ -1238,30 +1080,21 @@ describe("tenant background execution", () => {
 			registerUser("background-b@example.com"),
 		]);
 		const globalConfigBefore = await readFile(join(home, "config", "config.json"), "utf-8");
-		const configure = async (cookie: string, apiKey: string, token: string, sidecarBaseUrl: string, chatId: string) => {
-			expect((await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared", baseUrl: providerOrigin, apiKey, api: "openai-completions",
-					makeDefault: true, models: [{ id: "tenant-model", name: "Tenant stub" }],
-				}),
-			})).status).toBe(200);
+		const configure = async (cookie: string, chatId: string) => {
+			expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 			expect((await api(cookie, "/api/settings/channels", {
 				method: "PUT",
-				body: JSON.stringify({
-					bridge: { token },
-					channels: { qq: { enabled: true, mode: "bridge", sidecarBaseUrl } },
-				}),
+				body: JSON.stringify({ channels: { qq: { enabled: true } } }),
 			})).status).toBe(200);
 			expect((await api(cookie, "/api/channels/qq/default-target", {
 				method: "POST", body: JSON.stringify({ chatId }),
 			})).status).toBe(200);
 		};
 		await Promise.all([
-			configure(cookieA, "background-a-secret", "background-token-a", sidecarOriginA, "background-chat-a"),
-			configure(cookieB, "background-b-secret", "background-token-b", sidecarOriginB, "background-chat-b"),
+			configure(cookieA, "background-chat-a"),
+			configure(cookieB, "background-chat-b"),
 		]);
-		const createJob = async (cookie: string, name: string, prompt: string, runtime?: "legacy" | "durable") => {
+		const createJob = async (cookie: string, name: string, prompt: string, runtime?: "durable") => {
 			// Use the next UTC minute, not every minute. The test still exercises the
 			// real cron/deferred path without arming another slot during its cleanup.
 			const scheduled = new Date(Date.now() + 60_000);
@@ -1282,8 +1115,8 @@ describe("tenant background execution", () => {
 		await waitFor(() => ["background-a-prompt", "background-b-prompt"].every((prompt) =>
 			providerRequests.some((request) => request.body.includes(prompt)),
 		), "deferred tenant model executions", 75_000);
-		expect(providerRequests.find((request) => request.body.includes("background-a-prompt"))?.authorization).toBe("Bearer background-a-secret");
-		expect(providerRequests.find((request) => request.body.includes("background-b-prompt"))?.authorization).toBe("Bearer background-b-secret");
+		expect(providerRequests.find((request) => request.body.includes("background-a-prompt"))?.authorization).toBe("Bearer integration-test-secret");
+		expect(providerRequests.find((request) => request.body.includes("background-b-prompt"))?.authorization).toBe("Bearer integration-test-secret");
 		expect((await api(cookieA, `/api/jobs/${jobA.id}`, {
 			method: "PATCH", body: JSON.stringify({ enabled: false }),
 		})).status).toBe(200);
@@ -1302,8 +1135,8 @@ describe("tenant background execution", () => {
 		), "tenant background channel delivery");
 		const pushA = sidecarRequests.find((request) => request.path === "/push" && request.body.includes("background-chat-a") && request.body.includes("tenant stub response"));
 		const pushB = sidecarRequests.find((request) => request.path === "/push" && request.body.includes("background-chat-b") && request.body.includes("tenant stub response"));
-		expect(pushA).toMatchObject({ sidecar: "a", authorization: "Bearer background-token-a" });
-		expect(pushB).toMatchObject({ sidecar: "b", authorization: "Bearer background-token-b" });
+		expect(pushA).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token" });
+		expect(pushB).toMatchObject({ sidecar: "a", authorization: "Bearer channel-token" });
 
 		const sessionsA = await (await api(cookieA, "/api/sessions")).json() as Array<{ id: string; runtime?: string; origin?: string }>;
 		const sessionsB = await (await api(cookieB, "/api/sessions")).json() as Array<{ id: string; runtime?: string; origin?: string }>;
@@ -1357,7 +1190,7 @@ describe("tenant background execution", () => {
 describe("durable session HTTP boundary", () => {
 	it("persists BTW bring-back once without a synthetic user or model turn", async () => {
 		const cookie = await registerUser("durable-btw-bring-back@example.com");
-		await configureTestProvider(cookie, "durable-btw-secret");
+		await configureTestProvider(cookie);
 		const created = await api(cookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ newWorkspace: { isTemp: true } }),
 		});
@@ -1392,20 +1225,11 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-a@example.com"),
 			registerUser("durable-b@example.com"),
 		]);
-		const configure = async (cookie: string, apiKey: string) => {
-			const response = await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared",
-					baseUrl: providerOrigin,
-					apiKey,
-					api: "openai-completions",
-					models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-				}),
-			});
+		const configure = async (cookie: string) => {
+			const response = await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) });
 			expect(response.status).toBe(200);
 		};
-		await Promise.all([configure(cookieA, "durable-a-secret"), configure(cookieB, "durable-b-secret")]);
+		await Promise.all([configure(cookieA), configure(cookieB)]);
 		const createDurable = async (cookie: string) => {
 			const response = await api(cookie, "/api/sessions", {
 				method: "POST",
@@ -1439,8 +1263,8 @@ describe("durable session HTTP boundary", () => {
 			stream(cookieA, sessionA.id, "durable-a-main-prompt", "durable-a-request"),
 			stream(cookieB, sessionB.id, "durable-b-main-prompt", "durable-b-request"),
 		]);
-		expect(providerRequests.find((request) => request.body.includes("durable-a-main-prompt"))?.authorization).toBe("Bearer durable-a-secret");
-		expect(providerRequests.find((request) => request.body.includes("durable-b-main-prompt"))?.authorization).toBe("Bearer durable-b-secret");
+		expect(providerRequests.find((request) => request.body.includes("durable-a-main-prompt"))?.authorization).toBe("Bearer integration-test-secret");
+		expect(providerRequests.find((request) => request.body.includes("durable-b-main-prompt"))?.authorization).toBe("Bearer integration-test-secret");
 		const countA = providerRequests.filter((request) => request.body.includes("durable-a-main-prompt")).length;
 		await stream(cookieA, sessionA.id, "durable-a-main-prompt", "durable-a-request");
 		expect(providerRequests.filter((request) => request.body.includes("durable-a-main-prompt"))).toHaveLength(countA);
@@ -1453,7 +1277,6 @@ describe("durable session HTTP boundary", () => {
 		expect(detailA.messages.filter((message) => message.role === "user" && message.content === "durable-a-main-prompt")).toHaveLength(1);
 		const listB = await (await api(cookieB, "/api/sessions")).json() as Array<{ id: string }>;
 		expect(listB.some((session) => session.id === sessionA.id)).toBe(false);
-		expect(existsSync(join(home, "data", "sessions", `${sessionA.id}.jsonl`))).toBe(false);
 
 		const disconnected = await api(cookieA, "/api/chat/stream", {
 			method: "POST",
@@ -1491,14 +1314,7 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-workspace-write@example.com"),
 			registerUser("durable-workspace-write-other@example.com"),
 		]);
-		expect((await api(cookie, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-workspace-write-secret",
-				api: "openai-completions", makeDefault: true,
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		const created = await api(cookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
 		});
@@ -1542,15 +1358,17 @@ describe("durable session HTTP boundary", () => {
 		expect(file.status).toBe(200);
 		expect(await file.json()).toMatchObject({ path: "nested/durable-preview.txt", content: "durable preview content" });
 
-		const tenantIds = await readdir(join(home, "data", "tenants"));
-		const activityFiles = await Promise.all(tenantIds.map(async (tenantId) => {
-			try {
-				return await readFile(join(home, "data", "tenants", tenantId, "sessions", "workspace-activity.json"), "utf-8");
-			} catch {
-				return "";
-			}
-		}));
-		const activity = activityFiles.find((content) => content.includes(session.id)) ?? "";
+		const activityPool = new Pool({ connectionString: postgres.databaseUrl });
+		let activity = "";
+		try {
+			const rows = await activityPool.query<{ value: unknown }>(
+				"SELECT value FROM tenant_state WHERE key = $1",
+				[`activity:${session.id}`],
+			);
+			activity = rows.rows.map((row) => JSON.stringify(row.value)).join("\n");
+		} finally {
+			await activityPool.end();
+		}
 		expect(activity).toContain("nested/durable-preview.txt");
 
 		const noUiCreated = await api(cookie, "/api/sessions", {
@@ -1582,22 +1400,11 @@ describe("durable session HTTP boundary", () => {
 	}, 60_000);
 
 	it("instantiates preset workspaces for durable sessions with tenant ownership", async () => {
-		const presetDir = join(home, "data", "preset-cache", "durable-preset");
-		await mkdir(presetDir, { recursive: true });
-		await writeFile(join(presetDir, "preset.json"), JSON.stringify({ id: "durable-preset", name: "Durable preset" }));
-		await writeFile(join(presetDir, "agent.md"), "durable preset workspace instructions");
 		const [cookieA, cookieB] = await Promise.all([
 			registerUser("durable-preset-a@example.com"),
 			registerUser("durable-preset-b@example.com"),
 		]);
-		expect((await api(cookieA, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-preset-secret",
-				api: "openai-completions", makeDefault: true,
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookieA, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		const createPreset = () => api(cookieA, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable", presetId: "durable-preset" }),
 		});
@@ -1606,9 +1413,12 @@ describe("durable session HTTP boundary", () => {
 		const session = await first.json() as { id: string; runtime: string; workspaceId: string };
 		expect(session.runtime).toBe("durable");
 		expect(session.workspaceId).toMatch(/^preset-durable-preset-/);
+		// Preset agent.md stays in the image — never copied into the workspace.
 		const instructions = await api(cookieA, `/api/workspace/file?path=agent.md&workspaceId=${encodeURIComponent(session.workspaceId)}`);
-		expect(instructions.status).toBe(200);
-		expect(await instructions.json()).toMatchObject({ content: "durable preset workspace instructions" });
+		expect(instructions.status).toBe(404);
+		const detail = await api(cookieA, `/api/sessions/${session.id}`);
+		expect(detail.status).toBe(200);
+		expect(await detail.json()).toMatchObject({ id: session.id, workspaceId: session.workspaceId });
 		const second = await createPreset();
 		expect(second.status).toBe(201);
 		expect(await second.json()).toMatchObject({ runtime: "durable", workspaceId: session.workspaceId });
@@ -1618,14 +1428,7 @@ describe("durable session HTTP boundary", () => {
 
 	it("streams manual durable jobs and validates explicit runtime selection", async () => {
 		const cookie = await registerUser("durable-job-stream@example.com");
-		expect((await api(cookie, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared", baseUrl: providerOrigin, apiKey: "durable-job-stream-secret",
-				api: "openai-completions", makeDefault: true,
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		expect((await api(cookie, "/api/jobs", {
 			method: "POST",
 			body: JSON.stringify({ name: "bad runtime", cron: "0 9 * * *", taskType: "custom_prompt", prompt: "no", runtime: "other" }),
@@ -1658,7 +1461,7 @@ describe("durable session HTTP boundary", () => {
 		expect(streamText).toContain("job_result");
 		expect(streamText).toContain('"success":true');
 		expect(providerRequests.find((request) => request.body.includes("durable-job-stream-prompt"))?.authorization)
-			.toBe("Bearer durable-job-stream-secret");
+			.toBe("Bearer integration-test-secret");
 		const detail = await (await api(cookie, `/api/sessions/${session.id}`)).json() as {
 			runtime: string; origin: string; messages: Array<{ role: string; content: string }>;
 		};
@@ -1676,22 +1479,10 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-topic-a@example.com"),
 			registerUser("durable-topic-b@example.com"),
 		]);
-		const configure = async (cookie: string, apiKey: string) => {
-			expect((await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared",
-					baseUrl: providerOrigin,
-					apiKey,
-					api: "openai-completions",
-					models: [
-						{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 },
-						{ id: "other-model", name: "Other model", contextWindow: 32_000, maxTokens: 2_000 },
-					],
-				}),
-			})).status).toBe(200);
+		const configure = async (cookie: string) => {
+			expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		};
-		await Promise.all([configure(cookieA, "durable-topic-a-secret"), configure(cookieB, "durable-topic-b-secret")]);
+		await Promise.all([configure(cookieA), configure(cookieB)]);
 		const createDurable = async (cookie: string) => {
 			const response = await api(cookie, "/api/sessions", {
 				method: "POST", body: JSON.stringify({ runtime: "durable" }),
@@ -1723,8 +1514,8 @@ describe("durable session HTTP boundary", () => {
 		await waitFor(async () => await topicName(cookieA, sessionA.id) === "租户 A 学习目标"
 			&& await topicName(cookieB, sessionB.id) === "租户 B 学习目标", "durable automatic topics");
 		const automaticTopics = providerRequests.filter((request) => request.body.includes("请用一句简短的中文短语概括"));
-		const topicA = automaticTopics.filter((request) => request.authorization === "Bearer durable-topic-a-secret");
-		const topicB = automaticTopics.filter((request) => request.authorization === "Bearer durable-topic-b-secret");
+		const topicA = automaticTopics.filter((request) => request.body.includes("durable-topic-first-a"));
+		const topicB = automaticTopics.filter((request) => request.body.includes("durable-topic-first-b"));
 		expect(topicA).toHaveLength(1);
 		expect(topicB).toHaveLength(1);
 		expect((JSON.parse(topicA[0]!.body) as { model: string }).model).toBe("tenant-model");
@@ -1737,7 +1528,7 @@ describe("durable session HTTP boundary", () => {
 		const regenerated = await api(cookieA, `/api/sessions/${sessionA.id}/generate-topic`, { method: "POST" });
 		expect(regenerated.status).toBe(200);
 		expect(await regenerated.json()).toMatchObject({ name: "租户 A 学习目标", runtime: "durable", topicPendingUpgrade: false });
-		expect(providerRequests.filter((request) => request.authorization === "Bearer durable-topic-a-secret"
+		expect(providerRequests.filter((request) => request.body.includes("durable-topic-first-a")
 			&& request.body.includes("请用一句简短的中文短语概括"))).toHaveLength(2);
 	}, 60_000);
 
@@ -1746,16 +1537,10 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-l3-index-a@example.com"),
 			registerUser("durable-l3-index-b@example.com"),
 		]);
-		const configure = async (cookie: string, apiKey: string) => {
-			expect((await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared", baseUrl: providerOrigin, apiKey, api: "openai-completions",
-					models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-				}),
-			})).status).toBe(200);
+		const configure = async (cookie: string) => {
+			expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		};
-		await Promise.all([configure(cookieA, "durable-l3-index-a-secret"), configure(cookieB, "durable-l3-index-b-secret")]);
+		await Promise.all([configure(cookieA), configure(cookieB)]);
 		const createDurable = async (cookie: string) => {
 			const response = await api(cookie, "/api/sessions", { method: "POST", body: JSON.stringify({ runtime: "durable" }) });
 			expect(response.status).toBe(201);
@@ -1778,18 +1563,17 @@ describe("durable session HTTP boundary", () => {
 			chat(cookieA, recallA.id, "durable-l3-history-a", "durable-l3-history-request-a"),
 			chat(cookieB, recallB.id, "durable-l3-history-b", "durable-l3-history-request-b"),
 		]);
-		const finalA = providerRequests.find((request) => request.authorization === "Bearer durable-l3-index-a-secret"
-			&& request.body.includes("durable-l3-history-a") && request.body.includes("durable-topic-first-a"));
-		const finalB = providerRequests.find((request) => request.authorization === "Bearer durable-l3-index-b-secret"
-			&& request.body.includes("durable-l3-history-b") && request.body.includes("durable-topic-first-b"));
+		const finalA = providerRequests.find((request) => request.body.includes("durable-l3-history-a")
+			&& request.body.includes("durable-topic-first-a"));
+		const finalB = providerRequests.find((request) => request.body.includes("durable-l3-history-b")
+			&& request.body.includes("durable-topic-first-b"));
 		expect(finalA).toBeDefined();
 		expect(finalB).toBeDefined();
 		expect(finalA?.body).not.toContain("durable-topic-first-b");
 		expect(finalB?.body).not.toContain("durable-topic-first-a");
 
 		await chat(cookieA, autoA.id, "durable-topic-first followup", "durable-l3-auto-request");
-		const autoRequest = providerRequests.find((request) => request.authorization === "Bearer durable-l3-index-a-secret"
-			&& request.body.includes("durable-topic-first followup"));
+		const autoRequest = providerRequests.find((request) => request.body.includes("durable-topic-first followup"));
 		expect(autoRequest?.body).toContain("# 相关历史对话");
 		expect(autoRequest?.body).toContain("durable-topic-first-a");
 		expect(autoRequest?.body).not.toContain("durable-topic-first-b");
@@ -1802,16 +1586,7 @@ describe("durable session HTTP boundary", () => {
 
 	it("passes validated attachments and inline images without exposing model-only context as user text", async () => {
 		const cookieA = await registerUser("durable-attachments@example.com");
-		expect((await api(cookieA, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared",
-				baseUrl: providerOrigin,
-				apiKey: "durable-attachments-secret",
-				api: "openai-completions",
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookieA, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		const workspace = await (await api(cookieA, "/api/workspaces", {
 			method: "POST", body: JSON.stringify({ name: "Durable attachments" }),
 		})).json() as { id: string };
@@ -1865,13 +1640,32 @@ describe("durable session HTTP boundary", () => {
 		});
 		expect(nonStreaming.status).toBe(200);
 		expect(providerRequests.find((request) => request.body.includes("durable-nonstream-attachment"))?.body).toContain("普通附件");
+		const embedded = await api(cookieA, "/api/chat/stream", {
+			method: "POST",
+			body: JSON.stringify({
+				sessionId: session.id,
+				prompt: "durable-embedded-image",
+				clientRequestId: "durable-embedded-image-request",
+				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
+			}),
+		});
+		expect(embedded.status).toBe(400);
+		const uploadedNative = await api(cookieA, "/api/workspace/upload", {
+			method: "POST",
+			body: JSON.stringify({
+				workspaceId: workspace.id,
+				files: [{ path: ".chat-images/native.png", dataBase64: "aW1hZ2U=" }],
+			}),
+		});
+		expect(uploadedNative.status).toBe(201);
+		const nativeImageRef = { workspacePath: ".chat-images/native.png", mimeType: "image/png" };
 		const nativeImage = await api(cookieA, "/api/chat/stream", {
 			method: "POST",
 			body: JSON.stringify({
 				sessionId: session.id,
 				prompt: "durable-native-inline-image",
 				clientRequestId: "durable-native-inline-image-request",
-				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
+				images: [nativeImageRef],
 			}),
 		});
 		expect(nativeImage.status).toBe(200);
@@ -1879,14 +1673,17 @@ describe("durable session HTTP boundary", () => {
 		const nativeProviderBody = providerRequests.find((request) => request.body.includes("durable-native-inline-image"))?.body ?? "";
 		expect(nativeProviderBody).toContain("image_url");
 		expect(nativeProviderBody).toContain("aW1hZ2U=");
-		expect(nativeProviderBody).not.toContain("用户本轮上传了");
+		// The workspace-path hint is committed with the durable input so the
+		// model can open the uploaded file with tools.
+		expect(nativeProviderBody).toContain("用户本轮上传了 1 张图片");
+		expect(nativeProviderBody).toContain(".chat-images/");
 		const nativeRetry = await api(cookieA, "/api/chat/stream", {
 			method: "POST",
 			body: JSON.stringify({
 				sessionId: session.id,
 				prompt: "durable-native-inline-image",
 				clientRequestId: "durable-native-inline-image-request",
-				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
+				images: [nativeImageRef],
 			}),
 		});
 		expect(nativeRetry.status).toBe(200);
@@ -1908,62 +1705,41 @@ describe("durable session HTTP boundary", () => {
 				sessionId: session.id,
 				prompt: "durable-image-provider-rejection",
 				clientRequestId: "durable-image-provider-rejection-request",
-				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
+				images: [nativeImageRef],
 			}),
 		});
 		expect(rejectedNative.status).toBe(200);
-		expect(await rejectedNative.text()).toContain('"persisted":true');
+		// No OCR/native-image fallback: the provider's image_url rejection
+		// surfaces as a turn error instead of a silent text-only retry.
+		const rejectedText = await rejectedNative.text();
+		expect(rejectedText).toContain('"type":"error"');
+		expect(rejectedText).toContain('"persisted":false');
 		const rejectionRequests = providerRequests.filter((request) =>
 			request.body.includes("durable-image-provider-rejection"));
-		expect(rejectionRequests).toHaveLength(2);
+		expect(rejectionRequests).toHaveLength(1);
 		expect(rejectionRequests[0].body).toContain("image_url");
-		expect(rejectionRequests[0].body).not.toContain("用户本轮上传了");
-		expect(rejectionRequests[1].body).not.toContain("image_url");
-		expect(rejectionRequests[1].body).toContain("用户本轮上传了 1 张图片");
-		expect(rejectionRequests[1].body).toContain(".chat-images/");
-		const rejectedRetry = await api(cookieA, "/api/chat/stream", {
-			method: "POST",
-			body: JSON.stringify({
-				sessionId: session.id,
-				prompt: "durable-image-provider-rejection",
-				clientRequestId: "durable-image-provider-rejection-request",
-				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
-			}),
-		});
-		expect(await rejectedRetry.text()).toContain('"persisted":true');
-		expect(providerRequests.filter((request) =>
-			request.body.includes("durable-image-provider-rejection"))).toHaveLength(2);
-		const rejectedDetail = await (await api(cookieA, `/api/sessions/${session.id}`)).json() as {
-			messages: Array<{ role: string; content: string }>;
-		};
-		expect(rejectedDetail.messages.filter((message) =>
-			message.content === "durable-image-provider-rejection")).toHaveLength(1);
-		expect(rejectedDetail.messages.find((message) =>
-			message.content === "durable-image-provider-rejection")?.content).not.toContain("用户本轮上传了");
 
-		expect((await api(cookieA, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "text-only",
-				baseUrl: providerOrigin,
-				apiKey: "durable-text-only-secret",
-				api: "openai-completions",
-				models: [{ id: "text-model", name: "Text model", input: ["text"], contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookieA, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		expect((await api(cookieA, "/api/settings/model", {
 			method: "POST", body: JSON.stringify({ provider: "text-only", model: "text-model" }),
 		})).status).toBe(200);
 		const textSession = await (await api(cookieA, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable" }),
-		})).json() as { id: string };
+		})).json() as { id: string; workspaceId: string };
+		expect((await api(cookieA, "/api/workspace/upload", {
+			method: "POST",
+			body: JSON.stringify({
+				workspaceId: textSession.workspaceId,
+				files: [{ path: ".chat-images/text.png", dataBase64: "aW1hZ2U=" }],
+			}),
+		})).status).toBe(201);
 		const textOnly = await api(cookieA, "/api/chat", {
 			method: "POST",
 			body: JSON.stringify({
 				sessionId: textSession.id,
 				prompt: "durable-text-only-inline-image",
 				clientRequestId: "durable-text-only-inline-image-request",
-				images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
+				images: [{ workspacePath: ".chat-images/text.png", mimeType: "image/png" }],
 			}),
 		});
 		expect(textOnly.status).toBe(200);
@@ -1984,16 +1760,7 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-question-a@example.com"),
 			registerUser("durable-question-b@example.com"),
 		]);
-		const configured = await api(cookieA, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared",
-				baseUrl: providerOrigin,
-				apiKey: "durable-question-secret",
-				api: "openai-completions",
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		});
+		const configured = await api(cookieA, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) });
 		expect(configured.status).toBe(200);
 		const created = await api(cookieA, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable" }),
@@ -2074,16 +1841,7 @@ describe("durable session HTTP boundary", () => {
 			registerUser("durable-abort-a@example.com"),
 			registerUser("durable-abort-b@example.com"),
 		]);
-		expect((await api(cookieA, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared",
-				baseUrl: providerOrigin,
-				apiKey: "durable-abort-secret",
-				api: "openai-completions",
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookieA, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		const session = await (await api(cookieA, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable" }),
 		})).json() as { id: string };
@@ -2124,28 +1882,14 @@ describe("durable session HTTP boundary", () => {
 		expect(detail.messages.filter((message) => message.role === "user")).toHaveLength(1);
 	}, 60_000);
 
-	it("writes durable L1/L2/OCR state only to the authenticated tenant roots", async () => {
+	it("writes durable L2 state only to the authenticated tenant roots", async () => {
 		const [cookieA, cookieB] = await Promise.all([
 			registerUser("durable-memory-a@example.com"),
 			registerUser("durable-memory-b@example.com"),
 		]);
 		const configure = async (cookie: string, tenant: string) => {
-			const response = await api(cookie, "/api/settings/providers", {
-				method: "PUT",
-				body: JSON.stringify({
-					providerId: "shared",
-					baseUrl: providerOrigin,
-					apiKey: "durable-memory-secret",
-					api: "openai-completions",
-					models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-				}),
-			});
+			const response = await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) });
 			expect(response.status).toBe(200);
-			const ocr = await api(cookie, "/api/settings/ocr", {
-				method: "PUT",
-				body: JSON.stringify({ token: `durable-ocr-secret-${tenant}`, baseUrl: `${ocrOrigin}/jobs` }),
-			});
-			expect(ocr.status).toBe(200);
 		};
 		await Promise.all([configure(cookieA, "a"), configure(cookieB, "b")]);
 		const runMemoryTurn = async (cookie: string, prompt: string) => {
@@ -2182,60 +1926,27 @@ describe("durable session HTTP boundary", () => {
 		} finally {
 			await pool.end();
 		}
-		const rootA = join(home, "data", "tenants", tenantA);
-		const rootB = join(home, "data", "tenants", tenantB);
-		const [eventsA, eventsB, manifestA, manifestB, profileA, profileB] = await Promise.all([
-			readFile(join(rootA, "learner", "events.jsonl"), "utf-8"),
-			readFile(join(rootB, "learner", "events.jsonl"), "utf-8"),
-			readFile(join(rootA, "l2", "manifest.jsonl"), "utf-8"),
-			readFile(join(rootB, "l2", "manifest.jsonl"), "utf-8"),
-			readFile(join(rootA, "learner", "profile.json"), "utf-8"),
-			readFile(join(rootB, "learner", "profile.json"), "utf-8"),
-		]);
-		expect(eventsA).toContain("durable-concept-a");
-		expect(eventsA).not.toContain("durable-concept-b");
-		expect(eventsB).toContain("durable-concept-b");
-		expect(eventsB).not.toContain("durable-concept-a");
+		// The L2 manifest lives in PostgreSQL scoped to the tenant, not files in its data root.
+		const readManifest = async (tenantId: string) => {
+			const pool = new Pool({ connectionString: postgres.databaseUrl });
+			try {
+				const rows = await pool.query<{ entry: unknown }>("SELECT entry FROM l2_manifest WHERE tenant_id = $1", [tenantId]);
+				expect(rows.rows.length).toBeGreaterThan(0);
+				return rows.rows.map((row) => JSON.stringify(row.entry)).join("\n");
+			} finally {
+				await pool.end();
+			}
+		};
+		const [manifestA, manifestB] = await Promise.all([readManifest(tenantA), readManifest(tenantB)]);
 		expect(manifestA).toContain("durable-archive-a");
 		expect(manifestA).not.toContain("durable-archive-b");
 		expect(manifestB).toContain("durable-archive-b");
 		expect(manifestB).not.toContain("durable-archive-a");
-		expect(profileA).toContain("record_learning_event:");
-		expect(profileA).toContain("patch_learner_profile:");
-		expect(profileA).toContain("update_learner_profile:");
-		expect(profileA).toContain("durable-profile-a");
-		expect(profileA).not.toContain("durable-profile-b");
-		expect(profileB).toContain("durable-profile-b");
-		expect(profileB).not.toContain("durable-profile-a");
-		const readOcrCheckpoints = async (tenantRoot: string) => {
-			const directory = join(tenantRoot, "ocr");
-			const files = await readdir(directory);
-			expect(files).toHaveLength(1);
-			return (await Promise.all(files.map((file) => readFile(join(directory, file), "utf-8")))).join("\n");
-		};
-		const [ocrA, ocrB] = await Promise.all([readOcrCheckpoints(rootA), readOcrCheckpoints(rootB)]);
-		expect(ocrA).toContain("durable-ocr-text-a");
-		expect(ocrA).not.toContain("durable-ocr-text-b");
-		expect(ocrB).toContain("durable-ocr-text-b");
-		expect(ocrB).not.toContain("durable-ocr-text-a");
-		expect(ocrRequests.find((request) => request.body.includes("durable-ocr-a"))?.authorization).toBe("bearer durable-ocr-secret-a");
-		expect(ocrRequests.find((request) => request.body.includes("durable-ocr-b"))?.authorization).toBe("bearer durable-ocr-secret-b");
-		expect(existsSync(join(home, "data", "learner", "events.jsonl"))).toBe(false);
-		expect(existsSync(join(home, "data", "ocr"))).toBe(false);
 	}, 60_000);
 
 	it("replays and completes an admitted durable SSE turn after SIGKILL and restart", async () => {
 		const cookie = await registerUser("durable-restart@example.com");
-		expect((await api(cookie, "/api/settings/providers", {
-			method: "PUT",
-			body: JSON.stringify({
-				providerId: "shared",
-				baseUrl: providerOrigin,
-				apiKey: "durable-restart-secret",
-				api: "openai-completions",
-				models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
-			}),
-		})).status).toBe(200);
+		expect((await api(cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
 		const session = await (await api(cookie, "/api/sessions", {
 			method: "POST", body: JSON.stringify({ runtime: "durable" }),
 		})).json() as { id: string };
@@ -2282,4 +1993,417 @@ describe("durable session HTTP boundary", () => {
 		expect(detail.messages.some((message) => message.role === "assistant" && message.content === "tenant stub response")).toBe(true);
 		expect(providerRequests.filter((request) => request.body.includes("durable-restart-prompt"))).toHaveLength(2);
 	}, 60_000);
+});
+
+describe("workspace read routes in authenticated mode", () => {
+	const startProviderServer = async (
+		env: Record<string, string>,
+		existingHome?: string,
+	): Promise<{ child: ChildProcess; origin: string; home: string }> => {
+		const providerHome = existingHome ?? await mkdtemp(join(tmpdir(), "inno-server-wsread-"));
+		if (!existingHome) {
+			await mkdir(join(providerHome, "config"), { recursive: true });
+			await writeFile(join(providerHome, "config", "config.json"), JSON.stringify({
+				defaultProvider: "shared",
+				defaultModel: "tenant-model",
+				providers: {
+					dummy: { baseUrl: "http://127.0.0.1:9", apiKey: "x", api: "openai-completions", models: [{ id: "dummy-model" }] },
+					shared: {
+						baseUrl: providerOrigin,
+						apiKey: "integration-test-secret",
+						api: "openai-completions",
+						models: [{ id: "tenant-model", name: "Tenant model", contextWindow: 32_000, maxTokens: 2_000 }],
+					},
+				},
+			}));
+		}
+		const port = await freePort();
+		const childOrigin = `http://127.0.0.1:${port}`;
+		const providerChild = spawn(process.execPath, ["--import", "tsx", resolve(root, "apps/inno-agent/src/server.ts")], {
+			cwd: root,
+			env: {
+				...process.env,
+				INNO_HOME: providerHome,
+				INNO_CONFIG_DIR: join(providerHome, "config"),
+				INNO_SKILLS_DIR: join(providerHome, "skills"),
+				INNO_WORKSPACE_DIR: join(providerHome, "workspace"),
+				INNO_PORT: String(port),
+				INNO_HOST: "127.0.0.1",
+				DATABASE_URL: postgres.databaseUrl,
+				BETTER_AUTH_SECRET: SECRET,
+				BETTER_AUTH_URL: childOrigin,
+				...env,
+			},
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let providerOutput = "";
+		providerChild.stdout?.on("data", (chunk) => { providerOutput += chunk; });
+		providerChild.stderr?.on("data", (chunk) => { providerOutput += chunk; });
+		const deadline = Date.now() + 20_000;
+		while (true) {
+			if (providerChild.exitCode !== null) throw new Error(`Provider server exited: ${providerOutput}`);
+			try {
+				if ((await fetch(`${childOrigin}/health`)).ok) break;
+			} catch {}
+			if (Date.now() > deadline) throw new Error(`Provider server startup timed out: ${providerOutput}`);
+			await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+		}
+		return { child: providerChild, origin: childOrigin, home: providerHome };
+	};
+
+	const stopServer = async (providerChild: ChildProcess, providerHome: string) => {
+		if (providerChild.exitCode === null) {
+			providerChild.kill("SIGTERM");
+			await new Promise<void>((resolveExit) => providerChild.once("exit", () => resolveExit()));
+		}
+		await rm(providerHome, { recursive: true, force: true });
+	};
+
+	const providerApi = (providerOrigin: string, cookie: string, path: string, init: RequestInit = {}): Promise<Response> =>
+		fetch(`${providerOrigin}${path}`, {
+			...init,
+			headers: {
+				Cookie: cookie,
+				Origin: providerOrigin,
+				...(init.body ? { "Content-Type": "application/json" } : {}),
+				...init.headers,
+			},
+		});
+
+	const providerRegister = async (providerOrigin: string, email: string): Promise<string> => {
+		const response = await fetch(`${providerOrigin}/api/auth/sign-up/email`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Origin: providerOrigin },
+			body: JSON.stringify({ name: email, email, password: "tenant-test-password-123" }),
+		});
+		expect(response.status).toBe(200);
+		return response.headers.get("set-cookie")!.split(";", 1)[0]!;
+	};
+
+	it("memory provider keeps reads on the local disk (regression)", async () => {
+		const cookieA = await registerUser("ws-mem-a@example.com");
+		const cookieB = await registerUser("ws-mem-b@example.com");
+		const created = await api(cookieA, "/api/workspaces", {
+			method: "POST", body: JSON.stringify({ name: "Memory read" }),
+		});
+		expect(created.status).toBe(201);
+		const workspace = await created.json() as { id: string };
+		const upload = await api(cookieA, "/api/workspace/upload", {
+			method: "POST",
+			body: JSON.stringify({
+				workspaceId: workspace.id,
+				files: [{ path: "note.txt", dataBase64: Buffer.from("local bytes").toString("base64") }],
+			}),
+		});
+		expect(upload.status).toBe(201);
+		// With the default (memory) object store the panel still reads the
+		// worker's disk — the pre-S1b behaviour.
+		expect((await api(cookieA, `/api/workspace/tree?workspaceId=${workspace.id}`)).status).toBe(200);
+		const file = await api(cookieA, `/api/workspace/file?workspaceId=${workspace.id}&path=note.txt`);
+		expect(file.status).toBe(200);
+		expect(await file.json()).toMatchObject({ content: "local bytes" });
+		const raw = await api(cookieA, `/api/workspace/raw?workspaceId=${workspace.id}&path=note.txt`);
+		expect(raw.status).toBe(200);
+		expect(await raw.text()).toBe("local bytes");
+		expect((await api(cookieB, `/api/workspace/file?workspaceId=${workspace.id}&path=note.txt`)).status).toBe(404);
+	}, 60_000);
+
+	it("fs provider serves reads from the object store after the local dir is deleted", async () => {
+		const objectStoreDir = await mkdtemp(join(tmpdir(), "inno-wsread-objects-"));
+		const { child: providerChild, origin: providerOrigin, home: providerHome } = await startProviderServer({
+			INNO_OBJECT_STORAGE_PROVIDER: "fs",
+			INNO_OBJECT_STORAGE_DIR: objectStoreDir,
+		});
+		try {
+			const cookieA = await providerRegister(providerOrigin, "ws-read-a@example.com");
+			const cookieB = await providerRegister(providerOrigin, "ws-read-b@example.com");
+			const created = await providerApi(providerOrigin, cookieA, "/api/workspaces", {
+				method: "POST", body: JSON.stringify({ name: "Read store workspace" }),
+			});
+			expect(created.status).toBe(201);
+			const workspace = await created.json() as { id: string };
+
+			const upload = await providerApi(providerOrigin, cookieA, "/api/workspace/upload", {
+				method: "POST",
+				body: JSON.stringify({
+					workspaceId: workspace.id,
+					files: [
+						{ path: "docs/readme.md", dataBase64: Buffer.from("# store readme").toString("base64") },
+						{ path: "bin/blob.bin", dataBase64: Buffer.from([0, 1, 2, 255, 128]).toString("base64") },
+					],
+				}),
+			});
+			expect(upload.status).toBe(201);
+			expect((await providerApi(providerOrigin, cookieA, "/api/workspace/create", {
+				method: "POST",
+				body: JSON.stringify({ workspaceId: workspace.id, path: "empty-dir", type: "directory" }),
+			})).status).toBe(201);
+
+			// Delete the worker's local copy: reads must come from object storage.
+			const metaPool = new Pool({ connectionString: postgres.databaseUrl });
+			let relPath: string;
+			try {
+				const result = await metaPool.query<{ rel_path: string }>(
+					"SELECT rel_path FROM tenant_workspaces WHERE workspace_id = $1", [workspace.id],
+				);
+				relPath = result.rows[0]!.rel_path;
+			} finally {
+				await metaPool.end();
+			}
+			const localDir = join(providerHome, "workspace", relPath);
+			expect(existsSync(localDir)).toBe(true);
+			await rm(localDir, { recursive: true, force: true });
+
+			const tree = await providerApi(providerOrigin, cookieA, `/api/workspace/tree?workspaceId=${workspace.id}`);
+			expect(tree.status).toBe(200);
+			const treeBody = await tree.json() as {
+				root: string;
+				children: Array<{ name: string; type: string; children?: Array<{ name: string }> }>;
+			};
+			expect(treeBody.root).toBe("");
+			expect(treeBody.children.map((node) => `${node.type}:${node.name}`).sort())
+				.toEqual(["directory:bin", "directory:docs", "directory:empty-dir"]);
+			expect(treeBody.children.find((node) => node.name === "docs")?.children?.map((node) => node.name))
+				.toEqual(["readme.md"]);
+
+			const fileText = await providerApi(providerOrigin, cookieA, `/api/workspace/file?workspaceId=${workspace.id}&path=${encodeURIComponent("docs/readme.md")}`);
+			expect(fileText.status).toBe(200);
+			expect(await fileText.json()).toMatchObject({ kind: "markdown", content: "# store readme" });
+
+			const fileBinary = await providerApi(providerOrigin, cookieA, `/api/workspace/file?workspaceId=${workspace.id}&path=bin/blob.bin`);
+			expect(fileBinary.status).toBe(200);
+			const binaryBody = await fileBinary.json() as { kind: string; url?: string; content?: string };
+			expect(binaryBody.kind).toBe("binary");
+			expect(binaryBody.url).toContain("/api/workspace/raw?");
+			expect(binaryBody.content).toBeUndefined();
+
+			const raw = await providerApi(providerOrigin, cookieA, `/api/workspace/raw?workspaceId=${workspace.id}&path=bin/blob.bin`);
+			expect(raw.status).toBe(200);
+			expect([...new Uint8Array(await raw.arrayBuffer())]).toEqual([0, 1, 2, 255, 128]);
+
+			// T1.5: the fs provider cannot sign URLs, so the direct-upload
+			// endpoints report 404 (the client falls back to the proxy) and a
+			// download stays proxied instead of redirecting.
+			expect((await providerApi(providerOrigin, cookieA, "/api/workspace/upload-url", {
+				method: "POST",
+				body: JSON.stringify({ workspaceId: workspace.id, path: "big.bin", size: 100 }),
+			})).status).toBe(404);
+			expect((await providerApi(providerOrigin, cookieA, "/api/workspace/upload/complete", {
+				method: "POST",
+				body: JSON.stringify({ workspaceId: workspace.id, path: "bin/never-uploaded.bin" }),
+			})).status).toBe(404);
+			const download = await providerApi(providerOrigin, cookieA, `/api/workspace/raw?workspaceId=${workspace.id}&path=bin/blob.bin&download=1`, { redirect: "manual" });
+			expect(download.status).toBe(200);
+
+			const zipResponse = await providerApi(providerOrigin, cookieA, `/api/workspace/download-folder?workspaceId=${workspace.id}`);
+			expect(zipResponse.status).toBe(200);
+			const zip = Buffer.from(await zipResponse.arrayBuffer());
+			expect(zip.includes("docs/readme.md")).toBe(true);
+			expect(zip.includes("bin/blob.bin")).toBe(true);
+			expect(zip.includes("empty-dir/")).toBe(true);
+
+			for (const path of [
+				`/api/workspace/tree?workspaceId=${workspace.id}`,
+				`/api/workspace/file?workspaceId=${workspace.id}&path=docs/readme.md`,
+				`/api/workspace/raw?workspaceId=${workspace.id}&path=docs/readme.md`,
+				`/api/workspace/download-folder?workspaceId=${workspace.id}`,
+			]) {
+				expect((await providerApi(providerOrigin, cookieB, path)).status, path).toBe(404);
+			}
+		} finally {
+			await stopServer(providerChild, providerHome);
+			await rm(objectStoreDir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("local exec backend runs bash on the worker and replicates the file", async () => {
+		const objectStoreDir = await mkdtemp(join(tmpdir(), "inno-localexec-objects-"));
+		const { child: providerChild, origin: providerOriginChild, home: providerHome } = await startProviderServer({
+			INNO_OBJECT_STORAGE_PROVIDER: "fs",
+			INNO_OBJECT_STORAGE_DIR: objectStoreDir,
+			INNO_EXEC_BACKEND: "local",
+		});
+		try {
+			const cookie = await providerRegister(providerOriginChild, "local-exec@example.com");
+			expect((await providerApi(providerOriginChild, cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
+			const created = await providerApi(providerOriginChild, cookie, "/api/sessions", {
+				method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
+			});
+			expect(created.status).toBe(201);
+			const session = await created.json() as { id: string; workspaceId: string };
+
+			const response = await providerApi(providerOriginChild, cookie, "/api/chat/stream", {
+				method: "POST",
+				body: JSON.stringify({
+					sessionId: session.id,
+					prompt: "durable-bash-write",
+					clientRequestId: "durable-bash-write-request",
+				}),
+			});
+			expect(response.status).toBe(200);
+			const streamed = await readDurableStream(response);
+			expect(streamed).toContain('"toolName":"bash"');
+			expect(streamed).toContain('"type":"done"');
+
+			// The file bash wrote is in the fs object store, not just the worker's disk.
+			const readObjects = async (dir: string): Promise<string[]> => {
+				const out: string[] = [];
+				for (const entry of await readdir(dir, { withFileTypes: true })) {
+					const full = join(dir, entry.name);
+					if (entry.isDirectory()) out.push(...await readObjects(full));
+					else out.push(full);
+				}
+				return out;
+			};
+			const objectPaths = await readObjects(objectStoreDir);
+			const contents = await Promise.all(objectPaths.map((path) => readFile(path)));
+			expect(contents.some((bytes) => bytes.includes("bash-content"))).toBe(true);
+
+			// After the worker's local copy is deleted, panel reads still work
+			// from the manifest + object store.
+			const metaPool = new Pool({ connectionString: postgres.databaseUrl });
+			let relPath: string;
+			try {
+				const result = await metaPool.query<{ rel_path: string }>(
+					"SELECT rel_path FROM tenant_workspaces WHERE workspace_id = $1", [session.workspaceId],
+				);
+				relPath = result.rows[0]!.rel_path;
+			} finally {
+				await metaPool.end();
+			}
+			await rm(join(providerHome, "workspace", relPath), { recursive: true, force: true });
+			const raw = await providerApi(providerOriginChild, cookie, `/api/workspace/raw?workspaceId=${session.workspaceId}&path=bash-made.txt`);
+			expect(raw.status).toBe(200);
+			expect(await raw.text()).toBe("bash-content\n");
+		} finally {
+			await stopServer(providerChild, providerHome);
+			await rm(objectStoreDir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("local exec session survives SIGKILL: a restarted worker restores and reuses the workspace", async () => {
+		const objectStoreDir = await mkdtemp(join(tmpdir(), "inno-localexec-kill-"));
+		const env = {
+			INNO_OBJECT_STORAGE_PROVIDER: "fs",
+			INNO_OBJECT_STORAGE_DIR: objectStoreDir,
+			INNO_EXEC_BACKEND: "local",
+			INNO_DURABLE_STORAGE_LEASE_MS: "2000",
+		};
+		const first = await startProviderServer(env);
+		const providerHome = first.home;
+		let second: Awaited<ReturnType<typeof startProviderServer>> | null = null;
+		try {
+			const cookie = await providerRegister(first.origin, "local-exec-kill@example.com");
+			expect((await providerApi(first.origin, cookie, "/api/settings/model", { method: "POST", body: JSON.stringify({ provider: "shared", model: "tenant-model" }) })).status).toBe(200);
+			const created = await providerApi(first.origin, cookie, "/api/sessions", {
+				method: "POST", body: JSON.stringify({ runtime: "durable", newWorkspace: { isTemp: true } }),
+			});
+			expect(created.status).toBe(201);
+			const session = await created.json() as { id: string; workspaceId: string };
+
+			const response = await providerApi(first.origin, cookie, "/api/chat/stream", {
+				method: "POST",
+				body: JSON.stringify({
+					sessionId: session.id,
+					prompt: "durable-bash-write",
+					clientRequestId: "durable-bash-kill-request",
+				}),
+			});
+			expect(response.status).toBe(200);
+			const streamed = await readDurableStream(response);
+			expect(streamed).toContain('"type":"done"');
+			const turnId = /"turnId":"([^"]+)"/.exec(streamed)?.[1];
+			expect(turnId).toBeTruthy();
+
+			// The bash-written file was pushed into durable storage before the crash.
+			const objectDeadline = Date.now() + 15_000;
+			let replicated = false;
+			while (Date.now() < objectDeadline) {
+				const objectPaths: string[] = [];
+				const walk = async (dir: string) => {
+					for (const entry of await readdir(dir, { withFileTypes: true })) {
+						const full = join(dir, entry.name);
+						if (entry.isDirectory()) await walk(full);
+						else objectPaths.push(full);
+					}
+				};
+				await walk(objectStoreDir);
+				for (const path of objectPaths) {
+					if ((await readFile(path)).includes("bash-content")) { replicated = true; break; }
+				}
+				if (replicated) break;
+				await new Promise((resolveWait) => setTimeout(resolveWait, 200));
+			}
+			expect(replicated).toBe(true);
+
+			// Kill the worker mid-life and delete its local workspace copy: the
+			// restarted worker must rebuild it from the replica.
+			first.child.kill("SIGKILL");
+			await new Promise<void>((resolveExit) => first.child.once("exit", () => resolveExit()));
+			const metaPool = new Pool({ connectionString: postgres.databaseUrl });
+			let relPath: string;
+			try {
+				const result = await metaPool.query<{ rel_path: string }>(
+					"SELECT rel_path FROM tenant_workspaces WHERE workspace_id = $1", [session.workspaceId],
+				);
+				relPath = result.rows[0]!.rel_path;
+			} finally {
+				await metaPool.end();
+			}
+			const localFile = join(providerHome, "workspace", relPath, "bash-made.txt");
+			expect(existsSync(localFile)).toBe(true);
+			await rm(join(providerHome, "workspace", relPath), { recursive: true, force: true });
+			expect(existsSync(localFile)).toBe(false);
+
+			second = await startProviderServer(env, providerHome);
+			// The crashed worker's last terminal append may not have reached the
+			// journal, so the previous turn restores as active: the events
+			// endpoint is the intended recovery path — it resumes the orphaned
+			// projection and lets the turn finish before new prompts are allowed.
+			const replay = await providerApi(second.origin, cookie,
+				`/api/chat/events/${session.id}?turnId=${turnId}&after=0`);
+			expect(replay.status).toBe(200);
+			const replayed = await readDurableStream(replay);
+			expect(replayed).toContain('"type":"done"');
+
+			let response2: Response | null = null;
+			const takeoverDeadline = Date.now() + 15_000;
+			let attemptIndex = 0;
+			while (Date.now() < takeoverDeadline) {
+				const attempt = await providerApi(second.origin, cookie, "/api/chat/stream", {
+					method: "POST",
+					body: JSON.stringify({
+						sessionId: session.id,
+						prompt: "durable-bash-write",
+						clientRequestId: `durable-bash-kill-request-2-${++attemptIndex}`,
+					}),
+				});
+				if (attempt.status === 200) { response2 = attempt; break; }
+				expect(attempt.status).toBe(409);
+				await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+			}
+			expect(response2).not.toBeNull();
+			const streamed2 = await readDurableStream(response2!);
+			expect(streamed2).toContain('"type":"done"');
+
+			// The second turn's bash call ran the binding's full pull first, and
+			// the command itself rewrote the file — either way the local copy is
+			// back from durable storage.
+			expect(existsSync(localFile)).toBe(true);
+			expect(await readFile(localFile, "utf8")).toBe("bash-content\n");
+		} finally {
+			if (second) await stopServer(second.child, providerHome);
+			else if (first.child.exitCode === null) await stopServer(first.child, providerHome);
+			else await rm(providerHome, { recursive: true, force: true });
+			await rm(objectStoreDir, { recursive: true, force: true });
+		}
+	}, 90_000);
+});
+
+describe("local disk footprint", () => {
+	it("keeps tenant state out of the local disk: no data dir, scratch dir or virtual tenant root", () => {
+		expect(existsSync(join(home, "data"))).toBe(false);
+		expect(existsSync(join(home, "workspace", ".inno-scratch"))).toBe(false);
+		expect(existsSync("/inno-virtual")).toBe(false);
+	});
 });

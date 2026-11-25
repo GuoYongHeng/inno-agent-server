@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import type { Pool, PoolClient } from "pg";
 import { logger } from "../logger.js";
+import { WorkspaceStoreError } from "../workspace/workspace-store.js";
+import { resolveDurableShardId } from "./durable-tenant-router.js";
 import { withTenantTransaction } from "./schema.js";
 
 export type ResourceKind = "session" | "workspace" | "job" | "channel" | "memory" | "terminal" | "permission";
@@ -14,6 +17,16 @@ export interface TenantContext {
 export interface LegacyResourceSet {
 	sessions: string[];
 	workspaces: string[];
+}
+
+export type WorkspaceFileKind = "file" | "directory";
+
+/** One row of the `workspace_files` manifest (files AND explicit directories). */
+export interface WorkspaceFileRow {
+	relPath: string;
+	kind: WorkspaceFileKind;
+	size: number;
+	mtimeMs: number;
 }
 
 export interface LegacyMigrationReport {
@@ -40,6 +53,8 @@ export interface JobRunClaim {
 
 export interface DurableStorageLock {
 	readonly lost: boolean;
+	/** Backend pid of the dedicated connection holding the advisory lock. */
+	readonly backendPid: number;
 	onLost(listener: () => void): void;
 	release(): Promise<void>;
 }
@@ -65,6 +80,10 @@ class PostgresDurableStorageLock implements DurableStorageLock {
 
 	get lost(): boolean { return this.invalidated; }
 
+	get backendPid(): number {
+		return (this.client as unknown as { processID?: number }).processID ?? 0;
+	}
+
 	onLost(listener: () => void): void {
 		if (this.invalidated) listener();
 		else this.listeners.add(listener);
@@ -87,12 +106,25 @@ class PostgresDurableStorageLock implements DurableStorageLock {
 	}
 }
 
-function durableStorageLockKey(tenantId: string, sessionId: string): string {
+export function durableStorageLockKey(tenantId: string, sessionId: string): string {
 	const digest = createHash("sha256").update(`durable\0${tenantId}\0${sessionId}`).digest();
 	return BigInt.asIntN(64, digest.readBigUInt64BE(0)).toString();
 }
 
 const JOB_RUN_LEASE_MS = 5 * 60_000;
+
+/** How long a durable storage lease stays valid without a heartbeat.
+ * `INNO_DURABLE_STORAGE_LEASE_MS` shortens it in tests (zombie-owner takeover). */
+export const DURABLE_STORAGE_LEASE_MS = Math.max(1_000, Number(process.env.INNO_DURABLE_STORAGE_LEASE_MS) || 45_000);
+
+/** Identity recorded as `ds_metadata.owner_worker`. The resolved shard id
+ * (explicit config or container `HOSTNAME`) is preferred so leases line up
+ * with routing; otherwise host+pid. */
+export function durableWorkerId(env: NodeJS.ProcessEnv = process.env): string {
+	const shard = resolveDurableShardId(env);
+	if (shard) return shard;
+	return `${hostname()}:${process.pid}`;
+}
 
 /** A leased occurrence claim. Renewal and release are owner-token fenced. */
 class PostgresJobRunClaim implements JobRunClaim {
@@ -130,6 +162,9 @@ class PostgresJobRunClaim implements JobRunClaim {
 
 export class TenantStore {
 	constructor(private readonly pool: Pool) {}
+
+	/** The shared pool, for stores that keep tenant-scoped rows in the same database. */
+	get database(): Pool { return this.pool; }
 
 	async ensurePersonalTenant(userId: string): Promise<TenantContext> {
 		const client = await this.pool.connect();
@@ -256,6 +291,446 @@ export class TenantStore {
 		} catch (error) {
 			client.release(error instanceof Error ? error : undefined);
 			throw error;
+		}
+	}
+
+	/**
+	 * Claim durable session storage ownership for `workerId`. The conditional
+	 * update wins when the recorded lease is unowned/expired, already owned by
+	 * the claimant, or its owner is provably dead (no other backend holds the
+	 * session advisory lock); each successful claim bumps the fencing epoch
+	 * that `PgDurableStorage` commits are checked against. Returns the new
+	 * epoch, or null while another worker's live lease is still defensible.
+	 */
+	async claimDurableStorage(
+		context: TenantContext,
+		sessionId: string,
+		workerId: string,
+		leaseMs = DURABLE_STORAGE_LEASE_MS,
+		advisoryBackendPid: number | null = null,
+	): Promise<number | null> {
+		const owned = await this.pool.query(
+			`SELECT 1 FROM resource_ownership ownership
+			 JOIN tenant_memberships membership ON membership.tenant_id = ownership.tenant_id
+			 WHERE ownership.tenant_id = $1 AND ownership.resource_type = 'session'
+			   AND ownership.resource_id = $2 AND membership.user_id = $3`,
+			[context.tenantId, sessionId, context.userId],
+		);
+		if (owned.rowCount !== 1) throw new ResourceOwnershipError("session", sessionId);
+		// Sessions created before the storage migration have no metadata row yet.
+		await this.pool.query(
+			`INSERT INTO ds_metadata (session_id)
+			 SELECT id FROM durable_sessions WHERE id = $1
+			 ON CONFLICT DO NOTHING`,
+			[sessionId],
+		);
+		// A recorded owner is provably dead once no other backend still holds its
+		// advisory lock (process death releases it): a claimant that already owns
+		// the lock passes its backend pid so its own lock does not count; a
+		// claimant holding nothing requires the lock to be free entirely or the
+		// recorded lease to be expired, which fences a merely paused owner.
+		const lockKey = BigInt(durableStorageLockKey(context.tenantId, sessionId));
+		const classid = Number(BigInt.asIntN(32, lockKey >> 32n));
+		const objid = Number(BigInt.asIntN(32, lockKey));
+		const claimed = await this.pool.query<{ lease_epoch: string }>(
+			`UPDATE ds_metadata
+			 SET owner_worker = $2, last_worker = $2, lease_epoch = lease_epoch + 1,
+				 lease_expires_at = NOW() + ($3 * INTERVAL '1 millisecond')
+			 WHERE session_id = $1
+			   AND (owner_worker IS NULL OR owner_worker = $2
+					OR lease_expires_at IS NULL OR lease_expires_at < NOW()
+					OR NOT EXISTS (SELECT 1 FROM pg_locks
+						WHERE locktype = 'advisory' AND classid = $4 AND objid = $5 AND granted
+						  AND pid IS DISTINCT FROM $6))
+			 RETURNING lease_epoch`,
+			[sessionId, workerId, leaseMs, classid, objid, advisoryBackendPid],
+		);
+		const epoch = claimed.rows[0]?.lease_epoch;
+		return epoch === undefined ? null : Number(epoch);
+	}
+
+	/** Renew a held storage lease; false once the epoch was taken over. */
+	async renewDurableStorage(
+		sessionId: string,
+		workerId: string,
+		epoch: number,
+		leaseMs = DURABLE_STORAGE_LEASE_MS,
+	): Promise<boolean> {
+		const result = await this.pool.query(
+			`UPDATE ds_metadata
+			 SET lease_expires_at = NOW() + ($4 * INTERVAL '1 millisecond')
+			 WHERE session_id = $1 AND owner_worker = $2 AND lease_epoch = $3`,
+			[sessionId, workerId, epoch, leaseMs],
+		);
+		return result.rowCount === 1;
+	}
+
+	/** Release a held storage lease so another worker can claim immediately. */
+	async releaseDurableStorage(sessionId: string, epoch: number): Promise<void> {
+		await this.pool.query(
+			`UPDATE ds_metadata SET owner_worker = NULL, lease_expires_at = NULL
+			 WHERE session_id = $1 AND lease_epoch = $2`,
+			[sessionId, epoch],
+		);
+	}
+
+	/**
+	 * Authoritative tenant config copy for cross-worker takeover — readers
+	 * query this row directly; no local file is materialised. `updatedAt`
+	 * remains as the row's sync marker.
+	 */
+	async loadTenantConfigRecord(tenantId: string): Promise<{ config: string; updatedAt: string } | null> {
+		const rows = await this.pool.query<{ config: string; updated_at: string }>(
+			"SELECT config, updated_at::text AS updated_at FROM tenant_configs WHERE tenant_id = $1",
+			[tenantId],
+		);
+		const row = rows.rows[0];
+		return row ? { config: row.config, updatedAt: row.updated_at } : null;
+	}
+
+	/** Upsert the authoritative tenant config; returns the new updated_at marker. */
+	async saveTenantConfigRecord(tenantId: string, configJson: string): Promise<string> {
+		const rows = await this.pool.query<{ updated_at: string }>(
+			`INSERT INTO tenant_configs (tenant_id, config) VALUES ($1, $2)
+			 ON CONFLICT (tenant_id) DO UPDATE SET config = $2, updated_at = NOW()
+			 RETURNING updated_at::text AS updated_at`,
+			[tenantId, configJson],
+		);
+		return rows.rows[0]!.updated_at;
+	}
+
+	/**
+	 * Live recorded storage owner for request routing: owner_worker only while
+	 * its lease is unexpired and some backend still holds the session's advisory
+	 * lock (process death releases it, so a dead owner's live-looking lease is
+	 * ignored). Returns null for unowned or provably-dead-owner sessions.
+	 */
+	async durableSessionOwner(context: TenantContext, sessionId: string): Promise<string | null> {
+		return (await this.durableSessionRouteHint(context, sessionId)).owner;
+	}
+
+	/**
+	 * Routing hint for a session-scoped request: `owner` is the live recorded
+	 * storage owner (lease unexpired and the advisory lock still held), while
+	 * `affinity` is the worker that last claimed the session — set on every
+	 * claim and kept on release so idle sessions stay near their worker-local
+	 * files. Either may name a dead worker; the forward path handles that.
+	 */
+	async durableSessionRouteHint(context: TenantContext, sessionId: string): Promise<{ owner: string | null; affinity: string | null }> {
+		const lockKey = BigInt(durableStorageLockKey(context.tenantId, sessionId));
+		const classid = Number(BigInt.asIntN(32, lockKey >> 32n));
+		const objid = Number(BigInt.asIntN(32, lockKey));
+		const rows = await this.pool.query<{ owner_worker: string | null; last_worker: string | null; live: boolean }>(
+			`SELECT owner_worker, last_worker,
+				 (lease_expires_at > NOW()
+				   AND EXISTS (SELECT 1 FROM pg_locks
+					 WHERE locktype = 'advisory' AND classid = $2 AND objid = $3 AND granted)) AS live
+			 FROM ds_metadata WHERE session_id = $1`,
+			[sessionId, classid, objid],
+		);
+		const row = rows.rows[0];
+		return {
+			owner: row?.live ? row.owner_worker : null,
+			affinity: row?.last_worker ?? null,
+		};
+	}
+
+	/** Replicated workspace registry rows (durable source of truth across workers). */
+	async upsertWorkspaceRow(context: TenantContext, ws: { workspaceId: string; relPath: string; name: string; isTemp: boolean }): Promise<void> {
+		await this.pool.query(
+			`INSERT INTO tenant_workspaces (tenant_id, workspace_id, rel_path, name, is_temp, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, NOW())
+			 ON CONFLICT (tenant_id, workspace_id)
+			 DO UPDATE SET rel_path = EXCLUDED.rel_path, name = EXCLUDED.name,
+				is_temp = EXCLUDED.is_temp, updated_at = NOW()`,
+			[context.tenantId, ws.workspaceId, ws.relPath, ws.name, ws.isTemp],
+		);
+	}
+
+	async getWorkspaceRow(context: TenantContext, workspaceId: string): Promise<{ workspaceId: string; relPath: string; name: string; isTemp: boolean; createdAt: string; updatedAt: string } | null> {
+		const rows = await this.pool.query(
+			`SELECT workspace_id, rel_path, name, is_temp,
+				 created_at::text AS created_at, updated_at::text AS updated_at
+			 FROM tenant_workspaces WHERE tenant_id = $1 AND workspace_id = $2`,
+			[context.tenantId, workspaceId],
+		);
+		const row = rows.rows[0];
+		return row ? {
+			workspaceId: row.workspace_id, relPath: row.rel_path, name: row.name,
+			isTemp: row.is_temp, createdAt: row.created_at, updatedAt: row.updated_at,
+		} : null;
+	}
+
+	async deleteWorkspaceRow(context: TenantContext, workspaceId: string): Promise<void> {
+		await this.pool.query(
+			"DELETE FROM tenant_workspaces WHERE tenant_id = $1 AND workspace_id = $2",
+			[context.tenantId, workspaceId],
+		);
+		await this.pool.query(
+			"DELETE FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2",
+			[context.tenantId, workspaceId],
+		);
+		await this.pool.query(
+			"DELETE FROM session_workspaces WHERE tenant_id = $1 AND workspace_id = $2",
+			[context.tenantId, workspaceId],
+		);
+	}
+
+	/** Replicated session→workspace bindings (the local session map is a cache). */
+	async setSessionWorkspace(context: TenantContext, sessionId: string, workspaceId: string): Promise<void> {
+		await this.pool.query(
+			`INSERT INTO session_workspaces (tenant_id, session_id, workspace_id, updated_at)
+			 VALUES ($1, $2, $3, NOW())
+			 ON CONFLICT (tenant_id, session_id)
+			 DO UPDATE SET workspace_id = EXCLUDED.workspace_id, updated_at = NOW()`,
+			[context.tenantId, sessionId, workspaceId],
+		);
+	}
+
+	async getSessionWorkspace(context: TenantContext, sessionId: string): Promise<string | null> {
+		const rows = await this.pool.query<{ workspace_id: string }>(
+			"SELECT workspace_id FROM session_workspaces WHERE tenant_id = $1 AND session_id = $2",
+			[context.tenantId, sessionId],
+		);
+		return rows.rows[0]?.workspace_id ?? null;
+	}
+
+	async deleteSessionWorkspace(context: TenantContext, sessionId: string): Promise<void> {
+		await this.pool.query(
+			"DELETE FROM session_workspaces WHERE tenant_id = $1 AND session_id = $2",
+			[context.tenantId, sessionId],
+		);
+	}
+
+	/** The remote file listing for one workspace replica. */
+	async listWorkspaceFiles(context: TenantContext, workspaceId: string): Promise<WorkspaceFileRow[]> {
+		const rows = await this.pool.query<{ rel_path: string; kind: string; size: string; mtime_ms: string }>(
+			"SELECT rel_path, kind, size, mtime_ms FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2",
+			[context.tenantId, workspaceId],
+		);
+		return rows.rows.map((row) => ({
+			relPath: row.rel_path,
+			kind: row.kind === "directory" ? "directory" : "file",
+			size: Number(row.size),
+			mtimeMs: Number(row.mtime_ms),
+		}));
+	}
+
+	/** One manifest row, or null. */
+	async getWorkspaceFile(context: TenantContext, workspaceId: string, relPath: string): Promise<WorkspaceFileRow | null> {
+		const rows = await this.pool.query<{ rel_path: string; kind: string; size: string; mtime_ms: string }>(
+			"SELECT rel_path, kind, size, mtime_ms FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2 AND rel_path = $3",
+			[context.tenantId, workspaceId, relPath],
+		);
+		const row = rows.rows[0];
+		return row ? {
+			relPath: row.rel_path,
+			kind: row.kind === "directory" ? "directory" : "file",
+			size: Number(row.size),
+			mtimeMs: Number(row.mtime_ms),
+		} : null;
+	}
+
+	/**
+	 * Manifest rows whose rel_path equals `prefix` or sits under `prefix + "/"`,
+	 * in rel_path order, capped at `limit` rows. `""` lists the whole workspace.
+	 */
+	async listWorkspaceFilesUnder(
+		context: TenantContext,
+		workspaceId: string,
+		prefix: string,
+		limit: number,
+	): Promise<WorkspaceFileRow[]> {
+		const rows = await this.pool.query<{ rel_path: string; kind: string; size: string; mtime_ms: string }>(
+			`SELECT rel_path, kind, size, mtime_ms FROM workspace_files
+			 WHERE tenant_id = $1 AND workspace_id = $2 AND starts_with(rel_path, $3)
+			 ORDER BY rel_path LIMIT $4`,
+			[context.tenantId, workspaceId, prefix, limit],
+		);
+		return rows.rows.map((row) => ({
+			relPath: row.rel_path,
+			kind: row.kind === "directory" ? "directory" : "file",
+			size: Number(row.size),
+			mtimeMs: Number(row.mtime_ms),
+		}));
+	}
+
+	/**
+	 * Cheap existence/mtime probe under `prefix` (`""` = whole workspace):
+	 * whether any descendant row exists and the newest mtime among them,
+	 * without materializing the rows.
+	 */
+	async summarizeWorkspacePrefix(
+		context: TenantContext,
+		workspaceId: string,
+		prefix: string,
+	): Promise<{ count: number; maxMtimeMs: number }> {
+		const rows = await this.pool.query<{ count: string; max_mtime_ms: string | null }>(
+			`SELECT COUNT(*)::text AS count, MAX(mtime_ms)::text AS max_mtime_ms
+			 FROM workspace_files
+			 WHERE tenant_id = $1 AND workspace_id = $2 AND starts_with(rel_path, $3)`,
+			[context.tenantId, workspaceId, prefix],
+		);
+		const row = rows.rows[0];
+		return { count: Number(row?.count ?? 0), maxMtimeMs: Number(row?.max_mtime_ms ?? 0) };
+	}
+
+	/** Upsert one manifest row (file or directory). */
+	async putWorkspaceFile(context: TenantContext, workspaceId: string, row: WorkspaceFileRow): Promise<void> {
+		await this.pool.query(
+			`INSERT INTO workspace_files (tenant_id, workspace_id, rel_path, kind, size, mtime_ms, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, NOW())
+			 ON CONFLICT (tenant_id, workspace_id, rel_path)
+			 DO UPDATE SET kind = EXCLUDED.kind, size = EXCLUDED.size,
+				mtime_ms = EXCLUDED.mtime_ms, updated_at = NOW()`,
+			[context.tenantId, workspaceId, row.relPath, row.kind, row.size, row.mtimeMs],
+		);
+	}
+
+	/**
+	 * Delete the row at `path` plus, when `descendants`, every row under
+	 * `path + "/"`, in one transaction. Returns the removed rows so callers can
+	 * clean up file objects afterwards.
+	 */
+	async deleteWorkspaceFiles(
+		context: TenantContext,
+		workspaceId: string,
+		path: string,
+		descendants: boolean,
+	): Promise<WorkspaceFileRow[]> {
+		const client = await this.pool.connect();
+		try {
+			return await withTenantTransaction(client, async () => {
+				const removed = await client.query<{ rel_path: string; kind: string; size: string; mtime_ms: string }>(
+					`DELETE FROM workspace_files
+					 WHERE tenant_id = $1 AND workspace_id = $2
+					   AND (rel_path = $3 OR ($4 AND starts_with(rel_path, $5)))
+					 RETURNING rel_path, kind, size, mtime_ms`,
+					[context.tenantId, workspaceId, path, descendants, path === "" ? "" : `${path}/`],
+				);
+				return removed.rows.map((row) => ({
+					relPath: row.rel_path,
+					kind: row.kind === "directory" ? "directory" as const : "file" as const,
+					size: Number(row.size),
+					mtimeMs: Number(row.mtime_ms),
+				}));
+			});
+		} finally {
+			client.release();
+		}
+	}
+
+	/**
+	 * Rewrite a path subtree to a new prefix in ONE transaction: the row at
+	 * `from` and every `from + "/"` descendant becomes `to` / `to + "/…"`.
+	 * Throws `WorkspaceStoreError("exists")` when the destination path or a
+	 * descendant of it already has a row, and a plain Error when the source
+	 * subtree changed underneath (moved count mismatch).
+	 */
+	async moveWorkspaceFiles(
+		context: TenantContext,
+		workspaceId: string,
+		from: string,
+		to: string,
+	): Promise<WorkspaceFileRow[]> {
+		const client = await this.pool.connect();
+		try {
+			return await withTenantTransaction(client, async () => {
+				const conflicts = await client.query(
+					`SELECT 1 FROM workspace_files
+					 WHERE tenant_id = $1 AND workspace_id = $2
+					   AND (rel_path = $3 OR starts_with(rel_path, $4)) LIMIT 1`,
+					[context.tenantId, workspaceId, to, `${to}/`],
+				);
+				if ((conflicts.rowCount ?? 0) > 0) {
+					throw new WorkspaceStoreError("exists", `destination exists: ${to}`, to);
+				}
+				const source = await client.query<{ rel_path: string; kind: string; size: string; mtime_ms: string }>(
+					`SELECT rel_path, kind, size, mtime_ms FROM workspace_files
+					 WHERE tenant_id = $1 AND workspace_id = $2
+					   AND (rel_path = $3 OR starts_with(rel_path, $4))
+					 FOR UPDATE`,
+					[context.tenantId, workspaceId, from, `${from}/`],
+				);
+				if (source.rows.length === 0) return [];
+				const moved: WorkspaceFileRow[] = source.rows.map((row) => ({
+					relPath: row.rel_path,
+					kind: row.kind === "directory" ? "directory" : "file",
+					size: Number(row.size),
+					mtimeMs: Number(row.mtime_ms),
+				}));
+				await client.query(
+					`DELETE FROM workspace_files
+					 WHERE tenant_id = $1 AND workspace_id = $2
+					   AND (rel_path = $3 OR starts_with(rel_path, $4))`,
+					[context.tenantId, workspaceId, from, `${from}/`],
+				);
+				await client.query(
+					`INSERT INTO workspace_files (tenant_id, workspace_id, rel_path, kind, size, mtime_ms, updated_at)
+					 SELECT $1, $2, rel_path, kind, size, mtime_ms, NOW()
+					 FROM unnest($3::text[], $4::text[], $5::bigint[], $6::double precision[]) AS t(rel_path, kind, size, mtime_ms)`,
+					[
+						context.tenantId, workspaceId,
+						moved.map((row) => to + row.relPath.slice(from.length)),
+						moved.map((row) => row.kind),
+						moved.map((row) => row.size),
+						moved.map((row) => row.mtimeMs),
+					],
+				);
+				return moved;
+			});
+		} finally {
+			client.release();
+		}
+	}
+
+	/** Drop every manifest row of the workspace. */
+	async deleteAllWorkspaceFiles(context: TenantContext, workspaceId: string): Promise<void> {
+		await this.pool.query(
+			"DELETE FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2",
+			[context.tenantId, workspaceId],
+		);
+	}
+
+	/**
+	 * Apply one push diff: upsert present files and delete vanished ones in a
+	 * single transaction so the remote listing never observes a half-applied sync.
+	 */
+	async syncWorkspaceFiles(
+		context: TenantContext,
+		workspaceId: string,
+		upserts: Array<{ relPath: string; size: number; mtimeMs: number; kind?: WorkspaceFileKind }>,
+		deletes: string[],
+	): Promise<void> {
+		const client = await this.pool.connect();
+		try {
+			await withTenantTransaction(client, async () => {
+				if (upserts.length > 0) {
+					await client.query(
+						`INSERT INTO workspace_files (tenant_id, workspace_id, rel_path, kind, size, mtime_ms, updated_at)
+						 SELECT $1, $2, rel_path, kind, size, mtime_ms, NOW()
+						 FROM unnest($3::text[], $4::text[], $5::bigint[], $6::double precision[]) AS t(rel_path, kind, size, mtime_ms)
+						 ON CONFLICT (tenant_id, workspace_id, rel_path)
+						 DO UPDATE SET kind = EXCLUDED.kind, size = EXCLUDED.size,
+							mtime_ms = EXCLUDED.mtime_ms, updated_at = NOW()`,
+						[
+							context.tenantId, workspaceId,
+							upserts.map((f) => f.relPath),
+							upserts.map((f) => f.kind ?? "file"),
+							upserts.map((f) => f.size),
+							upserts.map((f) => f.mtimeMs),
+						],
+					);
+				}
+				if (deletes.length > 0) {
+					await client.query(
+						"DELETE FROM workspace_files WHERE tenant_id = $1 AND workspace_id = $2 AND rel_path = ANY($3::text[])",
+						[context.tenantId, workspaceId, deletes],
+					);
+				}
+			});
+		} finally {
+			client.release();
 		}
 	}
 

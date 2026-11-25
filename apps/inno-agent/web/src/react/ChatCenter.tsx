@@ -31,7 +31,6 @@ import {
 } from "../api/workspaces.js";
 import { ApiError } from "../api/client.js";
 import type { PresetMeta } from "../types/presets.js";
-import { arrayBufferToBase64 } from "../api/uploads.js";
 import { uploadWorkspaceFileWithProgress } from "../api/workspace.js";
 import type { AttachmentRef, ChatMessage } from "../types/chat.js";
 import { fetchPresetList, readCachedPresets, removeCachedPreset } from "../utils/preset-cache.js";
@@ -50,11 +49,10 @@ import {
 	type SlashPaletteAction,
 	type SlashPaletteEntry,
 } from "./chat/slash-palette-utils.js";
-import { fetchSlashCommands, type SlashCommandItem } from "../api/commands.js";
+import type { SlashCommandItem } from "./chat/slash-command.js";
 import { WorkspaceSwitchConfirm } from "./chat/WorkspaceSwitchConfirm.js";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher.js";
 import { BtwPanel } from "./BtwPanel.js";
-import { PermissionModeControl } from "./chat/PermissionModeControl.js";
 import type { WorkspaceChoice } from "./WorkspaceSwitcher.js";
 import { DEFAULT_UPLOAD_MAX_BYTES, DEFAULT_UPLOAD_MAX_LABEL, getOversizedFiles } from "../utils/upload-limits.js";
 import {
@@ -62,7 +60,9 @@ import {
 	isLargeTextPaste,
 	localPendingUpload,
 	pendingUploadId,
+	chatImageObjectPath,
 	prepareInlineImage,
+	toChatImageRef,
 	resizeComposerTextarea,
 	workspacePendingUpload,
 	type PendingPasteBlock,
@@ -125,6 +125,8 @@ function pendingUploadsFromRefs(refs: AttachmentRef[]): PendingUpload[] {
 	});
 }
 
+const NO_SLASH_COMMANDS: SlashCommandItem[] = [];
+
 export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProps) {
 	const { t } = useTranslation();
 	const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -163,20 +165,12 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	const [pasteBlocks, setPasteBlocks] = useState<PendingPasteBlock[]>([]);
 
 	// Slash-command palette (Codex-style): opens while the draft is a bare
-	// "/query". App actions (new chat, model picker) run locally; Agent
-	// commands come from GET /api/commands and become atomic bubbles when the
-	// feature is enabled, while the backend still receives their slash form.
-	const [slashCommands, setSlashCommands] = useState<SlashCommandItem[]>([]);
+	// "/query" and lists app actions (new chat, model picker, ...) that run
+	// locally. The agent publishes no commands of its own.
+	const slashCommands = NO_SLASH_COMMANDS;
 	const [slashActiveIndex, setSlashActiveIndex] = useState(0);
 	const [slashDismissedFor, setSlashDismissedFor] = useState<string | null>(null);
 
-	useEffect(() => {
-		let cancelled = false;
-		fetchSlashCommands()
-			.then((items) => { if (!cancelled) setSlashCommands(items); })
-			.catch(() => { /* palette simply stays limited to app actions */ });
-		return () => { cancelled = true; };
-	}, []);
 
 	// New-chat workspace selection is draft state until the first message creates
 	// a session. The active session path is bound in handleWorkspaceChange.
@@ -191,18 +185,28 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	const [workspaceSwitchResult, setWorkspaceSwitchResult] = useState<WorkspaceSwitchResult | null>(null);
 	const workspaceSwitchRequestRef = useRef(0);
 
+	// An open session uses the model pinned to it; with no session open the picker
+	// edits the default that new sessions start with.
+	const openSession = useStoreSnapshot(sessionsStore, () => {
+		const session = sessionsStore.sessions.find((item) => item.id === sessionsStore.currentSessionId);
+		return {
+			id: session?.id ?? null,
+			provider: session?.model?.provider ?? null,
+			modelId: session?.model?.id ?? null,
+		};
+	});
 	const modelState = useStoreSnapshot(settingsStore, () => {
 		const settings = settingsStore.settings;
 		const models = settings?.availableModels ?? settings?.configuredModels ?? [];
-		const current = models.find((model) => model.provider === settings?.defaultProvider && model.id === settings?.defaultModel);
 		return {
 			models,
 			defaultProvider: settings?.defaultProvider ?? "",
 			defaultModel: settings?.defaultModel ?? "",
-			currentModelSupportsNativeImages: current?.input.includes("image") ?? true,
 			isSavingModel: settingsStore.isSavingModel,
 		};
 	});
+	const activeProvider = openSession.provider ?? modelState.defaultProvider;
+	const activeModelId = openSession.modelId ?? modelState.defaultModel;
 	const modelOptions = useMemo(() => {
 		const seen = new Set<string>();
 		return modelState.models.filter((model) => {
@@ -212,7 +216,8 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 			return true;
 		});
 	}, [modelState.models]);
-	const currentModel = modelOptions.find((model) => model.provider === modelState.defaultProvider && model.id === modelState.defaultModel);
+	const currentModel = modelOptions.find((model) => model.provider === activeProvider && model.id === activeModelId);
+	const currentModelSupportsNativeImages = currentModel?.input.includes("image") ?? true;
 
 	const [presets, setPresets] = useState<PresetMeta[]>(() => readCachedPresets() ?? []);
 	const [presetsLoaded, setPresetsLoaded] = useState(() => readCachedPresets() !== null);
@@ -290,8 +295,8 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	const isWelcome = sessions.isWelcome;
 	const hasConversationStatus = Boolean(chat.pendingQuestion || chat.pendingPermission || sessions.busyBlocker);
 	const btwPanelOpen = useStoreSnapshot(btwStore, () => btwStore.isVisible);
-	// Sidebar/workspace layout shifts (e.g. after desktop window expansion) move
-	// the composer by translation without resizing it, so neither window resize
+	// Sidebar/workspace layout shifts move the composer by translation without
+	// resizing it, so neither window resize
 	// nor ResizeObserver fires. Track the layout values that shift the chat
 	// column and use them to nudge the floating panel to re-anchor.
 	const appLayout = useStoreSnapshot(appStore, () => ({
@@ -312,9 +317,13 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	const toggleModelPicker = useCallback(() => setModelPickerOpen((open) => !open), []);
 	const handleModelSelect = useCallback((model: InnoModelInfo) => {
 		setModelPickerOpen(false);
-		if (model.provider === modelState.defaultProvider && model.id === modelState.defaultModel) return;
+		if (model.provider === activeProvider && model.id === activeModelId) return;
+		if (openSession.id && openSession.provider) {
+			void sessionsStore.setSessionModel(openSession.id, model.provider, model.id);
+			return;
+		}
 		void settingsStore.switchModel(model.provider, model.id);
-	}, [modelState.defaultModel, modelState.defaultProvider]);
+	}, [activeModelId, activeProvider, openSession.id, openSession.provider]);
 	const openModelSettings = useCallback(() => {
 		setModelPickerOpen(false);
 		appStore.openSettings("models");
@@ -1022,9 +1031,9 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 						current.map((entry) => entry.path === key && entry.source === "local" ? { ...entry, ...patchItem } : entry));
 					patch({ status: "uploading", pct: 0 });
 					try {
-						const dataBase64 = arrayBufferToBase64(await item.file.arrayBuffer());
 						const node = await uploadWorkspaceFileWithProgress(
-							{ path: item.path, dataBase64 },
+							item.path,
+							item.file,
 							targetWorkspaceId,
 							(loaded, total) => patch({ pct: total > 0 ? Math.min(100, (loaded / total) * 100) : 0 }),
 						);
@@ -1046,9 +1055,9 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 						const uid = pending.file.uid;
 						engine.setUploadProgress(uid, 0);
 						try {
-							const dataBase64 = arrayBufferToBase64(await pending.file.file.arrayBuffer());
 							const node = await uploadWorkspaceFileWithProgress(
-								{ path: pending.file.path, dataBase64 },
+								pending.file.path,
+								pending.file.file,
 								targetWorkspaceId,
 								(loaded, total) => engine.setUploadProgress(uid, total > 0 ? Math.min(100, (loaded / total) * 100) : 0),
 							);
@@ -1068,7 +1077,20 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 					else await workspaceStore.loadTree();
 				}
 
-				const imagesToSend = pendingImages.length > 0 ? pendingImages.map(({ data, mimeType }) => ({ data, mimeType })) : undefined;
+				const uploadedImages = [];
+				for (const image of pendingImages) {
+					try {
+						const node = await uploadWorkspaceFileWithProgress(
+							chatImageObjectPath(image.mimeType),
+							image.file,
+							targetWorkspaceId,
+						);
+						uploadedImages.push(toChatImageRef(node.path, image));
+					} catch {
+						failedNames.push(image.name);
+					}
+				}
+				const imagesToSend = uploadedImages.length > 0 ? uploadedImages : undefined;
 				const bindings = engine && outgoing
 					? engine.finalizeBindings(outgoing.readyBindings, uploadedForBindings)
 					: [];
@@ -1080,12 +1102,13 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 					),
 				);
 				const messageContent = input || (
-					pendingImages.length > 0
+					uploadedImages.length > 0
 						? t("chat.describeImage")
 						: hasAttachments
 							? t("chat.describeAttachment")
 							: ""
 				);
+				if (!messageContent) return;
 
 				const editTarget = editTargetRef.current;
 				if (editTarget && editTarget.sessionId === targetSessionId) {
@@ -1203,7 +1226,6 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 		// so "new chat" would be a no-op.
 		if (!isWelcome) actions.push({ action: "new-chat", name: "new", description: t("chat.slashPalette.newChatDesc") });
 		actions.push({ action: "model", name: "model", description: t("chat.slashPalette.modelDesc") });
-		actions.push({ action: "profile", name: "profile", description: t("chat.slashPalette.profileDesc") });
 		actions.push({ action: "jobs", name: "jobs", description: t("chat.slashPalette.jobsDesc") });
 		actions.push({ action: "skills", name: "skills", description: t("chat.slashPalette.skillsDesc") });
 		actions.push({ action: "settings", name: "settings", description: t("chat.slashPalette.settingsDesc") });
@@ -1212,10 +1234,7 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 
 	const slashEntries = useMemo(() => {
 		if (slashQuery === null) return [];
-		// Bundled plugins' extension commands (rpiv-todo, pi-web-access, MCP
-		// adapter) are TUI overlays gated on ctx.hasUI — they no-op server-side,
-		// so only Inno's own webSafe commands are offered alongside skills and
-		// prompt templates (both expand into a normal turn).
+		// The agent publishes no commands; keep only ones that are safe to run headless.
 		const agentCommands = slashCommands.filter((command) => command.source !== "extension" || command.webSafe === true);
 		return buildSlashPaletteEntries(slashAppActions, agentCommands, slashQuery);
 	}, [slashAppActions, slashCommands, slashQuery]);
@@ -1240,9 +1259,6 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 					break;
 				// Feature panels became full pages in the new IA — navigate instead
 				// of opening a right-panel tab.
-				case "profile":
-					appStore.setPage("learner");
-					break;
 				case "jobs":
 					appStore.setPage("jobs");
 					break;
@@ -1312,9 +1328,9 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	}, []);
 
 	const addImageFiles = useCallback((files: File[]) => {
-		filterUploadFiles(files).forEach((file) => {
-			void prepareInlineImage(file).then((prepared) => setInlineImages((prev) => [...prev, prepared]));
-		});
+		const accepted = filterUploadFiles(files);
+		if (accepted.length === 0) return;
+		setInlineImages((prev) => [...prev, ...accepted.map((file) => prepareInlineImage(file))]);
 	}, [filterUploadFiles]);
 
 	const addLocalFiles = useCallback((files: File[]) => {
@@ -1388,7 +1404,11 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 		event.target.value = "";
 	}, [addImageFiles]);
 	const removeInlineImage = useCallback((index: number) => {
-		setInlineImages((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
+		setInlineImages((prev) => {
+			const removed = prev[index];
+			if (removed?.previewUrl.startsWith("blob:")) URL.revokeObjectURL(removed.previewUrl);
+			return prev.filter((_, currentIndex) => currentIndex !== index);
+		});
 	}, []);
 
 	const handleFiles = useCallback((event: ChangeEvent<HTMLInputElement>) => {
@@ -1448,7 +1468,7 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 			inlineImages={inlineImages}
 			pasteBlocks={pasteBlocks}
 			uploadChips={uploadChips}
-				modelState={modelState}
+				modelState={{ ...modelState, defaultProvider: activeProvider, defaultModel: activeModelId, currentModelSupportsNativeImages }}
 				modelOptions={modelOptions}
 				currentModel={currentModel}
 				conversationMode={!isWelcome}
@@ -1460,7 +1480,6 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 					streaming={chat.isSending || chat.jobStreaming}
 					revision={`${chat.messages.length}:${chat.isLoadingHistory}:${sessions.contextUsageRevision}`}
 				/> : null}
-				permissionControl={<PermissionModeControl variant={isWelcome ? "pill" : "inline"} />}
 			workspaceControl={isWelcome ? workspaceContext : undefined}
 			modelPickerOpen={modelPickerOpen}
 			attachMenuOpen={attachMenuOpen}
@@ -1559,7 +1578,7 @@ export function ChatCenter({ onOpenPresetPanels, onPreviewFile }: ChatCenterProp
 	const smartToastNode = smartToast ? (
 		<div className={`inno-smart-toast ${smartToast.error ? "is-error" : ""}`} role="status">{smartToast.message}</div>
 	) : null;
-	const btwControl = !isWelcome && sessions.currentSessionId && (!window.innoDesktop || appLayout.workspaceMode !== "collapsed") ? (
+	const btwControl = !isWelcome && sessions.currentSessionId ? (
 		<button
 			type="button"
 			className={`inno-conversation-btw-control flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--inno-text-subtle)] transition-colors hover:bg-[var(--inno-surface-muted)] hover:text-[var(--inno-text)] disabled:opacity-50 ${btwPanelOpen ? "bg-[var(--inno-accent-soft)] text-[var(--inno-accent)]" : ""}`}

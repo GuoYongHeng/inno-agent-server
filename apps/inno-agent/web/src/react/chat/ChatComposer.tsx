@@ -32,7 +32,6 @@ export interface ChatComposerProps {
 	modelOptions: InnoModelInfo[];
 	currentModel?: InnoModelInfo;
 	/** Permission switcher; welcome uses a pill, conversation uses a frameless labeled control. */
-	permissionControl?: ReactNode;
 	/** Read-only context meter, shown next to the model picker in conversations. */
 	contextUsageControl?: ReactNode;
 	/** Workspace selector shown on the welcome composer sub-pill row. */
@@ -91,7 +90,6 @@ export function ChatComposer({
 	modelState,
 	modelOptions,
 	currentModel,
-	permissionControl,
 	contextUsageControl,
 	workspaceControl,
 	conversationMode = false,
@@ -570,13 +568,12 @@ export function ChatComposer({
 						<button
 							type="button"
 							className="inno-composer-action inno-icon-button flex h-9 w-9 shrink-0 rounded-full disabled:opacity-50"
-							title={modelState.currentModelSupportsNativeImages ? t("chat.attachImage") : t("chat.attachImageViaOcr")}
+							title={t("chat.attachImage")}
 							disabled={chatIsSending || isUploading}
 							onClick={() => imageInputRef.current?.click()}
 						>
 							<Image size={16} />
 						</button>
-						{conversationMode ? permissionControl : null}
 					</div>
 					<div className="flex shrink-0 items-center gap-1">
 						<button
@@ -629,7 +626,6 @@ export function ChatComposer({
 			{conversationMode ? null : (
 				<div className="inno-composer-subrow">
 					{workspaceControl}
-					{permissionControl}
 					<span className="flex-1" aria-hidden="true" />
 					{renderModelPicker()}
 				</div>

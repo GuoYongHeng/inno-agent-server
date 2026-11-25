@@ -1,5 +1,4 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
-import { join } from "node:path";
 import { BridgeChannel } from "../../channels/bridge/bridge-channel.js";
 import { handleBridgeMessage } from "../../channels/bridge/bridge-server.js";
 import type { BridgeMessageResponse } from "../../channels/bridge/types.js";
@@ -8,10 +7,12 @@ import { feishuRegistrationBegin, feishuRegistrationPoll } from "../../channels/
 import type { PersonalChannelDispatcher } from "../../channels/personal-dispatcher.js";
 import type { ChannelName } from "../../channels/types.js";
 import { WeChatChannel } from "../../channels/wechat/wechat-channel.js";
-import { saveConfig, type InnoConfig } from "../../config.js";
+import type { WechatTokenPersistence } from "../../channels/wechat/ilink-client.js";
+import type { InnoConfig } from "../../config.js";
 import { logger } from "../../logger.js";
-import { loadTenantConfig, saveTenantConfig } from "../../tenants/config.js";
-import { getRequestTenant } from "../../tenants/http.js";
+import { loadTenantConfig, persistTenantConfig, resolveTenantConfig } from "../../tenants/config.js";
+import { getCurrentTenantStore } from "../../tenants/current.js";
+import { requireRequestTenant } from "../../tenants/http.js";
 import { json, matchRoute, readBody } from "../http-helpers.js";
 
 /**
@@ -21,7 +22,6 @@ import { json, matchRoute, readBody } from "../http-helpers.js";
  */
 export interface ChannelsRouteContext {
 	channelRegistry: ChannelRegistry;
-	dataDir: string;
 	configPath: string;
 	getConfig: () => InnoConfig;
 	setConfig: (config: InnoConfig) => void;
@@ -29,12 +29,16 @@ export interface ChannelsRouteContext {
 	getBridgeToken: () => string | undefined;
 	handleBridge?: (authHeader: string | undefined, body: unknown) => Promise<{ status: number; body: BridgeMessageResponse }>;
 	reloadFeishuChannel: () => Promise<void>;
-	getWechatChannel: () => WeChatChannel | null;
-	setWechatChannel: (channel: WeChatChannel) => void;
-	startWechatChannel?: (channel: WeChatChannel) => void;
+	/** Await before sync registry reads — channel construction is async (PG config). */
+	ensureChannelsReady?: () => Promise<void>;
+	getWechatChannel: () => Promise<WeChatChannel | null>;
+	setWechatChannel: (channel: WeChatChannel) => Promise<void>;
+	startWechatChannel?: (channel: WeChatChannel) => Promise<void>;
 	syncChannelOwnership?: (previous: InnoConfig, next: InnoConfig) => Promise<void>;
 	beginFeishuRegistration?: typeof feishuRegistrationBegin;
 	pollFeishuRegistration?: typeof feishuRegistrationPoll;
+	/** Tenant-scoped iLink token persistence for lazily created WeChat channels. */
+	wechatTokenPersistence?: () => WechatTokenPersistence;
 	trackWechatQr?: (qrId: string) => void;
 	assertWechatQr?: (qrId: string) => void;
 	confirmWechatLogin?: (qrId: string, botId: string, confirm: () => void) => Promise<void>;
@@ -61,15 +65,47 @@ export async function handleChannelsRoutes(
 	ctx: ChannelsRouteContext,
 ): Promise<boolean> {
 	const { channelRegistry } = ctx;
-	const tenant = getRequestTenant(req);
-	const getConfig = () => tenant ? loadTenantConfig(ctx.dataDir, tenant.tenantId) : ctx.getConfig();
+
+	// Bridge message endpoint
+	if (method === "POST" && url === "/api/bridge/messages") {
+		const body = await readBody(req);
+		const authHeader = req.headers.authorization;
+		if (ctx.handleBridge) {
+			const result = await ctx.handleBridge(authHeader, body);
+			json(res, result.status, result.body);
+			return true;
+		}
+		const bridgeToken = ctx.getBridgeToken();
+		const dispatcher = ctx.getDispatcher();
+		if (!bridgeToken || !dispatcher) {
+			json(res, 404, { error: "Bridge not configured" });
+			return true;
+		}
+		const result = handleBridgeMessage(
+			{ token: bridgeToken, channelRegistry, dispatcher },
+			authHeader,
+			body,
+		);
+		json(res, result.status, result.body);
+		return true;
+	}
+
+	// Tenant-authenticated channel management below — the bridge webhook above
+	// resolves its tenant from the bearer token, not the request session.
+	const tenant = requireRequestTenant(req);
+	// Writes persist the tenant record (user fields only); reads that feed
+	// channel construction resolve the merged view (server endpoints + toggles).
+	const getConfig = () => loadTenantConfig(getCurrentTenantStore(), tenant.tenantId);
+	const getEffectiveConfig = () => resolveTenantConfig(tenant.tenantId, ctx.getConfig(), getCurrentTenantStore());
+	// Channels are constructed lazily per tenant — ensure hydration before the
+	// sync registry reads below (all/get/getDefaultTarget).
+	await ctx.ensureChannelsReady?.();
 	const persistConfig = async (previous: InnoConfig, next: InnoConfig): Promise<void> => {
-		if (tenant && ctx.syncChannelOwnership) await ctx.syncChannelOwnership(previous, next);
+		if (ctx.syncChannelOwnership) await ctx.syncChannelOwnership(previous, next);
 		try {
-			if (tenant) saveTenantConfig(ctx.dataDir, tenant.tenantId, next);
-			else ctx.setConfig(saveConfig(ctx.configPath, next));
+			await persistTenantConfig(getCurrentTenantStore(), tenant.tenantId, next);
 		} catch (error) {
-			if (tenant && ctx.syncChannelOwnership) {
+			if (ctx.syncChannelOwnership) {
 				try { await ctx.syncChannelOwnership(next, previous); }
 				catch (rollbackError) { logger.error({ err: rollbackError }, "failed to roll back channel ownership after config save failure"); }
 			}
@@ -103,7 +139,7 @@ export async function handleChannelsRoutes(
 			json(res, 400, { error: "Missing chatId" });
 			return true;
 		}
-		channelRegistry.setDefaultTarget({
+		await channelRegistry.setDefaultTarget({
 			channel: defaultTargetMatch.name as ChannelName,
 			chatId,
 		});
@@ -129,30 +165,6 @@ export async function handleChannelsRoutes(
 		}
 		await channel.push(target, text);
 		json(res, 200, { channel: channelTestMatch.name, chatId: target.chatId, pushed: true });
-		return true;
-	}
-
-	// Bridge message endpoint
-	if (method === "POST" && url === "/api/bridge/messages") {
-		const body = await readBody(req);
-		const authHeader = req.headers.authorization;
-		if (ctx.handleBridge) {
-			const result = await ctx.handleBridge(authHeader, body);
-			json(res, result.status, result.body);
-			return true;
-		}
-		const bridgeToken = ctx.getBridgeToken();
-		const dispatcher = ctx.getDispatcher();
-		if (!bridgeToken || !dispatcher) {
-			json(res, 404, { error: "Bridge not configured" });
-			return true;
-		}
-		const result = handleBridgeMessage(
-			{ token: bridgeToken, channelRegistry, dispatcher },
-			authHeader,
-			body,
-		);
-		json(res, result.status, result.body);
 		return true;
 	}
 
@@ -200,7 +212,7 @@ export async function handleChannelsRoutes(
 			const result = await (ctx.pollFeishuRegistration?.(deviceCode) ?? feishuRegistrationPoll(deviceCode));
 			if (result.status === "confirmed" && result.appId && result.appSecret) {
 				// Save credentials to the owning tenant and start only its channel.
-				const previous = getConfig();
+				const previous = await getConfig();
 				const next: InnoConfig = {
 					...previous,
 					feishu: { appId: result.appId, appSecret: result.appSecret },
@@ -227,12 +239,13 @@ export async function handleChannelsRoutes(
 	// WeChat iLink QR login
 	if (method === "POST" && url === "/api/channels/wechat/qr-login") {
 		// Lazily create the WeChat channel if not yet instantiated
-		let wechatChannel = ctx.getWechatChannel();
+		let wechatChannel = await ctx.getWechatChannel();
 		if (!wechatChannel) {
-			const wechatDataDir = tenant ? join(ctx.dataDir, "tenants", tenant.tenantId) : ctx.dataDir;
-			wechatChannel = new WeChatChannel(wechatDataDir, getConfig().channels?.wechat);
+			const persistence = ctx.wechatTokenPersistence?.();
+			if (!persistence) throw new Error("WeChat token persistence is not available");
+			wechatChannel = new WeChatChannel(persistence, (await getEffectiveConfig()).channels?.wechat);
 			channelRegistry.register(wechatChannel);
-			ctx.setWechatChannel(wechatChannel);
+			await ctx.setWechatChannel(wechatChannel);
 		}
 		try {
 			const qr = await wechatChannel.getClient().getQrCode();
@@ -257,7 +270,7 @@ export async function handleChannelsRoutes(
 			json(res, 400, { error: "Missing qrId" });
 			return true;
 		}
-		const wechatChannel = ctx.getWechatChannel();
+		const wechatChannel = await ctx.getWechatChannel();
 		if (!wechatChannel) {
 			json(res, 400, { error: "WeChat channel not initialized" });
 			return true;
@@ -275,10 +288,10 @@ export async function handleChannelsRoutes(
 				const dispatcher = ctx.getDispatcher();
 				if (!wechatChannel.isConnected && dispatcher) {
 					if (ctx.startWechatChannel) {
-						ctx.startWechatChannel(wechatChannel);
+						await ctx.startWechatChannel(wechatChannel);
 					} else {
 						wechatChannel.onMessage((msg) => dispatcher.handle(wechatChannel, msg));
-						wechatChannel.start();
+						void wechatChannel.start().catch((err) => logger.error({ err }, "[wechat] failed to start channel"));
 					}
 				}
 			}
@@ -291,7 +304,7 @@ export async function handleChannelsRoutes(
 	}
 
 	if (method === "GET" && url === "/api/channels/wechat/status") {
-		const wechatChannel = ctx.getWechatChannel();
+		const wechatChannel = await ctx.getWechatChannel();
 		if (!wechatChannel) {
 			json(res, 200, { configured: false, connected: false });
 			return true;

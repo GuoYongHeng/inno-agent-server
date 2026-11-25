@@ -1,4 +1,4 @@
-import type { InlineImage } from "../../api/chat.js";
+import type { ChatImageRef } from "../../api/chat.js";
 
 export const PASTE_COLLAPSE_LINES = 20;
 export const PASTE_COLLAPSE_CHARS = 2000;
@@ -68,7 +68,13 @@ export function flattenWorkspaceFiles(
 	return out;
 }
 
-export type PreparedInlineImage = InlineImage & { name: string; previewUrl: string };
+/** Local file waiting to be uploaded to object storage. The chat request sends only the resulting path. */
+export type PreparedInlineImage = {
+	file: File;
+	name: string;
+	mimeType: string;
+	previewUrl: string;
+};
 
 function parseCssPixels(value: string): number {
 	const parsed = Number.parseFloat(value);
@@ -119,81 +125,26 @@ export function isLargeTextPaste(text: string): boolean {
 	return lineCount > PASTE_COLLAPSE_LINES || text.length > PASTE_COLLAPSE_CHARS;
 }
 
-// Inline chat images are sent to the provider as base64 inside the JSON body.
-// Full-resolution photos can exceed reverse-proxy body limits, so large images
-// are downscaled before they leave the browser.
-const INLINE_IMAGE_MAX_DIMENSION = 1280;
-const INLINE_IMAGE_TARGET_BYTES = 380 * 1024;
-const INLINE_IMAGE_MAX_BYTES = 500 * 1024;
-
-function rawInlineImage(file: File, dataUrl: string): PreparedInlineImage {
-	const commaIdx = dataUrl.indexOf(",");
-	const header = dataUrl.slice(0, commaIdx);
+export function prepareInlineImage(file: File): PreparedInlineImage {
 	return {
-		data: dataUrl.slice(commaIdx + 1),
-		mimeType: header.match(/:(.*?);/)?.[1] ?? file.type,
+		file,
 		name: file.name || "image",
-		previewUrl: dataUrl,
+		mimeType: file.type || "image/png",
+		previewUrl: URL.createObjectURL(file),
 	};
 }
 
-/** Binary size estimate of a base64 data URL payload. */
-function dataUrlBytes(dataUrl: string): number {
-	return Math.floor((dataUrl.length - dataUrl.indexOf(",") - 1) * 3 / 4);
+export function chatImageObjectPath(mimeType: string): string {
+	const ext = mimeType === "image/jpeg" ? ".jpg"
+		: mimeType === "image/webp" ? ".webp"
+		: mimeType === "image/gif" ? ".gif"
+		: ".png";
+	const id = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+		? crypto.randomUUID()
+		: `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+	return `.chat-images/${id}${ext}`;
 }
 
-/** Re-encode a decoded image until the payload fits the request budget. */
-function downscaleToFit(img: HTMLImageElement): string | undefined {
-	const canvas = document.createElement("canvas");
-	const ctx = canvas.getContext("2d");
-	if (!ctx) return undefined;
-	let scale = Math.min(1, INLINE_IMAGE_MAX_DIMENSION / Math.max(img.naturalWidth, img.naturalHeight));
-	let quality = 0.8;
-	let best: string | undefined;
-	for (let attempt = 0; attempt < 5; attempt++) {
-		canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
-		canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
-		ctx.fillStyle = "#ffffff";
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
-		ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-		const outUrl = canvas.toDataURL("image/jpeg", quality);
-		if (!best || outUrl.length < best.length) best = outUrl;
-		if (dataUrlBytes(outUrl) <= INLINE_IMAGE_TARGET_BYTES) break;
-		if (quality > 0.5) {
-			quality -= 0.15;
-		} else {
-			scale *= 0.75;
-			quality = 0.7;
-		}
-	}
-	return best;
-}
-
-export async function prepareInlineImage(file: File): Promise<PreparedInlineImage> {
-	const dataUrl = await new Promise<string>((resolve, reject) => {
-		const reader = new FileReader();
-		reader.onload = () => resolve(reader.result as string);
-		reader.onerror = () => reject(reader.error);
-		reader.readAsDataURL(file);
-	});
-	const passthrough = () => rawInlineImage(file, dataUrl);
-	if (file.size <= INLINE_IMAGE_MAX_BYTES) return passthrough();
-	try {
-		const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-			const el = document.createElement("img");
-			el.onload = () => resolve(el);
-			el.onerror = () => reject(new Error("image decode failed"));
-			el.src = dataUrl;
-		});
-		const outUrl = downscaleToFit(img);
-		if (!outUrl || outUrl.length >= dataUrl.length) return passthrough();
-		return {
-			data: outUrl.slice(outUrl.indexOf(",") + 1),
-			mimeType: "image/jpeg",
-			name: file.name || "image",
-			previewUrl: outUrl,
-		};
-	} catch {
-		return passthrough();
-	}
+export function toChatImageRef(path: string, image: PreparedInlineImage): ChatImageRef {
+	return { workspacePath: path, mimeType: image.mimeType, previewUrl: image.previewUrl };
 }

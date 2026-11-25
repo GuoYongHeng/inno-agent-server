@@ -50,10 +50,10 @@ afterEach(() => {
 describe("L2 wiki link maintenance", () => {
 	it("closes summary links when the planner omits candidates and adds only validated peer links", async () => {
 		const root = makeTempDir();
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 		const source = entry();
 		const summary = "## 关键概念\n\n- [[Alpha]]\n- [[Beta]]\n- [[Planner Omitted]]";
-		const sourcePath = createSourcePage(root, source, summary, source.extractedPath);
+		const sourcePath = (await createSourcePage(root, source, summary, source.extractedPath));
 		writeText(
 			join(root, "wiki", "concepts", "existing.md"),
 			`${serializeFrontmatter({
@@ -117,7 +117,7 @@ describe("L2 wiki link maintenance", () => {
 		expect(alphaFrontmatter?.tags).not.toContain("test");
 		expect(alphaFrontmatter?.related).toEqual(["beta", "existing-knowledge"]);
 
-		const graph = buildWikiGraph(root);
+		const graph = (await buildWikiGraph(root));
 		expect(graph.maintenance.missing).toEqual([]);
 		expect(graph.nodes.some((node) => node.id === "wiki/concepts/existing.md")).toBe(true);
 		expect(graph.edges.some((edge) => edge.target === "wiki/concepts/existing.md")).toBe(true);
@@ -131,10 +131,10 @@ describe("L2 wiki link maintenance", () => {
 
 	it("reuses an existing page type when extraction classifies a shared title differently", async () => {
 		const root = makeTempDir();
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 		const source = entry();
 		const summary = "## 关键概念\n\n- [[Shared Memory]]";
-		const sourcePath = createSourcePage(root, source, summary, source.extractedPath);
+		const sourcePath = (await createSourcePage(root, source, summary, source.extractedPath));
 		writeText(
 			join(root, "wiki", "concepts", "shared-memory.md"),
 			`${serializeFrontmatter({

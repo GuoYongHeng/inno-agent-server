@@ -6,9 +6,6 @@ import { authOptions } from "./runtime.js";
 import { migrateTenantDatabase, TENANT_SCHEMA_SQL } from "../tenants/schema.js";
 
 export async function migrateAuthDatabase(config: AuthRuntimeConfig, print = false): Promise<void> {
-	if (config.mode !== "better-auth") {
-		throw new Error("Auth migrations require INNO_AUTH_MODE=better-auth");
-	}
 	const pool = new Pool({ connectionString: config.databaseUrl });
 	try {
 		const auth = betterAuth({

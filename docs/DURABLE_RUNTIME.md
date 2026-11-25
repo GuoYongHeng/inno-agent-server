@@ -9,32 +9,37 @@ packages. Node.js **22.19.0 or newer** is required. The isolated host lives in
 `apps/inno-agent/src/agent/durable-runtime.ts`; the application catalog and
 runtime leases live in `durable-session-service.ts`.
 
-Durable execution is opt-in in local and authenticated compatibility mode. Set
-`INNO_DURABLE_ENABLED=true` to make the Web UI default new sessions to durable.
-With Better Auth plus `INNO_MULTI_USER_ENABLED=true`, Durable is required:
-startup fails unless `INNO_DURABLE_ENABLED=true`, omitted session/job runtimes
-default to Durable, and legacy execution endpoints return 409 with
-`durable_required`. Owned legacy history remains readable and manageable, but
-new chat, question/permission responses, manual job runs, channel inbound work,
-and automatic/deferred scheduler runs never fall back to the shared legacy
-queue. Better Auth without the multi-user flag retains the compatibility path.
+Durable is the **only** agent runtime. The earlier `pi-coding-agent`
+runtime (global `AgentSession`, JSONL history, host tools, the serialized prompt
+queue) was removed, and `INNO_DURABLE_ENABLED` no longer exists. With Better
+Auth plus `INNO_MULTI_USER_ENABLED=true` every session and job is Durable and
+tenant-owned; locally the same code runs against the local data root.
 
-The explicit HTTP creation contract is:
+> **Reading note.** Parts of this document compare Durable with "legacy" behavior
+> or describe the "compatibility mode" that preceded the removal. Those passages
+> are kept as design history; where they conflict with the above, the removal
+> wins. Old JSONL conversation history is not read at all, and `runtime: "legacy"`
+> is rejected (`400`) by `POST /api/sessions` and by job create/update.
+
+Creating a session:
 
 ```http
 POST /api/sessions
 Content-Type: application/json
 
-{"runtime":"durable"}
+{}
 ```
 
 An owned existing `workspaceId` may be supplied. The authenticated temporary
 workspace fallback and `newWorkspace` (temporary or named) are also supported.
 `presetId` instantiates or reuses the preset's stable tenant-owned workspace.
-Outside multi-user mode, omitting `runtime`, or passing `"legacy"`, keeps the
-existing PI `SessionManager` JSONL behavior. Historical JSONL is never migrated
-or opened as durable storage; in multi-user mode it is historical read-only
-compatibility rather than an execution backend.
+`runtime` is accepted only for older clients and must be `"durable"`.
+
+Added after the removal: a session pins its own model (`PATCH /api/sessions/:id`
+with `provider` + `modelId`, effective from the next request); editing an earlier
+user message forks the conversation (`POST /api/sessions/:id/branch-before-message`)
+and the catalog's `conversationId` points the session at the fork; context usage
+(`GET /api/sessions/:id/context-usage`) follows the provider's last reported usage.
 
 Durable IDs have the form `durable-<uuid>` and never pass through legacy
 `.jsonl` filename helpers. Each tenant has its own application catalog and
@@ -53,8 +58,7 @@ INNO_DURABLE_SHARD_ID=worker-a
 INNO_DURABLE_SHARD_URLS='{"worker-a":"http://worker-a:3000","worker-b":"http://worker-b:3000"}'
 ```
 
-Sharding requires Better Auth, `INNO_MULTI_USER_ENABLED=true`, and
-`INNO_DURABLE_ENABLED=true`. After cookie authentication and personal-tenant
+Sharding requires Better Auth and `INNO_MULTI_USER_ENABLED=true`. After cookie authentication and personal-tenant
 provisioning, the server hashes the verified tenant ID onto the sorted shard IDs.
 A non-owner forwards the untouched request, including JSON bodies and SSE, to
 that owner before lazy agent bootstrap. The owner authenticates the forwarded
@@ -98,8 +102,10 @@ The current durable slice supports:
   lock held for each open runtime's lifetime;
 - durable admission, submission reacquisition, and `resume()` on reopen;
 - concurrent independent sessions without the legacy global prompt queue;
-- preset instantiation into stable tenant-owned workspaces, including `agent.md`
-  and private skills, with repeated opens reusing the preset workspace;
+- preset open creates an empty tenant-owned workspace and records `presetId`.
+  Repeated opens reuse that workspace. Image `agent.md` is injected read-only;
+  `preset.json` `skills` are catalog ids materialized with the tenant's enabled
+  set. Workspace copies of `agent.md` / `.skills/` are ignored for preset sessions;
 - committed snapshots and existing Inno history/SSE event shapes;
 - tenant-local application SSE journals with exact numeric event replay and
   original-submission recovery after a process restart;
@@ -108,31 +114,29 @@ The current durable slice supports:
   streaming turns emit `workspace_change` events and persist tenant-local file
   activity so the existing workspace UI refreshes written files. Writes and
   edits require a replay-safe approval through the existing permission card;
-- replay-safe, tenant-local L1 context/event/evidence tools, direct profile
-  patch/update mutations, and L2 archive, query, and lint tools;
-- tenant-local L1 profile/recent-event context in durable instructions;
+- replay-safe, tenant-local L2 archive, query, and lint tools;
 - explicit `l3_recall` and threshold-gated automatic recall over
   ownership-filtered legacy and committed durable history, with verified tenant
   ALS restored when durable work resumes outside the HTTP request;
 - the same workspace `agent.md` and `.skills/` prompt sections as legacy,
   reloaded whenever the durable runtime opens;
-- `ocr_image` with tenant credentials, canonical workspace file checks,
-  persisted job-ID checkpoints, and cached final markdown;
-- `send_file_to_channel` with a tenant-local persistent outbox, payload
-  snapshots, original-target recovery, and cached completion results;
+- `send_file_to_channel` with the intent in `recovery_records` and the file
+  snapshot in object storage (`tenants/<t>/outbox/…`), original-target recovery,
+  and a cached completion. The bytes are loaded for the channel upload;
 - `ask_user_question` with stable question identity, tenant-local persisted
   answers, SSE turn rebinding, and original-run recovery after restart;
 - scoped active-turn cancellation through the existing chat abort endpoint,
   including pending-question/permission cleanup and persisted pi-durable abort marks;
 - structured workspace attachments on streaming and non-streaming chat, with
   canonical path validation and request-ID-deduplicated UI sidecar metadata;
-- inline images persisted under `.chat-images/`, native image blocks for
-  vision-capable models, OCR path hints for explicitly text-only models, and
-  same-submission OCR fallback when a provider rejects a native payload;
-  workspace previews restore through the same deduplicated sidecar;
+- chat images uploaded to `.chat-images/` before the turn. The chat body and
+  the durable transcript store the workspace path, not image bytes. Vision
+  models receive the bytes only on the provider request; text-only models get
+  a path hint. A provider image rejection fails the turn. Previews use the
+  workspace raw URL;
 - first-message fallback topics, automatic richer upgrades after six messages,
   and explicit `POST /api/sessions/:id/generate-topic`, all using the durable
-  session's pinned provider/model and isolated tenant credentials;
+  session's pinned provider/model from the shared, server-managed catalog;
 - graceful shutdown of open durable runtimes;
 - 30-day retention of completed channel/question/permission recovery records,
   cleaned only after the owning session is proved idle, plus recovery-record and
@@ -179,26 +183,12 @@ five-argument tool adapter. Shared business logic stays unchanged; the legacy
 extension reaches these native definitions only through its own reverse
 adapter, which supplies legacy-only model/session context where required.
 
-Replay safety requires application-level idempotency. Durable L1 event and
-evidence operations use IDs namespaced by session and tool call. The event is
-appended first; all derived profile changes and an `applied_operation_ids`
-marker are then committed together through the existing atomic profile write.
-A retry with the marker returns the persisted result without reapplying it. A
-crash between the event append and profile commit instead reuses the persisted
-event and applies its signals once. This closes the event/profile crash gap
-within the single-process/single-owner boundary; it is not a general
-exactly-once guarantee for model calls or external effects.
-
-Direct `patch_learner_profile` and `update_learner_profile` use operation IDs
-namespaced by tool, session, and stable tool-call ID. Their pure profile mutation
-and `applied_operation_ids` marker are committed by the same atomic profile write,
-so replay cannot repeat append/delta operations or increment the version twice.
-Legacy callers retain the original non-durable mutation path.
+Replay safety requires application-level idempotency. The memory tools are either read-only (`l2_query`, `l2_lint`, `l3_recall`) or idempotent by construction (`l2_archive` resumes by content hash and manifest records), so all are declared `replay: "safe"`; this is not a general exactly-once guarantee for model calls or external effects. (An earlier learner-profile layer, L1, used per-session/tool-call operation markers for the same purpose; it was removed.)
 
 Durable L2 archive uses deterministic conversion and page generation, disabling
 nested summarization/rich-page model calls. Existing content-hash deduplication
 and manifest records resume incomplete archives. Durable query skips the legacy
-append-only query log. L1/L2 feature gates and tenant data roots are preserved;
+append-only query log. L2/L3 feature gates and tenant data roots are preserved;
 memory writes never use the legacy global tenant root in authenticated mode.
 
 Durable L3 recall reuses the tenant-scoped session index and excludes the
@@ -288,7 +278,7 @@ at-least-once across crashes; the fallback does not claim exactly-once billing.
 
 Durable questions use the stable operation ID
 `ask_user_question:<sessionId>:<toolCallId>`. Records live under the
-tenant-local `durable/questions/<sessionId>/` directory, use mode `0600`, and
+tenant-local `durable/questions/<sessionId>/` directory (local mode; authenticated mode keeps them in the `recovery_records` PostgreSQL table), use mode `0600`, and
 bind the question ID to a hash of that operation ID. An accepted answer is
 persisted before its waiter is released or `question_resolved` is emitted.
 Replay-safe tool re-entry returns a completed answer from disk without showing
@@ -436,11 +426,10 @@ aliases, disabled shell/delete/rename/append behavior, workspace
 projection, inline-image retry path stability, provider-rejection OCR fallback
 in the same submission with capability caching and request-ID dedup,
 tenant-scoped attachment/image sidecar caching and request-ID dedup,
-replay-safe L1/L2 execution, explicit L3 recall, revision-idempotent durable-history
+replay-safe L2 execution, explicit L3 recall, revision-idempotent durable-history
 indexing with current-session exclusion and hidden automatic-recall projection,
-direct profile patch/update retry dedup,
 durable topic upgrade dedup, pinned-model selection, and manual-rename protection,
-L1 event/profile crash-gap recovery, deterministic L2 archive,
+interrupted-`l2_archive` replay, deterministic L2 archive,
 OCR completion caching and job-ID resume, channel payload/completion caching,
 verified tenant channel rebinding, proven-idle 30-day outbox/question/permission retention
 with live-recovery preservation and session-delete cleanup, legacy/durable
@@ -465,12 +454,12 @@ only on the selected owner, concurrent authenticated durable sessions, tenant-ow
 instantiation and stable workspace reuse, durable workspace writes with approval
 cards, stale-turn 409 and cross-tenant 404 responses, non-streaming `no_ui`
 write denial, SSE `workspace_change` events and tenant-local file activity, PostgreSQL advisory-lock
-contention/release and runtime invalidation on lock loss, per-tenant provider and
+contention/release and runtime invalidation on lock loss, shared-catalog provider and
 OCR Authorization headers, cross-tenant 404s, completed request-ID retries,
 lack of legacy JSONL creation, SSE disconnect/reconnect replay, HTTP SIGKILL/restart
 recovery of an admitted SSE turn with contiguous event IDs and no duplicate user
 history, tenant-local
-L1/L2/OCR writes, replay-safe direct profile patch/update, and tenant-scoped L3
+L2/OCR writes and tenant-scoped L3
 recall through the authenticated HTTP boundary, tenant-isolated explicit and
 automatic recall of previously committed durable sessions without exposing
 injected context as user history, automatic and manual durable

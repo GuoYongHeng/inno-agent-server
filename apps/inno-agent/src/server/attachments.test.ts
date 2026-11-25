@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -17,8 +17,8 @@ import {
 	clearSessionAttachments,
 	mergeSessionAttachments,
 	recordSessionAttachments,
-	resetAttachmentsStoreForTests,
 } from "./attachments-store.js";
+import { FileStateKv } from "../tenants/state-store.js";
 
 describe("normalizeSmartInputExtension", () => {
 	it("normalizes case, whitespace and the leading dot", () => {
@@ -206,19 +206,19 @@ describe("validateChatAttachments + buildAttachmentContext", () => {
 		expect(context).toContain("第2个「pdf」→ second.pdf");
 	});
 });
-
 describe("attachments sidecar store", () => {
 	let dataDir: string;
+	let kv: FileStateKv;
+	let kvB: FileStateKv;
 
 	beforeEach(() => {
 		dataDir = mkdtempSync(join(tmpdir(), "inno-attachments-store-"));
-		mkdirSync(join(dataDir, "sessions"), { recursive: true });
-		resetAttachmentsStoreForTests();
+		kv = new FileStateKv(dataDir);
+		kvB = new FileStateKv(join(dataDir, "tenant-b"));
 	});
 
 	afterEach(() => {
 		rmSync(dataDir, { recursive: true, force: true });
-		resetAttachmentsStoreForTests();
 	});
 
 	const attachments: ChatAttachments = {
@@ -226,12 +226,12 @@ describe("attachments sidecar store", () => {
 		loose: [],
 	};
 
-	it("merges recorded entries into matching user messages FIFO and skips non-matching ones", () => {
-		recordSessionAttachments(dataDir, "s1", { promptContent: "请读这份pdf", attachments, timestamp: 1 });
-		recordSessionAttachments(dataDir, "s1", { promptContent: "再看一次", attachments, timestamp: 2 });
-		recordSessionAttachments(dataDir, "s1", { promptContent: "请读这份pdf", attachments, timestamp: 3 });
+	it("merges recorded entries into matching user messages FIFO and skips non-matching ones", async () => {
+		await recordSessionAttachments(kv, "s1", { promptContent: "请读这份pdf", attachments, timestamp: 1 });
+		await recordSessionAttachments(kv, "s1", { promptContent: "再看一次", attachments, timestamp: 2 });
+		await recordSessionAttachments(kv, "s1", { promptContent: "请读这份pdf", attachments, timestamp: 3 });
 
-		const merged = mergeSessionAttachments(dataDir, "s1", [
+		const merged = await mergeSessionAttachments(kv, "s1", [
 			{ role: "assistant", content: "好的", timestamp: 0 },
 			{ role: "user", content: "请读这份pdf", timestamp: 1 },
 			{ role: "assistant", content: "完成", timestamp: 2 },
@@ -242,31 +242,31 @@ describe("attachments sidecar store", () => {
 		expect(merged[0].attachments).toBeUndefined();
 
 		// Unmatched entries (no "再看一次" message) stay inert for other sessions.
-		const other = mergeSessionAttachments(dataDir, "s2", [
+		const other = await mergeSessionAttachments(kv, "s2", [
 			{ role: "user", content: "请读这份pdf", timestamp: 4 },
 		]);
 		expect(other[0].attachments).toBeUndefined();
 	});
 
-	it("clears entries for a deleted session only", () => {
-		recordSessionAttachments(dataDir, "s1", { promptContent: "p", attachments, timestamp: 1 });
-		recordSessionAttachments(dataDir, "s2", { promptContent: "p", attachments, timestamp: 2 });
-		clearSessionAttachments(dataDir, "s1");
-		const merged = mergeSessionAttachments(dataDir, "s1", [{ role: "user", content: "p", timestamp: 1 }]);
+	it("clears entries for a deleted session only", async () => {
+		await recordSessionAttachments(kv, "s1", { promptContent: "p", attachments, timestamp: 1 });
+		await recordSessionAttachments(kv, "s2", { promptContent: "p", attachments, timestamp: 2 });
+		await clearSessionAttachments(kv, "s1");
+		const merged = await mergeSessionAttachments(kv, "s1", [{ role: "user", content: "p", timestamp: 1 }]);
 		expect(merged[0].attachments).toBeUndefined();
-		const kept = mergeSessionAttachments(dataDir, "s2", [{ role: "user", content: "p", timestamp: 2 }]);
+		const kept = await mergeSessionAttachments(kv, "s2", [{ role: "user", content: "p", timestamp: 2 }]);
 		expect(kept[0].attachments).toEqual(attachments);
 	});
 
-	it("restores durable inline images as workspace preview URLs", () => {
-		recordSessionAttachments(dataDir, "images", {
+	it("restores durable inline images as workspace preview URLs", async () => {
+		await recordSessionAttachments(kv, "images", {
 			promptContent: "看图",
 			images: [{ mimeType: "image/png", workspacePath: ".chat-images/a.png" }],
 			workspaceId: "workspace-a",
 			timestamp: 1,
 			requestId: "image-request",
 		});
-		const merged = mergeSessionAttachments(dataDir, "images", [{ role: "user", content: "看图", timestamp: 1 }]);
+		const merged = await mergeSessionAttachments(kv, "images", [{ role: "user", content: "看图", timestamp: 1 }]);
 		expect(merged[0].attachments).toBeUndefined();
 		expect(merged[0].images).toEqual([{
 			mimeType: "image/png",
@@ -274,21 +274,19 @@ describe("attachments sidecar store", () => {
 		}]);
 	});
 
-	it("scopes the cache by data root and deduplicates durable request IDs", () => {
-		const otherRoot = join(dataDir, "tenant-b");
-		mkdirSync(join(otherRoot, "sessions"), { recursive: true });
+	it("keeps stores of different tenants apart and deduplicates durable request IDs", async () => {
 		const otherAttachments: ChatAttachments = { bindings: [], loose: [{ path: "b.txt", kind: "file", source: "workspace" }] };
-		recordSessionAttachments(dataDir, "shared-session", { promptContent: "p", attachments, timestamp: 1, requestId: "request-a" });
-		recordSessionAttachments(dataDir, "shared-session", { promptContent: "p", attachments, timestamp: 2, requestId: "request-a" });
-		recordSessionAttachments(otherRoot, "shared-session", { promptContent: "p", attachments: otherAttachments, timestamp: 3, requestId: "request-b" });
+		await recordSessionAttachments(kv, "shared-session", { promptContent: "p", attachments, timestamp: 1, requestId: "request-a" });
+		await recordSessionAttachments(kv, "shared-session", { promptContent: "p", attachments, timestamp: 2, requestId: "request-a" });
+		await recordSessionAttachments(kvB, "shared-session", { promptContent: "p", attachments: otherAttachments, timestamp: 3, requestId: "request-b" });
 
-		const first = mergeSessionAttachments(dataDir, "shared-session", [
+		const first = await mergeSessionAttachments(kv, "shared-session", [
 			{ role: "user", content: "p", timestamp: 1 },
 			{ role: "user", content: "p", timestamp: 2 },
 		]);
 		expect(first[0].attachments).toEqual(attachments);
 		expect(first[1].attachments).toBeUndefined();
-		const second = mergeSessionAttachments(otherRoot, "shared-session", [{ role: "user", content: "p", timestamp: 3 }]);
+		const second = await mergeSessionAttachments(kvB, "shared-session", [{ role: "user", content: "p", timestamp: 3 }]);
 		expect(second[0].attachments).toEqual(otherAttachments);
 	});
 });

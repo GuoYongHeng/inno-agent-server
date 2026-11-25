@@ -2,58 +2,48 @@
 // pino-caller call sites map back to the original TS source locations.
 import "source-map-support/register.js";
 
+import { PgSessionCatalog } from "./agent/pg-session-catalog.js";
+import { createSandboxManager } from "./sandbox/index.js";
+import { LocalExecManager } from "./sandbox/local-exec-manager.js";
+import { PgSandboxQuotaStore } from "./sandbox/pg-sandbox-quota.js";
+import type { SandboxBindingProvider } from "./sandbox/sandbox-session.js";
+import { renderPrometheus } from "./utils/metrics.js";
 import { createServer, type IncomingMessage as HttpReq, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
-import { loadConfig, type InnoConfig } from "./config.js";
+import { loadConfig, normalizeSandboxConfig, type InnoConfig } from "./config.js";
 import { installFetchLogger } from "./utils/fetch-logger.js";
 import { applyProviderProxyBypass } from "./utils/proxy-bypass.js";
-import { ensureDir, readJson, readText, writeJson, writeText } from "./storage/file-store.js";
-import {
-	createNewSession,
-	getCurrentSessionId,
-	getLoadedSkills,
-	getSession,
-	getActivePromptToken,
-	initSession,
-	isQueueTaskCancelled,
-	reloadResources,
-	setPromptEventObserver,
-	setWorkspaceCwdResolver,
-} from "./agent/pi-runner.js";
-import { completePromptOnce, runPromptSerialized, runPromptStreamingInSession, runPromptInSession, abortPromptForTurnToken, abortJobPromptInSession } from "./agent/pi-runner.js";
+import { ensureDir, readText, writeText } from "./storage/file-store.js";
 import { closeDeferredRuns, configureDeferredRuns } from "./scheduler/deferred-runs.js";
-import { DurableSessionService } from "./agent/durable-session-service.js";
-import { runDurableJobPrompt } from "./agent/durable-job-runner.js";
-import type { CreatedJobSession, DurableJobExecution, DurableJobExecutor } from "./scheduler/job-runner.js";
+import { DurableSessionBusyError, DurableSessionService } from "./agent/durable-session-service.js";
+import { DURABLE_JOB_BUSY_WAIT_MS, runDurableJobPrompt } from "./agent/durable-job-runner.js";
+import { executeJob, type CreatedJobSession, type DurableJobExecution, type DurableJobExecutor } from "./scheduler/job-runner.js";
 import type { ScheduledJob } from "./scheduler/types.js";
 import { ChannelRegistry } from "./channels/channel.js";
-import type { ChannelStreamEvent } from "./channels/channel.js";
 import { FeishuChannel } from "./channels/feishu/feishu-channel.js";
-import { PersonalChannelDispatcher, type PersonalChannelDispatcherOptions, type StreamEventCallback } from "./channels/personal-dispatcher.js";
+import type { PersonalChannelDispatcherOptions, StreamEventCallback } from "./channels/personal-dispatcher.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import { bridgeChannelResourceId, TenantChannelManager } from "./channels/tenant-channel-manager.js";
+import { channelChatResourceId, channelUserResourceId, TenantChannelManager } from "./channels/tenant-channel-manager.js";
 import { bridgeBearerToken, handleBridgeMessage } from "./channels/bridge/bridge-server.js";
 import { BridgeChannel } from "./channels/bridge/bridge-channel.js";
 import { WeChatChannel } from "./channels/wechat/wechat-channel.js";
-import type { PersonalBridgeChannelConfig } from "./config.js";
-import { ScopedJobStore } from "./scheduler/scoped-job-store.js";
-import { CheckInStore } from "./checkins/check-in-store.js";
-import { seedManagedMcpConfig } from "./mcp/mcp-config-store.js";
-import { CronScheduler } from "./scheduler/cron-scheduler.js";
+import type { TokenData, WechatTokenPersistence } from "./channels/wechat/ilink-client.js";
+import { PgJobStore, type JobStore } from "./scheduler/job-store.js";
+import { TenantJsonLedger, TenantStateStore } from "./tenants/state-store.js";
+import { PgCheckInStore, type CheckInStore } from "./checkins/check-in-store.js";
 import { TenantCronScheduler } from "./scheduler/tenant-cron-scheduler.js";
-import { HttpError, json } from "./server/http-helpers.js";
+import { HttpError, json, readBody } from "./server/http-helpers.js";
 import { serveStatic } from "./server/static-serve.js";
 import { createRouteDispatcher } from "./server/route-dispatch.js";
 import {
 	safeJoinReal,
 	slugifySkillName,
 } from "./server/file-helpers.js";
-import { extractFrontmatterFields } from "./server/skill-frontmatter.js";
 import { handleChannelsRoutes } from "./server/routes/channels.js";
 import { handleJobsRoutes } from "./server/routes/jobs.js";
 import { handleCheckInsRoutes } from "./server/routes/checkins.js";
@@ -61,48 +51,36 @@ import { handleSettingsRoutes } from "./server/routes/settings.js";
 import { handleSkillsRoutes } from "./server/routes/skills.js";
 import { handleWorkspacesRoutes } from "./server/routes/workspaces.js";
 import { handleSessionsRoutes } from "./server/routes/sessions.js";
-import { handleLearnerRoutes } from "./server/routes/learner.js";
 import { handleWikiRoutes } from "./server/routes/wiki.js";
+import { setL2BackendResolver } from "./memory/l2/l2-backend.js";
+import { PgL2Backend } from "./memory/l2/pg-l2-backend.js";
+import { createObjectStore, normalizeObjectStorageConfig, type ObjectStore } from "./object-store/index.js";
 import { handlePresetsRoutes } from "./server/routes/presets.js";
-import { handlePracticeRoutes } from "./server/routes/practice.js";
+import { readPresetAgentMd, resolvePresetMeta } from "./presets/preset-store.js";
+import { SkillCatalogStore, type SkillCatalogRecord, type TenantSkillListing } from "./skills/catalog-store.js";
+import { buildCatalogSkillsSection, materializeSkill } from "./skills/materialize.js";
+import { publishSkillFromDir, publishSkillsFromRoot } from "./skills/publish.js";
+import { skillFileKey, skillManifestKey, skillObjectsPrefix, type SkillManifest } from "./skills/skill-object-key.js";
+import type { CatalogSkillListing } from "./server/routes/skills.js";
+import { createSchedulerTools } from "./scheduler/scheduler-tools.js";
 import { handleChatRoutes } from "./server/routes/chat.js";
-import { handleCommandsRoutes } from "./server/routes/commands.js";
 import { handleBtwRoutes } from "./server/routes/btw.js";
-import { mergeSessionAgentCommands } from "./server/agent-command-store.js";
-import { recordToolWorkspaceActivity } from "./server/workspace-activity-store.js";
-import { fallbackTopicFromMessages, generateSessionTopicWithCompletion } from "./server/session-topic.js";
 import {
-	mergeChannels,
-	selectActiveSessionEntries,
-	TOPIC_UPGRADE_MESSAGE_THRESHOLD,
-	type SessionChannel,
-	type SessionChannelMetadata,
-	type SessionMessageSummary,
-	type SessionQuestionMetadata,
-	type SessionSummary,
-	type SessionTopicMetadata,
 } from "./server/session-model.js";
 import { logger } from "./logger.js";
+import { VIRTUAL_TENANT_ROOT } from "./tenants/paths.js";
 import { applyRuntimeEnvironment, parseRuntimeArgs, resolveRuntimePaths } from "./runtime.js";
 import { createGracefulShutdownHandler, installProcessFallbacks } from "./utils/process-fallback.js";
-import { questionBridge } from "./agent/question-bridge.js";
-import { permissionBridge } from "./agent/permission-bridge.js";
-import { HOST_TERMINAL_DISABLED_ERROR } from "./agent/host-execution-policy.js";
-import { streamRegistry } from "./chat/stream-registry.js";
-import { DEFAULT_WORKSPACE_ID, WorkspaceRegistry, type WorkspaceMeta } from "./workspace/workspace-registry.js";
-import type { RemoteContentSource } from "./content-source/index.js";
-import { ContentHubCatalog } from "./content-source/catalog-service.js";
-import { RunRecordStore } from "./terminal/run-record-store.js";
-import { writeRunFile } from "./terminal/run-file.js";
-import { TerminalSessionManager } from "./terminal/terminal-session-manager.js";
-import type { ClientTerminalEvent, ServerTerminalEvent } from "./terminal/terminal-types.js";
-import { WebSocketServer, type WebSocket } from "ws";
+import { TEMP_WORKSPACE_ID, WorkspaceRegistry, type WorkspaceMeta } from "./workspace/workspace-registry.js";
+import { WorkspaceReplica } from "./workspace/workspace-replica.js";
+import { ObjectWorkspaceStore } from "./workspace/object-workspace-store.js";
+import type { WorkspaceStore } from "./workspace/workspace-store.js";
 import { readAuthRuntimeConfig, readListenConfig } from "./auth/config.js";
 import { assertSignUpAllowed, isPublicApiRequest, isTrustedOrigin, requireSession } from "./auth/http.js";
 import { createAuthRuntime } from "./auth/runtime.js";
-import { createBackgroundRequest, ownsRequestResource, setRequestTenant } from "./tenants/http.js";
-import { forwardDurableTenantRequest, readDurableShardConfig } from "./tenants/durable-tenant-router.js";
-import { resolveCurrentTenantDataDir, resolveCurrentTenantDataRoot } from "./tenants/paths.js";
+import { createBackgroundRequest, requireRequestTenant, setRequestTenant } from "./tenants/http.js";
+import type { TenantContext } from "./tenants/store.js";
+import { bufferBody, forwardDurableTenantRequest, readDurableShardConfig, replayBodyRequest } from "./tenants/durable-tenant-router.js";
 import { getCurrentTenant, getCurrentTenantStore, runWithoutTenantContext } from "./tenants/current.js";
 
 // ---------------------------------------------------------------------------
@@ -121,10 +99,9 @@ installFetchLogger();
 const parsed = parseRuntimeArgs(process.argv.slice(2));
 const paths = resolveRuntimePaths(parsed.options);
 applyRuntimeEnvironment(paths);
-
 const authConfig = readAuthRuntimeConfig(process.env);
 const durableShardConfig = readDurableShardConfig(process.env);
-const listenConfig = readListenConfig(process.env, authConfig.mode);
+const listenConfig = readListenConfig(process.env);
 const auth = createAuthRuntime(authConfig);
 await auth.checkConnection();
 
@@ -142,63 +119,140 @@ let config!: InnoConfig;
 // Before that, no INNO_HOME subdirectories or files are created.
 // ---------------------------------------------------------------------------
 
-const dataDir = paths.dataDir;
-const l2DataDir = paths.l2DataDir;
+const dataDir = VIRTUAL_TENANT_ROOT;
 const skillsDir = paths.skillsDir;
-const contentHubCatalog = new ContentHubCatalog({
-	dataDir,
-	paths,
-	skillsDir,
-	getConfig: () => config,
-});
+
+// Authenticated tenants keep L2 wiki state in PostgreSQL + object storage
+// (H3): wiki pages, logs and raw text go to l2_* tables; binary originals go
+// to the configured ObjectStore. Local mode keeps the file backend.
+let sharedObjectStore: ObjectStore | null = null;
+const getSharedObjectStore = (): ObjectStore => {
+	if (!sharedObjectStore) {
+		sharedObjectStore = createObjectStore(normalizeObjectStorageConfig(config?.objectStorage));
+	}
+	return sharedObjectStore;
+};
+
+let skillCatalogStore: SkillCatalogStore | null = null;
+const getSkillCatalog = (): SkillCatalogStore => {
+	if (!skillCatalogStore) {
+		skillCatalogStore = new SkillCatalogStore(auth.tenantStore.database);
+	}
+	return skillCatalogStore;
+};
+
+function toCatalogSkillListing(row: TenantSkillListing): CatalogSkillListing {
+	return {
+		name: row.name,
+		description: row.description,
+		enabled: row.enabled,
+		loaded: row.enabled,
+		filePath: `catalog:${row.skillId}@${row.version}`,
+		size: 0,
+		updatedAt: row.publishedAt,
+		diagnostics: [],
+		skillId: row.skillId,
+		version: row.version,
+		disableModelInvocation: row.disableModelInvocation,
+		source: row.source,
+		publishedAt: row.publishedAt,
+	};
+}
+
+/** Fetch a published skill's file manifest from object storage. */
+async function loadSkillManifest(record: SkillCatalogRecord): Promise<SkillManifest> {
+	const bytes = await getSharedObjectStore().get(skillManifestKey(record));
+	if (!bytes) throw new Error(`Skill manifest missing for ${record.skillId}@${record.version}`);
+	return JSON.parse(new TextDecoder().decode(bytes)) as SkillManifest;
+}
+
+/**
+ * Publish a skill directory into object storage + skill_catalog and enable it
+ * for the publishing tenant. Shared uploads never touch `skillsDir` — the
+ * image directory is only a boot-time seed.
+ */
+async function publishSkillDirToCatalog(
+	skillDir: string,
+	source: string,
+	tenant: TenantContext,
+): Promise<CatalogSkillListing> {
+	const result = await publishSkillFromDir({
+		objects: getSharedObjectStore(),
+		catalog: getSkillCatalog(),
+		skillDir,
+		source,
+		publishedBy: tenant.userId,
+		// Tenant uploads are tenant-owned: bodies under tenants/<id>/skills/,
+		// catalog row visible only to the uploader. Platform seeds stay shared.
+		ownerTenantId: tenant.tenantId,
+	});
+	const row = await getSkillCatalog().setEnabled(tenant.tenantId, result.skillId, true);
+	if (!row) throw new Error(`Skill ${result.skillId} failed to enable after publish`);
+	return toCatalogSkillListing(row);
+}
+
+/** Publish image-baked skills into object store + catalog, then opt tenants in. */
+async function seedSkillCatalogFromImage(): Promise<void> {
+	try {
+		const results = await publishSkillsFromRoot({
+			objects: getSharedObjectStore(),
+			catalog: getSkillCatalog(),
+			skillsRoot: skillsDir,
+			source: "image-seed",
+		});
+		const enabled = await getSkillCatalog().enableAllForAllTenants();
+		if (results.length > 0 || enabled > 0) {
+			logger.info({ published: results.length, tenantSkillRows: enabled }, "skill catalog seed complete");
+		}
+	} catch (err) {
+		logger.warn({ err }, "skill catalog seed failed");
+	}
+}
+/**
+ * Per-request workspace store: manifest + object store for authenticated
+ * tenants. The local workspace dir is only the execution mirror — user-facing
+ * file I/O never treats it as the source of truth. Shared by the workspace
+ * routes and the durable session service (T1.4).
+ */
+const workspaceStoreForRequest = (request: HttpReq): WorkspaceStore => {
+	const tenant = requireRequestTenant(request);
+	return new ObjectWorkspaceStore({ objects: getSharedObjectStore(), store: auth.tenantStore, context: tenant });
+};
+{
+	const l2Pool = auth.tenantStore.database;
+	const tenantL2Root = resolve(dataDir, "tenants");
+	setL2BackendResolver((resolvedDir) => {
+		const parts = relative(tenantL2Root, resolvedDir).split(sep);
+		if (parts.length !== 2 || parts[1] !== "l2") return null;
+		const tenantId = parts[0];
+		if (!tenantId || tenantId.startsWith(".")) return null;
+		return new PgL2Backend(l2Pool, tenantId, getSharedObjectStore());
+	});
+}
+
+// Workspace replication (H4): registry rows, session bindings and workspace
+// file bytes mirror into PostgreSQL + object storage so a takeover worker can
+// reconstruct a session's workspace. `memory` object storage is per-process
+// and cannot carry state across workers — replication still runs (it keeps
+// rows consistent for tests) but real deployments need "s3" or "fs". Created
+// lazily next to the workspace registry it materializes into.
+let workspaceReplica: WorkspaceReplica | null = null;
+
 
 // All stateful services are declared with !: — they are guaranteed to be
 // initialised before any API handler that uses them runs, because the HTTP
 // handler calls ensureBootstrapped() before dispatching.
-let jobStore!: ScopedJobStore;
+let jobStore!: JobStore;
+let tenantStateStore: TenantStateStore | undefined;
 let checkInStore!: CheckInStore;
 let channelRegistry!: ChannelRegistry;
 let workspaceRegistry!: WorkspaceRegistry;
-let runRecordStore!: RunRecordStore;
-let terminalManager!: TerminalSessionManager;
-let feishuChannel: FeishuChannel | null = null;
-let wechatChannel: WeChatChannel | null = null;
-let dispatcher: PersonalChannelDispatcher | null = null;
 let tenantChannelManager: TenantChannelManager | null = null;
-let scheduler: CronScheduler | TenantCronScheduler | null = null;
+let scheduler: TenantCronScheduler | null = null;
 let scheduledSessionFactory: ((job: ScheduledJob, request?: HttpReq) => Promise<CreatedJobSession | null>) | undefined;
 
 let bootstrapped = false;
 let bootstrapPromise: Promise<void> | null = null;
-let bridgeToken: string | undefined;
-
-/** Convert a raw PI SDK event to a ChannelStreamEvent for channel streaming replies. */
-function piEventToChannelStreamEvent(event: any): ChannelStreamEvent | null {
-	switch (event.type) {
-		case "message_update": {
-			const ev = event.assistantMessageEvent;
-			if (ev.type === "text_delta") return { type: "text_delta", delta: ev.delta };
-			if (ev.type === "thinking_delta") return { type: "thinking_delta", delta: ev.delta };
-			if (ev.type === "error") return { type: "error", message: ev.error?.errorMessage || "LLM API error" };
-			return null;
-		}
-		case "message_end": {
-			const msg = event.message;
-			if (msg && typeof msg === "object" && "stopReason" in msg && msg.stopReason === "error") {
-				return { type: "error", message: msg.errorMessage || "The model request failed." };
-			}
-			return null;
-		}
-		case "tool_execution_start":
-			return { type: "tool_start", toolCallId: event.toolCallId, toolName: event.toolName };
-		case "tool_execution_end": {
-			const summary = typeof event.result === "string" ? event.result.slice(0, 80) : undefined;
-			return { type: "tool_end", toolCallId: event.toolCallId, toolName: event.toolName, isError: event.isError, summary };
-		}
-		default:
-			return null;
-	}
-}
 
 /**
  * One-shot lazy bootstrap. Idempotent — concurrent requests while the first
@@ -212,115 +266,36 @@ async function ensureBootstrapped(): Promise<void> {
 		logger.info("[inno-server] first meaningful request — bootstrapping...");
 
 		// ---- config (loaded lazily, not at process start) ----
+		// config.json is the single source of truth for all platform config —
+		// deployment fields AND the server-managed catalog (providers, tavily,
+		// channel credentials, hub). Tenants never write it; their selections
+		// live in tenant_configs.
 		config = loadConfig(paths.configPath);
 		applyProviderProxyBypass(config);
-
-		// First-run MCP template: seeds <configDir>/mcp-adapter.json with a disabled
-		// reference server when the file doesn't exist yet. No-op afterwards.
-		seedManagedMcpConfig(paths);
+		getSandboxManager(); // fail fast on a sandbox config that cannot work
 
 		// ---- data directories ----
-		ensureDir(paths.learnerDataDir);
-		ensureDir(paths.sessionDir);
-		ensureDir(paths.jobsDir);
 		ensureDir(paths.skillsDir);
 		ensureDir(paths.workspaceDir);
 
 		// ---- stores ----
-		jobStore = new ScopedJobStore(dataDir, paths.jobsDir, config.scheduler?.timezone);
-		jobStore.normalizePersistedJobs();
-		checkInStore = new CheckInStore(() => resolveCurrentTenantDataRoot(dataDir), config.scheduler?.timezone, jobStore);
+		jobStore = new PgJobStore(auth.tenantStore.database, config.scheduler?.timezone);
+		tenantStateStore = new TenantStateStore(auth.tenantStore.database);
+		await jobStore.normalizePersistedJobs();
+		checkInStore = new PgCheckInStore(auth.tenantStore.database, config.scheduler?.timezone, jobStore);
 
-		channelRegistry = new ChannelRegistry(join(dataDir, "channels", "default-targets.json"));
+		channelRegistry = new ChannelRegistry();
 
-		workspaceRegistry = new WorkspaceRegistry(paths.workspaceDir, dataDir);
+		workspaceRegistry = new WorkspaceRegistry(paths.workspaceDir);
 		workspaceRegistry.ensureBootstrapped();
-		try {
-			const sessionFiles = existsSync(paths.sessionDir)
-				? readdirSync(paths.sessionDir).filter((f) => f.endsWith(".jsonl"))
-				: [];
-			workspaceRegistry.migrateUnboundSessions(sessionFiles, DEFAULT_WORKSPACE_ID);
-		} catch (err) {
-			logger.warn({ err }, "[sessions] unbound-session migration failed");
+		{
+			// Fails fast when no fs/s3 object storage is configured — the server
+			// cannot run without one.
+			workspaceReplica = new WorkspaceReplica(getSharedObjectStore(), auth.tenantStore, workspaceRegistry);
 		}
-
-		runRecordStore = new RunRecordStore(() => resolveCurrentTenantDataDir(dataDir, "runs"));
-		terminalManager = new TerminalSessionManager(workspaceRegistry, runRecordStore);
-
-		// Resolve agent cwd per session based on its workspace binding.
-		setWorkspaceCwdResolver((sessionPath: string) => {
-			const id = basename(sessionPath);
-			const workspaceId = workspaceRegistry.getSessionWorkspaceId(id);
-			return workspaceRegistry.resolveWorkspaceDir(workspaceId);
-		});
-		setPromptEventObserver((event, sessionPath) => {
-			if (event.type !== "tool_execution_start" && event.type !== "tool_execution_update") return;
-			// Progress events normally omit args; the start event is the source of
-			// truth in that case, so do not turn a harmless update into an
-			// incomplete-tracking warning.
-			if (event.type === "tool_execution_update" && event.args === undefined) return;
-			const sessionId = sessionPath ? basename(sessionPath) : getCurrentSessionId();
-			if (!sessionId) return;
-			const workspaceId = workspaceRegistry.getSessionWorkspaceId(sessionId);
-			const workspaceRoot = workspaceRegistry.resolveWorkspaceDir(workspaceId);
-			if (!workspaceRoot) return;
-			recordToolWorkspaceActivity(dataDir, {
-				sessionId,
-				workspaceId,
-				workspaceRoot,
-				toolName: event.toolName,
-				args: event.args,
-			});
-		});
-
-		migrateLegacyPiSkills();
+		await seedSkillCatalogFromImage();
 
 		// ---- channels ----
-		function migrateReminderChannels(): void {
-			const defaultFeishuTarget = channelRegistry.getDefaultTarget("feishu");
-			if (!defaultFeishuTarget) return;
-			for (const job of jobStore.list()) {
-				if (job.taskType !== "push_reminder") continue;
-				if (job.channel) continue;
-				jobStore.update(job.id, {
-					channel: "feishu",
-					target: defaultFeishuTarget,
-				});
-			}
-		}
-
-		const sharedDispatcherOptions: Omit<PersonalChannelDispatcherOptions, "channelRegistry" | "channelsDataDir"> = {
-			runPrompt: runPromptSerialized,
-			runPromptInSession,
-			runPromptStreamingInSession: (sessionPath, prompt, onEvent, images) => {
-				return runPromptStreamingInSession(sessionPath, prompt, (piEvent: any) => {
-					const channelEvent = piEventToChannelStreamEvent(piEvent);
-					if (channelEvent) onEvent(channelEvent);
-				}, images);
-			},
-			createNewSession: () => createNewSession(),
-			getCurrentSessionId,
-			recordSessionChannel: (ch, sid?) => recordCurrentSessionChannel(ch as SessionChannel, sid, { setOriginIfEmpty: true }),
-			maybeAutoGenerateTopic,
-			onSessionCreated: async (sessionId, channel) => {
-				const tenant = getCurrentTenant();
-				if (tenant) {
-					const store = getCurrentTenantStore();
-					if (!store) throw new Error("Channel session creation requires a tenant store");
-					const ws = workspaceRegistry.ensureChannelWorkspace(channel, tenant.tenantId);
-					await store.claimResource(tenant, "workspace", ws.id);
-					workspaceRegistry.bindSession(sessionId, ws.id);
-					return;
-				}
-				try {
-					const ws = workspaceRegistry.ensureChannelWorkspace(channel);
-					workspaceRegistry.bindSession(sessionId, ws.id);
-				} catch (err) {
-					logger.warn({ err }, `[sessions] failed to bind channel session ${sessionId}`);
-				}
-			},
-			sessionDir: join(dataDir, "sessions"),
-		};
 
 		const runDurableChannelPrompt = (
 			sessionId: string,
@@ -329,70 +304,61 @@ async function ensureBootstrapped(): Promise<void> {
 			images?: ImageContent[],
 		) => {
 			const turnId = `channel-${randomUUID()}`;
+			const tenant = getCurrentTenant();
 			return runDurableJobPrompt(backgroundTenantRequest(), durableSessions, sessionId, prompt, {
 				requestId: `channel-request-${randomUUID()}`,
 				turnId,
 				onEvent,
 				images,
 				noUi: true,
+				...(tenant ? { forwardToOwner: (payload: InternalPromptPayload) => forwardJobToOwner(tenant, payload) } : {}),
 			});
 		};
-		const tenantDispatcherOptions: typeof sharedDispatcherOptions = authConfig.multiUserEnabled ? {
-			...sharedDispatcherOptions,
-			runPrompt: async () => { throw new Error("Multi-user channel prompts require an owned durable session"); },
+		const dispatcherOptions: Omit<PersonalChannelDispatcherOptions, "channelRegistry" | "channelsDataDir"> = {
+			runPrompt: async () => { throw new Error("Channel prompts require an owned durable session"); },
+			getCurrentSessionId: () => "",
+			onSessionCreated: async (sessionId, channel) => {
+				const tenant = getCurrentTenant();
+				const store = getCurrentTenantStore();
+				if (!tenant || !store) throw new Error("Channel session creation requires a tenant context");
+				const ws = workspaceRegistry.ensureChannelWorkspace(channel, tenant.tenantId);
+				await store.claimResource(tenant, "workspace", ws.id);
+				workspaceRegistry.bindSession(sessionId, ws.id);
+				if (workspaceReplica) {
+					await workspaceReplica.replicateWorkspace(tenant, ws);
+					await workspaceReplica.setSessionBinding(tenant, sessionId, ws.id);
+				}
+			},
 			runPromptInSession: (sessionId, prompt, images) => runDurableChannelPrompt(sessionId, prompt, undefined, images),
 			runPromptStreamingInSession: (sessionId, prompt, onEvent, images) => runDurableChannelPrompt(sessionId, prompt, onEvent, images),
 			createNewSession: async (channel = "web") => {
 				const tenant = getCurrentTenant();
 				const store = getCurrentTenantStore();
-				if (!tenant || !store) throw new Error("Durable channel session creation requires a verified tenant");
+				if (!tenant || !store) throw new Error("Durable channel session creation requires a tenant context");
 				const req = backgroundTenantRequest();
 				const workspace = workspaceRegistry.ensureChannelWorkspace(channel, tenant.tenantId);
 				await store.claimResource(tenant, "workspace", workspace.id);
-				const summary = durableSessions.create(req, { workspaceId: workspace.id });
+				const summary = await durableSessions.create(req, { workspaceId: workspace.id });
 				if (!workspaceRegistry.bindSession(summary.id, workspace.id)) throw new Error("Channel workspace not found");
+				if (workspaceReplica) {
+					await workspaceReplica.replicateWorkspace(tenant, workspace);
+					await workspaceReplica.setSessionBinding(tenant, summary.id, workspace.id);
+				}
 				return summary.id;
 			},
-			resolveSessionTarget: async (sessionId) => durableSessions.get(backgroundTenantRequest(), sessionId) ? sessionId : null,
-			maybeAutoGenerateTopic: undefined,
-		} : sharedDispatcherOptions;
+			resolveSessionTarget: async (sessionId) => await durableSessions.get(backgroundTenantRequest(), sessionId) ? sessionId : null,
+		};
 
-		if (auth.mode === "local") {
-			if (config.feishu?.appId && config.channels?.feishu?.enabled) {
-				feishuChannel = new FeishuChannel(config.feishu, dataDir, config.channels.feishu);
-				channelRegistry.register(feishuChannel);
-			}
-
-			bridgeToken = config.bridge?.token;
-			if (bridgeToken) {
-				const qqConfig = config.channels?.qq as PersonalBridgeChannelConfig | undefined;
-				if (qqConfig?.enabled && qqConfig.sidecarBaseUrl) {
-					channelRegistry.register(new BridgeChannel("qq", qqConfig.sidecarBaseUrl, bridgeToken));
-				}
-				const wechatConfigBridge = config.channels?.wechat;
-				if (wechatConfigBridge?.enabled && "sidecarBaseUrl" in wechatConfigBridge && (wechatConfigBridge as PersonalBridgeChannelConfig).mode === "bridge") {
-					channelRegistry.register(new BridgeChannel("wechat", (wechatConfigBridge as PersonalBridgeChannelConfig).sidecarBaseUrl, bridgeToken));
-				}
-			}
-
-			const wechatCfg = config.channels?.wechat;
-			if (wechatCfg?.enabled && (!("mode" in wechatCfg) || (wechatCfg as { mode?: string }).mode !== "bridge")) {
-				wechatChannel = new WeChatChannel(dataDir, wechatCfg);
-				channelRegistry.register(wechatChannel);
-			}
-			migrateReminderChannels();
-		} else {
-			bridgeToken = undefined;
+		{
 			tenantChannelManager = new TenantChannelManager({
-				dataDir,
-				tenantStore: auth.tenantStore!,
-				dispatcher: tenantDispatcherOptions,
-				createChannels: ({ config: tenantConfig, channelsDataDir: tenantChannelsDir, registry, dispatch }) => {
-					const tenantDataDir = dirname(tenantChannelsDir);
+				tenantStore: auth.tenantStore,
+				getLocalConfig: () => config,
+				dispatcher: dispatcherOptions,
+				createChannels: ({ config: tenantConfig, registry, dispatch, wechatTokenPersistence }) => {
 					let tenantFeishu: FeishuChannel | null = null;
 					let tenantWechat: WeChatChannel | null = null;
 					if (tenantConfig.feishu?.appId && tenantConfig.channels?.feishu?.enabled) {
-						tenantFeishu = new FeishuChannel(tenantConfig.feishu, tenantDataDir, tenantConfig.channels.feishu);
+						tenantFeishu = new FeishuChannel(tenantConfig.feishu, tenantConfig.channels.feishu);
 						registry.register(tenantFeishu);
 						tenantFeishu.onMessage((msg) => dispatch(tenantFeishu!, msg));
 						tenantFeishu.start();
@@ -413,10 +379,10 @@ async function ensureBootstrapped(): Promise<void> {
 					}
 					const wechatConfig = tenantConfig.channels?.wechat;
 					if (wechatConfig?.enabled && (!("mode" in wechatConfig) || wechatConfig.mode !== "bridge")) {
-						tenantWechat = new WeChatChannel(tenantDataDir, wechatConfig);
+						tenantWechat = new WeChatChannel(wechatTokenPersistence!, wechatConfig);
 						registry.register(tenantWechat);
 						tenantWechat.onMessage((msg) => dispatch(tenantWechat!, msg));
-						tenantWechat.start();
+						void tenantWechat.start().catch((err) => logger.error({ err }, "[wechat] failed to start channel"));
 					}
 					return {
 						wechatChannel: tenantWechat ?? undefined,
@@ -430,86 +396,36 @@ async function ensureBootstrapped(): Promise<void> {
 		}
 
 		// ---- agent session ----
-		logger.info("[inno-server] initializing agent session...");
-		await initSession(config, paths, channelRegistry, {
-			sandbox: parsed.options.sandbox,
-			authenticated: auth.mode === "better-auth",
-			extensionDeps: {
-				workspaceRegistry,
-				runRecordStore,
-				getCurrentSessionId,
-				recordChannelInteraction: (channel) => recordCurrentSessionChannel(channel as SessionChannel),
-			},
-		});
-
-		// ---- post-init: dispatcher, channels, cron, WebSocket ----
-		if (auth.mode === "local") {
-			const channelsDataDir = join(dataDir, "channels");
-			ensureDir(channelsDataDir);
-			dispatcher = new PersonalChannelDispatcher({
-				...sharedDispatcherOptions,
-				channelRegistry,
-				channelsDataDir,
-			});
-
-			if (feishuChannel) {
-				feishuChannel.onMessage((msg) => dispatcher!.handle(feishuChannel!, msg));
-				feishuChannel.start();
-
-				// Auto-discover default target on first boot if none persisted
-				if (!channelRegistry.getDefaultTarget("feishu")) {
-					feishuChannel.discoverDefaultTarget().then((target) => {
-						if (target) {
-							channelRegistry.setDefaultTarget(target);
-							logger.info({ chatId: target.chatId }, "[feishu] auto-set default target from chat list");
-						}
-					}).catch((err) => {
-						logger.warn({ err }, "[feishu] initial target discovery failed");
-					});
-				}
-			}
-			if (wechatChannel) {
-				wechatChannel.onMessage((msg) => dispatcher!.handle(wechatChannel!, msg));
-				wechatChannel.start();
-			}
-		}
+		// ---- post-init: cron, WebSocket ----
 
 		async function createScheduledSession(job: ScheduledJob, request?: HttpReq): Promise<CreatedJobSession | null> {
 			try {
-				if (authConfig.multiUserEnabled || job.runtime === "durable") {
+				{
 					const req = request ?? backgroundTenantRequest();
 					const tenant = getCurrentTenant();
 					const store = getCurrentTenantStore();
-					if (tenant && !store) throw new Error("Scheduled session creation requires a tenant store");
-					const ws = workspaceRegistry.ensureChannelWorkspace("scheduler", tenant?.tenantId);
-					if (tenant) await store!.claimResource(tenant, "workspace", ws.id);
-					const summary = durableSessions.create(req, { workspaceId: ws.id, origin: "scheduler" });
+					if (!tenant || !store) throw new Error("Scheduled session creation requires a tenant context");
+					const ws = workspaceRegistry.ensureChannelWorkspace("scheduler", tenant.tenantId);
+					await store.claimResource(tenant, "workspace", ws.id);
+					const summary = await durableSessions.create(req, { workspaceId: ws.id, origin: "scheduler" });
 					try {
-						if (tenant) await store!.claimResource(tenant, "session", summary.id);
+						await store.claimResource(tenant, "session", summary.id);
 						if (!workspaceRegistry.bindSession(summary.id, ws.id)) throw new Error("Workspace not found");
+						if (workspaceReplica) {
+							await workspaceReplica.replicateWorkspace(tenant, ws);
+							await workspaceReplica.setSessionBinding(tenant, summary.id, ws.id);
+						}
 						return { id: summary.id, runtime: "durable" };
 					} catch (error) {
 						await durableSessions.delete(req, summary.id).catch(() => undefined);
 						workspaceRegistry.unbindSession(summary.id);
-						if (tenant) await store!.releaseResource(tenant, "session", summary.id).catch(() => undefined);
+						if (workspaceReplica) await workspaceReplica.clearSessionBinding(tenant, summary.id).catch(() => undefined);
+						await store.releaseResource(tenant, "session", summary.id).catch(() => undefined);
 						throw error;
 					}
 				}
-				const id = await createNewSession({});
-				const tenant = getCurrentTenant();
-				if (tenant) {
-					const store = getCurrentTenantStore();
-					if (!store) throw new Error("Scheduled session creation requires a tenant store");
-					await store.claimResource(tenant, "session", id);
-					const ws = workspaceRegistry.ensureChannelWorkspace("scheduler", tenant.tenantId);
-					await store.claimResource(tenant, "workspace", ws.id);
-					workspaceRegistry.bindSession(id, ws.id);
-				}
-				recordCurrentSessionChannel("scheduler", id, { setOriginIfEmpty: true });
-				const sessionPath = sessionFileFromId(paths.sessionDir, id);
-				return sessionPath && existsSync(sessionPath) ? sessionPath : null;
 			} catch (err) {
-				logger.error({ err, runtime: job.runtime ?? "legacy" }, "scheduled run session creation failed");
+				logger.error({ err, jobId: job.id }, "scheduled run session creation failed");
 				return null;
 			}
 		}
@@ -524,29 +440,19 @@ async function ensureBootstrapped(): Promise<void> {
 			checkInStore,
 			createSession: createScheduledSession,
 			durableExecutor,
-			durableClaims: auth.mode === "better-auth",
+			durableClaims: true,
 		});
-		if (auth.mode === "local") {
-			scheduler = new CronScheduler(jobStore, channelRegistry, checkInStore, {
-				createSession: (job) => job.runtime === "durable" ? createScheduledSession(job) : Promise.resolve(null),
-				durableExecutor,
-			});
-		} else {
-			scheduler = new TenantCronScheduler(auth.tenantStore!, jobStore, channelRegistry, checkInStore, {
-				createSession: createScheduledSession,
-				durableExecutor,
-			});
-		}
+		scheduler = new TenantCronScheduler(auth.tenantStore, jobStore, channelRegistry, checkInStore, {
+			createSession: createScheduledSession,
+			durableExecutor,
+		});
 		scheduler.start();
 
-		logger.info({ channels: auth.mode === "local" ? channelRegistry.all().map((c) => c.name).join(", ") || "none" : "tenant-scoped" }, "[inno-server] channels");
-		logger.info({ jobCount: jobStore.list().length }, "[inno-server] jobs loaded");
+		logger.info("[inno-server] tenant-scoped channels");
+		logger.info({ jobCount: (await jobStore.normalizePersistedJobs()).length }, "[inno-server] jobs loaded");
 
 		bootstrapped = true;
 		logger.info("[inno-server] bootstrap complete");
-		// Simple Mode cards and the remote skill library are warmed in the
-		// background. Never make the first meaningful API response wait on GitHub.
-		void contentHubCatalog.warm();
 	}).catch((err) => {
 		logger.error({ err }, "[inno-server] bootstrap failed");
 		bootstrapPromise = null; // allow retry on next request
@@ -560,62 +466,15 @@ async function ensureBootstrapped(): Promise<void> {
 // Channel hot-reload
 // ---------------------------------------------------------------------------
 
-/**
- * Stop the current Feishu channel (if any) and reinitialize it from the
- * current in-memory config. Called after PUT /api/settings/channels so that
- * new credentials take effect without a server restart.
- */
+/** Reload the current tenant's Feishu channel after PUT /api/settings/channels
+ * so new credentials take effect without a server restart. */
 async function reloadFeishuChannel(): Promise<void> {
-	if (tenantChannelManager) {
-		await tenantChannelManager.reloadCurrent();
-		return;
-	}
-	// Tear down existing instance
-	channelRegistry.unregister("feishu");
-	if (feishuChannel) {
-		try { await feishuChannel.stop(); } catch { /* best effort */ }
-		feishuChannel = null;
-	}
-
-	// If feishu is now configured and enabled, create a new instance
-	if (!config.feishu?.appId || !config.channels?.feishu?.enabled) {
-		logger.info("[feishu] channel disabled or not configured, skipping reload");
-		return;
-	}
-
-	feishuChannel = new FeishuChannel(config.feishu, dataDir, config.channels.feishu);
-	channelRegistry.register(feishuChannel);
-
-	if (dispatcher) {
-		feishuChannel.onMessage((msg) => dispatcher!.handle(feishuChannel!, msg));
-	}
-	feishuChannel.start();
-	logger.info("[feishu] channel hot-reloaded with new credentials");
-
-	// Auto-discover default target if none exists yet (fixes first-time setup
-	// chicken-and-egg: user had to send FROM Feishu before agent could send TO it)
-	if (!channelRegistry.getDefaultTarget("feishu")) {
-		const target = await feishuChannel.discoverDefaultTarget();
-		if (target) {
-			channelRegistry.setDefaultTarget(target);
-			logger.info({ chatId: target.chatId }, "[feishu] auto-set default target from chat list");
-		}
-	}
+	await tenantChannelManager?.reloadCurrent();
 }
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
-
-function sessionRevision(filePath: string): string {
-	try {
-		const stat = statSync(filePath);
-		return `${stat.size}:${stat.mtimeMs}`;
-	} catch {
-		return "missing";
-	}
-}
-
 
 // ---------------------------------------------------------------------------
 // Static file serving (web/dist/)
@@ -626,46 +485,6 @@ const webDistDir = paths.webDistDir;
 // ---------------------------------------------------------------------------
 // Local data helpers
 // ---------------------------------------------------------------------------
-
-function sessionFileFromId(sessionDir: string, id: string): string | null {
-	const fileName = basename(id);
-	if (fileName !== id || !fileName.endsWith(".jsonl")) return null;
-	return safeJoinReal(sessionDir, fileName);
-}
-
-function textFromContent(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((part) => {
-			if (!part || typeof part !== "object") return "";
-			const record = part as Record<string, unknown>;
-			return record.type === "text" && typeof record.text === "string" ? record.text : "";
-		})
-		.filter(Boolean)
-		.join("\n")
-		.trim();
-}
-
-function imagesFromContent(content: unknown): Array<{ previewUrl: string; mimeType: string }> {
-	if (!Array.isArray(content)) return [];
-	const result: Array<{ previewUrl: string; mimeType: string }> = [];
-	for (const part of content) {
-		if (!part || typeof part !== "object") continue;
-		const record = part as Record<string, unknown>;
-		if (
-			record.type === "image" &&
-			typeof record.data === "string" &&
-			typeof record.mimeType === "string"
-		) {
-			result.push({
-				previewUrl: `data:${record.mimeType};base64,${record.data}`,
-				mimeType: record.mimeType,
-			});
-		}
-	}
-	return result;
-}
 
 function parseSkillFrontmatter(content: string): Record<string, string | boolean> {
 	const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -797,7 +616,7 @@ function installSkillZip(fileName: string, data: Buffer, targetRoot: string = sk
 /**
  * Install a skill from an already-extracted directory: locate the SKILL.md,
  * normalize its frontmatter, and copy the package into the skills directory.
- * Shared by zip upload and skill-library import.
+ * Shared by zip upload and markdown upload.
  */
 function installSkillFromExtractedDir(extractDir: string, fallbackName: string, targetRoot: string = skillsDir): { name: string; filePath: string } {
 	const skillFile = findSkillFile(extractDir);
@@ -852,9 +671,9 @@ function findWorkspaceContentRoot(extractDir: string): string | null {
 
 /**
  * Recursively copy imported content into the new workspace directory.
- * File-by-file (not cpSync) for robustness against asar-unpacked paths in
- * Electron packaged builds. `preset.json` is hub metadata, not content —
- * it only contributes the default workspace name and is not copied.
+ * File-by-file (not cpSync) to skip noise files cleanly. `preset.json` is
+ * hub metadata, not content — it only contributes the default workspace
+ * name and is not copied.
  */
 function copyWorkspaceImportContents(sourceDir: string, targetDir: string): void {
 	ensureDir(targetDir);
@@ -936,152 +755,6 @@ function importWorkspaceZip(fileName: string, data: Buffer, name?: string): Work
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Remote content hub (skill library + preset workspaces)
-//
-// Backed by a RemoteContentSource (GitHub repo by default, or a self-hosted
-// bundle service). The source is created lazily from config.contentHub and
-// recreated whenever the hub config changes, so settings edits take effect
-// without a restart.
-// ---------------------------------------------------------------------------
-/** Get (or rebuild) the content source for the current config.contentHub. */
-function getContentSource(): RemoteContentSource {
-	return contentHubCatalog.getSource();
-}
-
-/** Drop the source so the next call rebuilds it (and its cache) from config. */
-function invalidateContentSource(): void {
-	contentHubCatalog.invalidate();
-}
-
-function listSkillLibrary(forceRefresh = false) {
-	return contentHubCatalog.listSkillLibrary(forceRefresh);
-}
-
-function listPresetLibrary(forceRefresh = false) {
-	return contentHubCatalog.listPresetLibrary(forceRefresh);
-}
-
-/**
- * Import a skill from the remote library into the global skills directory.
- * Downloads the item's files into a temp dir, then installs through the same
- * path as a zip upload (validates SKILL.md, normalizes frontmatter).
- */
-async function importSkillFromLibrary(skillName: string): Promise<{ name: string; filePath: string }> {
-	const source = getContentSource();
-	const tempRoot = join(tmpdir(), `inno-libskill-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-	const extractDir = join(tempRoot, "extract");
-	ensureDir(extractDir);
-	try {
-		await source.downloadItem("skills", skillName, extractDir);
-		return installSkillFromExtractedDir(extractDir, slugifySkillName(skillName), skillsDir);
-	} finally {
-		rmSync(tempRoot, { recursive: true, force: true });
-	}
-}
-
-function migrateLegacyPiSkills(): void {
-	const legacySkillsDir = join(paths.workspaceDir, ".pi", "skills");
-	if (!existsSync(legacySkillsDir)) return;
-	ensureDir(skillsDir);
-	for (const entry of readdirSync(legacySkillsDir, { withFileTypes: true })) {
-		if (!entry.isDirectory()) continue;
-		const legacySkillDir = join(legacySkillsDir, entry.name);
-		const legacySkillFile = join(legacySkillDir, "SKILL.md");
-		if (!existsSync(legacySkillFile)) continue;
-		const content = readText(legacySkillFile);
-		const skill = ensureSkillDocument(content, entry.name);
-		const targetDir = join(skillsDir, skill.name);
-		if (!existsSync(targetDir)) {
-			ensureDir(targetDir);
-			cpSync(legacySkillDir, targetDir, { recursive: true });
-			writeText(join(targetDir, "SKILL.md"), skill.content);
-		}
-	}
-}
-
-interface SkillRegistry {
-	disabled: string[];
-}
-
-function skillRegistryPath(): string {
-	return join(paths.configDir, "skills.json");
-}
-
-function readSkillRegistry(): SkillRegistry {
-	const registry = readJson<Partial<SkillRegistry>>(skillRegistryPath(), {});
-	return {
-		disabled: Array.isArray(registry.disabled)
-			? registry.disabled.filter((item): item is string => typeof item === "string")
-			: [],
-	};
-}
-
-function writeSkillRegistry(registry: SkillRegistry): void {
-	ensureDir(paths.configDir);
-	writeJson(skillRegistryPath(), registry);
-}
-
-function disabledSkillNames(): Set<string> {
-	return new Set(readSkillRegistry().disabled);
-}
-
-function setSkillEnabled(name: string, enabled: boolean): void {
-	const registry = readSkillRegistry();
-	const disabled = new Set(registry.disabled);
-	if (enabled) {
-		disabled.delete(name);
-	} else {
-		disabled.add(name);
-	}
-	writeSkillRegistry({ disabled: Array.from(disabled).sort() });
-	writeDisabledSkillsIgnoreFile(disabled);
-}
-
-function writeDisabledSkillsIgnoreFile(disabled: Set<string>): void {
-	const lines = Array.from(disabled)
-		.sort()
-		.map((name) => `${name}/`);
-	writeText(join(skillsDir, ".ignore"), lines.length > 0 ? `${lines.join("\n")}\n` : "");
-}
-
-function listProjectSkills(): unknown[] {
-	ensureDir(skillsDir);
-	const disabled = disabledSkillNames();
-	const loaded = getLoadedSkills();
-	const loadedByPath = new Map(loaded.skills.map((skill) => [resolve(skill.filePath), skill]));
-	const diagnosticsByPath = new Map<string, string[]>();
-	for (const diagnostic of loaded.diagnostics) {
-		if (!diagnostic.path) continue;
-		const diagnosticPath = resolve(diagnostic.path);
-		const list = diagnosticsByPath.get(diagnosticPath) ?? [];
-		list.push(diagnostic.message);
-		diagnosticsByPath.set(diagnosticPath, list);
-	}
-
-	return readdirSync(skillsDir, { withFileTypes: true })
-		.filter((entry) => entry.isDirectory())
-		.map((entry) => {
-			const name = entry.name;
-			const filePath = join(skillsDir, name, "SKILL.md");
-			const content = existsSync(filePath) ? readText(filePath) : "";
-			const stat = existsSync(filePath) ? statSync(filePath) : statSync(join(skillsDir, name));
-			const loadedSkill = loadedByPath.get(resolve(filePath));
-			const fields = extractFrontmatterFields(content);
-			return {
-				name,
-				description: fields.description,
-				category: fields.category || undefined,
-				enabled: !disabled.has(name),
-				loaded: Boolean(loadedSkill),
-				filePath: relative(paths.workspaceDir, filePath),
-				size: existsSync(filePath) ? stat.size : 0,
-				updatedAt: stat.mtime.toISOString(),
-				diagnostics: diagnosticsByPath.get(resolve(filePath)) ?? [],
-			};
-		})
-		.sort((a, b) => a.name.localeCompare(b.name));
-}
 
 /**
  * Refresh the agent's in-memory skills in the background.
@@ -1093,265 +766,34 @@ function listProjectSkills(): unknown[] {
  * upload UI stuck on "uploading". Fire-and-forget keeps the request snappy.
  */
 function scheduleSkillsReload(): void {
-	void reloadResources().catch((err) => {
-		logger.warn({ err }, "[inno-server] skills reload failed");
-	});
+	// Durable sessions list the shared skills when their runtime opens, so there
+	// is no process-wide skill cache to refresh. Open sessions pick up changes
+	// the next time they are reopened.
 }
 
-function sessionTopicMetadataPath(): string {
-	return join(resolveCurrentTenantDataRoot(dataDir), "sessions", "meta.json");
+/** Ambient-tenant state ledger shared by channel runtimes. */
+function tenantState(): TenantStateStore {
+	if (!tenantStateStore) throw new Error("tenant state store is not initialized");
+	return tenantStateStore;
 }
 
-function readSessionTopicMetadata(): SessionTopicMetadata {
-	return readJson<SessionTopicMetadata>(sessionTopicMetadataPath(), {});
-}
-
-function writeSessionTopic(id: string, topic: string, generated = false, extra?: { upgraded?: boolean }): void {
-	const metadata = readSessionTopicMetadata();
-	metadata[id] = { topic, generated, updatedAt: new Date().toISOString(), ...(extra?.upgraded ? { upgraded: true } : {}) };
-	writeJson(sessionTopicMetadataPath(), metadata);
-}
-
-function parseSessionFile(filePath: string): { summary: SessionSummary; messages: SessionMessageSummary[] } | null {
-	try {
-		const raw = readFileSync(filePath, "utf-8");
-		const lines = raw.split("\n").filter((line) => line.trim().length > 0);
-		const entries = selectActiveSessionEntries(lines.map((line) => JSON.parse(line) as Record<string, unknown>));
-		const messages: SessionMessageSummary[] = [];
-		const channels = new Set<SessionChannel>();
-		let createdAt = "";
-		let lastMessageAt = "";
-
-		// Aggregator for the in-progress assistant turn. PI splits one assistant
-		// turn into multiple JSONL entries (thinking + toolCalls + toolResults
-		// + final text), so we merge them back into a single bubble.
-		let pendingAssistant: SessionMessageSummary | null = null;
-		const finalizeAssistant = () => {
-			if (pendingAssistant) {
-				messages.push(pendingAssistant);
-				pendingAssistant = null;
-			}
-		};
-		const ensureAssistant = (timestamp: number, entryId?: string): SessionMessageSummary => {
-			if (!pendingAssistant) {
-				pendingAssistant = { role: "assistant", content: "", timestamp, entryId };
-			} else if (entryId) {
-				pendingAssistant.entryId = entryId;
-			}
-			return pendingAssistant;
-		};
-
-		for (const entry of entries) {
-			const timestamp = typeof entry.timestamp === "string" ? entry.timestamp : "";
-			if (!createdAt && timestamp) createdAt = timestamp;
-			// Detect channel ONLY from structured JSON fields written by the system
-			// (message.channel / message.source / message.api / message.model).
-			// We intentionally do NOT substring-match the raw line for natural-language
-			// keywords like "飞书" / "scheduled" — those appear in ordinary user/assistant
-			// text and would falsely tag a web session as a feishu/scheduler session.
-			// Verified on unmodified code: a learner asking "飞书的英文名?" (user text)
-			// or a reply that merely mentions "飞书" (assistant text) both got mislabeled
-			// as channel=feishu even though origin stayed web. The authoritative channel
-			// record lives in channels.json (via recordCurrentSessionChannel); this
-			// detection is only a best-effort hint for legacy sessions that predate it.
-			let entryChannel: SessionChannel | undefined;
-			const msgObj = entry.type === "message" && entry.message && typeof entry.message === "object"
-				? entry.message as Record<string, unknown>
-				: undefined;
-			const channelField = typeof msgObj?.channel === "string" ? (msgObj.channel as string) : "";
-			const sourceField = typeof msgObj?.source === "string" ? (msgObj.source as string) : "";
-			const apiField = typeof msgObj?.api === "string" ? (msgObj.api as string) : "";
-			const modelField = typeof msgObj?.model === "string" ? (msgObj.model as string) : "";
-			if (channelField === "feishu") {
-				channels.add("feishu");
-				entryChannel = "feishu";
-			}
-			if (channelField === "wechat" || channelField === "wecom") {
-				channels.add("wechat");
-				entryChannel = entryChannel ?? "wechat";
-			}
-			if (channelField === "qq") {
-				channels.add("qq");
-				entryChannel = entryChannel ?? "qq";
-			}
-			if (sourceField === "web" || channelField === "web") {
-				channels.add("web");
-				entryChannel = entryChannel ?? "web";
-			}
-			// Scheduler-authored assistant messages carry a synthetic api/model marker.
-			if (apiField === "inno-background" || modelField === "scheduler") {
-				channels.add("scheduler");
-				entryChannel = entryChannel ?? "scheduler";
-			}
-
-			if (!msgObj) continue;
-			if (timestamp) lastMessageAt = timestamp;
-			const message = msgObj;
-			const role = message.role;
-			const ts = timestamp ? Date.parse(timestamp) : Date.now();
-
-			if (role === "user") {
-				finalizeAssistant();
-				const content = textFromContent(message.content);
-				if (!content) continue;
-				const images = imagesFromContent(message.content);
-				const msg: SessionMessageSummary = {
-					role: "user",
-					content,
-					timestamp: ts,
-					channel: entryChannel,
-					entryId: typeof entry.id === "string" ? entry.id : undefined,
-					parentEntryId: typeof entry.parentId === "string" ? entry.parentId : null,
-				};
-				if (images.length > 0) msg.images = images;
-				messages.push(msg);
-				continue;
-			}
-
-			if (role === "assistant") {
-				const pending = ensureAssistant(ts, typeof entry.id === "string" ? entry.id : undefined);
-				if (entryChannel && !pending.channel) pending.channel = entryChannel;
-				const content = message.content;
-				if (Array.isArray(content)) {
-					for (const part of content) {
-						if (!part || typeof part !== "object") continue;
-						const block = part as Record<string, unknown>;
-						if (block.type === "text" && typeof block.text === "string") {
-							pending.content = pending.content
-								? `${pending.content}\n${block.text}`
-								: block.text;
-						} else if (block.type === "thinking" && typeof block.thinking === "string") {
-							pending.thinking = pending.thinking
-								? `${pending.thinking}\n${block.thinking}`
-								: block.thinking;
-						} else if (block.type === "toolCall") {
-							const toolCallId = typeof block.id === "string" ? block.id : "";
-							const toolName = typeof block.name === "string" ? block.name : "tool";
-							const args = block.arguments;
-							pending.tools = pending.tools ?? [];
-							pending.tools.push({
-								toolCallId,
-								toolName,
-								args,
-								contentOffset: pending.content.length,
-							});
-						}
-					}
-				} else if (typeof content === "string" && content) {
-					pending.content = pending.content ? `${pending.content}\n${content}` : content;
-				}
-				pending.timestamp = ts;
-				if (typeof message.stopReason === "string") pending.stopReason = message.stopReason;
-				// If this assistant entry ended the turn (stopReason "stop"), finalize.
-				if (typeof message.stopReason === "string" && message.stopReason !== "toolUse") {
-					finalizeAssistant();
-				}
-				continue;
-			}
-
-			if (role === "toolResult") {
-				const pending = ensureAssistant(ts);
-				const toolCallId = typeof message.toolCallId === "string" ? message.toolCallId : "";
-				const toolName = typeof message.toolName === "string" ? message.toolName : "tool";
-				// PI keeps a tool's structured details alongside its text content. Keep
-				// those details in session history so completed questionnaires can be
-				// rendered with the selected options, and the todo widget can rebuild
-				// its task list, after the session is reopened.
-				const result = (toolName === "ask_user_question" || toolName === "todo") && message.details !== undefined
-					? message.details
-					: textFromContent(message.content) || message.content;
-				const isError = Boolean(message.isError);
-				pending.tools = pending.tools ?? [];
-				const existing = pending.tools.find((t) => t.toolCallId === toolCallId);
-				if (existing) {
-					existing.result = result;
-					existing.isError = isError;
-				} else {
-					pending.tools.push({ toolCallId, toolName, args: undefined, result, isError });
-				}
-				continue;
-			}
-		}
-		finalizeAssistant();
-
-		// Filter out empty assistant entries (no text, no thinking, no tools).
-		const filtered = messages.filter((m) =>
-			m.role === "user" ? !!m.content : (m.content || m.thinking || (m.tools && m.tools.length > 0)),
-		);
-
-		const displayMessages = mergeSessionAgentCommands(dataDir, basename(filePath), filtered);
-		const firstUser = displayMessages.find((message) => message.role === "user");
-		const preview = firstUser?.content.trim() ?? "";
-		const name = preview ? (preview.length > 48 ? `${preview.slice(0, 45)}...` : preview) : basename(filePath);
-		const stat = statSync(filePath);
-		const fallbackTime = stat.mtime.toISOString();
-		return {
-			summary: {
-				id: basename(filePath),
-				name,
-				createdAt: createdAt || fallbackTime,
-				updatedAt: lastMessageAt || createdAt || fallbackTime,
-				messageCount: filtered.length,
-				preview,
-				channels: channels.size > 0 ? Array.from(channels) : [],
-			},
-			messages: displayMessages,
-		};
-	} catch (err) {
-		return null;
-	}
-}
-
-function sessionChannelMetadataPath(): string {
-	return join(resolveCurrentTenantDataRoot(dataDir), "sessions", "channels.json");
-}
-
-// --- Pending question persistence (survives process restart) ---
-function sessionQuestionMetadataPath(): string {
-	return join(dataDir, "sessions", "questions.json");
-}
-
-/** In-memory cache of questions.json — read once, updated on every write.
- *  Avoids a synchronous readFileSync on every session-detail request. */
-let _questionMetadataCache: SessionQuestionMetadata | null = null;
-
-function readSessionQuestionMetadata(): SessionQuestionMetadata {
-	if (_questionMetadataCache === null) {
-		_questionMetadataCache = readJson<SessionQuestionMetadata>(sessionQuestionMetadataPath(), {});
-	}
-	return _questionMetadataCache;
-}
-
-function writeSessionQuestionMetadata(meta: SessionQuestionMetadata): void {
-	_questionMetadataCache = meta;
-	writeJson(sessionQuestionMetadataPath(), meta);
-}
-
-function readSessionChannelMetadata(): SessionChannelMetadata {
-	return readJson<SessionChannelMetadata>(sessionChannelMetadataPath(), {});
-}
-
-function recordCurrentSessionChannel(
-	channel: SessionChannel,
-	explicitSessionId?: string,
-	options?: { setOriginIfEmpty?: boolean },
-): void {
-	const id = explicitSessionId || (() => {
-		const sessionFile = getSession().sessionFile;
-		return sessionFile ? basename(sessionFile) : "";
-	})();
-	if (!id) return;
-	const metadata = readSessionChannelMetadata();
-	const prev = metadata[id];
-	metadata[id] = {
-		channels: mergeChannels(prev?.channels ?? [], [channel]),
-		// origin is the immutable birthplace of the session: set once and never
-		// overwritten. Interaction tagging (e.g. a web session pushing a file to
-		// feishu) must NOT change origin, so it omits setOriginIfEmpty.
-		origin: prev?.origin ?? (options?.setOriginIfEmpty ? channel : undefined),
-		updatedAt: new Date().toISOString(),
+/**
+ * WeChat iLink token persistence backed by `tenant_state`: a worker restart on
+ * another host keeps the logged-in iLink session.
+ */
+function wechatTokenPersistence(): WechatTokenPersistence {
+	const ledger = new TenantJsonLedger<TokenData>(tenantState(), "wechat-token");
+	let cached: TokenData | undefined;
+	return {
+		read: () => cached,
+		write: (data) => {
+			cached = data;
+			void ledger.save(data).catch((err) => logger.error({ err }, "[wechat] failed to persist token"));
+		},
+		hydrate: async () => {
+			cached = await ledger.load();
+		},
 	};
-	writeJson(sessionChannelMetadataPath(), metadata);
 }
 
 /**
@@ -1359,24 +801,14 @@ function recordCurrentSessionChannel(
  * the session's birthplace IS the scheduler. Override the "web" origin that
  * POST /api/sessions stamped at creation time so the sidebar can badge it.
  */
-function recordJobRunSession(sessionId: string, req?: HttpReq): void {
+async function recordJobRunSession(sessionId: string, req?: HttpReq): Promise<void> {
 	if (!sessionId) return;
-	if (req && durableSessions.get(req, sessionId)) {
-		durableSessions.markSchedulerOrigin(req, sessionId);
+	if (req && await durableSessions.get(req, sessionId)) {
+		await durableSessions.markSchedulerOrigin(req, sessionId);
 		return;
 	}
-	const metadata = readSessionChannelMetadata();
-	const prev = metadata[sessionId];
-	metadata[sessionId] = {
-		channels: mergeChannels(prev?.channels ?? [], ["scheduler"]),
-		origin: "scheduler",
-		updatedAt: new Date().toISOString(),
-	};
-	writeJson(sessionChannelMetadataPath(), metadata);
-}
-
-async function generateSessionTopic(summary: SessionSummary, messages: SessionMessageSummary[]): Promise<string> {
-	return generateSessionTopicWithCompletion(summary, messages, completePromptOnce);
+	// The session does not exist on this worker (sharded deployment): the
+	// owner worker applies the scheduler origin when it claims the run.
 }
 
 /**
@@ -1392,144 +824,223 @@ async function generateSessionTopic(summary: SessionSummary, messages: SessionMe
  *    TOPIC_UPGRADE_MESSAGE_THRESHOLD messages — generate a richer summary
  *    once there is enough context.
  */
-const _pendingAutoTopics = new Set<string>();
-
-function maybeAutoGenerateTopic(sessionId: string): void {
-	const claimKey = `${getCurrentTenant()?.tenantId ?? "local"}:${sessionId}`;
-	if (!sessionId || _pendingAutoTopics.has(claimKey)) return;
-	const existing = readSessionTopicMetadata()[sessionId];
-	if (existing && (!existing.generated || existing.upgraded)) return;
-
-	const sessionPath = sessionFileFromId(join(dataDir, "sessions"), sessionId);
-	if (!sessionPath || !existsSync(sessionPath)) return;
-
-	_pendingAutoTopics.add(claimKey);
-	void (async () => {
-		try {
-			const parsed = parseSessionFile(sessionPath);
-			if (!parsed || parsed.messages.length < 2) return;
-			if (existing && parsed.messages.length < TOPIC_UPGRADE_MESSAGE_THRESHOLD) return;
-			const topic = existing
-				? await generateSessionTopic(parsed.summary, parsed.messages)
-				: fallbackTopicFromMessages(parsed.messages, parsed.summary);
-			writeSessionTopic(sessionId, topic, true, existing ? { upgraded: true } : undefined);
-			logger.info(`[auto-topic] ${sessionId} → ${topic}${existing ? " (upgraded)" : ""}`);
-		} catch (err) {
-			logger.warn({ err }, `auto-topic generation failed for ${sessionId}`);
-		} finally {
-			_pendingAutoTopics.delete(claimKey);
-		}
-	})();
-}
-
 // ---------------------------------------------------------------------------
 // HTTP Server
 // ---------------------------------------------------------------------------
 
-/**
- * The prompt currently holding the shared serial queue, if any. Only prompts
- * hold queue slots for a meaningful duration; switch/create are instant.
- */
-function getQueueBlocker(): { sessionId: string; turnId: string; questionPending: boolean } | null {
-	const token = getActivePromptToken();
-	if (!token) return null;
-	const state = streamRegistry.getByTurn(token);
-	if (!state || (state.status !== "queued" && state.status !== "running")) return null;
-	const pending = questionBridge.pendingInfo();
-	const pendingPermission = permissionBridge.pendingInfo();
-	return {
-		sessionId: state.sessionId,
-		turnId: state.turnId,
-		// A permission card parks the agent loop exactly like a question card.
-		questionPending: pending?.turnId === state.turnId || pendingPermission?.turnId === state.turnId,
-	};
-}
-
-/**
- * Session-retention policy (issue #124): a turn parked on a question card can
- * never progress without the user, yet it holds the shared prompt queue for
- * up to the 30-minute question timeout — blocking every session switch /
- * creation behind it. Navigating to a DIFFERENT session implicitly abandons
- * the card, so abort that turn to release the queue. Turns that are actively
- * generating are left alone (they end on their own; the user can still stop
- * them explicitly via the scoped abort endpoint).
- *
- * Mirrors the scoped abort route: cancel the registry state, resolve the
- * parked question (session.abort() alone cannot wake it), then abort.
- */
-function releaseQueueFromQuestionBlockedTurn(targetSessionId: string): void {
-	const blocker = getQueueBlocker();
-	if (!blocker || !blocker.questionPending || blocker.sessionId === targetSessionId) return;
-	const state = streamRegistry.getByTurn(blocker.turnId);
-	if (!state) return;
-	logger.info({ blockedSession: blocker.sessionId, turnId: blocker.turnId, targetSessionId }, "auto-aborting question-blocked turn to release the prompt queue");
-	streamRegistry.requestCancel(state);
-	questionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: "switched_away" });
-	permissionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: "switched_away" });
-	if (state.status === "running") void abortPromptForTurnToken(state.turnId);
-}
-
-/**
- * Run an enqueue-backed operation with a hard wait bound. If the queue is
- * held by a long turn the caller gets a 409 with blocker details instead of
- * hanging for minutes; a client disconnect cancels the still-queued task so
- * it never executes out from under a user who already gave up.
- */
-async function runQueueOpWithTimeout<T>(
-	_req: HttpReq,
-	res: ServerResponse,
-	op: (signal: AbortSignal) => Promise<T>,
-	timeoutMs = 8_000,
-): Promise<T | null> {
-	const aborter = new AbortController();
-	// res "close" with the response unfinished = the client went away. (req
-	// "close" is unusable here: it fires as soon as the request body is fully
-	// received, long before we answer.)
-	res.on("close", () => { if (!res.writableFinished) aborter.abort(); });
-	const timer = setTimeout(() => aborter.abort(), timeoutMs);
-	try {
-		return await op(aborter.signal);
-	} catch (err) {
-		if (isQueueTaskCancelled(err)) {
-			if (!res.writableFinished && !res.destroyed) {
-				json(res, 409, { error: "session_busy", blocking: getQueueBlocker() ?? undefined });
-			}
-			return null;
-		}
-		throw err;
-	} finally {
-		clearTimeout(timer);
+// Platform-level sandbox, built on first use because the config is loaded lazily.
+// Without a remote sandbox, INNO_EXEC_BACKEND=local runs every tool — bash
+// included — on this worker inside the session's workspace directory
+// (roadmap H5 phase 1); any other value keeps the workspace-file-only env.
+let sandboxManager: SandboxBindingProvider | null | undefined;
+function getSandboxManager(): SandboxBindingProvider | undefined {
+	if (sandboxManager === undefined) {
+		const sandboxConfig = normalizeSandboxConfig(config?.sandbox);
+		sandboxManager = sandboxConfig.enabled
+			? createSandboxManager(sandboxConfig, new PgSandboxQuotaStore(auth.tenantStore.database))
+			: process.env.INNO_EXEC_BACKEND === "local"
+				? new LocalExecManager({
+					...(workspaceReplica ? { replica: workspaceReplica } : {}),
+					maxConcurrent: Math.max(0, Number(process.env.INNO_EXEC_LOCAL_MAX_CONCURRENT) || 0),
+				})
+				: null;
+		if (sandboxManager) console.log(`[inno-server] ${sandboxConfig.enabled ? `sandbox enabled (${sandboxConfig.provider}, approval: ${sandboxConfig.requireApproval})` : "local execution backend enabled (bash runs on this worker)"}`);
 	}
+	return sandboxManager ?? undefined;
 }
 
 const durableSessions = new DurableSessionService({
 	dataDir,
+	getStateKv: () => tenantStateStore,
 	getLocalConfig: () => config,
-	enabled: process.env.INNO_DURABLE_ENABLED === "true",
+	enabled: true,
 	resolveWorkspaceDir: (sessionId, fallbackWorkspaceId) => workspaceRegistry.resolveWorkspaceDir(
 		workspaceRegistry.getSessionWorkspaceId(sessionId) || fallbackWorkspaceId,
 	) ?? undefined,
 	getChannelRegistry: () => channelRegistry,
+	skillsDir,
+	resolveCatalogSkillsSection: async ({ tenant, workspaceDir, extraSkillIds }) => {
+		try {
+			const catalog = getSkillCatalog();
+			const enabled = await catalog.listEnabledForTenant(tenant.tenantId);
+			const byId = new Map(enabled.map((row) => [row.skillId, row]));
+			for (const skillId of extraSkillIds ?? []) {
+				if (byId.has(skillId)) continue;
+				const row = await catalog.get(skillId);
+				if (row) byId.set(skillId, row);
+				else logger.warn({ skillId, tenantId: tenant.tenantId }, "preset-bound skill missing from catalog");
+			}
+			const skills = [...byId.values()];
+			if (skills.length === 0) return undefined;
+			return await buildCatalogSkillsSection({
+				objects: getSharedObjectStore(),
+				skills,
+				workspaceDir,
+			});
+		} catch (err) {
+			logger.warn({ err, tenantId: tenant.tenantId }, "catalog skills section failed; falling back to skillsDir");
+			return undefined;
+		}
+	},
+	resolvePresetAgentSection: (presetId) => readPresetAgentMd(paths, presetId),
+	resolvePresetSkillIds: (presetId) => {
+		try {
+			return resolvePresetMeta(paths, presetId).skills;
+		} catch {
+			return [];
+		}
+	},
+	getSchedulerTools: () => createSchedulerTools(jobStore, channelRegistry, checkInStore, {
+		// "Run this job now" from a conversation: give the run a durable session of its own.
+		runJob: async (job) => {
+			const created = await scheduledSessionFactory?.(job);
+			if (!created || typeof created === "string" || created.runtime !== "durable") {
+				throw new Error("Could not create a session for the scheduled job");
+			}
+			return executeJob(job, jobStore, channelRegistry, "manual", checkInStore, {
+				sessionId: created.id,
+				sessionRuntime: "durable",
+				durableExecutor: (execution) => executeDurableJob(backgroundTenantRequest(), execution),
+			});
+		},
+	}),
 	tenantStore: auth.tenantStore,
+	getSandboxManager,
+	workspaceStoreFor: workspaceStoreForRequest,
+	recoveryPool: auth.tenantStore.database,
+	objectStore: getSharedObjectStore(),
+	pgCatalog: new PgSessionCatalog(auth.tenantStore.database),
+	workspaceReplica: {
+		materializeSession: (tenant, sessionId, catalogWorkspaceId, options) =>
+			workspaceReplica
+				? workspaceReplica.materializeSessionWorkspace(tenant, sessionId, catalogWorkspaceId, options)
+				: Promise.resolve(catalogWorkspaceId || TEMP_WORKSPACE_ID),
+		pull: async (tenant, workspaceId, dir, options) => { await workspaceReplica?.pull(tenant, workspaceId, dir, options); },
+		materializeFile: async (tenant, workspaceId, dir, relPath) =>
+			workspaceReplica ? workspaceReplica.materializeFile(tenant, workspaceId, dir, relPath) : false,
+		push: async (tenant, workspaceId, dir) => { await workspaceReplica?.push(tenant, workspaceId, dir); },
+	},
 });
 
 const activeDurableJobTurns = new Map<string, string>();
 
+// Worker-to-worker internal prompt forwarding: when a session's lease is held
+// by another worker past the busy wait, internal prompts (scheduler jobs,
+// channel inbound) are handed to the owner over POST /api/internal/durable-prompt
+// authenticated by the shared INNO_WORKER_TOKEN. Without the token the endpoint
+// is 404 and forwarding is off — the busy error propagates exactly as before.
+const workerToken = process.env.INNO_WORKER_TOKEN?.trim() ?? "";
+const INTERNAL_FORWARD_TIMEOUT_MS = 600_000;
+const INTERNAL_PROMPT_PATH = "/api/internal/durable-prompt";
+
+interface InternalPromptPayload {
+	sessionId: string;
+	prompt: string;
+	requestId: string;
+	turnId: string;
+	notifyOnly?: boolean;
+}
+
+/** Forward an internal prompt to the worker recorded as the session owner. */
+async function forwardJobToOwner(tenant: TenantContext, execution: InternalPromptPayload): Promise<string | null> {
+	if (!workerToken || !durableShardConfig) return null;
+	const hint = await auth.tenantStore.durableSessionRouteHint(tenant, execution.sessionId);
+	const owner = hint.owner ?? hint.affinity;
+	if (!owner || owner === durableShardConfig.localShardId) return null;
+	const base = durableShardConfig.targets[owner];
+	if (!base) return null;
+	try {
+		const response = await fetch(new URL(INTERNAL_PROMPT_PATH, base), {
+			method: "POST",
+			headers: { "content-type": "application/json", "x-inno-worker-token": workerToken },
+			body: JSON.stringify(execution),
+			// The remote turn runs to completion inside this request; the timeout
+			// must exceed the longest expected job turn.
+			signal: AbortSignal.timeout(INTERNAL_FORWARD_TIMEOUT_MS),
+		});
+		if (!response.ok) return null;
+		const data = await response.json() as { text?: unknown };
+		return typeof data.text === "string" ? data.text : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Execute a forwarded internal prompt on the owner worker (no re-forward). */
+async function handleInternalDurablePrompt(req: HttpReq, res: ServerResponse): Promise<void> {
+	const presented = typeof req.headers["x-inno-worker-token"] === "string" ? req.headers["x-inno-worker-token"] : "";
+	const authenticated = Boolean(workerToken)
+		&& presented.length === workerToken.length
+		&& timingSafeEqual(Buffer.from(presented), Buffer.from(workerToken));
+	if (!authenticated) { json(res, 404, { error: "Not found" }); return; }
+	await ensureBootstrapped();
+	const body = await readBody(req) as Record<string, unknown>;
+	const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+	const prompt = typeof body.prompt === "string" ? body.prompt : "";
+	if (!sessionId || !prompt) { json(res, 400, { error: "sessionId and prompt are required" }); return; }
+	const requestId = typeof body.requestId === "string" && body.requestId ? body.requestId : `internal-${randomUUID()}`;
+	const turnId = typeof body.turnId === "string" && body.turnId ? body.turnId : `internal-${randomUUID()}`;
+	// The tenant comes from the session's own catalog row, never from the body;
+	// tenant_memberships joins need the owning user, taken from the tenant row.
+	const row = await auth.tenantStore.database.query<{ tenant_id: string; owner_user_id: string }>(
+		`SELECT sessions.tenant_id, tenants.owner_user_id
+		 FROM durable_sessions sessions JOIN tenants ON tenants.id = sessions.tenant_id
+		 WHERE sessions.id = $1`, [sessionId]);
+	const found = row.rows[0];
+	if (!found) { json(res, 404, { error: "Session not found" }); return; }
+	const breq = createBackgroundRequest({ tenantId: found.tenant_id, userId: found.owner_user_id, role: "owner" }, auth.tenantStore);
+	// Internal prompts bypass the cookie gate where tenant config is normally
+	// materialised — sync it here so the tenant's model/provider config exists.
+	try {
+		if (body.notifyOnly === true) {
+			await durableSessions.appendAssistantNotification(breq, sessionId, prompt, requestId, { busyWaitMs: DURABLE_JOB_BUSY_WAIT_MS });
+			json(res, 200, { text: prompt });
+			return;
+		}
+		const text = await runDurableJobPrompt(breq, durableSessions, sessionId, prompt, {
+			requestId, turnId, noUi: true, busyWaitMs: DURABLE_JOB_BUSY_WAIT_MS,
+		});
+		json(res, 200, { text });
+	} catch (error) {
+		if (error instanceof DurableSessionBusyError) { json(res, 409, { error: "Session is busy" }); return; }
+		logger.error({ err: error, sessionId }, "internal durable prompt failed");
+		json(res, 500, { error: error instanceof Error ? error.message : String(error) });
+	}
+}
+
 function backgroundTenantRequest(): HttpReq {
 	const tenant = getCurrentTenant();
-	if (!tenant) return createBackgroundRequest();
+	if (!tenant) throw new Error("Background durable execution requires a tenant context");
 	const store = getCurrentTenantStore();
 	if (!store) throw new Error("Background durable execution requires a tenant store");
 	return createBackgroundRequest(tenant, store);
 }
 
 async function executeDurableJob(req: HttpReq, execution: DurableJobExecution): Promise<string> {
+	const tenant = requireRequestTenant(req);
+	const forward = (payload: InternalPromptPayload) => forwardJobToOwner(tenant, payload);
+	// A reminder is recorded as a notice in the run's conversation; no model turn.
+	if (execution.notifyOnly) {
+		try {
+			await durableSessions.appendAssistantNotification(req, execution.sessionId, execution.prompt, execution.requestId, { busyWaitMs: DURABLE_JOB_BUSY_WAIT_MS });
+		} catch (error) {
+			if (forward && error instanceof DurableSessionBusyError) {
+				const text = await forward({ ...execution, notifyOnly: true });
+				if (text !== null) return text;
+			}
+			throw error;
+		}
+		return execution.prompt;
+	}
 	if (activeDurableJobTurns.has(execution.sessionId)) {
 		throw new Error("Durable session already has an active job run");
 	}
 	activeDurableJobTurns.set(execution.sessionId, execution.turnId);
 	try {
-		return await runDurableJobPrompt(req, durableSessions, execution.sessionId, execution.prompt, execution);
+		return await runDurableJobPrompt(req, durableSessions, execution.sessionId, execution.prompt, {
+			...execution,
+			...(forward ? { forwardToOwner: forward } : {}),
+		});
 	} finally {
 		if (activeDurableJobTurns.get(execution.sessionId) === execution.turnId) {
 			activeDurableJobTurns.delete(execution.sessionId);
@@ -1546,155 +1057,213 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		jobStore,
 		channelRegistry,
 		checkInStore,
-		resolveSession: (sessionId) => {
-			if (durableSessions.get(req, sessionId)) return { id: sessionId, runtime: "durable" };
-			const sessionPath = sessionFileFromId(paths.sessionDir, sessionId);
-			return sessionPath && existsSync(sessionPath) ? { id: sessionId, path: sessionPath, runtime: "legacy" } : null;
-		},
+		resolveSession: async (sessionId) => await durableSessions.get(req, sessionId) ? { id: sessionId, runtime: "durable" } : null,
 		createSession: async (request, job) => scheduledSessionFactory?.(job, request) ?? null,
 		durableExecutor: executeDurableJob,
-		durableRequired: authConfig.multiUserEnabled,
 		disconnectJobRun: (sessionId, turnId) => {
 			if (activeDurableJobTurns.get(sessionId) === turnId) {
-				durableSessions.cancelPermissionTurn(req, sessionId, turnId);
-				durableSessions.cancelQuestionTurn(req, sessionId, turnId);
+				void Promise.all([
+					durableSessions.cancelPermissionTurn(req, sessionId, turnId),
+					durableSessions.cancelQuestionTurn(req, sessionId, turnId),
+				]).catch((error) => logger.warn({ err: error, sessionId, turnId }, "cancelling a disconnected job run's pending prompts failed"));
 			}
 		},
 		recordJobRunSession,
 		tenantStore: auth.tenantStore,
 		abortJobRun: async (sessionId) => {
 			const durableTurnId = activeDurableJobTurns.get(sessionId);
-			if (durableTurnId && durableSessions.get(req, sessionId)) {
-				await durableSessions.abort(req, sessionId, durableTurnId);
-				return true;
-			}
-			const sessionPath = sessionFileFromId(paths.sessionDir, sessionId);
-			if (!sessionPath || !existsSync(sessionPath)) return false;
-			return abortJobPromptInSession(sessionPath);
+			if (!durableTurnId || !await durableSessions.get(req, sessionId)) return false;
+			await durableSessions.abort(req, sessionId, durableTurnId);
+			return true;
 		},
 	}),
 
 	// --- Channels + bridge (extracted to server/routes/channels.ts) ---
 	channels: (req, res, method, url) => handleChannelsRoutes(req, res, method, url, {
 		channelRegistry,
-		dataDir,
 		configPath: paths.configPath,
 		getConfig: () => config,
 		setConfig: (next) => { config = next; },
-		getDispatcher: () => tenantChannelManager ?? dispatcher,
-		getBridgeToken: () => bridgeToken,
-		handleBridge: auth.mode === "better-auth" ? async (authHeader, body) => {
+		getDispatcher: () => tenantChannelManager,
+		getBridgeToken: () => undefined,
+		handleBridge: async (authHeader, body) => {
 			const manager = tenantChannelManager!;
 			const token = bridgeBearerToken(authHeader);
-			const result = await manager.runWithBridgeToken(token, () => handleBridgeMessage({
+			const msg = body as { channel?: string; chatId?: string; userId?: string };
+			const result = await manager.runWithBridgeMessage(token, msg,
+				() => handleBridgeMessage({
+					token,
+					channelRegistry: manager,
+					dispatcher: manager,
+					requireChatId: true,
+				}, authHeader, body));
+			if (result !== null) return result;
+			if (!manager.hasBridgeToken(token)) {
+				return { status: 401, body: { ok: false as const, error: "Unauthorized" } };
+			}
+			// Valid sidecar token but no tenant claims this chat/user identity:
+			// still run the body validation so malformed messages get their 400,
+			// then reject the unroutable (well-formed) message.
+			const validated = handleBridgeMessage({
 				token,
 				channelRegistry: manager,
-				dispatcher: manager,
+				dispatcher: { handle: async () => {} },
 				requireChatId: true,
-			}, authHeader, body));
-			return result ?? { status: 401, body: { ok: false as const, error: "Unauthorized" } };
-		} : undefined,
-		reloadFeishuChannel,
-		getWechatChannel: () => tenantChannelManager ? tenantChannelManager.getWechatChannel() : wechatChannel,
-		setWechatChannel: (channel) => {
-			if (tenantChannelManager) tenantChannelManager.setWechatChannel(channel);
-			else wechatChannel = channel;
+			}, authHeader, body);
+			if (validated.status !== 200) return validated;
+			return { status: 401, body: { ok: false as const, error: "No tenant claims this channel identity" } };
 		},
-		startWechatChannel: auth.mode === "better-auth"
-			? (channel) => tenantChannelManager!.startWechatChannel(channel)
-			: undefined,
-		syncChannelOwnership: auth.mode === "better-auth"
-			? (previous, next) => tenantChannelManager!.syncOwnership(previous, next)
-			: undefined,
-		beginFeishuRegistration: auth.mode === "better-auth" ? () => tenantChannelManager!.beginFeishuRegistration() : undefined,
-		pollFeishuRegistration: auth.mode === "better-auth" ? (deviceCode) => tenantChannelManager!.pollFeishuRegistration(deviceCode) : undefined,
-		trackWechatQr: auth.mode === "better-auth" ? (qrId) => tenantChannelManager!.trackWechatQr(qrId) : undefined,
-		assertWechatQr: auth.mode === "better-auth" ? (qrId) => tenantChannelManager!.assertWechatQr(qrId) : undefined,
-		confirmWechatLogin: auth.mode === "better-auth"
-			? (qrId, botId, confirm) => tenantChannelManager!.confirmWechatLogin(qrId, botId, confirm)
-			: undefined,
+		reloadFeishuChannel,
+		ensureChannelsReady: () => tenantChannelManager!.ready(),
+		getWechatChannel: () => tenantChannelManager!.getWechatChannel(),
+		setWechatChannel: (channel) => tenantChannelManager!.setWechatChannel(channel),
+		startWechatChannel: (channel) => tenantChannelManager!.startWechatChannel(channel),
+		wechatTokenPersistence: () => wechatTokenPersistence(),
+		syncChannelOwnership: (previous, next) => tenantChannelManager!.syncOwnership(previous, next),
+		beginFeishuRegistration: () => tenantChannelManager!.beginFeishuRegistration(),
+		pollFeishuRegistration: (deviceCode) => tenantChannelManager!.pollFeishuRegistration(deviceCode),
+		trackWechatQr: (qrId) => tenantChannelManager!.trackWechatQr(qrId),
+		assertWechatQr: (qrId) => tenantChannelManager!.assertWechatQr(qrId),
+		confirmWechatLogin: (qrId, botId, confirm) => tenantChannelManager!.confirmWechatLogin(qrId, botId, confirm),
 	}),
 
 	// --- Skills API ---
 	skills: (req, res, method, url) => handleSkillsRoutes(req, res, method, url, {
-		skillsDir,
-		sharedSkillsReadOnly: auth.mode === "better-auth",
-		scheduleSkillsReload,
-		listProjectSkills,
-		setSkillEnabled,
-		installSkillZip,
-		installSkillMarkdown,
-		listSkillLibrary,
-		importSkillFromLibrary,
+		catalog: {
+			listForTenant: async () => {
+				const tenant = requireRequestTenant(req);
+				const rows = await getSkillCatalog().listForTenant(tenant.tenantId);
+				return rows.map(toCatalogSkillListing);
+			},
+			setEnabled: async (skillId, enabled) => {
+				const tenant = requireRequestTenant(req);
+				const row = await getSkillCatalog().setEnabled(tenant.tenantId, skillId, enabled);
+				return row ? toCatalogSkillListing(row) : null;
+			},
+			installPackage: async (fileName, data) => {
+				const tenant = requireRequestTenant(req);
+				const tempRoot = mkdtempSync(join(tmpdir(), "inno-skill-pub-"));
+				try {
+					const ext = extname(fileName).toLowerCase();
+					const installed = ext === ".zip"
+						? installSkillZip(fileName, data, tempRoot)
+						: installSkillMarkdown(fileName, data, tempRoot);
+					return await publishSkillDirToCatalog(join(tempRoot, installed.name), "upload", tenant);
+				} finally {
+					rmSync(tempRoot, { recursive: true, force: true });
+				}
+			},
+			describe: async (skillId) => {
+				const tenant = requireRequestTenant(req);
+				const record = await getSkillCatalog().getForTenant(skillId, tenant.tenantId);
+				if (!record) return null;
+				const manifest = await loadSkillManifest(record);
+				const listing = (await getSkillCatalog().listForTenant(tenant.tenantId))
+					.find((row) => row.skillId === skillId)
+					?? { ...record, enabled: false, installedAt: null };
+				return { entry: toCatalogSkillListing(listing), files: manifest.files };
+			},
+			readFile: async (skillId, relPath) => {
+				const tenant = requireRequestTenant(req);
+				const record = await getSkillCatalog().getForTenant(skillId, tenant.tenantId);
+				if (!record) return null;
+				const manifest = await loadSkillManifest(record);
+				const clean = relPath.replace(/^\/+/, "");
+				if (!clean || clean.split("/").some((part) => part === ".." || part === "")) return null;
+				if (!manifest.files.some((file) => file.relPath === clean)) return null;
+				return getSharedObjectStore().get(skillFileKey(record, clean));
+			},
+			writeFile: async (skillId, relPath, content) => {
+				const tenant = requireRequestTenant(req);
+				const record = await getSkillCatalog().get(skillId);
+				if (!record) return null;
+				if (record.ownerTenantId !== tenant.tenantId) {
+					throw Object.assign(new Error("Only the owning tenant can modify this skill"), { statusCode: 403 });
+				}
+				const tempRoot = mkdtempSync(join(tmpdir(), "inno-skill-edit-"));
+				try {
+					const dir = await materializeSkill(getSharedObjectStore(), record, tempRoot);
+					// materializeSkill drops the manifest copy into the root — it is
+					// bookkeeping, not package content, and must not be republished.
+					rmSync(join(dir, "_manifest.json"), { force: true });
+					const target = join(dir, relPath);
+					if (!existsSync(target) || !statSync(target).isFile()) return null;
+					writeFileSync(target, content, "utf-8");
+					const result = await publishSkillFromDir({
+						objects: getSharedObjectStore(),
+						catalog: getSkillCatalog(),
+						skillDir: dir,
+						source: "edit",
+						publishedBy: tenant.userId,
+					});
+					const listing = (await getSkillCatalog().listForTenant(tenant.tenantId))
+						.find((row) => row.skillId === result.skillId);
+					return listing ? toCatalogSkillListing(listing) : null;
+				} finally {
+					rmSync(tempRoot, { recursive: true, force: true });
+				}
+			},
+			delete: async (skillId) => {
+				const tenant = requireRequestTenant(req);
+				const record = await getSkillCatalog().get(skillId);
+				if (!record) return false;
+				if (record.ownerTenantId !== tenant.tenantId) {
+					throw Object.assign(new Error("Only the owning tenant can delete this skill"), { statusCode: 403 });
+				}
+				if (!(await getSkillCatalog().deleteForTenant(skillId, tenant.tenantId))) return false;
+				await getSharedObjectStore()
+					.deletePrefix(skillObjectsPrefix(record))
+					.catch((err) => logger.warn({ err, skillId }, "failed to delete published skill objects"));
+				return true;
+			},
+		},
 	}),
 
 	// --- Sessions API (extracted to server/routes/sessions.ts) ---
 	sessions: (req, res, method, url) => handleSessionsRoutes(req, res, method, url, {
-		workspaceRegistry, dataDir, paths, getContentSource, tenantStore: auth.tenantStore, durableSessions,
-		durableRequired: authConfig.multiUserEnabled,
-		getCachedPresetAvailability: (presetId) => contentHubCatalog.getCachedPresetAvailability(presetId),
-		parseSessionFile, sessionRevision,
-		readSessionChannelMetadata, sessionChannelMetadataPath,
-		readSessionTopicMetadata, sessionTopicMetadataPath, writeSessionTopic,
-		readSessionQuestionMetadata, writeSessionQuestionMetadata,
-		recordCurrentSessionChannel, generateSessionTopic,
-		sessionFileFromId, releaseQueueFromQuestionBlockedTurn, runQueueOpWithTimeout,
+		workspaceRegistry, paths, tenantStore: auth.tenantStore, durableSessions,
+		workspaceReplica,
 	}),
 
 	// --- Wiki + L2 raw upload API (extracted to server/routes/wiki.ts) ---
-	wiki: (req, res, method, url) => handleWikiRoutes(req, res, method, url, { l2DataDir, dataDir }),
+	wiki: (req, res, method, url) => handleWikiRoutes(req, res, method, url, { dataDir }),
 
-	// --- Learner profile API (extracted to server/routes/learner.ts) ---
-	learner: (req, res, method, url) => handleLearnerRoutes(req, res, method, url, { paths }),
 
 	// --- Workspace API + registry + session binding (extracted to server/routes/workspaces.ts) ---
 	workspaces: (req, res, method, url) => handleWorkspacesRoutes(req, res, method, url, {
-		workspaceRegistry, dataDir, paths, tenantStore: auth.tenantStore,
-		installSkillZip, installSkillMarkdown, scheduleSkillsReload, importWorkspaceZip,
-		sessionFileFromId,
-		releaseQueueFromQuestionBlockedTurn, runQueueOpWithTimeout,
+		workspaceRegistry, stateKv: tenantState(), paths, tenantStore: auth.tenantStore,
+		installSkillZip, installSkillMarkdown, scheduleSkillsReload, importWorkspaceZip, durableSessions,
+		workspaceReplica,
+		// Read routes serve from the manifest + object store in authenticated
+		// mode; local mode (and any test without a tenant) uses the filesystem.
+		workspaceStoreFor: workspaceStoreForRequest,
+		objects: getSharedObjectStore,
 	}),
 
 	// --- Presets API (extracted to server/routes/presets.ts) ---
-	presets: (req, res, method, url) => handlePresetsRoutes(req, res, method, url, { paths, listPresetLibrary }),
+	presets: (req, res, method, url) => handlePresetsRoutes(req, res, method, url, { paths }),
 
-	// --- Terminal sessions + Runs (extracted to server/routes/practice.ts) ---
-	practice: (req, res, method, url) => handlePracticeRoutes(req, res, method, url, {
-		workspaceRegistry, dataDir, terminalManager, runRecordStore, tenantStore: auth.tenantStore,
-		hostTerminalDisabled: auth.mode === "better-auth",
-	}),
-
-	// --- Settings + MCP API (extracted to server/routes/settings.ts) ---
+	// --- Settings API (extracted to server/routes/settings.ts) ---
 	settings: (req, res, method, url) => handleSettingsRoutes(req, res, method, url, {
 		paths,
 		getConfig: () => config,
 		setConfig: (next) => { config = next; },
 		reloadFeishuChannel,
-		syncChannelOwnership: auth.mode === "better-auth"
-			? (previous, next) => tenantChannelManager!.syncOwnership(previous, next)
-			: undefined,
+		syncChannelOwnership: (previous, next) => tenantChannelManager!.syncOwnership(previous, next),
 		scheduleSkillsReload,
-		invalidateContentSource,
+		invalidateSandbox: () => { sandboxManager = undefined; },
 	}),
-
-	// --- Slash commands API (extracted to server/routes/commands.ts) ---
-	commands: (req, res, method, url) => handleCommandsRoutes(req, res, method, url),
 
 	// --- Btw side-question API (extracted to server/routes/btw.ts) ---
 	btw: (req, res, method, url) => handleBtwRoutes(req, res, method, url, {
-		dataDir, sessionFileFromId, parseSessionFile, tenantStore: auth.tenantStore,
+		stateKv: tenantState(), tenantStore: auth.tenantStore,
 		durableSessions,
-		durableRequired: authConfig.multiUserEnabled,
 	}),
 
 	// --- Chat API (extracted to server/routes/chat.ts) ---
 	chat: (req, res, method, url) => handleChatRoutes(req, res, method, url, {
-		workspaceRegistry, dataDir, paths, tenantStore: auth.tenantStore, durableSessions,
-		durableRequired: authConfig.multiUserEnabled,
-		sessionFileFromId, releaseQueueFromQuestionBlockedTurn,
-		readSessionQuestionMetadata, writeSessionQuestionMetadata,
-		recordCurrentSessionChannel, maybeAutoGenerateTopic,
-		parseSessionFile, sessionRevision,
+		workspaceRegistry, tenantStore: auth.tenantStore, durableSessions,
+		workspaceReplica,
 	}),
 });
 
@@ -1735,6 +1304,19 @@ const server = createServer(async (req, response) => {
 			return;
 		}
 
+		// Process metrics for local scraping only: counters expose tenant-agnostic
+		// totals, but there is no auth here, so non-loopback callers get 404.
+		if (method === "GET" && path === "/metrics") {
+			const remote = req.socket.remoteAddress ?? "";
+			if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote)) {
+				json(res, 404, { error: "Not found" });
+				return;
+			}
+			res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
+			res.end(renderPrometheus());
+			return;
+		}
+
 		// Better Auth must receive the untouched request body and must not
 		// initialize the agent just to sign in or register.
 		if (path === "/api/auth" || path.startsWith("/api/auth/")) {
@@ -1745,38 +1327,66 @@ const server = createServer(async (req, response) => {
 		if (method === "GET" && path === "/api/session") {
 			const session = await auth.getSession(req);
 			json(res, 200, {
-				mode: auth.mode,
+				mode: "better-auth",
 				allowSignUp: auth.allowSignUp,
 				durableEnabled: durableSessions.enabled,
-				durableRequired: authConfig.multiUserEnabled,
+				durableRequired: true,
 				user: session?.principal ?? null,
 			});
 			return;
 		}
 
+		// Worker-to-worker prompt forwarding: token-authenticated, deliberately
+		// outside the cookie gate and the durable shard forwarder (it is already
+		// running on the intended owner; a busy session answers 409).
+		if (method === "POST" && path === INTERNAL_PROMPT_PATH) {
+			await handleInternalDurablePrompt(req, res);
+			return;
+		}
+
 		if (path.startsWith("/api/") && !isPublicApiRequest(method, path)) {
-			if (auth.mode === "better-auth" && !isTrustedOrigin(req.headers.origin, authConfig)) {
+			if (!isTrustedOrigin(req.headers.origin, authConfig)) {
 				throw new HttpError(403, "Untrusted request origin");
 			}
 			const session = await requireSession(req, res, auth);
-			if (auth.mode === "better-auth" && !session) return;
-			if (session && auth.tenantStore) {
-				const tenant = await auth.tenantStore.ensurePersonalTenant(session.principal.userId);
-				setRequestTenant(req, tenant, auth.tenantStore);
-				if (durableShardConfig && forwardDurableTenantRequest(req, res, tenant, durableShardConfig)) return;
+			if (!session) return;
+			const tenant = await auth.tenantStore.ensurePersonalTenant(session.principal.userId);
+			await getSkillCatalog().enableAllForTenant(tenant.tenantId).catch((err) => {
+				logger.warn({ err, tenantId: tenant.tenantId }, "failed to opt tenant into skill catalog");
+			});
+			if (durableShardConfig) {
+				const routedReq = await forwardDurableTenantRequest(req, res, tenant, durableShardConfig,
+					(sessionId) => auth.tenantStore.durableSessionRouteHint(tenant, sessionId));
+				if (!routedReq) return;
+				req = routedReq;
 			}
-		}
+			setRequestTenant(req, tenant, auth.tenantStore);
+			// Materialise the authoritative tenant config so this worker can
+			// serve tenant-scoped reads after taking over from another worker.
+			}
 
 		// Public sidecar callbacks have no cookie. Recover their tenant only from
 		// PostgreSQL token ownership, then forward the untouched body to the same
 		// durable owner before bootstrapping any local channel runtime. The owner
 		// repeats the bearer-token and ownership checks in the normal bridge route.
-		if (durableShardConfig && auth.tenantStore && method === "POST" && path === "/api/bridge/messages") {
-			const token = bridgeBearerToken(req.headers.authorization);
-			const tenant = token
-				? await auth.tenantStore.findResourceOwner("channel", bridgeChannelResourceId(token))
-				: null;
-			if (tenant && forwardDurableTenantRequest(req, res, tenant, durableShardConfig)) return;
+		if (durableShardConfig && method === "POST" && path === "/api/bridge/messages") {
+			// The bridge token is shared; the owning tenant is resolved from the
+			// claimed chat/user identity inside the buffered message body.
+			const buffered = await bufferBody(req);
+			let msg: { channel?: string; chatId?: string; userId?: string } = {};
+			try { msg = JSON.parse(buffered.toString("utf8")) as typeof msg; } catch { /* handled downstream */ }
+			const channel = typeof msg.channel === "string" ? msg.channel : "";
+			const ids = [
+				typeof msg.chatId === "string" && msg.chatId ? channelChatResourceId(channel, msg.chatId) : null,
+				typeof msg.userId === "string" && msg.userId ? channelUserResourceId(channel, msg.userId) : null,
+			].filter((id): id is string => Boolean(id));
+			let tenant: Awaited<ReturnType<typeof auth.tenantStore.findResourceOwner>> = null;
+			for (const id of ids) {
+				tenant = await auth.tenantStore.findResourceOwner("channel", id);
+				if (tenant) break;
+			}
+			req = replayBodyRequest(req, buffered);
+			if (tenant && !(await forwardDurableTenantRequest(req, res, tenant, durableShardConfig))) return;
 		}
 
 		// --- Lazy bootstrap on first API request ---
@@ -1834,161 +1444,9 @@ const server = createServer(async (req, response) => {
 });
 
 // ---------------------------------------------------------------------------
-// Terminal WebSocket setup (the bindTerminalWs helper references the lazy
-// terminalManager, but the upgrade handler only fires AFTER the first successful
-// bootstrap — terminal WebSocket connections can't happen before then).
-// ---------------------------------------------------------------------------
-
-const wss = new WebSocketServer({ noServer: true });
-server.on("upgrade", (req, socket, head) => {
-	void (async () => {
-		const url = req.url ?? "";
-		const m = /^\/api\/terminal\/sessions\/([^/?]+)\/ws$/.exec(url.split("?")[0]);
-		if (!m) { socket.destroy(); return; }
-		if (auth.mode === "better-auth" && !isTrustedOrigin(req.headers.origin, authConfig)) {
-			socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-			socket.destroy();
-			return;
-		}
-		const session = auth.mode === "better-auth" ? await auth.getSession(req) : null;
-		if (auth.mode === "better-auth" && !session) {
-			socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-			socket.destroy();
-			return;
-		}
-		if (auth.mode === "better-auth") {
-			const body = JSON.stringify({ error: HOST_TERMINAL_DISABLED_ERROR });
-			socket.write(`HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
-			socket.destroy();
-			return;
-		}
-		if (session && auth.tenantStore) {
-			const tenant = await auth.tenantStore.ensurePersonalTenant(session.principal.userId);
-			setRequestTenant(req, tenant, auth.tenantStore);
-		}
-		if (!bootstrapped) { socket.destroy(); return; }
-		const terminalId = decodeURIComponent(m[1]);
-		const ts = terminalManager.get(terminalId);
-		if (!ts || !await ownsRequestResource(req, auth.tenantStore, "terminal", terminalId)
-			|| !await ownsRequestResource(req, auth.tenantStore, "session", ts.sessionId)) {
-			socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-			socket.destroy();
-			return;
-		}
-		wss.handleUpgrade(req, socket, head, (ws) => {
-			bindTerminalWs(ws, terminalId);
-		});
-	})().catch((err) => {
-		logger.warn({ err }, "Terminal WebSocket authentication failed");
-		socket.destroy();
-	});
-});
-
-function sendTerminal(ws: WebSocket, event: ServerTerminalEvent): void {
-	if (ws.readyState === ws.OPEN) {
-		ws.send(JSON.stringify(event));
-	}
-}
-
-function bindTerminalWs(ws: WebSocket, terminalId: string): void {
-	const ts = terminalManager.get(terminalId);
-	if (!ts) {
-		sendTerminal(ws, { type: "error", message: "Terminal not found" });
-		ws.close();
-		return;
-	}
-
-	sendTerminal(ws, { type: "ready", sessionId: ts.sessionId, cwd: ts.cwd, workspaceId: ts.workspaceId });
-
-	const offData = ts.pty.onData((chunk: string) => {
-		const { cleaned, finishedRun } = terminalManager.processOutput(ts, chunk);
-		if (cleaned) {
-			terminalManager.recordOutput(ts, cleaned);
-			sendTerminal(ws, { type: "output", data: cleaned });
-		}
-		if (finishedRun) {
-			const run = terminalManager.finishActiveRun(ts, finishedRun.exitCode);
-			sendTerminal(ws, { type: "exit", code: finishedRun.exitCode, runId: run?.id });
-		}
-	});
-	const offExit = ts.pty.onExit(({ exitCode, signal }) => {
-		const run = terminalManager.finishActiveRun(ts, exitCode, signal ? String(signal) : undefined);
-		sendTerminal(ws, { type: "exit", code: exitCode, signal: signal ? String(signal) : undefined, runId: run?.id });
-		ws.close();
-	});
-
-	ws.on("message", (raw) => {
-		let event: ClientTerminalEvent;
-		try {
-			event = JSON.parse(raw.toString()) as ClientTerminalEvent;
-		} catch (err) {
-			sendTerminal(ws, { type: "error", message: "Invalid JSON" });
-			return;
-		}
-		switch (event.type) {
-			case "input":
-				if (typeof event.data === "string") ts.pty.write(event.data);
-				break;
-			case "resize":
-				if (typeof event.cols === "number" && typeof event.rows === "number") {
-					ts.pty.resize(event.cols, event.rows);
-				}
-				break;
-			case "run": {
-				if (typeof event.command !== "string" || !event.command.trim()) break;
-				if (event.command.length > 4096) {
-					sendTerminal(ws, { type: "error", message: "Command too long" });
-					break;
-				}
-				// Long sources (e.g. a model-generated code block) travel as file
-				// content instead of an inlined command, which would hit the 4096
-				// limit above. The file lands in the terminal's cwd before the run.
-				if (typeof event.content === "string" && event.content && event.sourceFile) {
-					try {
-						writeRunFile(ts.cwd, event.sourceFile, event.content);
-					} catch (err) {
-						sendTerminal(ws, { type: "error", message: err instanceof Error ? err.message : "Failed to write run file" });
-						break;
-					}
-				}
-				const record = terminalManager.startRun(ts, event.command, event.sourceFile);
-				sendTerminal(ws, { type: "run_started", runId: record.id, command: event.command });
-				break;
-			}
-			case "close":
-				ws.close();
-				break;
-		}
-	});
-
-	ws.on("close", () => {
-		offData();
-		offExit();
-		terminalManager.finishActiveRun(ts, null);
-	});
-}
-
-// ---------------------------------------------------------------------------
 // Start listening immediately — /health and static files work right away.
 // All other endpoints call ensureBootstrapped() lazily on first request.
 // ---------------------------------------------------------------------------
-
-// Inject persistence callbacks into questionBridge so pending question cards
-// survive a full process restart.
-questionBridge.setPersistence({
-	save: (sessionId, question) => {
-		const meta = readSessionQuestionMetadata();
-		meta[sessionId] = question;
-		writeSessionQuestionMetadata(meta);
-	},
-	remove: (sessionId) => {
-		const meta = readSessionQuestionMetadata();
-		if (sessionId in meta) {
-			delete meta[sessionId];
-			writeSessionQuestionMetadata(meta);
-		}
-	},
-});
 
 // Process-level last resort: a stray rejection or an exception escaping a
 // catch block would otherwise kill the process silently (or via a secondary
@@ -1999,13 +1457,11 @@ questionBridge.setPersistence({
 installProcessFallbacks({
 	onFatal: () => {
 		try { server.close(); } catch { /* best effort */ }
-		try { wss.close(); } catch { /* best effort */ }
 	},
 });
 
 const gracefulShutdown = createGracefulShutdownHandler({
 	server,
-	wss,
 	exit: (code) => process.exit(code),
 	onClose: async () => {
 		scheduler?.stop();

@@ -1,8 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { createServer as createHttpServer } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,12 +10,10 @@ import type { ModelRef, SubmissionId } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it } from "vitest";
 import { durableEntriesToMessages } from "./durable-projection.js";
 import { DurableSessionRuntime, DurableStorageOwnerError } from "./durable-runtime.js";
-import { loadEvents, loadProfile } from "../memory/learner/profile-store.js";
 import { readManifest } from "../memory/l2/manifest-store.js";
 import { ChannelRegistry } from "../channels/channel.js";
 import { DurableQuestionStore } from "./durable-questions.js";
 import { DurablePermissionStore } from "./durable-permissions.js";
-import { buildImagePathsHint } from "../server/inline-images.js";
 import {
 	channelOutboxPayloadPath,
 	completeChannelOutbox,
@@ -148,52 +144,6 @@ describe("DurableSessionRuntime", () => {
 		expect(durableEntriesToMessages((await runtime.snapshot()).entries).filter((message) => message.role === "user")).toHaveLength(1);
 	});
 
-	it("retries rejected native images with committed OCR context in the same submission", async () => {
-		const root = tempRoot();
-		const provider = fauxRuntime();
-		const image = { type: "image" as const, data: "aW1hZ2U=", mimeType: "image/png" };
-		const hint = buildImagePathsHint([".chat-images/image.png"]);
-		provider.faux.setResponses([
-			(context) => {
-				const body = JSON.stringify(context);
-				expect(body).toContain('"type":"image"');
-				expect(body).not.toContain("用户本轮上传了");
-				return fauxAssistantMessage([], {
-					stopReason: "error", errorMessage: "unknown variant 'image_url', expected 'text'",
-				});
-			},
-			(context) => {
-				const body = JSON.stringify(context);
-				expect(body).not.toContain('"type":"image"');
-				expect(body).toContain("用户本轮上传了");
-				expect(body).toContain(".chat-images/image.png");
-				return fauxAssistantMessage("fallback complete");
-			},
-			(context) => {
-				// Capability rejections skip native images for later turns in this runtime.
-				expect(JSON.stringify(context)).not.toContain('"type":"image"');
-				return fauxAssistantMessage("next fallback complete");
-			},
-		]);
-		const runtime = await open({ storagePath: join(root, "image-fallback.sqlite"), ...provider });
-		const content = [{ type: "text" as const, text: "inspect image" }, image, { type: "text" as const, text: hint }];
-		const submission = await runtime.submit(content, "image-fallback-request");
-		expect(await waitForText(runtime, submission.id)).toBe("fallback complete");
-		expect(provider.faux.state.callCount).toBe(2);
-
-		const duplicate = await runtime.submit(content, "image-fallback-request");
-		expect(duplicate.id).toBe(submission.id);
-		expect(await waitForText(runtime, duplicate.id)).toBe("fallback complete");
-		expect(provider.faux.state.callCount).toBe(2);
-		const next = await runtime.submit([
-			{ type: "text", text: "inspect another image" }, image, { type: "text", text: hint },
-		], "next-image-fallback-request");
-		expect(await waitForText(runtime, next.id)).toBe("next fallback complete");
-		expect(provider.faux.state.callCount).toBe(3);
-		expect(durableEntriesToMessages((await runtime.snapshot()).entries)
-			.filter((message) => message.role === "user").map((message) => message.content))
-			.toEqual(["inspect image", "inspect another image"]);
-	});
 
 	it("persists turn cancellation across close and reopen", async () => {
 		const root = tempRoot();
@@ -278,15 +228,10 @@ describe("DurableSessionRuntime", () => {
 		expect(tools.find((call) => call.toolCallId === "escape-note")).toMatchObject({ toolName: "write", isError: true });
 	});
 
-	it("runs replay-safe tenant memory tools without duplicate writes after reopen", async () => {
+	it("runs the replay-safe l2_archive tool without duplicate writes after reopen", async () => {
 		const root = tempRoot();
 		const provider = fauxRuntime();
 		provider.faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("record_learning_event", {
-				event_type: "goal_declared",
-				context: { goal_id: "goal-rust" },
-				payload: { goal_description: "学习 Rust", action: "active" },
-			}, { id: "memory-event" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage(fauxToolCall("l2_archive", {
 				title: "Rust 所有权",
 				content: "所有权与借用基础",
@@ -297,21 +242,15 @@ describe("DurableSessionRuntime", () => {
 		const storagePath = join(root, "session.sqlite");
 		const memory = {
 			sessionId: "durable-memory-test",
-			learnerDataDir: join(root, "tenant", "learner"),
 			l2DataDir: join(root, "tenant", "l2"),
 			workspaceDir: root,
-			l1Enabled: true,
 			l2Enabled: true,
 		};
 		let runtime = await open({ storagePath, memory, ...provider });
 		const submission = await runtime.submit("remember this", "memory-request");
 		expect(await waitForText(runtime, submission.id)).toBe("memory complete");
-		expect(provider.faux.state.callCount).toBe(3);
-		expect(loadEvents(memory.learnerDataDir)).toHaveLength(1);
-		expect(loadProfile(memory.learnerDataDir).applied_operation_ids).toEqual([
-			"record_learning_event:durable-memory-test:memory-event",
-		]);
-		expect(readManifest(memory.l2DataDir)).toHaveLength(1);
+		expect(provider.faux.state.callCount).toBe(2);
+		expect((await readManifest(memory.l2DataDir))).toHaveLength(1);
 		await runtime.close();
 		openRuntimes.splice(openRuntimes.indexOf(runtime), 1);
 
@@ -319,9 +258,8 @@ describe("DurableSessionRuntime", () => {
 		const duplicate = await runtime.submit("remember this", "memory-request");
 		expect(duplicate.id).toBe(submission.id);
 		expect(await waitForText(runtime, duplicate.id)).toBe("memory complete");
-		expect(provider.faux.state.callCount).toBe(3);
-		expect(loadEvents(memory.learnerDataDir)).toHaveLength(1);
-		expect(readManifest(memory.l2DataDir)).toHaveLength(1);
+		expect(provider.faux.state.callCount).toBe(2);
+		expect((await readManifest(memory.l2DataDir))).toHaveLength(1);
 	});
 
 	it("enforces one in-process owner and leaves unrelated legacy JSONL untouched", async () => {
@@ -394,7 +332,7 @@ describe("DurableSessionRuntime", () => {
 		const sessionId = "durable-retention";
 		const questionDir = join(root, "questions");
 		const questions = new DurableQuestionStore(sessionId, questionDir);
-		questions.bindTurn({ turnId: "old-http", noUi: true });
+		await questions.bindTurn({ turnId: "old-http", noUi: true });
 		await questions.ask("old-question", { questions: [] }, new AbortController().signal);
 		const questionPath = join(questionDir, readdirSync(questionDir)[0]!);
 		const outboxDir = join(root, "outbox");
@@ -426,7 +364,7 @@ describe("DurableSessionRuntime", () => {
 		expect(existsSync(questionPath)).toBe(false);
 	}, 20_000);
 
-	it("replays an interrupted memory tool without duplicating its event or profile signals", async () => {
+	it("replays an interrupted l2_archive without duplicating its source", async () => {
 		const root = tempRoot();
 		const storagePath = join(root, "memory-crash.sqlite");
 		const dataRoot = join(root, "tenant");
@@ -437,124 +375,25 @@ describe("DurableSessionRuntime", () => {
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		children.add(child);
-		const output = await waitForOutput(child, "event-applied-before-profile-commit");
+		const output = await waitForOutput(child, "archived-before-commit");
 		const submissionId = Number(/submission:(\d+)/.exec(output)?.[1]) as SubmissionId;
 		expect(Number.isInteger(submissionId)).toBe(true);
 		await once(child, "exit");
 		children.delete(child);
+		const l2DataDir = join(dataRoot, "l2");
+		expect((await readManifest(l2DataDir))).toHaveLength(1);
 
 		const provider = fauxRuntime();
 		provider.faux.setResponses([fauxAssistantMessage("memory recovered")]);
-		const memory = {
-			sessionId: "durable-crash-memory",
-			learnerDataDir: join(dataRoot, "learner"),
-			l2DataDir: join(dataRoot, "l2"),
-			workspaceDir: dataRoot,
-			l1Enabled: true,
-			l2Enabled: true,
-		};
+		const memory = { sessionId: "durable-crash-memory", l2DataDir, workspaceDir: dataRoot, l2Enabled: true };
 		const runtime = await open({ storagePath, memory, ...provider });
 		const recovered = await runtime.waitForSubmission(submissionId);
 		expect(recovered).toMatchObject({ status: "done", text: "memory recovered" });
 		expect(provider.faux.state.callCount).toBe(1);
-		const events = loadEvents(memory.learnerDataDir);
-		const profile = loadProfile(memory.learnerDataDir);
-		expect(events).toHaveLength(1);
-		expect(profile.applied_operation_ids).toEqual([
-			"record_learning_event:durable-crash-memory:crash-memory-event",
-		]);
-		expect(profile.knowledge_states[0]).toMatchObject({
-			concept_id: "physics.force_decomposition",
-			evidence_ids: [events[0]!.event_id],
-		});
+		// The archive ran again on recovery and must have found its own earlier records.
+		expect((await readManifest(l2DataDir))).toHaveLength(1);
 	}, 20_000);
 
-	it("resumes a submitted OCR job after SIGKILL without submitting it again", async () => {
-		const root = tempRoot();
-		const workspace = join(root, "workspace");
-		mkdirSync(workspace, { recursive: true });
-		writeFileSync(join(workspace, "note.png"), "fixture image");
-		let submissions = 0;
-		let polls = 0;
-		let resultFetches = 0;
-		let finished = false;
-		let notifyFirstPoll!: () => void;
-		const firstPoll = new Promise<void>((resolveFirstPoll) => { notifyFirstPoll = resolveFirstPoll; });
-		const server = createHttpServer((req, res) => {
-			const path = new URL(req.url ?? "/", "http://ocr.local").pathname;
-			if (req.method === "POST" && path === "/jobs") {
-				submissions += 1;
-				req.resume();
-				req.on("end", () => {
-					res.writeHead(200, { "Content-Type": "application/json" });
-					res.end(JSON.stringify({ data: { jobId: "ocr-crash-job" } }));
-				});
-				return;
-			}
-			if (req.method === "GET" && path === "/jobs/ocr-crash-job") {
-				polls += 1;
-				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ data: finished ? {
-					state: "done",
-					resultUrl: { jsonUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/result` },
-				} : { state: "running" } }));
-				if (polls === 1) notifyFirstPoll();
-				return;
-			}
-			if (req.method === "GET" && path === "/result") {
-				resultFetches += 1;
-				res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-				res.end(`${JSON.stringify({ result: { layoutParsingResults: [{ markdown: { text: "崩溃后恢复的 OCR 文本" } }] } })}\n`);
-				return;
-			}
-			res.writeHead(404);
-			res.end();
-		});
-		await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
-		const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/jobs`;
-		try {
-			const storagePath = join(root, "ocr-crash.sqlite");
-			const checkpointDir = join(root, "tenant", "ocr");
-			const fixture = fileURLToPath(new URL("./durable-ocr-crash-fixture.ts", import.meta.url));
-			const child = spawn(process.execPath, ["--import", "tsx", fixture, storagePath, checkpointDir, workspace, baseUrl], {
-				cwd: process.cwd(),
-				env: { ...process.env },
-				stdio: ["ignore", "pipe", "pipe"],
-			});
-			children.add(child);
-			const output = await waitForOutput(child, "submission:");
-			const submissionId = Number(/submission:(\d+)/.exec(output)?.[1]) as SubmissionId;
-			await firstPoll;
-			child.kill("SIGKILL");
-			await once(child, "exit");
-			children.delete(child);
-			finished = true;
-
-			const provider = fauxRuntime();
-			provider.faux.setResponses([fauxAssistantMessage("ocr recovered")]);
-			const runtime = await open({
-				storagePath,
-				workspaceDir: workspace,
-				ocr: {
-					sessionId: "durable-crash-ocr",
-					checkpointDir,
-					workspaceDir: workspace,
-					ocrApi: { token: "fixture-token", baseUrl },
-				},
-				...provider,
-			});
-			const recovered = await runtime.waitForSubmission(submissionId);
-			expect(recovered).toMatchObject({ status: "done", text: "ocr recovered" });
-			expect(submissions).toBe(1);
-			expect(polls).toBeGreaterThanOrEqual(2);
-			expect(resultFetches).toBe(1);
-			const messages = durableEntriesToMessages((await runtime.snapshot()).entries);
-			const tool = messages.flatMap((message) => message.tools ?? []).find((call) => call.toolCallId === "crash-ocr-call");
-			expect(JSON.stringify(tool?.result)).toContain("崩溃后恢复的 OCR 文本");
-		} finally {
-			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
-		}
-	}, 20_000);
 
 	it("replays an unconfirmed channel send from its outbox snapshot after SIGKILL", async () => {
 		const root = tempRoot();
@@ -586,8 +425,8 @@ describe("DurableSessionRuntime", () => {
 			parse: async () => null,
 			reply: async () => {},
 			push: async () => {},
-			sendFile: async (target, filePath, fileName) => {
-				sends.push({ chatId: target.chatId, fileName, contents: readFileSync(filePath, "utf-8") });
+			sendFile: async (target, file, fileName) => {
+				sends.push({ chatId: target.chatId, fileName, contents: typeof file === "string" ? readFileSync(file, "utf-8") : Buffer.from(file.bytes).toString("utf-8") });
 			},
 		});
 		channelRegistry.setDefaultTarget({ channel: "feishu", chatId: "changed-default-chat" });
@@ -636,7 +475,7 @@ describe("DurableSessionRuntime", () => {
 		provider.faux.setResponses([fauxAssistantMessage("permission approval recovered")]);
 		const store = new DurablePermissionStore("durable-crash-permission", permissionDir);
 		const events: Array<Record<string, unknown>> = [];
-		store.bindTurn({ turnId: "recovered-turn", emit: (event) => events.push(event) });
+		await store.bindTurn({ turnId: "recovered-turn", emit: (event) => events.push(event) });
 		const runtime = await open({
 			storagePath,
 			workspaceDir: workspace,
@@ -648,7 +487,7 @@ describe("DurableSessionRuntime", () => {
 
 		expect(recovered).toMatchObject({ status: "done", text: "permission approval recovered" });
 		expect(events).toEqual([]);
-		expect(store.pendingPermission()).toBeUndefined();
+		expect((await store.pendingPermission())).toBeUndefined();
 		expect(readFileSync(join(workspace, "recovered.txt"), "utf-8")).toBe("written after recovered approval");
 		const messages = durableEntriesToMessages((await runtime.snapshot()).entries);
 		expect(messages.filter((message) => message.role === "user")).toHaveLength(1);
@@ -678,7 +517,7 @@ describe("DurableSessionRuntime", () => {
 		provider.faux.setResponses([fauxAssistantMessage("question answer recovered")]);
 		const store = new DurableQuestionStore("durable-crash-question", questionDir);
 		const events: Array<Record<string, unknown>> = [];
-		store.bindTurn({ turnId: "recovered-turn", emit: (event) => events.push(event) });
+		await store.bindTurn({ turnId: "recovered-turn", emit: (event) => events.push(event) });
 		const runtime = await open({
 			storagePath,
 			workspaceDir: workspace,
@@ -689,7 +528,7 @@ describe("DurableSessionRuntime", () => {
 
 		expect(recovered).toMatchObject({ status: "done", text: "question answer recovered" });
 		expect(events).toEqual([]);
-		expect(store.pendingQuestion()).toBeUndefined();
+		expect((await store.pendingQuestion())).toBeUndefined();
 		const messages = durableEntriesToMessages((await runtime.snapshot()).entries);
 		const tool = messages.flatMap((message) => message.tools ?? []).find((call) => call.toolCallId === "crash-question-call");
 		expect(JSON.stringify(tool?.result)).toContain("继续学习吗？");

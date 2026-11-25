@@ -3,7 +3,7 @@ import type { AssistantMessage, Message, ToolResultMessage } from "@earendil-wor
 import type { ChatStreamEvent } from "../chat/stream-registry.js";
 import type { SessionMessageSummary, SessionSummary } from "../server/session-model.js";
 import { isChatAttachmentContext } from "../server/attachments.js";
-import { isImagePathsHint } from "../server/inline-images.js";
+import { isImagePathsHint, isNativeImageMarker } from "../server/inline-images.js";
 import { isRecallPromptContext } from "../memory/l3/recall.js";
 
 function textContent(message: Message): string {
@@ -21,7 +21,7 @@ function userTextContent(message: Extract<Message, { role: "user" }>): string {
 	const textBlocks = message.content.filter((block) => block.type === "text");
 	return textBlocks
 		.filter((block, index) => index === 0 || !isChatAttachmentContext(block.text)
-			&& !isImagePathsHint(block.text) && !isRecallPromptContext(block.text))
+			&& !isImagePathsHint(block.text) && !isNativeImageMarker(block.text) && !isRecallPromptContext(block.text))
 		.map((block) => block.text)
 		.join("\n")
 		.trim();

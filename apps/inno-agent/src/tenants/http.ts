@@ -1,6 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import type { ResourceKind, TenantContext, TenantStore } from "./store.js";
 import { enterTenantContext } from "./current.js";
+import { HttpError } from "../server/http-helpers.js";
 
 const requestTenants = new WeakMap<IncomingMessage, TenantContext>();
 
@@ -12,6 +13,14 @@ export function setRequestTenant(req: IncomingMessage, context: TenantContext, s
 
 export function getRequestTenant(req: IncomingMessage): TenantContext | null {
 	return requestTenants.get(req) ?? null;
+}
+
+/** Every authenticated request carries a verified tenant — a missing context
+ * is a server wiring bug, not a mode. */
+export function requireRequestTenant(req: IncomingMessage): TenantContext {
+	const tenant = requestTenants.get(req);
+	if (!tenant) throw new HttpError(500, "Missing tenant context on an authenticated request");
+	return tenant;
 }
 
 /** Internal request-shaped scope for background services that already restore
@@ -27,36 +36,27 @@ export function createBackgroundRequest(context?: TenantContext, store?: TenantS
 
 export async function ownsRequestResource(
 	req: IncomingMessage,
-	store: TenantStore | null | undefined,
+	store: TenantStore,
 	kind: ResourceKind,
 	resourceId: string,
 ): Promise<boolean> {
-	const tenant = getRequestTenant(req);
-	if (!tenant) return true;
-	if (!store) throw new Error("Tenant store is required for an authenticated request");
-	return store.ownsResource(tenant, kind, resourceId);
+	return store.ownsResource(requireRequestTenant(req), kind, resourceId);
 }
 
 export async function claimRequestResource(
 	req: IncomingMessage,
-	store: TenantStore | null | undefined,
+	store: TenantStore,
 	kind: ResourceKind,
 	resourceId: string,
 ): Promise<void> {
-	const tenant = getRequestTenant(req);
-	if (!tenant) return;
-	if (!store) throw new Error("Tenant store is required for an authenticated request");
-	await store.claimResource(tenant, kind, resourceId);
+	await store.claimResource(requireRequestTenant(req), kind, resourceId);
 }
 
 export async function releaseRequestResource(
 	req: IncomingMessage,
-	store: TenantStore | null | undefined,
+	store: TenantStore,
 	kind: ResourceKind,
 	resourceId: string,
 ): Promise<void> {
-	const tenant = getRequestTenant(req);
-	if (!tenant) return;
-	if (!store) throw new Error("Tenant store is required for an authenticated request");
-	await store.releaseResource(tenant, kind, resourceId);
+	await store.releaseResource(requireRequestTenant(req), kind, resourceId);
 }

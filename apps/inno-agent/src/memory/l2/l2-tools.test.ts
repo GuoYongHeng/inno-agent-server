@@ -44,17 +44,21 @@ function fakeMemory(root: string): L2Memory {
 	} as unknown as L2Memory;
 }
 
+/** Model access handed to the tools under test; set per call by executeTool. */
+let richForCall: { model: unknown; modelRegistry: unknown } | undefined;
+const richProvider = () => richForCall as never;
+
 function executeTool(
 	tool: ReturnType<typeof createL2Tools>[number],
 	callId: string,
 	params: Record<string, unknown>,
-	legacy: { model?: unknown; modelRegistry?: unknown } = {},
+	rich: { model?: unknown; modelRegistry?: unknown } = {},
 ) {
+	richForCall = rich.model && rich.modelRegistry ? { model: rich.model, modelRegistry: rich.modelRegistry } : undefined;
 	return (tool.execute as (...args: any[]) => Promise<any>)(
 		params,
 		{
 			callId,
-			innoLegacy: legacy,
 			output: vi.fn(),
 			details: vi.fn(async () => undefined),
 		},
@@ -63,7 +67,7 @@ function executeTool(
 }
 
 async function archive(root: string, content: string) {
-	const tool = createL2Tools(root, undefined, fakeMemory(root))[0];
+	const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
 	return executeTool(
 		tool,
 		"call-1",
@@ -106,7 +110,7 @@ describe("l2_archive", () => {
 		const root = makeTempDir();
 		await archive(root, "正文包含 [[间隔重复]] 概念。");
 
-		const entries = readManifest(root);
+		const entries = (await readManifest(root));
 		expect(entries).toHaveLength(1);
 		expect(entries[0].status).toBe("indexed");
 		expect(readFileSync(join(root, entries[0].rawPath), "utf8")).toContain("间隔重复");
@@ -123,13 +127,13 @@ describe("l2_archive", () => {
 		await archive(root, "完全相同的资料");
 		const duplicate = await archive(root, "完全相同的资料");
 
-		expect(readManifest(root)).toHaveLength(1);
+		expect((await readManifest(root))).toHaveLength(1);
 		expect(duplicate.details).toMatchObject({ duplicate: true });
 	});
 
 	it("keeps durable archive deterministic even when a model context is available", async () => {
 		const root = makeTempDir();
-		const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, true)[0];
+		const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, true, richProvider)[0];
 		await executeTool(
 			tool,
 			"durable-call-1",
@@ -139,20 +143,20 @@ describe("l2_archive", () => {
 
 		expect(summarizeContentMock).not.toHaveBeenCalled();
 		expect(generateRichWikiPagesMock).not.toHaveBeenCalled();
-		expect(readManifest(root)).toHaveLength(1);
-		expect(readManifest(root)[0].status).toBe("indexed");
+		expect((await readManifest(root))).toHaveLength(1);
+		expect((await readManifest(root))[0].status).toBe("indexed");
 	});
 
 	it("re-ingests indexed content when a recorded wiki page is missing", async () => {
 		const root = makeTempDir();
 		const content = "页面缺失后应重新摄入的资料";
 		await archive(root, content);
-		const first = readManifest(root)[0];
+		const first = (await readManifest(root))[0];
 		const firstId = first.id;
 		rmSync(join(root, first.wikiPages[0]));
 
 		const result = await archive(root, content);
-		const entries = readManifest(root);
+		const entries = (await readManifest(root));
 
 		expect(result.details).not.toMatchObject({ duplicate: true });
 		expect(entries).toHaveLength(1);
@@ -164,12 +168,12 @@ describe("l2_archive", () => {
 		const root = makeTempDir();
 		const content = "来源文件缺失后应重新摄入的资料";
 		await archive(root, content);
-		const first = readManifest(root)[0];
+		const first = (await readManifest(root))[0];
 		rmSync(join(root, first.rawPath));
 		rmSync(join(root, first.extractedPath!));
 
 		const result = await archive(root, content);
-		const [entry] = readManifest(root);
+		const [entry] = (await readManifest(root));
 
 		expect(result.details).not.toMatchObject({ duplicate: true });
 		expect(entry.id).toBe(first.id);
@@ -184,7 +188,7 @@ describe("l2_archive", () => {
 		const content = `${"前置内容。\n\n".repeat(6_000)}末尾定义 [[尾部概念]]。`;
 		await archive(root, content);
 
-		const entry = readManifest(root)[0];
+		const entry = (await readManifest(root))[0];
 		const linkedPage = entry.wikiPages.find((pagePath) => pagePath.includes("尾部概念"));
 		expect(linkedPage).toBeDefined();
 		expect(readFileSync(join(root, linkedPage!), "utf8")).toContain(entry.id);
@@ -195,13 +199,13 @@ describe("l2_archive", () => {
 		const titles = Array.from({ length: 22 }, (_, index) => `概念${index + 1}`);
 		await archive(root, titles.map((title) => `[[${title}]]`).join("、"));
 
-		const entry = readManifest(root)[0];
+		const entry = (await readManifest(root))[0];
 		const sourcePage = readFileSync(join(root, entry.wikiPages[0]), "utf8");
 		expect(entry.wikiPages).toHaveLength(21);
 		expect(sourcePage).toContain("[[概念20]]");
 		expect(sourcePage).toContain("概念21");
 		expect(sourcePage).not.toContain("[[概念21]]");
-		expect(runL2Lint(root).findings.filter((finding) => finding.code === "dangling_link")).toEqual([]);
+		expect((await runL2Lint(root)).findings.filter((finding) => finding.code === "dangling_link")).toEqual([]);
 	});
 
 	it("resumes an incomplete manifest record instead of duplicating the source", async () => {
@@ -211,7 +215,7 @@ describe("l2_archive", () => {
 		const extractedPath = "extracted/existing.md";
 		writeText(join(root, rawPath), content);
 		writeText(join(root, extractedPath), content);
-		upsertManifest(root, {
+		(await upsertManifest(root, {
 			id: "l2src_resume1",
 			title: "学习资料",
 			sourceType: "markdown",
@@ -224,10 +228,10 @@ describe("l2_archive", () => {
 			source: { origin: "user_upload" },
 			createdAt: "2026-07-30T00:00:00.000Z",
 			updatedAt: "2026-07-30T00:00:00.000Z",
-		});
+		}));
 
 		await archive(root, content);
-		const entries = readManifest(root);
+		const entries = (await readManifest(root));
 		expect(entries).toHaveLength(1);
 		expect(entries[0]).toMatchObject({ id: "l2src_resume1", rawPath, extractedPath, status: "indexed" });
 	});
@@ -235,7 +239,7 @@ describe("l2_archive", () => {
 	it("records a partial rich write as retryable after source/index metadata has been updated", async () => {
 		const root = makeTempDir();
 		const memory = fakeMemory(root);
-		const tool = createL2Tools(root, undefined, memory)[0];
+		const tool = createL2Tools(root, undefined, memory, undefined, false, false, richProvider)[0];
 		summarizeContentMock.mockResolvedValue({ analysis: "analysis", sourceContext: "source", chunked: false });
 		generateRichWikiPagesMock.mockResolvedValue({
 			created: ["wiki/sources/学习资料.md"],
@@ -254,7 +258,7 @@ describe("l2_archive", () => {
 			{ model: {} as never, modelRegistry: {} as never },
 		)).rejects.toThrow("Ingest incomplete: 1 wiki file write failure(s)");
 
-		const entry = readManifest(root)[0];
+		const entry = (await readManifest(root))[0];
 		expect(entry).toMatchObject({ status: "error", wikiPages: ["wiki/sources/学习资料.md"] });
 		expect(readFileSync(join(root, "wiki/index.md"), "utf8")).toContain("[[sources/学习资料]]");
 		expect(memory.indexPageByPath).not.toHaveBeenCalled();
@@ -262,7 +266,7 @@ describe("l2_archive", () => {
 
 	it("returns rich-ingest warnings and review counts to the caller", async () => {
 		const root = makeTempDir();
-		const tool = createL2Tools(root, undefined, fakeMemory(root))[0];
+		const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
 		summarizeContentMock.mockResolvedValue({ analysis: "analysis", sourceContext: "source", chunked: false });
 		generateRichWikiPagesMock.mockResolvedValue({
 			created: ["wiki/sources/学习资料.md"],
@@ -291,7 +295,7 @@ describe("l2_archive", () => {
 
 	it("adds a deterministic ingest log when rich generation omits wiki/log.md", async () => {
 		const root = makeTempDir();
-		const tool = createL2Tools(root, undefined, fakeMemory(root))[0];
+		const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
 		summarizeContentMock.mockResolvedValue({ analysis: "analysis", sourceContext: "source", chunked: false });
 		generateRichWikiPagesMock.mockResolvedValue({
 			created: ["wiki/sources/学习资料.md"],
@@ -316,7 +320,7 @@ describe("l2_archive", () => {
 
 	it("does not register a missing rich source fallback in the manifest", async () => {
 		const root = makeTempDir();
-		const tool = createL2Tools(root, undefined, fakeMemory(root))[0];
+		const tool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
 		summarizeContentMock.mockResolvedValue({ analysis: "analysis", sourceContext: "source", chunked: false });
 		generateRichWikiPagesMock.mockResolvedValue({
 			created: ["wiki/concepts/kept.md"],
@@ -335,7 +339,7 @@ describe("l2_archive", () => {
 			{ model: {} as never, modelRegistry: {} as never },
 		);
 
-		const entry = readManifest(root)[0];
+		const entry = (await readManifest(root))[0];
 		expect(result.details.wikiPagePath).toContain("wiki/sources/");
 		expect(entry.wikiPages).toEqual(["wiki/concepts/kept.md"]);
 	});
@@ -357,7 +361,7 @@ describe("l2_archive", () => {
 		const previousWorkspace = process.env.INNO_WORKSPACE_DIR;
 		process.env.INNO_WORKSPACE_DIR = fallbackWorkspace;
 		try {
-			const tool = createL2Tools(root, undefined, fakeMemory(root), () => activeWorkspace)[0];
+			const tool = createL2Tools(root, undefined, fakeMemory(root), () => activeWorkspace, false, false, richProvider)[0];
 			await executeTool(
 				tool,
 				"call-file",
@@ -369,7 +373,7 @@ describe("l2_archive", () => {
 		}
 
 		expect(parseDocumentMock).toHaveBeenCalledWith(sourcePath);
-		const entry = readManifest(root)[0];
+		const entry = (await readManifest(root))[0];
 		expect(readFileSync(join(root, entry.rawPath), "utf8")).toBe("%PDF-active-workspace");
 		expect(readFileSync(join(root, entry.extractedPath!), "utf8")).toContain("当前会话工作区中的完整资料");
 	});
@@ -389,8 +393,8 @@ describe("l2_archive", () => {
 				pages: [{ pageNumber: 1, text: "第二篇资料" }],
 			});
 
-		const firstTool = createL2Tools(root, undefined, fakeMemory(root))[0];
-		const secondTool = createL2Tools(root, undefined, fakeMemory(root))[0];
+		const firstTool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
+		const secondTool = createL2Tools(root, undefined, fakeMemory(root), undefined, false, false, richProvider)[0];
 		const firstArchive = archiveFile(firstTool, "call-first", "第一篇", firstFile);
 		await vi.waitFor(() => expect(parseDocumentMock).toHaveBeenCalledTimes(1));
 
@@ -406,7 +410,7 @@ describe("l2_archive", () => {
 		await Promise.all([firstArchive, secondArchive]);
 
 		expect(parseDocumentMock.mock.calls.map(([filePath]) => filePath)).toEqual([firstFile, secondFile]);
-		expect(readManifest(root).map((entry) => entry.title)).toEqual(["第一篇", "第二篇"]);
+		expect((await readManifest(root)).map((entry) => entry.title)).toEqual(["第一篇", "第二篇"]);
 	});
 
 	it("keeps post-completeness retrieval index failures non-critical and continues the archive queue", async () => {
@@ -416,8 +420,8 @@ describe("l2_archive", () => {
 		vi.mocked(memory.indexPageByPath)
 			.mockImplementationOnce(() => firstIndex.promise)
 			.mockResolvedValue(undefined);
-		const firstTool = createL2Tools(root, undefined, memory)[0];
-		const secondTool = createL2Tools(root, undefined, memory)[0];
+		const firstTool = createL2Tools(root, undefined, memory, undefined, false, false, richProvider)[0];
+		const secondTool = createL2Tools(root, undefined, memory, undefined, false, false, richProvider)[0];
 
 		const firstArchive = executeTool(
 			firstTool,
@@ -431,13 +435,13 @@ describe("l2_archive", () => {
 			{ title: "后续资料", content: "第二篇正文", sourceType: "markdown" },
 		);
 		await Promise.resolve();
-		expect(readManifest(root)).toHaveLength(1);
+		expect((await readManifest(root))).toHaveLength(1);
 
 		firstIndex.reject(new Error("index failed"));
 		await expect(firstArchive).resolves.toMatchObject({ details: { wikiPagePath: expect.any(String) } });
 		await expect(secondArchive).resolves.toMatchObject({ details: { wikiPagePath: expect.any(String) } });
-		expect(readManifest(root).find((entry) => entry.title === "失败资料")?.status).toBe("indexed");
-		expect(readManifest(root).find((entry) => entry.title === "后续资料")?.status).toBe("indexed");
+		expect((await readManifest(root)).find((entry) => entry.title === "失败资料")?.status).toBe("indexed");
+		expect((await readManifest(root)).find((entry) => entry.title === "后续资料")?.status).toBe("indexed");
 	});
 
 	it("does not serialize archives that target different L2 directories", async () => {

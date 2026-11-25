@@ -5,6 +5,7 @@ import {
 	type BinaryReader,
 	type DirReader,
 	type ExecutionEnv,
+	type FileErrorCode,
 	type FileInfo,
 	type FileWatcher,
 	type Result,
@@ -15,7 +16,10 @@ import {
 	type WatchTarget,
 } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
-import { canonicalContainmentRoot, resolveContainedPath } from "../utils/path-safety.js";
+import { constants } from "node:fs";
+import { mkdir, open, realpath, stat, type FileHandle } from "node:fs/promises";
+import { basename, dirname, join, relative, sep } from "node:path";
+import { canonicalContainmentRoot, isWithin, resolveContainedPath } from "../utils/path-safety.js";
 
 /**
  * Host environment for workspace-contained durable file tools. Read, write and
@@ -26,9 +30,39 @@ import { canonicalContainmentRoot, resolveContainedPath } from "../utils/path-sa
 export class WorkspaceFileEnv extends NodeExecutionEnv implements ExecutionEnv {
 	private readonly canonicalWorkspaceRoot: string;
 
-	constructor(private readonly workspaceRoot: string) {
+	/**
+	 * @param materialize lazy-pull hook (authenticated replica mode): given a
+	 * workspace-relative path, downloads the manifest file into the local copy
+	 * when it is missing or drifted; resolves false when the manifest has no
+	 * such file. Read ops retry once after a successful materialize.
+	 */
+	constructor(private readonly workspaceRoot: string,
+		private readonly materialize?: (relPath: string) => Promise<boolean>) {
 		super({ cwd: workspaceRoot });
 		this.canonicalWorkspaceRoot = canonicalContainmentRoot(workspaceRoot);
+	}
+
+	/** Workspace-relative path under either view of the root (see `contained`). */
+	private relPathOf(contained: string): string | null {
+		for (const root of [this.workspaceRoot, this.canonicalWorkspaceRoot]) {
+			const rel = relative(root, contained).split(sep).join("/");
+			if (rel && rel !== "." && !rel.startsWith("..")) return rel;
+		}
+		return null;
+	}
+
+	/** Run `fn`, and on not_found lazily pull the manifest file, then retry once. */
+	private async withMaterialize<T>(contained: string, fn: () => Promise<Result<T, FileError>>): Promise<Result<T, FileError>> {
+		const result = await fn();
+		if (result.ok || result.error.code !== "not_found" || !this.materialize) return result;
+		const rel = this.relPathOf(contained);
+		if (!rel) return result;
+		try {
+			if (!(await this.materialize(rel))) return result;
+		} catch {
+			return result;
+		}
+		return fn();
 	}
 
 	private contained(path: string): string | FileError {
@@ -38,6 +72,52 @@ export class WorkspaceFileEnv extends NodeExecutionEnv implements ExecutionEnv {
 		return resolveContainedPath(this.workspaceRoot, path)
 			?? resolveContainedPath(this.canonicalWorkspaceRoot, path)
 			?? new FileError("permission_denied", "Path escapes the durable session workspace", path);
+	}
+
+	/**
+	 * Open `contained` so the file that is read or written is provably inside the
+	 * workspace even if a path component is swapped for a symlink after the
+	 * lexical check (check/use race). The path is resolved first, the resolved
+	 * path is opened with O_NOFOLLOW (a link swapped in as the final component
+	 * fails), and after the open the descriptor must still be the very file that
+	 * the path resolves to inside the workspace (catches swapped parents).
+	 * Writes never truncate before that verification.
+	 */
+	private async openVerified(contained: string, write: boolean, signal?: AbortSignal): Promise<FileHandle> {
+		const denied = () => new FileError("permission_denied", "Path escapes the durable session workspace", contained);
+		let real: string;
+		try {
+			real = await realpath(contained);
+		} catch (error) {
+			if (!write || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			await mkdir(dirname(contained), { recursive: true });
+			real = join(await realpath(dirname(contained)), basename(contained));
+		}
+		if (!isWithin(this.canonicalWorkspaceRoot, real)) throw denied();
+		const flags = (write ? constants.O_WRONLY | constants.O_CREAT : constants.O_RDONLY) | (constants.O_NOFOLLOW ?? 0);
+		const handle = await open(real, flags);
+		try {
+			signal?.throwIfAborted();
+			const [opened, resolved] = await Promise.all([handle.stat(), stat(await realpath(real))]);
+			if (opened.ino !== resolved.ino || opened.dev !== resolved.dev || !isWithin(this.canonicalWorkspaceRoot, await realpath(real))) {
+				throw denied();
+			}
+			return handle;
+		} catch (error) {
+			await handle.close();
+			throw error;
+		}
+	}
+
+	private fileError(error: unknown, path: string): FileError {
+		if (error instanceof FileError) return error;
+		const code = (error as NodeJS.ErrnoException)?.code;
+		const message = error instanceof Error ? error.message : String(error);
+		const mapped: Record<string, FileErrorCode> = {
+			ENOENT: "not_found", EACCES: "permission_denied", EPERM: "permission_denied", ELOOP: "permission_denied",
+			ENOTDIR: "not_directory", EISDIR: "is_directory", EINVAL: "invalid", ABORT_ERR: "aborted",
+		};
+		return new FileError(mapped[code ?? ""] ?? "unknown", message, path, error instanceof Error ? error : undefined);
 	}
 
 	private deny<T>(path: string): Result<T, FileError> {
@@ -60,32 +140,56 @@ export class WorkspaceFileEnv extends NodeExecutionEnv implements ExecutionEnv {
 
 	override async readTextFile(path: string, context: Context): Promise<Result<string, FileError>> {
 		const contained = this.contained(path);
-		return contained instanceof FileError ? { ok: false, error: contained } : super.readTextFile(contained, context);
+		if (contained instanceof FileError) return { ok: false, error: contained };
+		return this.withMaterialize(contained, async () => {
+			try {
+				const handle = await this.openVerified(contained, false, context.abortSignal);
+				try {
+					return { ok: true, value: await handle.readFile({ encoding: "utf8", signal: context.abortSignal }) };
+				} finally {
+					await handle.close();
+				}
+			} catch (error) {
+				return { ok: false, error: this.fileError(error, contained) };
+			}
+		});
 	}
 
 	override async openTextLineReader(path: string, context: Context): Promise<Result<TextLineReader, FileError>> {
 		const contained = this.contained(path);
-		return contained instanceof FileError ? { ok: false, error: contained } : super.openTextLineReader(contained, context);
+		return contained instanceof FileError ? { ok: false, error: contained } : this.withMaterialize(contained, () => super.openTextLineReader(contained, context));
 	}
 
 	override async readTextLines(path: string, options: { maxLines?: number } | undefined, context: Context): Promise<Result<string[], FileError>> {
 		const contained = this.contained(path);
-		return contained instanceof FileError ? { ok: false, error: contained } : super.readTextLines(contained, options, context);
+		return contained instanceof FileError ? { ok: false, error: contained } : this.withMaterialize(contained, () => super.readTextLines(contained, options, context));
 	}
 
 	override async readBinaryFile(path: string, context: Context): Promise<Result<Uint8Array, FileError>> {
 		const contained = this.contained(path);
-		return contained instanceof FileError ? { ok: false, error: contained } : super.readBinaryFile(contained, context);
+		if (contained instanceof FileError) return { ok: false, error: contained };
+		return this.withMaterialize(contained, async () => {
+			try {
+				const handle = await this.openVerified(contained, false, context.abortSignal);
+				try {
+					return { ok: true, value: await handle.readFile({ signal: context.abortSignal }) };
+				} finally {
+					await handle.close();
+				}
+			} catch (error) {
+				return { ok: false, error: this.fileError(error, contained) };
+			}
+		});
 	}
 
 	override async openBinaryReader(path: string, options: { noFollow?: boolean } | undefined, context: Context): Promise<Result<BinaryReader, FileError>> {
 		const contained = this.contained(path);
-		return contained instanceof FileError ? { ok: false, error: contained } : super.openBinaryReader(contained, options, context);
+		return contained instanceof FileError ? { ok: false, error: contained } : this.withMaterialize(contained, () => super.openBinaryReader(contained, options, context));
 	}
 
 	override async fileInfo(path: string, context: Context): Promise<Result<FileInfo, FileError>> {
 		const contained = this.contained(path);
-		return contained instanceof FileError ? { ok: false, error: contained } : super.fileInfo(contained, context);
+		return contained instanceof FileError ? { ok: false, error: contained } : this.withMaterialize(contained, () => super.fileInfo(contained, context));
 	}
 
 	override async listDir(path: string, context: Context): Promise<Result<FileInfo[], FileError>> {
@@ -105,7 +209,7 @@ export class WorkspaceFileEnv extends NodeExecutionEnv implements ExecutionEnv {
 
 	override async exists(path: string, context: Context): Promise<Result<boolean, FileError>> {
 		const contained = this.contained(path);
-		return contained instanceof FileError ? { ok: false, error: contained } : super.exists(contained, context);
+		return contained instanceof FileError ? { ok: false, error: contained } : this.withMaterialize(contained, () => super.exists(contained, context));
 	}
 
 	override watch(_targets: readonly WatchTarget[], _onChange: (change: WatchChange) => void, _context: Context): Promise<Result<FileWatcher, FileError>> {
@@ -114,7 +218,19 @@ export class WorkspaceFileEnv extends NodeExecutionEnv implements ExecutionEnv {
 
 	override async writeFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
 		const contained = this.contained(path);
-		return contained instanceof FileError ? { ok: false, error: contained } : super.writeFile(contained, content, context);
+		if (contained instanceof FileError) return { ok: false, error: contained };
+		try {
+			const handle = await this.openVerified(contained, true, context.abortSignal);
+			try {
+				await handle.truncate(0);
+				await handle.writeFile(content, { signal: context.abortSignal });
+				return { ok: true, value: undefined };
+			} finally {
+				await handle.close();
+			}
+		} catch (error) {
+			return { ok: false, error: this.fileError(error, contained) };
+		}
 	}
 
 	override appendFile(path: string, _content: string | Uint8Array, _context: Context): Promise<Result<void, FileError>> {

@@ -6,10 +6,11 @@
  */
 
 import { tavily, type TavilySearchResponse } from "@tavily/core";
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
-import type { ConfigHolder } from "./inno-extension.js";
+import type { ConfigHolder } from "./config-holder.js";
 import { logger } from "../logger.js";
+import { defineInnoTool } from "./inno-tool.js";
 
 /** Upper bound for a single search request (seconds, Tavily API timeout). */
 const REQUEST_TIMEOUT_S = 60;
@@ -38,8 +39,8 @@ function formatResults(resp: TavilySearchResponse): string {
 	return parts.join("\n\n") || "未找到相关结果。";
 }
 
-export function createTavilyTools(configHolder: ConfigHolder): ToolDefinition[] {
-	const tool = defineTool({
+export function createTavilyTools(configHolder: ConfigHolder): ToolRegistration[] {
+	const tool = defineInnoTool({
 		name: "web_search",
 		label: "联网搜索 (Tavily)",
 		description:
@@ -65,19 +66,13 @@ export function createTavilyTools(configHolder: ConfigHolder): ToolDefinition[] 
 				Type.Boolean({ description: "是否返回 Tavily 综合摘要答案（默认 true）" }),
 			),
 		}),
-		async execute(_toolCallId, params) {
-			const typed = params as {
-				query: string;
-				searchDepth?: "basic" | "advanced";
-				maxResults?: number;
-				topic?: "general" | "news" | "finance";
-				includeAnswer?: boolean;
-			};
+		async execute(params) {
+			const typed = params;
 			const query = String(typed.query ?? "").trim();
 			if (!query) {
 				return {
 					content: [{ type: "text" as const, text: "请提供 query（搜索查询词）。" }],
-					details: { error: "missing_query" } as Record<string, unknown>,
+					details: { error: "missing_query" },
 				};
 			}
 
@@ -88,7 +83,7 @@ export function createTavilyTools(configHolder: ConfigHolder): ToolDefinition[] 
 						type: "text" as const,
 						text: "尚未配置 Tavily API Key。请在设置面板的「联网搜索 (Tavily)」卡片填入 API Key 后重试。",
 					}],
-					details: { error: "tavily_not_configured" } as Record<string, unknown>,
+					details: { error: "tavily_not_configured" },
 				};
 			}
 
@@ -118,14 +113,14 @@ export function createTavilyTools(configHolder: ConfigHolder): ToolDefinition[] 
 							url: r.url,
 							score: r.score,
 						})),
-					} as Record<string, unknown>,
+					},
 				};
 			} catch (err) {
 				logger.warn({ err, query }, "web_search: tavily search failed");
 				const msg = err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text" as const, text: `联网搜索失败：${msg}` }],
-					details: { error: "search_failed", query, message: msg } as Record<string, unknown>,
+					details: { error: "search_failed", query, message: msg },
 				};
 			}
 		},

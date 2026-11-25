@@ -12,7 +12,7 @@
  *
  * Privacy: by default only metadata (URL, status, elapsed time, body sizes)
  * is logged. Request/response bodies — which contain the system prompt,
- * learner profile, user messages and model output — are only logged when
+ * user messages and model output — are only logged when
  * LOG_LLM_BODY=1 is set explicitly.
  */
 
@@ -32,8 +32,8 @@ const MAX_BODY_LENGTH = 8000;
 const MAX_RESPONSE_BODY_LENGTH = 4000;
 
 /**
- * Body logging is opt-in: request bodies contain the system prompt, learner
- * profile, user messages and uploaded document contents, and response bodies
+ * Body logging is opt-in: request bodies contain the system prompt,
+ * user messages and uploaded document contents, and response bodies
  * contain model output — all of it private learning data that should not sit
  * in `log/server-*.log` by default. Set LOG_LLM_BODY=1 (or "true") to include
  * truncated bodies when actively debugging a provider issue. Read dynamically

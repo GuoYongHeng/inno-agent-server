@@ -37,16 +37,16 @@ function writePage(root: string, name: string, title: string, sourceId: string, 
 }
 
 describe("L2 wiki graph visualization data", () => {
-	it("deduplicates reciprocal links and applies relevance only to explicit edges", () => {
+	it("deduplicates reciprocal links and applies relevance only to explicit edges", async () => {
 		const root = mkdtempSync(join(tmpdir(), "inno-l2-graph-"));
 		tempDirs.push(root);
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 
 		const alpha = writePage(root, "alpha", "Alpha", "source-1", "[[Beta]] and again [[Beta]], plus [[Gamma]].");
 		const beta = writePage(root, "beta", "Beta", "source-1", "[[Alpha]]");
 		const gamma = writePage(root, "gamma", "Gamma", "source-2", "A separate source.");
 
-		const graph = buildWikiGraph(root);
+		const graph = (await buildWikiGraph(root));
 		const pageEdges = graph.edges.filter((edge) => edge.type === "link" && edge.target.startsWith("wiki/"));
 		const alphaBeta = pageEdges.filter((edge) => new Set([edge.source, edge.target]).has(alpha) && new Set([edge.source, edge.target]).has(beta));
 		const alphaGamma = pageEdges.find((edge) => new Set([edge.source, edge.target]).has(alpha) && new Set([edge.source, edge.target]).has(gamma));
@@ -58,10 +58,10 @@ describe("L2 wiki graph visualization data", () => {
 		expect(graph.nodes.every((node) => node.type !== "tag")).toBe(true);
 	});
 
-	it("skips query and unresolved synthetic nodes", () => {
+	it("skips query and unresolved synthetic nodes", async () => {
 		const root = mkdtempSync(join(tmpdir(), "inno-l2-graph-"));
 		tempDirs.push(root);
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 		writePage(root, "alpha", "Alpha", "source-1", "[[Missing Page]]");
 		writeText(
 			join(root, "wiki", "queries", "open-question.md"),
@@ -71,21 +71,21 @@ describe("L2 wiki graph visualization data", () => {
 			})}\n# Open question\n\n[[alpha]]\n`,
 		);
 
-		const graph = buildWikiGraph(root);
+		const graph = (await buildWikiGraph(root));
 		expect(graph.nodes.some((node) => node.id.includes("open-question"))).toBe(false);
 		expect(graph.nodes.some((node) => node.id === "Missing Page")).toBe(false);
 		expect(graph.maintenance.missing).toContainEqual(expect.objectContaining({ link: "Missing Page" }));
 	});
 
-	it("uses query pages only as relevance neighbors, never visible graph nodes", () => {
+	it("uses query pages only as relevance neighbors, never visible graph nodes", async () => {
 		const root = mkdtempSync(join(tmpdir(), "inno-l2-graph-"));
 		tempDirs.push(root);
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 		const alpha = writePage(root, "alpha", "Alpha", "source-1", "[[Beta]]\n[[Question]]");
 		const beta = writePage(root, "beta", "Beta", "source-2", "[[Alpha]]\n[[Question]]");
 		writePage(root, "question", "Question", "source-1", "[[Alpha]]\n[[Beta]]", "query");
 
-		const graph = buildWikiGraph(root);
+		const graph = (await buildWikiGraph(root));
 		const edge = graph.edges.find((candidate) => new Set([candidate.source, candidate.target]).size === 2
 			&& [candidate.source, candidate.target].includes(alpha) && [candidate.source, candidate.target].includes(beta));
 
@@ -95,10 +95,10 @@ describe("L2 wiki graph visualization data", () => {
 		expect(edge?.weight).toBeCloseTo(6.8 + 1.5 / Math.log(4), 8);
 	});
 
-	it("includes schema-defined directories in the graph", () => {
+	it("includes schema-defined directories in the graph", async () => {
 		const root = mkdtempSync(join(tmpdir(), "inno-l2-graph-schema-"));
 		tempDirs.push(root);
-		ensureL2Directories(root);
+		(await ensureL2Directories(root));
 		writeText(
 			join(root, "wiki/methods/custom.md"),
 			`${serializeFrontmatter({
@@ -107,7 +107,7 @@ describe("L2 wiki graph visualization data", () => {
 			})}\n# Custom method\n\nA schema-defined page.\n`,
 		);
 
-		const graph = buildWikiGraph(root);
+		const graph = (await buildWikiGraph(root));
 		expect(graph.nodes).toContainEqual(expect.objectContaining({ id: "wiki/methods/custom.md", type: "method" }));
 	});
 

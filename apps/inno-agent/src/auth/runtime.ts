@@ -17,9 +17,8 @@ export interface AuthSession {
 }
 
 export interface AuthRuntime {
-	mode: "local" | "better-auth";
 	allowSignUp: boolean;
-	tenantStore: TenantStore | null;
+	tenantStore: TenantStore;
 	getSession(req: IncomingMessage): Promise<AuthSession | null>;
 	handle(req: IncomingMessage, res: ServerResponse): Promise<void>;
 	checkConnection(): Promise<void>;
@@ -31,20 +30,6 @@ export const authOptions = {
 } satisfies Partial<BetterAuthOptions>;
 
 export function createAuthRuntime(config: AuthRuntimeConfig): AuthRuntime {
-	if (config.mode === "local") {
-		return {
-			mode: config.mode,
-			allowSignUp: false,
-			tenantStore: null,
-			getSession: async () => null,
-			handle: async (_req, res) => {
-				res.writeHead(404).end();
-			},
-			close: async () => {},
-			checkConnection: async () => {},
-		};
-	}
-
 	const pool = new Pool({
 		connectionString: config.databaseUrl,
 		max: 10,
@@ -60,7 +45,6 @@ export function createAuthRuntime(config: AuthRuntimeConfig): AuthRuntime {
 	const tenantStore = new TenantStore(pool);
 
 	return {
-		mode: config.mode,
 		allowSignUp: config.allowSignUp,
 		tenantStore,
 		async getSession(req) {

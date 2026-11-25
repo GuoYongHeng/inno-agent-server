@@ -7,7 +7,6 @@ import {
 	UNAUTHORIZED_EVENT,
 	type AuthSessionResponse,
 } from "../api/auth.js";
-import { terminalStore } from "../stores/terminal-store.js";
 import { sessionsStore } from "../stores/sessions-store.js";
 
 export function AuthGate({ children }: { children: ReactNode }) {
@@ -47,8 +46,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
 		);
 	}
 	if (!session) return <main className="h-full bg-[var(--inno-chat-bg)]" aria-label={t("auth.loading")} />;
-	if (session.mode === "local" || session.user) {
-		terminalStore.setHostTerminalDisabled(session.mode === "better-auth");
+	if (session.user) {
 		sessionsStore.durableEnabled = session.durableEnabled === true;
 		sessionsStore.durableRequired = session.durableRequired === true;
 		return children;

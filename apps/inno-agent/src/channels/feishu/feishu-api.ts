@@ -132,9 +132,9 @@ export class FeishuAPI {
 	 * Images are routed through the image upload API + `image` message type;
 	 * everything else uses the file upload API + `file` message type.
 	 */
-	async sendFile(chatId: string, filePath: string, fileName?: string): Promise<void> {
-		const name = fileName ?? basename(filePath);
-		const buffer = readFileSync(filePath);
+	async sendFile(chatId: string, file: string | { bytes: Uint8Array }, fileName?: string): Promise<void> {
+		const name = fileName ?? (typeof file === "string" ? basename(file) : "file");
+		const buffer = typeof file === "string" ? readFileSync(file) : Buffer.from(file.bytes);
 
 		if (isImageFile(name)) {
 			const upload = await this.client.im.v1.image.create({

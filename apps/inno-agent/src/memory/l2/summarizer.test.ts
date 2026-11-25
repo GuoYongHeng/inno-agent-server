@@ -11,6 +11,13 @@ import { buildAnalysisSystemPrompt, buildChunkSystemPrompt, hashLongSourceText, 
 import { computeWikiSourceBudget } from "./wiki-generator.js";
 import { splitSourceIntoSemanticChunks } from "./structural-chunker.js";
 
+import { existsSync } from "node:fs";
+
+const fileCheckpoint = (path: string) => ({
+	load: async () => (existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : null),
+	save: async (checkpoint: unknown) => writeFileSync(path, JSON.stringify(checkpoint)),
+});
+
 const model = {} as never;
 const registry = {
 	getApiKeyAndHeaders: vi.fn().mockResolvedValue({ ok: true, apiKey: "test-key", headers: {} }),
@@ -131,7 +138,7 @@ describe("L2 summarizer", () => {
 			return { stopReason: "stop", content: [{ type: "text", text: `## Chunk Analysis\n${phase} analysis\n## Updated Global Digest\n${phase} digest` }] };
 		});
 
-		await summarizeContent(model, registry, "Long", contentA, "", { checkpointPath, sourceIdentity: "same.md" });
+		await summarizeContent(model, registry, "Long", contentA, "", { checkpoint: fileCheckpoint(checkpointPath), sourceIdentity: "same.md" });
 		const firstCalls = completeMock.mock.calls.length;
 		const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
 		expect(checkpoint).toMatchObject({ sourceHash: hashLongSourceText(contentA), completedThrough: checkpoint.chunkTotal });
@@ -139,7 +146,7 @@ describe("L2 summarizer", () => {
 
 		completeMock.mockClear();
 		phase = "B";
-		const result = await summarizeContent(model, registry, "Long", contentB, "", { checkpointPath, sourceIdentity: "same.md" });
+		const result = await summarizeContent(model, registry, "Long", contentB, "", { checkpoint: fileCheckpoint(checkpointPath), sourceIdentity: "same.md" });
 		expect(completeMock).toHaveBeenCalledTimes(firstCalls);
 		expect(result?.analysis).toContain("B analysis");
 		expect(result?.analysis).not.toContain("A analysis");
@@ -173,7 +180,7 @@ describe("L2 summarizer", () => {
 		});
 
 		const result = await summarizeContent(model, registry, "Long", content, "", {
-			checkpointPath, sourceIdentity: "resume.md", folderContext: "Research > Long",
+			checkpoint: fileCheckpoint(checkpointPath), sourceIdentity: "resume.md", folderContext: "Research > Long",
 		});
 		expect(completeMock).toHaveBeenCalledTimes(chunks.length - 1);
 		const firstPrompt = completeMock.mock.calls[0][1].messages[0].content[0].text as string;

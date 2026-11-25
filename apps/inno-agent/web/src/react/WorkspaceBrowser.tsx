@@ -9,7 +9,6 @@ import { workspacesStore } from "../stores/workspaces-store.js";
 import { sessionsStore } from "../stores/sessions-store.js";
 import { appStore } from "../stores/app-store.js";
 import { getSessionWorkspace } from "../api/workspaces.js";
-import { RunButton } from "./terminal/RunButton.js";
 import { LazyCodeEditor } from "./LazyCodeEditor.js";
 import { LazyMarkdownEditor } from "./LazyMarkdownEditor.js";
 import type { WorkspaceFileDetail, WorkspaceFileKind, WorkspaceOfficeFormat } from "../types/workspace.js";
@@ -670,7 +669,6 @@ function FileContentPane({ onToggleSidebar, sidebarOpen }: { onToggleSidebar: ()
 					</div>
 				</div>
 				<div className="flex items-center gap-2">
-					{state.file ? <RunButton filePath={state.file.path} /> : null}
 					{canEdit && (
 						<button
 							type="button"

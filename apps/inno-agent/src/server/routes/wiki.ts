@@ -1,21 +1,20 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
-import { existsSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, extname, join } from "node:path";
+import { basename, extname } from "node:path";
 import { logger } from "../../logger.js";
 import { getL2Memory } from "../../memory/l2/l2-memory.js";
 import { readManifest, removeWikiPathFromManifest } from "../../memory/l2/manifest-store.js";
 import { buildWikiGraph } from "../../memory/l2/wiki-graph.js";
 import { parseFrontmatter, rebuildIndex } from "../../memory/l2/wiki-maintainer.js";
 import type { WikiIngestReview } from "../../memory/l2/wiki-generator.js";
-import { ensureDir, readJsonl, readText, writeText } from "../../storage/file-store.js";
-import { safeJoinReal } from "../file-helpers.js";
+import { l2Store, checkL2Path, readJsonLines, type L2Backend } from "../../memory/l2/l2-backend.js";
 import { json, readBody, UPLOAD_MAX_BODY_BYTES } from "../http-helpers.js";
 import { listWikiPagePaths } from "../../memory/l2/wiki-page-files.js";
-import { getRequestTenant } from "../../tenants/http.js";
+import { requireRequestTenant } from "../../tenants/http.js";
 import { resolveTenantDataDir } from "../../tenants/paths.js";
 
 export interface WikiRouteContext {
-	l2DataDir: string;
+	/** Local-mode L2 directory (tests). Authenticated requests use the tenant's PostgreSQL backend. */
+	l2DataDir?: string;
 	dataDir?: string;
 }
 
@@ -25,9 +24,9 @@ export interface WikiRouteContext {
 // it as an explicit parameter instead.
 // ---------------------------------------------------------------------------
 
-function manifestSourceIdByWikiPath(l2DataDir: string): Map<string, string> {
+async function manifestSourceIdByWikiPath(store: L2Backend): Promise<Map<string, string>> {
 	const map = new Map<string, string>();
-	for (const entry of readManifest(l2DataDir)) {
+	for (const entry of await readManifest(store)) {
 		for (const wikiPath of entry.wikiPages) {
 			map.set(wikiPath, entry.id);
 		}
@@ -56,11 +55,19 @@ function uploadExtension(fileName: string, mimeType: string): string {
 	return ".bin";
 }
 
+/** Validate a client-supplied wiki-relative path; null on traversal/junk. */
+function safeWikiPath(path: string): string | null {
+	try {
+		return checkL2Path(path);
+	} catch {
+		return null;
+	}
+}
+
 /**
  * /api/wiki/* and /api/l2/raw/upload route domain. Returns true when the
- * request was handled. Extracted verbatim from server.ts during the P2 route
- * split — behavior unchanged. (The L2 upload route previously sat ~170 lines
- * below the wiki routes; exact-path matching makes the reordering inert.)
+ * request was handled. Reads go through the L2 backend mounted for the
+ * tenant (files locally, PostgreSQL + object store in auth mode).
  */
 export async function handleWikiRoutes(
 	req: HttpReq,
@@ -69,21 +76,21 @@ export async function handleWikiRoutes(
 	url: string,
 	ctx: WikiRouteContext,
 ): Promise<boolean> {
-	const tenant = getRequestTenant(req);
+	const tenant = requireRequestTenant(req);
 	if (tenant && !ctx.dataDir) throw new Error("dataDir is required for tenant wiki storage");
 	const l2DataDir = tenant
 		? resolveTenantDataDir(req, ctx.dataDir!, "l2")
-		: ctx.l2DataDir;
+		: ctx.l2DataDir ?? (() => { throw new Error("L2 storage requires a tenant"); })();
+	const store = l2Store(l2DataDir);
 
 	// --- Wiki API ---
 	if (method === "GET" && url === "/api/wiki/pages") {
 		try {
-			const sourceIds = manifestSourceIdByWikiPath(l2DataDir);
+			const sourceIds = await manifestSourceIdByWikiPath(store);
 			const pages: unknown[] = [];
-			for (const wikiPath of listWikiPagePaths(l2DataDir)) {
-				const fullPath = join(l2DataDir, wikiPath);
-				if (existsSync(fullPath)) {
-					const content = readText(fullPath);
+			for (const wikiPath of await listWikiPagePaths(store)) {
+				if (await store.exists(wikiPath)) {
+					const content = await store.readText(wikiPath);
 					const { frontmatter, body } = parseFrontmatter(content);
 					pages.push({
 						path: wikiPath,
@@ -104,21 +111,17 @@ export async function handleWikiRoutes(
 	if (method === "GET" && url.startsWith("/api/wiki/page?")) {
 		const params = new URL(url, "http://localhost").searchParams;
 		const path = params.get("path");
-		if (!path) {
-			json(res, 400, { error: "Missing path parameter" });
+		const rel = path ? safeWikiPath(path) : null;
+		if (!rel) {
+			json(res, 400, { error: path ? "Invalid wiki path" : "Missing path parameter" });
 			return true;
 		}
-		const fullPath = safeJoinReal(l2DataDir, path);
-		if (!fullPath) {
-			json(res, 400, { error: "Invalid wiki path" });
-			return true;
-		}
-		if (!existsSync(fullPath)) {
+		if (!(await store.exists(rel))) {
 			json(res, 404, { error: "Wiki page not found" });
 			return true;
 		}
-		const content = readText(fullPath);
-		json(res, 200, { path, content });
+		const content = await store.readText(rel);
+		json(res, 200, { path: rel, content });
 		return true;
 	}
 
@@ -126,52 +129,44 @@ export async function handleWikiRoutes(
 		const body = (await readBody(req)) as Record<string, unknown>;
 		const path = body.path as string | undefined;
 		const content = body.content as string | undefined;
-		if (!path || content === undefined) {
+		const rel = path ? safeWikiPath(path) : null;
+		if (!rel || content === undefined) {
 			json(res, 400, { error: "Missing path or content" });
 			return true;
 		}
-		const fullPath = safeJoinReal(l2DataDir, path);
-		if (!fullPath) {
-			json(res, 400, { error: "Invalid wiki path" });
-			return true;
-		}
-		writeText(fullPath, content);
-		await getL2Memory(l2DataDir).indexPageByPath(path);
+		await store.writeText(rel, content);
+		await getL2Memory(l2DataDir).indexPageByPath(rel);
 		try {
-			rebuildIndex(l2DataDir, readManifest(l2DataDir));
+			await rebuildIndex(store, await readManifest(store));
 		} catch (err) {
-			logger.warn({ err, path }, "failed to rebuild wiki index after page update");
+			logger.warn({ err, path: rel }, "failed to rebuild wiki index after page update");
 		}
-		json(res, 200, { path, saved: true });
+		json(res, 200, { path: rel, saved: true });
 		return true;
 	}
 
 	if (method === "DELETE" && url.startsWith("/api/wiki/page?")) {
 		const params = new URL(url, "http://localhost").searchParams;
 		const path = params.get("path");
-		if (!path) {
-			json(res, 400, { error: "Missing path parameter" });
+		const rel = path ? safeWikiPath(path) : null;
+		if (!rel) {
+			json(res, 400, { error: path ? "Invalid wiki path" : "Missing path parameter" });
 			return true;
 		}
-		const fullPath = safeJoinReal(l2DataDir, path);
-		if (!fullPath) {
-			json(res, 400, { error: "Invalid wiki path" });
-			return true;
-		}
-		if (!existsSync(fullPath)) {
+		if (!(await store.exists(rel))) {
 			json(res, 404, { error: "Wiki page not found" });
 			return true;
 		}
 		try {
-			rmSync(fullPath);
-			removeWikiPathFromManifest(l2DataDir, path);
-			await getL2Memory(l2DataDir).removePage(path);
+			await store.delete(rel);
+			await removeWikiPathFromManifest(store, rel);
+			await getL2Memory(l2DataDir).removePage(rel);
 			try {
-				rebuildIndex(l2DataDir, readManifest(l2DataDir));
+				await rebuildIndex(store, await readManifest(store));
 			} catch (err) {
-				logger.warn({ err, path }, "failed to rebuild wiki index after page deletion");
+				logger.warn({ err, path: rel }, "failed to rebuild wiki index after page deletion");
 			}
-			json(res, 200, { path, deleted: true });
+			json(res, 200, { path: rel, deleted: true });
 		} catch (err) {
 			logger.warn({ err }, "failed to delete wiki page");
 			json(res, 500, { error: "Failed to delete wiki page" });
@@ -181,7 +176,7 @@ export async function handleWikiRoutes(
 
 	if (method === "GET" && url === "/api/wiki/reviews") {
 		try {
-			const reviews = readJsonl<WikiIngestReview>(join(l2DataDir, "reviews.jsonl"))
+			const reviews = (await readJsonLines<WikiIngestReview>(store, "reviews.jsonl"))
 				.sort((a, b) => String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")));
 			json(res, 200, reviews);
 		} catch (err) {
@@ -193,7 +188,7 @@ export async function handleWikiRoutes(
 
 	if (method === "GET" && url === "/api/wiki/graph") {
 		try {
-			json(res, 200, buildWikiGraph(l2DataDir));
+			json(res, 200, await buildWikiGraph(store));
 		} catch (err) {
 			logger.warn({ err }, "failed to build wiki graph");
 			json(res, 200, { nodes: [], edges: [] });
@@ -203,13 +198,13 @@ export async function handleWikiRoutes(
 
 	if (method === "GET" && url === "/api/wiki/stats") {
 		try {
-			const entries = readManifest(l2DataDir);
+			const entries = await readManifest(store);
 			let totalSize = 0;
 			let pageCount = 0;
-			for (const wikiPath of listWikiPagePaths(l2DataDir)) {
-				const fullPath = join(l2DataDir, wikiPath);
-				if (existsSync(fullPath)) {
-					totalSize += statSync(fullPath).size;
+			for (const wikiPath of await listWikiPagePaths(store)) {
+				const stat = await store.stat(wikiPath);
+				if (stat) {
+					totalSize += stat.size;
 					pageCount++;
 				}
 			}
@@ -232,17 +227,14 @@ export async function handleWikiRoutes(
 			return true;
 		}
 
-		const dir = join(l2DataDir, "raw", "uploads");
-		ensureDir(dir);
 		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 		const safeName = sanitizeUploadName(fileName);
 		const ext = uploadExtension(safeName, mimeType);
 		const base = basename(safeName, ext).slice(0, 80) || "upload";
 		const outputName = `${timestamp}-${base}${ext}`;
-		const outputPath = join(dir, outputName);
 		const data = Buffer.from(dataBase64, "base64");
-		writeFileSync(outputPath, data);
-		const rawPath = join("raw", "uploads", outputName);
+		const rawPath = `raw/uploads/${outputName}`;
+		await store.putBinary(rawPath, data, mimeType);
 		json(res, 201, {
 			fileName,
 			mimeType,

@@ -48,7 +48,7 @@ export class CronScheduler {
 		if (this.ticking) return;
 		this.ticking = true;
 		try {
-			const jobs = this.jobStore.list();
+			const jobs = await this.jobStore.list();
 			const now = new Date();
 			for (const job of jobs) {
 				if (!job.enabled || this.running.has(job.id)) continue;
@@ -57,7 +57,7 @@ export class CronScheduler {
 				const occurrenceId = occurrenceIdFor(job.id, scheduledAt);
 				try {
 					if (this.checkInStore && isLearningJob(job)) {
-						const slot = this.checkInStore.getOccurrence(job.id, occurrenceId, now);
+						const slot = await this.checkInStore.getOccurrence(job.id, occurrenceId, now);
 						if (slot && (slot.status === "success" || slot.status === "skipped")) {
 							this.runJob(job, scheduledAt, occurrenceId, false);
 							continue;
@@ -91,24 +91,15 @@ export class CronScheduler {
 				const createdSession = createSession && this.options.createSession
 					? await this.options.createSession(job)
 					: undefined;
-				const sessionPath = typeof createdSession === "string" ? createdSession : createdSession?.path;
-				const sessionId = createdSession && typeof createdSession === "object" ? createdSession.id : undefined;
-				const sessionRuntime = createdSession && typeof createdSession === "object" ? createdSession.runtime : undefined;
-				if (createSession && this.options.createSession && !createdSession
-					&& (this.options.durableClaims || job.runtime === "durable")) {
+				if (createSession && this.options.createSession && !createdSession) {
 					throw new Error("Scheduled run could not create an owned session");
 				}
-				if (job.runtime === "durable" && createSession && sessionRuntime !== "durable") {
-					throw new Error("Durable scheduled job did not create a durable session");
-				}
 				const result = await executeJob(job, this.jobStore, this.channelRegistry, "scheduled", this.checkInStore, {
-					sessionPath,
-					sessionId,
-					sessionRuntime,
+					sessionId: createdSession?.id,
+					sessionRuntime: createdSession?.runtime,
 					durableExecutor: this.options.durableExecutor,
 					scheduledAt,
 					occurrenceId: this.checkInStore || this.options.durableClaims ? occurrenceId : undefined,
-					allowSessionChannelInference: !this.options.durableClaims,
 				});
 				if (result.success) logger.info({ jobId: job.id, pushedToChannel: result.pushedToChannel }, "scheduler job completed");
 				else logger.error({ jobId: job.id, error: result.error }, "scheduler job failed");

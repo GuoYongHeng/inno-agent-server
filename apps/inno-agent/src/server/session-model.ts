@@ -1,4 +1,4 @@
-import type { PersistedQuestion } from "../agent/question-bridge.js";
+import type { PersistedQuestion } from "../agent/question-types.js";
 import type { ChatAttachments } from "./attachments.js";
 
 /**

@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { ensureDir, readJson, writeJson } from "../storage/file-store.js";
+import { ensureDir } from "../storage/file-store.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -19,7 +19,6 @@ export interface WorkspaceMeta {
 interface RegistryFile {
 	workspaces: WorkspaceMeta[];
 	/** One-time flag: legacy unbound sessions have been bound to the default workspace. */
-	migratedUnboundToDefault?: boolean;
 }
 
 type SessionWorkspaceMap = Record<string, string>;
@@ -65,34 +64,33 @@ function shortHash(): string {
 // Registry
 // ---------------------------------------------------------------------------
 
+/**
+ * Process-local view of the workspaces this worker knows. It is a cache, not a
+ * store: the durable registry rows and session→workspace bindings live in
+ * PostgreSQL (`tenant_workspaces`, `session_workspaces`) and are adopted on
+ * demand by `WorkspaceReplica.materializeWorkspace`. Nothing is written to disk
+ * apart from the workspace directories themselves.
+ */
 export class WorkspaceRegistry {
-	constructor(
-		private readonly workspaceDir: string,
-		private readonly dataDir: string,
-	) {}
+	private registry: RegistryFile = { workspaces: [] };
+	private sessionMap: SessionWorkspaceMap = {};
 
-	private registryPath(): string {
-		return join(this.dataDir, "workspaces", "registry.json");
-	}
-
-	private sessionMapPath(): string {
-		return join(this.dataDir, "sessions", "workspaces.json");
-	}
+	constructor(private readonly workspaceDir: string) {}
 
 	private loadRegistry(): RegistryFile {
-		return readJson<RegistryFile>(this.registryPath(), { workspaces: [] });
+		return this.registry;
 	}
 
 	private saveRegistry(reg: RegistryFile): void {
-		writeJson(this.registryPath(), reg);
+		this.registry = reg;
 	}
 
 	private loadSessionMap(): SessionWorkspaceMap {
-		return readJson<SessionWorkspaceMap>(this.sessionMapPath(), {});
+		return this.sessionMap;
 	}
 
 	private saveSessionMap(map: SessionWorkspaceMap): void {
-		writeJson(this.sessionMapPath(), map);
+		this.sessionMap = map;
 	}
 
 	/** Ensure the shared tmp workspace exists; preserve a legacy default if present. */
@@ -300,30 +298,21 @@ export class WorkspaceRegistry {
 		return { ws, created: true };
 	}
 
+	get workspaceRoot(): string {
+		return this.workspaceDir;
+	}
+
 	/**
-	 * One-time migration: bind any session not present in the session→workspace
-	 * map to `targetWorkspaceId`. This preserves the working directory of legacy
-	 * sessions that used to fall back to the shared public workspace.
+	 * Insert a workspace exactly as described (used when materializing a
+	 * replicated row from durable storage). No-op when the id already exists.
 	 */
-	migrateUnboundSessions(sessionIds: string[], targetWorkspaceId: string): void {
+	adoptWorkspace(meta: WorkspaceMeta): WorkspaceMeta {
 		const reg = this.loadRegistry();
-		if (reg.migratedUnboundToDefault) return;
-		if (!reg.workspaces.some((w) => w.id === targetWorkspaceId)) {
-			reg.migratedUnboundToDefault = true;
-			this.saveRegistry(reg);
-			return;
-		}
-		const map = this.loadSessionMap();
-		let changed = false;
-		for (const sid of sessionIds) {
-			if (!(sid in map)) {
-				map[sid] = targetWorkspaceId;
-				changed = true;
-			}
-		}
-		if (changed) this.saveSessionMap(map);
-		reg.migratedUnboundToDefault = true;
+		const existing = reg.workspaces.find((w) => w.id === meta.id);
+		if (existing) return existing;
+		reg.workspaces.push({ ...meta });
 		this.saveRegistry(reg);
+		return meta;
 	}
 
 	renameWorkspace(id: string, name: string): WorkspaceMeta | null {

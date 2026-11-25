@@ -1,6 +1,4 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
-import { join } from "node:path";
-import { mkdirSync } from "node:fs";
 import type { RealtimeChatChannel, MessageHandler, StreamingReplyChannel, StreamingReplyHandle, ChannelStreamEvent } from "../channel.js";
 import type { IncomingMessage, PushTarget, MessageAttachment } from "../types.js";
 import type { PersonalChannelConfig } from "../../config.js";
@@ -17,14 +15,12 @@ export class FeishuChannel implements RealtimeChatChannel, StreamingReplyChannel
 	private wsClient: Lark.WSClient;
 	private messageHandler: MessageHandler | null = null;
 	private processedMessages = new Set<string>();
-	private downloadDir: string;
 	private personalOnly: boolean;
 	private allowedUserIds: Set<string> | null;
 	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 	constructor(
 		feishuConfig: FeishuConfig,
-		dataDir?: string,
 		channelConfig?: PersonalChannelConfig,
 	) {
 		this.api = new FeishuAPI(feishuConfig);
@@ -33,9 +29,6 @@ export class FeishuChannel implements RealtimeChatChannel, StreamingReplyChannel
 			appSecret: feishuConfig.appSecret,
 			loggerLevel: Lark.LoggerLevel.info,
 		});
-		this.downloadDir = join(dataDir ?? "data", "downloads");
-		mkdirSync(this.downloadDir, { recursive: true });
-
 		this.personalOnly = channelConfig?.personalOnly ?? true;
 		this.allowedUserIds = channelConfig?.allowedUserIds?.length
 			? new Set(channelConfig.allowedUserIds)
@@ -231,16 +224,18 @@ export class FeishuChannel implements RealtimeChatChannel, StreamingReplyChannel
 				};
 			}
 
+			// Nothing is written to the server's disk: resources are read straight
+			// into memory. Non-image files are only announced to the agent.
 			const safeName = fileName ?? fileKey;
-			const filePath = join(this.downloadDir, `${messageId}_${safeName}`);
-			await resp.writeFile(filePath);
-
 			const ext = safeName.toLowerCase().split(".").pop() ?? "";
 			const imageExts = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
 
 			if (imageExts.has(ext)) {
-				const { readFileSync } = await import("node:fs");
-				const buffer = readFileSync(filePath);
+				const chunks: Buffer[] = [];
+				for await (const chunk of resp.getReadableStream()) {
+					chunks.push(Buffer.from(chunk as Uint8Array));
+				}
+				const buffer = Buffer.concat(chunks);
 				const mimeMap: Record<string, string> = {
 					png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
 					gif: "image/gif", webp: "image/webp", bmp: "image/bmp",
@@ -250,14 +245,12 @@ export class FeishuChannel implements RealtimeChatChannel, StreamingReplyChannel
 					fileName: safeName,
 					mimeType: mimeMap[ext] ?? "image/png",
 					data: buffer.toString("base64"),
-					filePath,
 				};
 			}
 
 			return {
 				type: "file",
 				fileName: safeName,
-				filePath,
 			};
 		} catch (err) {
 			logger.error({ err, fileKey }, "Feishu download resource error");
@@ -281,8 +274,8 @@ export class FeishuChannel implements RealtimeChatChannel, StreamingReplyChannel
 		await this.api.sendMessage(target.chatId, text);
 	}
 
-	async sendFile(target: PushTarget, filePath: string, fileName?: string): Promise<void> {
-		await this.api.sendFile(target.chatId, filePath, fileName);
+	async sendFile(target: PushTarget, file: string | { bytes: Uint8Array }, fileName?: string): Promise<void> {
+		await this.api.sendFile(target.chatId, file, fileName);
 	}
 
 	/**

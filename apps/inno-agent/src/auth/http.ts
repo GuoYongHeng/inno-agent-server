@@ -26,7 +26,6 @@ export async function requireSession(
 	res: ServerResponse,
 	auth: AuthRuntime,
 ): Promise<AuthSession | null> {
-	if (auth.mode === "local") return null;
 	const session = await auth.getSession(req);
 	if (!session) {
 		json(res, 401, { error: "Authentication required" });
@@ -36,7 +35,7 @@ export async function requireSession(
 }
 
 export function assertSignUpAllowed(auth: AuthRuntime, method: string, path: string): void {
-	if (auth.mode === "better-auth" && !auth.allowSignUp
+	if (!auth.allowSignUp
 		&& method === "POST" && path === "/api/auth/sign-up/email") {
 		throw new HttpError(403, "Sign-up is disabled");
 	}

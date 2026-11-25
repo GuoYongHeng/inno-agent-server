@@ -1,15 +1,6 @@
 import type { JobRuntime, ScheduledJob } from "./types.js";
 import type { JobStore } from "./job-store.js";
 import type { ChannelRegistry } from "../channels/channel.js";
-import {
-	appendAssistantNotification,
-	appendAssistantNotificationInSession,
-	getCurrentSessionChannelHint,
-	runPromptInSession,
-	runPromptStreamingInSession,
-	runPromptSerialized,
-	type StreamEventCallback,
-} from "../agent/pi-runner.js";
 import { computeNextRunAt, isOneShotCron } from "./cron-utils.js";
 import { randomUUID } from "node:crypto";
 import { logger } from "../logger.js";
@@ -27,18 +18,24 @@ export interface JobRunResult {
 
 export type JobRunTrigger = "scheduled" | "manual" | "api";
 
+/** Forwards model events of a run to a caller-owned stream. */
+export type StreamEventCallback = (event: any) => void;
+
+/** The conversation a run executes in. Every run has one, and it is durable. */
 export interface JobSessionTarget {
 	id: string;
-	runtime: JobRuntime;
-	/** Legacy JSONL path; durable sessions deliberately never have one. */
-	path?: string;
+	runtime: "durable";
 }
 
-export type CreatedJobSession = string | JobSessionTarget;
+export type CreatedJobSession = JobSessionTarget;
 
 export interface DurableJobExecution {
 	sessionId: string;
+	/** The prompt to run, or with `notifyOnly` the text to record. */
 	prompt: string;
+	/** Record `prompt` in the session as an assistant notice without asking the
+	 * model anything. Used by reminder tasks. */
+	notifyOnly?: boolean;
 	requestId: string;
 	turnId: string;
 	onEvent?: (event: any) => void;
@@ -48,7 +45,6 @@ export type DurableJobExecutor = (execution: DurableJobExecution) => Promise<str
 
 export interface JobExecutionOptions {
 	/** Explicit session target for a manual or automatic run. */
-	sessionPath?: string;
 	sessionId?: string;
 	sessionRuntime?: JobRuntime;
 	/** Durable execution is injected by the server; there is no legacy fallback. */
@@ -62,8 +58,6 @@ export interface JobExecutionOptions {
 	occurrenceId?: string;
 	/** Scheduled instant used to derive a daily plan slot. */
 	scheduledAt?: string;
-	/** Scheduled tenant jobs must not infer a channel from the shared active session. */
-	allowSessionChannelInference?: boolean;
 }
 
 async function runJobPrompt(
@@ -86,12 +80,24 @@ async function runJobPrompt(
 			...(options.onEvent ? { onEvent: options.onEvent } : {}),
 		});
 	}
-	if (options?.sessionPath) {
-		return options.onEvent
-			? runPromptStreamingInSession(options.sessionPath, job.prompt, options.onEvent)
-			: runPromptInSession(options.sessionPath, job.prompt);
-	}
-	return runPromptSerialized(job.prompt);
+	throw new Error("Agent jobs run in a durable session; none was provided");
+}
+
+/** Record a reminder in the run's session so it shows up in the conversation. */
+async function noteReminderInSession(
+	options: JobExecutionOptions | undefined,
+	job: ScheduledJob,
+	runId: string,
+	text: string,
+): Promise<void> {
+	if (!options?.sessionId || !options.durableExecutor) return;
+	await options.durableExecutor({
+		sessionId: options.sessionId,
+		prompt: text,
+		notifyOnly: true,
+		requestId: `reminder-${job.id}-${runId}`,
+		turnId: randomUUID(),
+	});
 }
 
 /**
@@ -115,10 +121,10 @@ export async function executeJob(
 	const requestedOccurrenceId = options?.occurrenceId
 		?? (options?.scheduledAt ? occurrenceIdFor(job.id, options.scheduledAt) : undefined);
 	const requestedOccurrence = !isReminderJob && checkInStore && requestedOccurrenceId
-		? checkInStore.getOccurrence(job.id, requestedOccurrenceId, startedAt)
+		? await checkInStore.getOccurrence(job.id, requestedOccurrenceId, startedAt)
 		: undefined;
 	const checkInOccurrence = !isReminderJob && checkInStore
-		? checkInStore.resolveOccurrence(job.id, requestedOccurrenceId, startedAt)
+		? await checkInStore.resolveOccurrence(job.id, requestedOccurrenceId, startedAt)
 		: undefined;
 	// A selected slot must still belong to today's live plan. The route also
 	// validates this before execution, but keeping the guard here prevents an
@@ -141,7 +147,7 @@ export async function executeJob(
 		// Continue without attaching this run to a current-day occurrence.
 	}
 
-	const inferredChannel = inferChannel(job, channelRegistry, options?.allowSessionChannelInference !== false);
+	const inferredChannel = inferChannel(job, channelRegistry);
 	if (!job.channel && inferredChannel) {
 		job.channel = inferredChannel;
 		jobStore.update(job.id, { channel: inferredChannel });
@@ -152,14 +158,10 @@ export async function executeJob(
 		lastError: undefined,
 	});
 
-	const useDurable = options?.sessionRuntime === "durable"
-		|| (!options?.sessionRuntime && !options?.sessionPath && !options?.sessionId && job.runtime === "durable");
+	const useDurable = !(job.taskType === "push_reminder" || job.taskType === "check_in_reminder");
 
 	try {
-		if (useDurable && isReminderJob) {
-			throw new Error("Durable job execution does not support reminder tasks; use a custom agent prompt");
-		}
-		if (isCheckInReminder && checkInStore?.isCheckedInToday()) {
+		if (isCheckInReminder && await checkInStore?.isCheckedInToday()) {
 			const finishedAt = new Date();
 			const output = "今天已经完成学习打卡，跳过提醒。";
 			jobStore.appendRun({
@@ -174,9 +176,7 @@ export async function executeJob(
 				trigger,
 			});
 			const oneShot = isOneShotCron(job.cron) && isReminderJob;
-			if (options?.sessionPath) {
-				await appendAssistantNotificationInSession(options.sessionPath, output);
-			}
+			await noteReminderInSession(options, job, runId, output);
 			await jobStore.mutate(job.id, (current) => ({
 				lastRunAt: finishedAt.toISOString(),
 				lastStatus: "skipped",
@@ -189,10 +189,7 @@ export async function executeJob(
 	}
 
 	const output = await runJobPrompt(job, options, runId, useDurable);
-		if (isReminderJob) {
-			if (options?.sessionPath) await appendAssistantNotificationInSession(options.sessionPath, output);
-			else appendAssistantNotification(output);
-		}
+		if (isReminderJob) await noteReminderInSession(options, job, runId, output);
 
 		let pushedToChannel: string | undefined;
 		let pushSkippedReason: string | undefined;
@@ -414,7 +411,7 @@ async function reconcileCheckIn(
 	error: string | undefined,
 ): Promise<CheckInStatus | undefined> {
 	if (!checkInStore || !occurrence) return undefined;
-	const result = checkInStore.recordOccurrence({
+	const result = await checkInStore.recordOccurrence({
 		occurrenceId: occurrence.occurrenceId,
 		jobId: occurrence.jobId,
 		scheduledAt: occurrence.scheduledAt,
@@ -440,15 +437,10 @@ function formatCheckInReminderOutput(prompt: string): string {
 	return trimmed || "今天还有学习任务未完成。完成今日计划后，学习打卡会自动完成。";
 }
 
-function inferChannel(job: ScheduledJob, channelRegistry: ChannelRegistry, allowSessionHint: boolean): ScheduledJob["channel"] | undefined {
+function inferChannel(job: ScheduledJob, channelRegistry: ChannelRegistry): ScheduledJob["channel"] | undefined {
 	if (job.channel) return job.channel;
 	if (job.taskType === "push_reminder") {
-		const hinted = allowSessionHint ? getCurrentSessionChannelHint() : "unknown";
-		if (hinted !== "unknown" && hinted !== "web" && hinted !== "cli" && hinted !== "scheduler") {
-			const ch = hinted as ScheduledJob["channel"];
-			if (ch && channelRegistry.get(ch)) return ch;
-		}
-		// Fallback: any channel with a default target
+		// Any channel with a default target
 		for (const name of ["feishu", "wechat", "qq"] as const) {
 			if (channelRegistry.getDefaultTarget(name)) return name;
 		}

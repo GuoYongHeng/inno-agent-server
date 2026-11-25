@@ -1,5 +1,4 @@
-import { join } from "node:path";
-import { readJson, writeJson } from "../storage/file-store.js";
+import type { TenantStateKv } from "../tenants/state-store.js";
 
 export const BTW_STATE_VERSION = 1 as const;
 export const BTW_INTERRUPTED_ERROR = "回答在应用关闭时中断，请重试";
@@ -36,12 +35,11 @@ export interface BtwWindowGeometry {
 	height: number;
 }
 
-export interface BtwPersistedState {
-	version: typeof BTW_STATE_VERSION;
+/** Window chrome shared by every session of a tenant (`btw:window`). */
+export interface BtwWindowState {
 	window: BtwWindowGeometry;
 	windowInitialized: boolean;
 	minimized: boolean;
-	sessions: Record<string, BtwSessionState>;
 }
 
 export interface BtwStateResponse {
@@ -58,24 +56,14 @@ const DEFAULT_WINDOW: BtwWindowGeometry = {
 	height: 420,
 };
 
-let cache = new Map<string, BtwPersistedState>();
+const WINDOW_KEY = "btw:window";
+const sessionKey = (sessionId: string) => `btw:session:${sessionId}`;
 
-export function btwStatePath(dataDir: string): string {
-	return join(dataDir, "sessions", "btw.json");
-}
+/** Sessions whose pending exchanges were already reconciled in this process. */
+let restored = new Set<string>();
 
 function defaultSession(): BtwSessionState {
 	return { nextTabNumber: 1, activeTabId: null, tabs: [] };
-}
-
-function defaultState(): BtwPersistedState {
-	return {
-		version: BTW_STATE_VERSION,
-		window: { ...DEFAULT_WINDOW },
-		windowInitialized: false,
-		minimized: false,
-		sessions: {},
-	};
 }
 
 function finiteNumber(value: unknown, fallback: number): number {
@@ -141,87 +129,68 @@ function normalizeSession(raw: unknown, restorePending: boolean): BtwSessionStat
 	};
 }
 
-function normalizeState(raw: unknown, restorePending: boolean): BtwPersistedState {
-	const base = defaultState();
-	if (!raw || typeof raw !== "object") return base;
-	const item = raw as Record<string, unknown>;
-	const rawWindow = item.window && typeof item.window === "object"
-		? item.window as Record<string, unknown>
-		: {};
-	const sessions: Record<string, BtwSessionState> = {};
-	if (item.sessions && typeof item.sessions === "object") {
-		for (const [sessionId, session] of Object.entries(item.sessions as Record<string, unknown>)) {
-			if (sessionId) sessions[sessionId] = normalizeSession(session, restorePending);
-		}
-	}
+function normalizeWindow(raw: unknown): BtwWindowState {
+	const item = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+	const rawWindow = item.window && typeof item.window === "object" ? item.window as Record<string, unknown> : {};
 	return {
-		version: BTW_STATE_VERSION,
 		window: {
-			x: finiteNumber(rawWindow.x, base.window.x),
-			y: finiteNumber(rawWindow.y, base.window.y),
-			width: Math.max(1, finiteNumber(rawWindow.width, base.window.width)),
-			height: Math.max(1, finiteNumber(rawWindow.height, base.window.height)),
+			x: finiteNumber(rawWindow.x, DEFAULT_WINDOW.x),
+			y: finiteNumber(rawWindow.y, DEFAULT_WINDOW.y),
+			width: Math.max(1, finiteNumber(rawWindow.width, DEFAULT_WINDOW.width)),
+			height: Math.max(1, finiteNumber(rawWindow.height, DEFAULT_WINDOW.height)),
 		},
 		windowInitialized: item.windowInitialized === true,
 		minimized: item.minimized === true,
-		sessions,
 	};
 }
 
-function read(dataDir: string): BtwPersistedState {
-	const key = btwStatePath(dataDir);
-	const cached = cache.get(key);
-	if (cached) return cached;
-	const loaded = normalizeState(readJson<unknown>(key, null), true);
-	cache.set(key, loaded);
-	return loaded;
+/**
+ * Load one session's BTW state. The first read of a session in this process
+ * turns exchanges still marked `pending` into errors (their request died with
+ * the previous process) and persists that; later reads return stored state so
+ * exchanges that are genuinely in flight stay pending.
+ */
+export async function readBtwState(kv: TenantStateKv, sessionId: string): Promise<BtwStateResponse> {
+	const win = normalizeWindow(await kv.get<unknown>(WINDOW_KEY));
+	const raw = await kv.get<unknown>(sessionKey(sessionId));
+	const restoreKey = `${kv.scope ?? ""}\0${sessionId}`;
+	let session: BtwSessionState;
+	if (raw === undefined) {
+		session = defaultSession();
+	} else if (!restored.has(restoreKey)) {
+		session = normalizeSession(raw, true);
+		await kv.set(sessionKey(sessionId), session);
+	} else {
+		session = normalizeSession(raw, false);
+	}
+	restored.add(restoreKey);
+	return { session, ...win };
 }
 
-function write(dataDir: string, state: BtwPersistedState): void {
-	const key = btwStatePath(dataDir);
-	cache.set(key, state);
-	writeJson(key, state);
-}
-
-export function readBtwState(dataDir: string, sessionId: string): BtwStateResponse {
-	const state = read(dataDir);
-	return {
-		session: state.sessions[sessionId] ?? defaultSession(),
-		window: { ...state.window },
-		windowInitialized: state.windowInitialized,
-		minimized: state.minimized,
-	};
-}
-
-export function writeBtwState(dataDir: string, sessionId: string, input: BtwStateResponse): BtwStateResponse {
-	const state = read(dataDir);
-	const next: BtwPersistedState = {
-		...state,
+export async function writeBtwState(kv: TenantStateKv, sessionId: string, input: BtwStateResponse): Promise<BtwStateResponse> {
+	const current = normalizeWindow(await kv.get<unknown>(WINDOW_KEY));
+	const win: BtwWindowState = {
 		window: {
-			x: finiteNumber(input.window.x, state.window.x),
-			y: finiteNumber(input.window.y, state.window.y),
-			width: Math.max(1, finiteNumber(input.window.width, state.window.width)),
-			height: Math.max(1, finiteNumber(input.window.height, state.window.height)),
+			x: finiteNumber(input.window.x, current.window.x),
+			y: finiteNumber(input.window.y, current.window.y),
+			width: Math.max(1, finiteNumber(input.window.width, current.window.width)),
+			height: Math.max(1, finiteNumber(input.window.height, current.window.height)),
 		},
 		windowInitialized: input.windowInitialized === true,
 		minimized: input.minimized === true,
-		sessions: {
-			...state.sessions,
-			[sessionId]: normalizeSession(input.session, false),
-		},
 	};
-	write(dataDir, next);
-	return readBtwState(dataDir, sessionId);
+	const session = normalizeSession(input.session, false);
+	await kv.set(WINDOW_KEY, win);
+	await kv.set(sessionKey(sessionId), session);
+	restored.add(`${kv.scope ?? ""}\0${sessionId}`);
+	return { session, ...win };
 }
 
-export function clearSessionBtw(dataDir: string, sessionId: string): void {
-	const state = read(dataDir);
-	if (!(sessionId in state.sessions)) return;
-	const sessions = { ...state.sessions };
-	delete sessions[sessionId];
-	write(dataDir, { ...state, sessions });
+export async function clearSessionBtw(kv: TenantStateKv, sessionId: string): Promise<void> {
+	await kv.delete(sessionKey(sessionId));
+	restored.delete(`${kv.scope ?? ""}\0${sessionId}`);
 }
 
 export function resetBtwStoreForTests(): void {
-	cache = new Map<string, BtwPersistedState>();
+	restored = new Set<string>();
 }

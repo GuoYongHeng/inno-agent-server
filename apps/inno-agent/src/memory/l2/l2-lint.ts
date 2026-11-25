@@ -1,7 +1,7 @@
-import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, extname } from "node:path";
 import { parse as parseYaml } from "yaml";
 
-import { fileExists, readText } from "../../storage/file-store.js";
+import { l2Store, type L2Backend, type L2Target } from "./l2-backend.js";
 import { readManifest } from "./manifest-store.js";
 import type { WikiPageFrontmatter, WikiPageType } from "./types.js";
 import { buildAliasIndex, extractOutgoingLinks } from "./wiki-links.js";
@@ -56,24 +56,12 @@ function normalizePath(value: string): string {
 	return value.replace(/\\/g, "/");
 }
 
-function fileExistsWithin(root: string, relativePath: string): boolean {
-	const absoluteRoot = resolve(root);
-	const target = resolve(absoluteRoot, relativePath);
-	const fromRoot = relative(absoluteRoot, target);
-	if (fromRoot === ".." || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) return false;
-	return fileExists(target);
-}
-
 function finding(code: L2LintCode, severity: L2LintSeverity, path: string, message: string): L2LintFinding {
 	return { code, severity, path: normalizePath(path), message };
 }
 
-function wikiPagePaths(l2DataDir: string): string[] {
-	return listWikiPagePaths(l2DataDir);
-}
-
-function readPage(l2DataDir: string, path: string, findings: L2LintFinding[], routing: WikiSchemaRouting): PageRecord {
-	const content = readText(join(l2DataDir, path));
+async function readPage(store: L2Backend, path: string, findings: L2LintFinding[], routing: WikiSchemaRouting): Promise<PageRecord> {
+	const content = await store.readText(path);
 	const match = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
 	if (!match) {
 		findings.push(finding("missing_frontmatter", "error", path, "Page has no complete YAML frontmatter block."));
@@ -136,8 +124,8 @@ function readPage(l2DataDir: string, path: string, findings: L2LintFinding[], ro
 	};
 }
 
-function indexedWikiPaths(l2DataDir: string): Set<string> {
-	const index = readText(join(l2DataDir, "wiki", "index.md"));
+async function indexedWikiPaths(store: L2Backend): Promise<Set<string>> {
+	const index = await store.readText("wiki/index.md");
 	const paths = new Set<string>();
 	const pattern = /`(wiki[\\/][^`]+\.md)`/g;
 	let match: RegExpExecArray | null;
@@ -148,15 +136,16 @@ function indexedWikiPaths(l2DataDir: string): Set<string> {
 }
 
 /** Run deterministic, read-only structural checks over one L2 Wiki root. */
-export function runL2Lint(l2DataDir: string): L2LintReport {
+export async function runL2Lint(target: L2Target): Promise<L2LintReport> {
+	const store = l2Store(target);
 	const findings: L2LintFinding[] = [];
-	const manifest = readManifest(l2DataDir);
-	const schemaPath = join(l2DataDir, "wiki", "SCHEMA.md");
-	const routing = parseWikiSchemaRouting(fileExists(schemaPath) ? readText(schemaPath) : "");
+	const manifest = await readManifest(store);
+	const routing = parseWikiSchemaRouting(await store.readText("wiki/SCHEMA.md"));
 	const manifestIds = new Set(manifest.map((entry) => entry.id));
-	const pagePaths = wikiPagePaths(l2DataDir);
+	const pagePaths = await listWikiPagePaths(store);
 	const actualPagePaths = new Set(pagePaths.map(normalizePath));
-	const pages = pagePaths.map((path) => readPage(l2DataDir, path, findings, routing));
+	const pages: PageRecord[] = [];
+	for (const path of pagePaths) pages.push(await readPage(store, path, findings, routing));
 
 	const alias = buildAliasIndex(pages);
 	for (const page of pages) {
@@ -177,18 +166,18 @@ export function runL2Lint(l2DataDir: string): L2LintReport {
 			findings.push(finding("incomplete_archive", "warning", "manifest.jsonl", `Source ${entry.id} is ${entry.status}, not indexed.`));
 		}
 		for (const sourcePath of [entry.rawPath, entry.extractedPath].filter((value): value is string => Boolean(value))) {
-			if (!fileExistsWithin(l2DataDir, sourcePath)) {
+			if (!(await store.exists(sourcePath))) {
 				findings.push(finding("missing_source_file", "error", "manifest.jsonl", `Source ${entry.id} is missing file: ${sourcePath}.`));
 			}
 		}
 		for (const pagePath of entry.wikiPages) {
-			if (!fileExistsWithin(l2DataDir, pagePath)) {
+			if (!(await store.exists(pagePath))) {
 				findings.push(finding("manifest_page_missing", "error", "manifest.jsonl", `Source ${entry.id} references missing page: ${pagePath}.`));
 			}
 		}
 	}
 
-	const indexedPaths = indexedWikiPaths(l2DataDir);
+	const indexedPaths = await indexedWikiPaths(store);
 	for (const pagePath of actualPagePaths) {
 		if (!indexedPaths.has(pagePath)) {
 			findings.push(finding("index_missing_page", "warning", "wiki/index.md", `Wiki page is absent from index: ${pagePath}.`));

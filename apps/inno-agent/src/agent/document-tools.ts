@@ -1,20 +1,28 @@
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { existsSync } from "node:fs";
 import { resolve, isAbsolute } from "node:path";
 import { parseDocument, screenshotDocument, DocumentParseError } from "../memory/l2/document-parser.js";
 import { logger } from "../logger.js";
-import { checkWorkspaceMutationPath } from "./workspace-path-guard.js";
+import { formatNativeImageMarker, persistInlineImages } from "../server/inline-images.js";
+import { defineInnoTool } from "./inno-tool.js";
+import { LocalWorkspaceFileAccess } from "../workspace/local-workspace-file-access.js";
+import type { WorkspaceFileAccess } from "../workspace/workspace-files.js";
 
 export interface DocumentToolOptions {
 	restrictToWorkspace?: boolean;
+	/** Session workspace. Durable sessions pass it explicitly; the legacy adapter
+	 * supplies the session cwd instead. */
+	workspaceDir?: string;
+	/** Workspace file access seam; defaults to a local access over workspaceDir. */
+	files?: WorkspaceFileAccess;
 }
 
 /**
  * Create document parsing tools for the Inno Agent.
  */
-export function createDocumentTools(options: DocumentToolOptions = {}): ToolDefinition[] {
-	const parseDocumentTool = defineTool({
+export function createDocumentTools(options: DocumentToolOptions = {}): ToolRegistration[] {
+	const parseDocumentTool = defineInnoTool({
 		name: "parse_document",
 		label: "解析文档",
 		description:
@@ -34,18 +42,11 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolDefi
 				}),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-			const typed = params as {
-				filePath: string;
-				includePageDetails?: boolean;
-				includeScreenshots?: boolean;
-			};
-			const reportProgress = (text: string, phase: string): void => {
+		async execute(params, api) {
+			const typed = params;
+			const reportProgress = (text: string, _phase: string): void => {
 				try {
-					onUpdate?.({
-						content: [{ type: "text" as const, text }],
-						details: { phase, filePath: typed.filePath },
-					});
+					api.output(text);
 				} catch {
 					// Progress reporting is best-effort and must never fail parsing.
 				}
@@ -54,35 +55,59 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolDefi
 			// The tool context is session-scoped. The process environment points at
 			// the runtime's default workspace and can be different from the
 			// workspace bound to the current chat session.
-			const workspaceDir = ctx.cwd || process.env.INNO_WORKSPACE_DIR || process.cwd();
-			const pathCheck = options.restrictToWorkspace
-				? checkWorkspaceMutationPath(workspaceDir, typed.filePath)
-				: {
-					allowed: true,
+			const workspaceDir = options.workspaceDir || process.env.INNO_WORKSPACE_DIR || process.cwd();
+			const files = options.files
+				?? new LocalWorkspaceFileAccess({ root: workspaceDir });
+			let resolvedPath: string;
+			let relPath: string | undefined;
+			if (options.restrictToWorkspace) {
+				const rel = files.toRelative(typed.filePath);
+				if (!rel) {
+					return {
+						content: [{ type: "text" as const, text: "文件路径必须位于当前工作区内，且不能通过符号链接指向工作区外。" }],
+						details: { error: "outside_workspace", filePath: typed.filePath, pageCount: 0, textLength: 0 },
+					};
+				}
+				relPath = rel;
+				resolvedPath = rel;
+			} else {
+				const pathCheck = {
+					allowed: true as const,
 					resolvedPath: isAbsolute(typed.filePath) ? typed.filePath : resolve(workspaceDir, typed.filePath),
 				};
-			if (!pathCheck.allowed || !pathCheck.resolvedPath) {
-				return {
-					content: [{ type: "text" as const, text: "文件路径必须位于当前工作区内，且不能通过符号链接指向工作区外。" }],
-					details: { error: pathCheck.reason ?? "outside_workspace", filePath: typed.filePath, pageCount: 0, textLength: 0 },
-				};
+				resolvedPath = pathCheck.resolvedPath;
 			}
-			const resolvedPath = pathCheck.resolvedPath;
 
 			// Check file existence before attempting parse
 			reportProgress("正在检查文件", "checking");
-			if (!existsSync(resolvedPath)) {
-				return {
-					content: [{ type: "text" as const, text: `文件不存在: ${typed.filePath}` }],
-					details: { error: "file_not_found", filePath: resolvedPath, pageCount: 0, textLength: 0 },
-				};
+			if (relPath === undefined) {
+				if (!existsSync(resolvedPath)) {
+					return {
+						content: [{ type: "text" as const, text: `文件不存在: ${typed.filePath}` }],
+						details: { error: "file_not_found", filePath: resolvedPath, pageCount: 0, textLength: 0 },
+					};
+				}
 			}
 
 			// Parse document
 			let parsed;
 			try {
 				reportProgress("正在解析文档", "parsing");
-				parsed = await parseDocument(resolvedPath);
+				if (relPath !== undefined) {
+					const outcome = await files.withLocalFile(relPath, async (localPath) => {
+						resolvedPath = localPath;
+						return await parseDocument(localPath);
+					});
+					if (outcome === null) {
+						return {
+							content: [{ type: "text" as const, text: `文件不存在: ${typed.filePath}` }],
+							details: { error: "file_not_found", filePath: typed.filePath, pageCount: 0, textLength: 0 },
+						};
+					}
+					parsed = outcome;
+				} else {
+					parsed = await parseDocument(resolvedPath);
+				}
 				reportProgress(`已读取 ${parsed.pageCount} 页，正在整理内容`, "parsed");
 			} catch (err) {
 				logger.warn({ err, filePath: resolvedPath }, "parse_document tool: document parsing failed");
@@ -113,22 +138,30 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolDefi
 				}
 			}
 
-			const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [
+			const content: Array<{ type: "text"; text: string }> = [
 				{ type: "text", text: lines.join("\n") },
 			];
 
-			// Screenshots
+			// Screenshots stay on disk / object storage. The transcript keeps a path
+			// marker; the generation hook expands it only for the provider request.
 			if (typed.includeScreenshots) {
 				try {
 					reportProgress("正在生成页面截图", "screenshots");
-					const screenshots = await screenshotDocument(resolvedPath);
-					for (const shot of screenshots) {
-						content.push({
-							type: "image",
+					const takeShots = async (path: string) => await screenshotDocument(path);
+					const screenshots = relPath !== undefined
+						? await files.withLocalFile(relPath, (localPath) => takeShots(localPath)) ?? []
+						: await takeShots(resolvedPath);
+					const persisted = persistInlineImages(
+						screenshots.map((shot) => ({
+							type: "image" as const,
 							data: shot.imageBuffer.toString("base64"),
 							mimeType: "image/png",
-						});
-					}
+						})),
+						workspaceDir,
+						`parse-document:${typed.filePath}:${screenshots.length}`,
+					);
+					const marker = formatNativeImageMarker(persisted.map((workspacePath) => ({ workspacePath, mimeType: "image/png" })));
+					if (marker) content.push({ type: "text", text: marker });
 				} catch (err) {
 					logger.warn({ err }, "document screenshot generation failed");
 					content.push({
@@ -141,7 +174,6 @@ export function createDocumentTools(options: DocumentToolOptions = {}): ToolDefi
 			return {
 				content,
 				details: {
-					error: undefined as string | undefined,
 					filePath: resolvedPath,
 					pageCount: parsed.pageCount,
 					textLength: parsed.text.length,

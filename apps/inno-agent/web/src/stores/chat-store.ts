@@ -1,11 +1,10 @@
 import { EventEmitter } from "./event-emitter.js";
 import { streamChat, abortChat, getChatStatus, streamSessionEvents, submitChatQuestion, submitChatPermission, formatQuestionnaireAsPrompt } from "../api/chat.js";
-import type { InlineImage } from "../api/chat.js";
+import type { ChatImageRef } from "../api/chat.js";
 import type { ChatAttachments, ChatMessage, ChatStreamEvent, ChatToolRecord, ChatTraceStep, PendingPermission, PendingQuestion, PermissionDecisionKind, QuestionnaireResult, StreamEventEnvelope, StreamSnapshot, WorkspaceFileChange } from "../types/chat.js";
 import { notebookStore } from "./notebook-store.js";
 import { appStore } from "./app-store.js";
 import { workspaceStore, type StreamingWorkspacePreview } from "./workspace-store.js";
-import { ensureWindowForPanel } from "./window-expansion.js";
 import { applyChatTraceEvent, finalizeTraceSteps, traceStepsFromEvents, traceTerminalState } from "../utils/chat-trace.js";
 import type { JobRunStreamEvent } from "../types/jobs.js";
 import { skillMessageFromContent } from "../react/chat/skill-message-collapse.js";
@@ -108,14 +107,14 @@ export class ChatStoreImpl extends EventEmitter<ChatStoreEvents> {
 	/** Last user prompt sent, kept so users can Retry. */
 	lastUserPrompt: string | null = null;
 	/** Images from the last send, kept so users can Retry. */
-	lastImages: InlineImage[] | undefined = undefined;
+	lastImages: ChatImageRef[] | undefined = undefined;
 	/** Pending question from agent's ask_user_question tool */
 	pendingQuestion: PendingQuestion | null = null;
 	/** Question IDs the user has already answered. Suppresses stale replays
 	 *  (backend may re-push a question event before the answer POST lands) and
 	 *  guards restored cards against reappearing from a stale cache. */
 	private answeredQuestionIds = new Set<string>();
-	/** Pending permission ask from pi-permission-system's gate (web approval card). */
+	/** Pending workspace write/edit approval (web approval card). */
 	pendingPermission: PendingPermission | null = null;
 	/** Permission request IDs the user already decided. Suppresses stale replays. */
 	private answeredPermissionIds = new Set<string>();
@@ -149,9 +148,9 @@ export class ChatStoreImpl extends EventEmitter<ChatStoreEvents> {
 	/** Last time any stream envelope was applied; a stale value after a page
 	 *  resume means the in-flight stream likely died while suspended. */
 	private lastStreamActivityAt = 0;
-	private retryInputBySession = new Map<string, { prompt: string; images?: InlineImage[]; attachments?: ChatAttachments }>();
+	private retryInputBySession = new Map<string, { prompt: string; images?: ChatImageRef[]; attachments?: ChatAttachments }>();
 
-	async send(prompt: string, images?: InlineImage[], sessionIdOverride?: string | null, attachments?: ChatAttachments): Promise<void> {
+	async send(prompt: string, images?: ChatImageRef[], sessionIdOverride?: string | null, attachments?: ChatAttachments): Promise<void> {
 		if ((!prompt.trim() && !images?.length && !hasAttachmentFiles(attachments)) || this.isSending) return;
 		const { sessionsStore } = await import("./sessions-store.js");
 		const targetSessionId = sessionIdOverride === undefined
@@ -167,8 +166,8 @@ export class ChatStoreImpl extends EventEmitter<ChatStoreEvents> {
 			role: "user",
 			content: prompt,
 			timestamp: Date.now(),
-			images: images?.map(({ data, mimeType }) => ({
-				previewUrl: `data:${mimeType};base64,${data}`,
+			images: images?.map(({ previewUrl, mimeType, workspacePath }) => ({
+				previewUrl: previewUrl ?? `/api/workspace/raw?path=${encodeURIComponent(workspacePath)}`,
 				mimeType,
 			})),
 			attachments,
@@ -1333,18 +1332,6 @@ const FILE_EXTENSIONS = [
 const FILE_PATH_RE = new RegExp(`(?:^|[\\s"'\\\`“”‘’（(])((?:[\\w.-]+\\/)*[\\w.-]+\\.(${FILE_EXTENSIONS}))(?:$|[\\s"'\\\`“”‘’）),，。:：])`, "i");
 
 async function revealWorkspacePreview(): Promise<void> {
-	const currentMode = appStore.workspaceMode;
-	const opensSplitPanel = currentMode !== "full";
-	const targetMode = currentMode === "collapsed" || currentMode === "quarter" ? "half" : currentMode;
-	const targetWidth = appStore.workspaceWidth < 560 ? 640 : appStore.workspaceWidth;
-
-	if (opensSplitPanel) {
-		// Desktop: grow the native window first. Browser users have no desktop
-		// bridge, so ensureWindowForPanel returns "unavailable" and the local
-		// fitPanelLayout fallback below still opens the panel safely.
-		await ensureWindowForPanel("right", targetWidth, targetMode);
-	}
-
 	appStore.setRightPanelTab("preview");
 	if (appStore.workspaceWidth < 560) appStore.setWorkspaceWidth(640);
 	if (appStore.workspaceMode === "collapsed" || appStore.workspaceMode === "quarter") {
