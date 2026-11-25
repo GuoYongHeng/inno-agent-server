@@ -277,9 +277,10 @@ async function ensureBootstrapped(): Promise<void> {
 		logger.info("[inno-server] first meaningful request — bootstrapping...");
 
 		// ---- config (loaded lazily, not at process start) ----
-		// Mutable platform config lives in the `platform_config` row so every
-		// worker shares one copy; config.json only supplies immutable fields
-		// plus a per-boot seed for any mutable keys it still carries.
+		// Platform config = file-backed deployment fields + the server-managed
+		// document (provider catalog, channel credentials, Tavily, hub) from
+		// the `platform_config` row. config.json may not carry managed keys;
+		// ops write the row via `npm run platform:config`.
 		const resolved = await resolvePlatformConfig(
 			auth.tenantStore.database,
 			readRawConfigFile(paths.configPath),

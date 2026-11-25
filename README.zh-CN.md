@@ -98,25 +98,13 @@ Provider 目录由部署方在 `config.json` 中统一种子，账号只能在 S
 {
   "defaultProvider": "innospark",
   "defaultModel": "claude-sonnet-4-6",
-  "providers": {
-    "innospark": {
-      "baseUrl": "https://api.example.com",
-      "api": "anthropic-messages",
-      "apiKey": "replace-me",
-      "models": [{ "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6" }]
-    }
-  },
   "server": { "port": 3000 },
-  "channels": {
-    "feishu": { "enabled": false },
-    "wechat": { "enabled": false, "mode": "ilink" }
-  },
-  "memory": { "l2Enabled": true, "l3Enabled": true },
-  "ui": { "theme": "light" }
+  "sandbox": { "enabled": false },
+  "presets": { "dir": "" }
 }
 ```
 
-每个供应商声明 `baseUrl`、`api`(`openai-completions` 或 `anthropic-messages`)、`apiKey` 和 `models[]` 列表。此文件只需承载不可变部署字段（`server`、`sandbox`、`objectStorage`、`presets`）——可变平台配置（providers、渠道凭据、Tavily、内容中心、memory/ui/scheduler 默认值）存于 PostgreSQL `platform_config` 行，所有 worker 共享一份；`config.json` 中仍出现的可变键会作为每次启动的种子覆盖库中对应值。此文件是服务端托管的模型目录——租户无法通过 API 或 UI 修改 provider，其默认模型选择按租户存于 PostgreSQL。
+此文件只放部署字段和固定默认模型。provider 目录用 `npm run platform:config -- platform.json` 写入 `platform_config` 行，`platform.json` 形如 `{"providers": {"innospark": {"baseUrl": ..., "api": "anthropic-messages", "apiKey": ..., "models": [{"id": "claude-sonnet-4-6", ...}]}}}`；每个供应商声明 `baseUrl`、`api`(`openai-completions` 或 `anthropic-messages`)、`apiKey` 和 `models[]` 列表。服务端托管配置（provider 目录、渠道凭据/端点、Tavily、内容中心）只存于 PostgreSQL `platform_config` 行——`config.json` 不得声明这些键（含则拒绝启动）；运维用 `npm run platform:config -- <file>` 写入。用户级默认值（memory、smartInput、UI 主题、scheduler 时区=Asia/Shanghai）硬编码在代码里，按租户在 `tenant_configs` 覆盖。此文件是服务端托管的模型目录——租户无法通过 API 或 UI 修改 provider，其默认模型选择按租户存于 PostgreSQL。
 
 ### 运行时路径
 

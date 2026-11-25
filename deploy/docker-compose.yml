@@ -61,12 +61,13 @@ services:
       minio-init:
         condition: service_completed_successfully
     volumes:
-      # /etc/inno-agent/config.json is the OPERATOR-MANAGED catalog: providers
-      # and apiKeys, tavily key, channel endpoints/bridge token. Tenants only
-      # pick a model and flip channel/memory toggles — their choices live in
-      # the tenant_configs row, read async per request, never on disk. Seed
-      # this file once (see config.example.json); keep the volume persistent
-      # because it holds real credentials.
+      # /etc/inno-agent/config.json holds DEPLOYMENT fields only (server /
+      # sandbox / objectStorage / presets / defaultProvider / defaultModel).
+      # The server-managed catalog — providers/apiKeys, tavily key, channel
+      # endpoints/bridge token — lives in the platform_config row and is
+      # written once via `npm run platform:config -- <file>`; the file may
+      # not carry those keys (boot refuses). Tenants only pick a model and
+      # flip channel/memory toggles — their choices live in tenant_configs.
       - inno-agent-config:/etc/inno-agent
       # Everything else the agent writes — workspace copies in
       # INNO_WORKSPACE_DIR (including its .inno-scratch caches) — is

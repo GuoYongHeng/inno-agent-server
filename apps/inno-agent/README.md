@@ -8,7 +8,7 @@
 
 - Node.js >= 22.19.0（pi-durable 的最低版本要求）
 - 已 `npm install` 并 `npm run build`（在仓库根目录执行）
-- `runtime/config/config.json` 已配置（参考 `config.example.json`，至少填好一个 provider 的 `apiKey`）
+- `runtime/config/config.json` 已配置（参考 `config.example.json`，部署字段 + 默认模型），provider 目录已用 `npm run platform:config -- <file>` 写入 `platform_config` 行
 
 ## 安装
 

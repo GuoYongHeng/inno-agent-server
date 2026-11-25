@@ -72,56 +72,42 @@ describe("key split", () => {
 			objectStorage: { provider: "s3" },
 			presets: { dir: "/app/presets" },
 		});
-		expect(Object.keys(pickMutableConfig(raw)).sort()).toEqual(["providers", "smartInput", "tavily"]);
+		expect(Object.keys(pickMutableConfig(raw)).sort()).toEqual(["providers", "tavily"]);
 	});
 });
 
 describe("resolvePlatformConfig", () => {
-	it("seeds mutable file keys into the empty row and merges with file immutable keys", async () => {
-		const { pool, state } = fakePool();
-		const fileRaw = {
-			providers: PROVIDERS,
+	it("merges the stored managed doc over file deployment fields", async () => {
+		const { pool, state } = fakePool({ providers: PROVIDERS, tavily: { apiKey: "db-key" } });
+		const { config, doc } = await resolvePlatformConfig(pool, {
 			defaultProvider: "alpha",
 			defaultModel: "m1",
 			objectStorage: { provider: "s3" },
-		};
-		const { config, doc, seeded } = await resolvePlatformConfig(pool, fileRaw);
-		expect(seeded).toBe(true);
-		expect(state.saves).toBe(1);
+		});
+		expect(state.saves).toBe(0); // never writes — the row is the source of truth
 		expect(doc.providers).toEqual(PROVIDERS);
 		expect(config.defaultProvider).toBe("alpha");
+		expect(config.tavily).toEqual({ apiKey: "db-key" });
 		expect(config.objectStorage).toEqual({ provider: "s3" });
 	});
 
-	it("keeps stored keys the file does not mention (trimmed config.json cannot wipe the DB)", async () => {
-		const { pool, state } = fakePool({ providers: PROVIDERS, tavily: { apiKey: "db-key" } });
-		const { config, seeded } = await resolvePlatformConfig(pool, {
-			objectStorage: { provider: "s3" },
-		});
-		expect(seeded).toBe(false);
-		expect(state.saves).toBe(0);
-		expect(config.tavily).toEqual({ apiKey: "db-key" });
-		expect(Object.keys(config.providers)).toEqual(["alpha"]);
+	it("rejects a file that declares server-managed keys", async () => {
+		const { pool } = fakePool({ providers: PROVIDERS });
+		await expect(
+			resolvePlatformConfig(pool, { providers: PROVIDERS, tavily: { apiKey: "x" } }),
+		).rejects.toThrow(/server-managed keys: providers, tavily/);
 	});
 
-	it("lets file keys override stored ones (ConfigMap-style desired state)", async () => {
-		const { pool } = fakePool({ tavily: { apiKey: "old" }, providers: PROVIDERS });
-		const { config, doc, seeded } = await resolvePlatformConfig(pool, {
-			tavily: { apiKey: "new" },
-		});
-		expect(seeded).toBe(true);
-		expect(doc.tavily).toEqual({ apiKey: "new" });
-		expect(config.tavily).toEqual({ apiKey: "new" });
-	});
-
-	it("throws like the old file loader when no provider exists anywhere", async () => {
+	it("throws when neither file defaults nor the DB doc provide a provider", async () => {
 		const { pool } = fakePool();
 		await expect(resolvePlatformConfig(pool, {})).rejects.toThrow(/at least one provider/);
 	});
 
-	it("drops unknown legacy keys from the stored doc out of InnoConfig", async () => {
-		const { pool } = fakePool({ providers: PROVIDERS, skillRegistry: { disabled: ["x"] } });
+	it("platform defaults for memory/ui/scheduler come from hardcoded normalize defaults", async () => {
+		const { pool } = fakePool({ providers: PROVIDERS });
 		const { config } = await resolvePlatformConfig(pool, {});
-		expect((config as unknown as Record<string, unknown>).skillRegistry).toBeUndefined();
+		expect(config.memory?.l2Enabled).toBe(true);
+		expect(config.scheduler?.timezone).toBe("Asia/Shanghai");
+		expect(config.ui?.theme).toBe("light");
 	});
 });

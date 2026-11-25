@@ -24,18 +24,24 @@ npm run build    # 编译 backend + 前端，约 10s
 ## 3. 配置 API key
 
 ```bash
-mkdir -p runtime/config runtime/skills workspace
+mkdir -p runtime/config workspace
 cp config.example.json runtime/config/config.json
 ```
 
-编辑 `runtime/config/config.json`，把 `apiKey` 换成你自己的。下面三个例子任选一个：
+`config.json` 只放部署字段（端口、沙箱、对象存储、预设目录、默认模型）。**provider 目录不入文件**——写进 PostgreSQL `platform_config` 行：
+
+```bash
+# 先跑迁移（首次）
+export DATABASE_URL=postgres://...
+npm run auth:migrate
+```
+
+新建 `platform.json` 写入 provider（下面三个例子任选一个），然后 `npm run platform:config -- platform.json`：
 
 **Anthropic 官方**
 
 ```json
 {
-  "defaultProvider": "anthropic",
-  "defaultModel": "claude-sonnet-4-6",
   "providers": {
     "anthropic": {
       "baseUrl": "https://api.anthropic.com",
@@ -43,8 +49,7 @@ cp config.example.json runtime/config/config.json
       "apiKey": "sk-ant-...",
       "models": [{ "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6" }]
     }
-  },
-  "server": { "port": 3000 }
+  }
 }
 ```
 
@@ -52,8 +57,6 @@ cp config.example.json runtime/config/config.json
 
 ```json
 {
-  "defaultProvider": "deepseek",
-  "defaultModel": "deepseek-chat",
   "providers": {
     "deepseek": {
       "baseUrl": "https://api.deepseek.com",
@@ -61,14 +64,26 @@ cp config.example.json runtime/config/config.json
       "apiKey": "sk-...",
       "models": [{ "id": "deepseek-chat", "name": "DeepSeek Chat" }]
     }
-  },
-  "server": { "port": 3000 }
+  }
 }
 ```
 
-**InnoSpark（默认模板）**
+**InnoSpark**
 
-直接用 `config.example.json` 的内容，把 `apiKey` 字段填上即可。
+```json
+{
+  "providers": {
+    "innospark": {
+      "baseUrl": "https://api.innospark.cn",
+      "api": "anthropic-messages",
+      "apiKey": "...",
+      "models": [{ "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6" }]
+    }
+  }
+}
+```
+
+写完后把 `config.json` 里的 `defaultProvider`/`defaultModel` 指向你配的 provider 和模型。查看当前平台配置用 `npm run platform:config -- --print`。
 
 ## 4. 启动
 
@@ -129,7 +144,7 @@ npm run web:dev        # 终端 2 — Vite :5173（代理 /api 到 :3000）
 
 **修改了 backend 代码不生效？** backend 跑的是编译后的 `dist/`，需要重新 `npm run build` 再重启。前端在 `web:dev` 下走 Vite HMR，改完直接刷新即可。
 
-**想换 provider？** 服务端部署的模型目录由平台配置统一管理（`platform_config` 行，`config.json` 里的可变键在启动时作为 seed 写入；普通账号不能在设置页改 provider）。用户在 Web UI 顶部模型选择器或设置页里挑默认模型——选择写入 PostgreSQL 里的租户配置，不回写 config 文件。
+**想换 provider？** 服务端部署的模型目录在 PostgreSQL `platform_config` 行里（运维用 `npm run platform:config` 写入；普通账号不能在设置页改 provider）。用户在 Web UI 顶部模型选择器或设置页里挑默认模型——选择写入 PostgreSQL 里的租户配置，不回写 config 文件。
 
 **想看 backend 日志？** `tail -f runtime/logs/server.log`（用 `restart-dev.sh` 启动的话日志在这里）。
 

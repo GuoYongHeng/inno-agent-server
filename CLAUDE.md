@@ -94,7 +94,9 @@ npm run restart:fast    # skip build, restart only
 ```bash
 mkdir -p runtime/config runtime/skills workspace
 cp config.example.json runtime/config/config.json
-# Edit runtime/config/config.json — set providers[*].apiKey
+# Edit runtime/config/config.json — deployment fields + defaultProvider/defaultModel
+# Write the provider catalog into the platform_config row:
+#   DATABASE_URL=... npm run platform:config -- platform.json
 # Optional: presets.dir; skills seed from INNO_SKILLS_DIR on boot
 ```
 
@@ -155,7 +157,7 @@ Precedence: command-line flag → env var → `~/.inno-agent/...`.
 
 **Local-disk rule:** durable tenant state is not a data directory. `INNO_DATA_DIR`/`--data` are gone. What still touches local disk:
 
-1. Operator files: `config.json` under `INNO_CONFIG_DIR` (immutable deployment fields only — `server`, `sandbox`, `objectStorage`, `presets`) and the image/seed skills dir `INNO_SKILLS_DIR`. Mutable platform config lives in the PostgreSQL `platform_config` row (`src/platform-config.ts`); mutable keys still present in `config.json` act as a per-boot seed that overrides the stored copy. A legacy `skills.json` disable list in the config dir is ignored entirely (tenant enablement is `tenant_skills`; there is no platform-level disable list).
+1. Operator files: `config.json` under `INNO_CONFIG_DIR` (immutable deployment fields only — `server`, `sandbox`, `objectStorage`, `presets`) and the image/seed skills dir `INNO_SKILLS_DIR`. Server-managed config lives only in the PostgreSQL `platform_config` row (`src/platform-config.ts`, written via `npm run platform:config`); `config.json` may not declare managed keys — boot fails if it does. Per-user defaults (memory/smartInput/ui, scheduler timezone Asia/Shanghai) are hardcoded in `normalizeConfig`. A legacy `skills.json` disable list in the config dir is ignored entirely (tenant enablement is `tenant_skills`; there is no platform-level disable list).
 2. The session workspace under `INNO_WORKSPACE_DIR`. With object storage this directory is a disposable working copy (local exec runs bash and file tools here). Preset open creates an empty workspace; it does not copy `agent.md` or `.skills/`.
 3. Logs always go to stdout — the platform owns rotation.
 
@@ -348,7 +350,7 @@ Deployment manifests live under `deploy/` (`Dockerfile.backend`, `Dockerfile.fro
 
 ### User-facing config (`<configDir>/config.json`)
 
-Operator-managed (volume `inno-agent-config`). Immutable fields stay in the file (`server`, `sandbox`, `objectStorage`, `presets`); everything else (providers, apiKeys, Tavily, channel endpoints/mode, `bridge.token`, `contentHub`, memory/smartInput/ui/scheduler defaults, global default model) is stored in the `platform_config` row and the file copy only seeds it on boot. The effective config is `mergeTenantConfig(localConfig, tenantConfig)` (`tenants/config.ts`): server fields from the `platform_config` row, user fields from the tenant row. Template: `config.example.json` at repo root. Declares `defaultProvider`, `defaultModel`, a `providers` map (each with `baseUrl`, `api` ∈ {`openai-completions`, `anthropic-messages`}, `apiKey`, `models[]`), optional `server.port`, optional `channels.*` blocks, optional `bridge.token`, optional `contentHub`, `memory`, and `ui` sections. Authenticated tenants keep only their selections (default model, channel toggles/allow-lists, memory/ui) in the PostgreSQL `tenant_configs` row — read async on demand, never written to disk. A new tenant starts with no selection and picks a model from the server-managed catalog before prompting.
+Operator-managed (volume `inno-agent-config`). Immutable fields stay in the file (`server`, `sandbox`, `objectStorage`, `presets`, `defaultProvider`, `defaultModel`); the file also carries the fixed `defaultProvider`/`defaultModel`; server-managed keys (providers, apiKeys, Tavily, channel endpoints/mode, `bridge.token`, `contentHub`) live only in the `platform_config` row (boot rejects a file that declares them); memory/smartInput/ui defaults are hardcoded, scheduler timezone is fixed to Asia/Shanghai. The effective config is `mergeTenantConfig(localConfig, tenantConfig)` (`tenants/config.ts`): server fields from the `platform_config` row, user fields from the tenant row. Template: `config.example.json` at repo root. Declares `defaultProvider`, `defaultModel`, a `providers` map (each with `baseUrl`, `api` ∈ {`openai-completions`, `anthropic-messages`}, `apiKey`, `models[]`), optional `server.port`, optional `channels.*` blocks, optional `bridge.token`, optional `contentHub`, `memory`, and `ui` sections. Authenticated tenants keep only their selections (default model, channel toggles/allow-lists, memory/ui) in the PostgreSQL `tenant_configs` row — read async on demand, never written to disk. A new tenant starts with no selection and picks a model from the server-managed catalog before prompting.
 
 Model config supports `reasoning` (boolean), `input` (modality array, e.g. `["text", "image"]`), `contextWindow`, and `maxTokens` per model entry. Provider config supports `authHeader` (boolean) and `bypassProxy` (boolean) fields.
 

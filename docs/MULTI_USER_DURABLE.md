@@ -67,7 +67,7 @@ Tenant-scoped Durable catalog / workspace / config / memory
 - 一个账号对应一个 personal tenant；当前没有 Organization/team 阶段。
 - tenant 只能来自已验证的 Better Auth session、服务端 membership 或 PostgreSQL ownership。
 - 未认证请求返回 401；跨 tenant 资源读取和执行返回 404。
-- Provider 目录、Tavily key、bridge token 和渠道端点由 `platform_config` 行统一托管（启动时以 `config.json` 中仍存在的可变键为 seed），租户不可写；tenant 配置行只存选择（默认模型、渠道开关/白名单、memory/ui），消费方直接 await 查询，不落本地文件。
+- Provider 目录、Tavily key、bridge token 和渠道端点存于 `platform_config` 行（运维 `npm run platform:config` 写入，`config.json` 不得含这些键），租户不可写；tenant 配置行只存选择（默认模型、渠道开关/白名单、memory/ui），消费方直接 await 查询，不落本地文件。
 - 历史文件不会自动归属于第一个登录用户，必须运行显式 legacy-owner migration。
 - authenticated 模式移除 PI host shell/通用 host file tools 和 PTY terminal；保留的路径工具执行 canonical workspace/symlink 检查。
 - MCP、subagents、web-access、codemode、computer-use 等多用户尚未隔离的能力保持关闭，而不是伪装成 tenant-safe。

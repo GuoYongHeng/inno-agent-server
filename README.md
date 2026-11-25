@@ -98,25 +98,13 @@ The operator seeds the provider catalog in `config.json`; each account only pick
 {
   "defaultProvider": "innospark",
   "defaultModel": "claude-sonnet-4-6",
-  "providers": {
-    "innospark": {
-      "baseUrl": "https://api.example.com",
-      "api": "anthropic-messages",
-      "apiKey": "replace-me",
-      "models": [{ "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6" }]
-    }
-  },
   "server": { "port": 3000 },
-  "channels": {
-    "feishu": { "enabled": false },
-    "wechat": { "enabled": false, "mode": "ilink" }
-  },
-  "memory": { "l2Enabled": true, "l3Enabled": true },
-  "ui": { "theme": "light" }
+  "sandbox": { "enabled": false },
+  "presets": { "dir": "" }
 }
 ```
 
-Each provider declares a `baseUrl`, an `api` (`openai-completions` or `anthropic-messages`), an `apiKey`, and a `models[]` list. Only immutable deployment fields (`server`, `sandbox`, `objectStorage`, `presets`) must live in this file — mutable platform config (providers, channel credentials, Tavily, hub, memory/ui/scheduler defaults) is stored in the PostgreSQL `platform_config` row so every worker shares one copy; mutable keys still present in `config.json` act as a per-boot seed that overrides the stored copy. This file is the operator-managed catalog — tenants cannot edit providers through the API or UI; their default-model choice is stored per-tenant in PostgreSQL. Each conversation keeps the model it was started with until you switch it.
+This file holds deployment fields plus the fixed default model. The provider catalog is written to the `platform_config` row — e.g. `npm run platform:config -- platform.json` where `platform.json` looks like `{"providers": {"innospark": {"baseUrl": ..., "api": "anthropic-messages", "apiKey": ..., "models": [{"id": "claude-sonnet-4-6", ...}]}}}`. Each provider declares a `baseUrl`, an `api` (`openai-completions` or `anthropic-messages`), an `apiKey`, and a `models[]` list. server-managed config (provider catalog, channel credentials/endpoints, Tavily, content hub) lives ONLY in the PostgreSQL `platform_config` row — `config.json` must not declare it (boot refuses a file that does); operators write it with `npm run platform:config -- <file>`. Per-user defaults (memory, smart input, UI theme, scheduler timezone = Asia/Shanghai) are hardcoded and overridden per tenant in `tenant_configs`. This file is the operator-managed catalog — tenants cannot edit providers through the API or UI; their default-model choice is stored per-tenant in PostgreSQL. Each conversation keeps the model it was started with until you switch it.
 
 ### Runtime paths
 

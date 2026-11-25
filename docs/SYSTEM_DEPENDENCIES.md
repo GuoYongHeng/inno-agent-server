@@ -62,7 +62,7 @@ apt-get update && apt-get install -y unzip zip bash && rm -rf /var/lib/apt/lists
 
 ```
 /etc/inno-agent/          # 配置文件目录（只读；仅不可变部署字段）
-  └── config.json         # server / sandbox / objectStorage / presets
+  └── config.json         # server / sandbox / objectStorage / presets / defaultProvider / defaultModel
 /var/lib/inno-agent/
   └── skills/             # 技能 seed 目录（只读；启动时发布进对象存储 catalog）
 /srv/inno-workspace/      # 会话工作区执行目录（读写；对象存储副本的临时镜像，非事实源）
