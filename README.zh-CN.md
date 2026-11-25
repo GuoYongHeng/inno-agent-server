@@ -116,7 +116,7 @@ Provider 目录由部署方在 `config.json` 中统一种子，账号只能在 S
 }
 ```
 
-每个供应商声明 `baseUrl`、`api`(`openai-completions` 或 `anthropic-messages`)、`apiKey` 和 `models[]` 列表。此文件是服务端托管的模型目录——租户无法通过 API 或 UI 修改 provider，其默认模型选择按租户存于 PostgreSQL。
+每个供应商声明 `baseUrl`、`api`(`openai-completions` 或 `anthropic-messages`)、`apiKey` 和 `models[]` 列表。此文件只需承载不可变部署字段（`server`、`sandbox`、`objectStorage`、`presets`）——可变平台配置（providers、渠道凭据、Tavily、内容中心、memory/ui/scheduler 默认值）存于 PostgreSQL `platform_config` 行，所有 worker 共享一份；`config.json` 中仍出现的可变键会作为每次启动的种子覆盖库中对应值。此文件是服务端托管的模型目录——租户无法通过 API 或 UI 修改 provider，其默认模型选择按租户存于 PostgreSQL。
 
 ### 运行时路径
 
@@ -132,7 +132,7 @@ Provider 目录由部署方在 `config.json` 中统一种子，账号只能在 S
 
 预设模板：`config.json` 的 `presets.dir`（默认 `<code>/presets`）。打开预设只建空工作区；`agent.md` 从镜像只读注入，`preset.json` 的 `skills` 绑定平台 catalog。  
 平台技能：`npm run skills:publish` 发布；租户通过 skills API 启用/禁用（`tenant_skills`）。  
-对象存储：不写进 `config.example.json`，用 `INNO_OBJECT_STORAGE_*`（见 `.env.example`）。未配置时是进程内 memory，不能跨 worker。
+对象存储：**必填**（`fs` 或 `s3`），不写进 `config.example.json`，用 `INNO_OBJECT_STORAGE_*`（见 `.env.example`）。未配置时服务拒绝启动。
 
 ### 权限
 
@@ -140,7 +140,7 @@ agent 没有 shell，也没有宿主机执行能力。文件工具（`read`、`w
 
 ### 内容中心(Content Hub)
 
-**平台技能**存放在对象存储 `platform/skills/<id>/<version>/`，元数据在 `skill_catalog`，租户启用关系在 `tenant_skills`。镜像内 `INNO_SKILLS_DIR` 会在启动时 seed 进目录；运维用 `npm run skills:publish` 发布更新（需 `DATABASE_URL` + 对象存储）。远程**内容中心**（`contentHub`，默认 [`Chloris-Blaxk/inno-agent-hub`](https://github.com/Chloris-Blaxk/inno-agent-hub)）主要用于浏览；租户「导入」只会启用**已经发布**到 catalog 的技能。简单模式预设不属于内容中心，由 `presets.dir` 配置。
+**平台技能**存放在对象存储 `platform/skills/<id>/<version>/`，元数据在 `skill_catalog`，租户启用关系在 `tenant_skills`；平台技能对租户只读+可启用。镜像内 `INNO_SKILLS_DIR` 会在启动时 seed 进目录；运维用 `npm run skills:publish` 发布更新（需 `DATABASE_URL` + 对象存储）。**租户自有技能**（Web 上传或内容中心导入）存放在 `tenants/<tenantId>/skills/<id>/<version>/`，仅 owner 租户可见（`skill_catalog.owner_tenant_id`），可由 owner 编辑/删除——不会写入任何共享本地技能目录。远程**内容中心**（`contentHub`，默认 [`Chloris-Blaxk/inno-agent-hub`](https://github.com/Chloris-Blaxk/inno-agent-hub)）主要用于浏览；租户「导入」只会启用**已经发布**到 catalog 的技能。简单模式预设不属于内容中心，由 `presets.dir` 配置。
 
 ## 架构
 
@@ -186,6 +186,12 @@ INNO_CONFIG_DIR=/etc/inno-agent \
 INNO_SKILLS_DIR=/var/lib/inno-agent/skills \
 INNO_WORKSPACE_DIR=/srv/inno-workspace \
 INNO_PORT=3000 \
+# 对象存储为必填（fs 或 s3——未配置时服务拒绝启动）：
+INNO_OBJECT_STORAGE_PROVIDER=s3 \
+INNO_OBJECT_STORAGE_ENDPOINT=... \
+INNO_OBJECT_STORAGE_BUCKET=... \
+INNO_OBJECT_STORAGE_ACCESS_KEY_ID=... \
+INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY=... \
 npm run server
 ```
 

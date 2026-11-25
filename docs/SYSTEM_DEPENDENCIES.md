@@ -61,19 +61,15 @@ apt-get update && apt-get install -y unzip zip bash && rm -rf /var/lib/apt/lists
 ### 2.4 目录结构和权限
 
 ```
-/etc/inno-agent/          # 配置文件目录（只读）
-  └── config.json
-/var/lib/inno-agent/      # 数据主目录（读写）
-  ├── data/               # L2 Wiki、L3 跨对话记忆、sessions、jobs
-  │   ├── l2/             # L2 Wiki 知识库
-  │   ├── l3/             # L3 SQLite 跨对话索引
-  │   ├── sessions/       # PI session JSONL 文件
-  │   ├── jobs/           # 定时任务持久化
-  │   └── log/            # 服务日志（pino 按天轮转）
-  └── skills/             # 技能包目录（可读写）
-/srv/inno-workspace/      # 默认工作区目录（读写）
+/etc/inno-agent/          # 配置文件目录（只读；仅不可变部署字段）
+  └── config.json         # server / sandbox / objectStorage / presets
+/var/lib/inno-agent/
+  └── skills/             # 技能 seed 目录（只读；启动时发布进对象存储 catalog）
+/srv/inno-workspace/      # 会话工作区执行目录（读写；对象存储副本的临时镜像，非事实源）
 /tmp/                     # 临时文件（ZIP 打包等操作使用）
 ```
+
+> 租户状态（会话、L2/L3 记忆、jobs、可变平台配置、技能 catalog 元数据）全部在 PostgreSQL；技能与 workspace 字节在对象存储（`INNO_OBJECT_STORAGE_*`，必填，`fs` 或 `s3`）。日志只输出到 stdout，不写本地文件。
 
 ---
 
