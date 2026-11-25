@@ -6,10 +6,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	pickImmutableConfig,
 	pickMutableConfig,
-	platformSkillDisabled,
 	readRawConfigFile,
 	resolvePlatformConfig,
-	withSkillDisabled,
 	type PlatformConfigDoc,
 } from "./platform-config.js";
 
@@ -64,7 +62,7 @@ describe("key split", () => {
 		const raw = {
 			server: { port: 3000 },
 			objectStorage: { provider: "s3" },
-			logging: { dir: "/tmp/logs" },
+			presets: { dir: "/app/presets" },
 			providers: PROVIDERS,
 			tavily: { apiKey: "x" },
 			smartInput: { enabled: false },
@@ -72,7 +70,7 @@ describe("key split", () => {
 		expect(pickImmutableConfig(raw)).toEqual({
 			server: { port: 3000 },
 			objectStorage: { provider: "s3" },
-			logging: { dir: "/tmp/logs" },
+			presets: { dir: "/app/presets" },
 		});
 		expect(Object.keys(pickMutableConfig(raw)).sort()).toEqual(["providers", "smartInput", "tavily"]);
 	});
@@ -121,26 +119,9 @@ describe("resolvePlatformConfig", () => {
 		await expect(resolvePlatformConfig(pool, {})).rejects.toThrow(/at least one provider/);
 	});
 
-	it("does not let the skillRegistry sidecar leak into InnoConfig", async () => {
+	it("drops unknown legacy keys from the stored doc out of InnoConfig", async () => {
 		const { pool } = fakePool({ providers: PROVIDERS, skillRegistry: { disabled: ["x"] } });
-		const { config, doc } = await resolvePlatformConfig(pool, {});
+		const { config } = await resolvePlatformConfig(pool, {});
 		expect((config as unknown as Record<string, unknown>).skillRegistry).toBeUndefined();
-		expect(doc.skillRegistry).toEqual({ disabled: ["x"] });
-	});
-});
-
-describe("skill registry sidecar", () => {
-	it("reads and writes the disabled list inside the doc", () => {
-		let doc: PlatformConfigDoc = {};
-		doc = withSkillDisabled(doc, "a", false);
-		doc = withSkillDisabled(doc, "b", false);
-		expect(platformSkillDisabled(doc)).toEqual(new Set(["a", "b"]));
-		doc = withSkillDisabled(doc, "a", true);
-		expect(platformSkillDisabled(doc)).toEqual(new Set(["b"]));
-	});
-	it("tolerates garbage in the stored doc", () => {
-		expect(platformSkillDisabled({ skillRegistry: { disabled: ["a", 5, null] as never } }))
-			.toEqual(new Set(["a"]));
-		expect(platformSkillDisabled(null)).toEqual(new Set());
 	});
 });

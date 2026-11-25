@@ -221,22 +221,11 @@ export interface InnoConfig {
 	sandbox?: Omit<Partial<InnoSandboxConfig>, "limits"> & { limits?: Partial<SandboxLimits> };
 	/** Platform-level blob storage (Alibaba Cloud OSS, MinIO or S3); never read from a tenant config. */
 	objectStorage?: RawObjectStorageConfig;
-	/** Platform-level logging; never read from a tenant config. */
-	logging?: InnoLoggingConfig;
 	/**
 	 * Platform-level preset workspace templates (baked into the image). Never
 	 * read from a tenant config.
 	 */
 	presets?: InnoPresetsConfig;
-}
-
-export interface InnoLoggingConfig {
-	/**
-	 * Directory for daily-rotated `server-YYYY-MM-DD.log` files. Unset (the
-	 * default) writes logs to stdout only. A relative path is resolved against
-	 * the process working directory.
-	 */
-	dir?: string;
 }
 
 export interface InnoPresetsConfig {
@@ -555,7 +544,6 @@ export function normalizeConfig(
 		tavily: config.tavily,
 		...(config.sandbox ? { sandbox: config.sandbox } : {}),
 		...(config.objectStorage ? { objectStorage: config.objectStorage } : {}),
-		...(config.logging ? { logging: config.logging } : {}),
 		...(config.presets ? { presets: config.presets } : {}),
 	} as InnoConfig;
 }
@@ -696,21 +684,6 @@ export function getConfiguredPort(config: InnoConfig, override?: number): number
 	return config.server?.port ?? 3000;
 }
 
-
-/**
- * Read only `logging.dir` from the config file. The logger must be configured
- * at process start, before the lazily-loaded full config is validated, and a
- * broken config must never prevent logging from working.
- */
-export function readLoggingDir(configPath: string): string | undefined {
-	try {
-		const raw = JSON.parse(readFileSync(configPath, "utf-8")) as { logging?: { dir?: unknown } };
-		const dir = raw.logging?.dir;
-		return typeof dir === "string" && dir.trim() ? dir.trim() : undefined;
-	} catch {
-		return undefined;
-	}
-}
 
 /**
  * Read only `presets.dir` from the config file. Path resolution happens before

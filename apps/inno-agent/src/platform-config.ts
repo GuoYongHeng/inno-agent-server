@@ -6,12 +6,12 @@ import { normalizeConfig, type InnoConfig } from "./config.js";
  * Platform configuration split.
  *
  * `config.json` is now immutable deployment input only: listen settings,
- * sandbox, object storage, logging and the baked-in presets directory.
+ * sandbox, object storage and the baked-in presets directory.
  * Everything an operator used to edit between restarts — the provider
  * catalog, channel credentials, search keys, feature toggles, per-platform
- * defaults for tenant-overridable sections, and the legacy skill-disable
- * list — lives in the `platform_config` row so every worker shares one
- * copy and replicas cannot drift.
+ * defaults for tenant-overridable sections — lives in the
+ * `platform_config` row so every worker shares one copy and replicas
+ * cannot drift.
  *
  * Boot semantics: mutable keys explicitly present in config.json are
  * upserted into the stored document (the file acts like a ConfigMap —
@@ -26,7 +26,6 @@ export const PLATFORM_IMMUTABLE_KEYS = [
 	"server",
 	"sandbox",
 	"objectStorage",
-	"logging",
 	"presets",
 ] as const;
 
@@ -49,19 +48,8 @@ export const PLATFORM_MUTABLE_KEYS = [
 	"openai",
 ] as const;
 
-/**
- * Sidecar carried inside the platform_config document but not part of
- * InnoConfig: the legacy global skill-disable list previously kept in
- * `<configDir>/skills.json`.
- */
-export interface SkillRegistryDoc {
-	disabled: string[];
-}
-
 /** The JSON document stored in platform_config.config (TEXT). */
-export type PlatformConfigDoc = Record<string, unknown> & {
-	skillRegistry?: SkillRegistryDoc;
-};
+export type PlatformConfigDoc = Record<string, unknown>;
 
 /**
  * Read the raw config.json without normalizing. A missing file yields `{}`
@@ -135,11 +123,6 @@ export async function savePlatformConfigDoc(pool: Pool, doc: PlatformConfigDoc):
 	);
 }
 
-function stripSidecar(doc: PlatformConfigDoc): Record<string, unknown> {
-	const { skillRegistry: _skillRegistry, ...config } = doc;
-	return config;
-}
-
 /**
  * Resolve the effective platform config at bootstrap: seed the DB document
  * with mutable keys explicitly present in config.json, persist the merged
@@ -157,30 +140,7 @@ export async function resolvePlatformConfig(
 	if (seeded) await savePlatformConfigDoc(pool, doc);
 	const config = normalizeConfig({
 		...pickImmutableConfig(fileRaw),
-		...stripSidecar(doc),
+		...doc,
 	} as Parameters<typeof normalizeConfig>[0]);
 	return { config, doc, seeded };
-}
-
-/** Global skill-disable list stored inside the platform config document. */
-export function platformSkillDisabled(doc: PlatformConfigDoc | null | undefined): Set<string> {
-	const disabled = doc?.skillRegistry?.disabled;
-	return new Set(
-		Array.isArray(disabled) ? disabled.filter((item): item is string => typeof item === "string") : [],
-	);
-}
-
-/** Return a new document with `name` added to / removed from the disabled list. */
-export function withSkillDisabled(
-	doc: PlatformConfigDoc,
-	name: string,
-	enabled: boolean,
-): PlatformConfigDoc {
-	const disabled = platformSkillDisabled(doc);
-	if (enabled) disabled.delete(name);
-	else disabled.add(name);
-	return {
-		...doc,
-		skillRegistry: { disabled: [...disabled].sort() },
-	};
 }

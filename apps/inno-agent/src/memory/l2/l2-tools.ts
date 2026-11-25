@@ -4,8 +4,7 @@ import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { defineInnoTool } from "../../agent/inno-tool.js";
 import { randomUUID, createHash } from "node:crypto";
-import { basename, join, isAbsolute, resolve } from "node:path";
-import { unlinkSync } from "node:fs";
+import { basename, isAbsolute, resolve } from "node:path";
 
 import type { ManifestEntry, RawSourceType } from "./types.js";
 import { saveRaw, saveRawFile } from "./raw-store.js";
@@ -21,10 +20,9 @@ import {
 	readMaintenanceContext,
 } from "./wiki-maintainer.js";
 import { queryWikiHybridDetailed } from "./wiki-query.js";
-import { summarizeContent } from "./summarizer.js";
+import { summarizeContent, type SummarizerCheckpoint } from "./summarizer.js";
 import { generateRichWikiPages } from "./wiki-generator.js";
 import { maintainLinkedWikiPages } from "./wiki-linker.js";
-import { fileExists } from "../../storage/file-store.js";
 import { l2Store } from "./l2-backend.js";
 import { parseDocument, DocumentParseError } from "./document-parser.js";
 import { getL2Memory, type L2Memory } from "./l2-memory.js";
@@ -336,7 +334,10 @@ export function createL2Tools(
 					].filter(Boolean).join("\n\n");
 					let summaryBody = `## 摘要\n\n${extractedContent}`;
 					let generationSourceContext = extractedContent;
-					const analysisCheckpointPath = join(l2DataDir, "ingest-progress", `${entry.id}-${entry.contentHash}.json`);
+					// Ingest checkpoints live in the L2 backend (PG rows for tenants),
+					// never the worker's disk — a resumed ingest must survive failover.
+					const checkpointKey = `_ingest-progress/${entry.id}-${entry.contentHash}.json`;
+					const checkpointStore = l2Store(l2DataDir);
 					if (model) {
 						reportProgress("正在生成摘要", "summarizing");
 						const summary = await summarizeContent(
@@ -346,7 +347,15 @@ export function createL2Tools(
 							extractedContent,
 							wikiContext,
 							{
-								checkpointPath: analysisCheckpointPath,
+								checkpoint: {
+									load: async () => {
+										try {
+											const raw = await checkpointStore.readText(checkpointKey);
+											return raw ? JSON.parse(raw) as SummarizerCheckpoint : null;
+										} catch { return null; }
+									},
+									save: (checkpoint) => checkpointStore.writeText(checkpointKey, JSON.stringify(checkpoint)),
+								},
 								sourceIdentity: promptSourceIdentity,
 								folderContext: params.folderContext?.trim(),
 								overview: maintenanceContext.overview,
@@ -489,9 +498,9 @@ export function createL2Tools(
 							if (!reconciled) logger.warn({ source: params.title }, "l2_archive: retrieval index remains out of sync");
 						}
 					try {
-						if (fileExists(analysisCheckpointPath)) unlinkSync(analysisCheckpointPath);
+						await checkpointStore.delete(checkpointKey);
 					} catch (err) {
-						logger.warn({ err, analysisCheckpointPath }, "l2_archive: failed to clear completed ingest checkpoint");
+						logger.warn({ err, checkpointKey }, "l2_archive: failed to clear completed ingest checkpoint");
 					}
 
 				} catch (err) {

@@ -116,7 +116,7 @@ The operator seeds the provider catalog in `config.json`; each account only pick
 }
 ```
 
-Each provider declares a `baseUrl`, an `api` (`openai-completions` or `anthropic-messages`), an `apiKey`, and a `models[]` list. Only immutable deployment fields (`server`, `sandbox`, `objectStorage`, `logging`, `presets`) must live in this file — mutable platform config (providers, channel credentials, Tavily, hub, memory/ui/scheduler defaults) is stored in the PostgreSQL `platform_config` row so every worker shares one copy; mutable keys still present in `config.json` act as a per-boot seed that overrides the stored copy. This file is the operator-managed catalog — tenants cannot edit providers through the API or UI; their default-model choice is stored per-tenant in PostgreSQL. Each conversation keeps the model it was started with until you switch it.
+Each provider declares a `baseUrl`, an `api` (`openai-completions` or `anthropic-messages`), an `apiKey`, and a `models[]` list. Only immutable deployment fields (`server`, `sandbox`, `objectStorage`, `presets`) must live in this file — mutable platform config (providers, channel credentials, Tavily, hub, memory/ui/scheduler defaults) is stored in the PostgreSQL `platform_config` row so every worker shares one copy; mutable keys still present in `config.json` act as a per-boot seed that overrides the stored copy. This file is the operator-managed catalog — tenants cannot edit providers through the API or UI; their default-model choice is stored per-tenant in PostgreSQL. Each conversation keeps the model it was started with until you switch it.
 
 ### Runtime paths
 

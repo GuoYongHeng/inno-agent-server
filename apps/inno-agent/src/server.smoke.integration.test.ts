@@ -100,7 +100,6 @@ beforeAll(async () => {
 	writeFileSync(
 		join(home, "config", "config.json"),
 		JSON.stringify({
-			logging: { dir: join(home, "logs") },
 			defaultProvider: "dummy",
 			defaultModel: "dummy-model",
 			providers: {

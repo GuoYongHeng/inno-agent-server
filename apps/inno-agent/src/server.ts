@@ -15,18 +15,14 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, sta
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
-import { normalizeSandboxConfig, readLoggingDir, type InnoConfig } from "./config.js";
+import { normalizeSandboxConfig, type InnoConfig } from "./config.js";
 import {
-	platformSkillDisabled,
 	readRawConfigFile,
 	resolvePlatformConfig,
-	savePlatformConfigDoc,
-	withSkillDisabled,
-	type PlatformConfigDoc,
 } from "./platform-config.js";
 import { installFetchLogger } from "./utils/fetch-logger.js";
 import { applyProviderProxyBypass } from "./utils/proxy-bypass.js";
-import { ensureDir, readJson, readText, writeText } from "./storage/file-store.js";
+import { ensureDir, readText, writeText } from "./storage/file-store.js";
 import { closeDeferredRuns, configureDeferredRuns } from "./scheduler/deferred-runs.js";
 import { DurableSessionBusyError, DurableSessionService } from "./agent/durable-session-service.js";
 import { DURABLE_JOB_BUSY_WAIT_MS, runDurableJobPrompt } from "./agent/durable-job-runner.js";
@@ -52,7 +48,6 @@ import {
 	safeJoinReal,
 	slugifySkillName,
 } from "./server/file-helpers.js";
-import { extractFrontmatterFields } from "./server/skill-frontmatter.js";
 import { handleChannelsRoutes } from "./server/routes/channels.js";
 import { handleJobsRoutes } from "./server/routes/jobs.js";
 import { handleCheckInsRoutes } from "./server/routes/checkins.js";
@@ -66,7 +61,6 @@ import { PgL2Backend } from "./memory/l2/pg-l2-backend.js";
 import { createObjectStore, normalizeObjectStorageConfig, type ObjectStore } from "./object-store/index.js";
 import { handlePresetsRoutes } from "./server/routes/presets.js";
 import { readPresetAgentMd, resolvePresetMeta } from "./presets/preset-store.js";
-import { loadSkillsFromDir } from "./agent/skills.js";
 import { SkillCatalogStore, type SkillCatalogRecord, type TenantSkillListing } from "./skills/catalog-store.js";
 import { buildCatalogSkillsSection, materializeSkill } from "./skills/materialize.js";
 import { publishSkillFromDir, publishSkillsFromRoot } from "./skills/publish.js";
@@ -77,7 +71,7 @@ import { handleChatRoutes } from "./server/routes/chat.js";
 import { handleBtwRoutes } from "./server/routes/btw.js";
 import {
 } from "./server/session-model.js";
-import { configureLogging, logger } from "./logger.js";
+import { logger } from "./logger.js";
 import { VIRTUAL_TENANT_ROOT } from "./tenants/paths.js";
 import { applyRuntimeEnvironment, parseRuntimeArgs, resolveRuntimePaths } from "./runtime.js";
 import { createGracefulShutdownHandler, installProcessFallbacks } from "./utils/process-fallback.js";
@@ -111,8 +105,6 @@ installFetchLogger();
 const parsed = parseRuntimeArgs(process.argv.slice(2));
 const paths = resolveRuntimePaths(parsed.options);
 applyRuntimeEnvironment(paths);
-configureLogging({ dir: readLoggingDir(paths.configPath) });
-
 const authConfig = readAuthRuntimeConfig(process.env);
 const durableShardConfig = readDurableShardConfig(process.env);
 const listenConfig = readListenConfig(process.env);
@@ -126,13 +118,6 @@ const port = parsed.options.port
 
 // Config is loaded on first API request, not at startup.
 let config!: InnoConfig;
-
-/**
- * The stored platform_config document (mutable config + sidecars like the
- * legacy skill-disable list). Populated during bootstrap; skill routes read
- * it through `platformSkillDisabled`.
- */
-let platformDoc: PlatformConfigDoc | undefined;
 
 // ---------------------------------------------------------------------------
 // Lazy bootstrap — directories, stores, channels, and agent session are
@@ -300,7 +285,6 @@ async function ensureBootstrapped(): Promise<void> {
 			readRawConfigFile(paths.configPath),
 		);
 		config = resolved.config;
-		platformDoc = await seedSkillRegistryFromFile(resolved.doc);
 		applyProviderProxyBypass(config);
 		getSandboxManager(); // fail fast on a sandbox config that cannot work
 
@@ -323,7 +307,6 @@ async function ensureBootstrapped(): Promise<void> {
 			// cannot run without one.
 			workspaceReplica = new WorkspaceReplica(getSharedObjectStore(), auth.tenantStore, workspaceRegistry);
 		}
-		migrateLegacyPiSkills();
 		await seedSkillCatalogFromImage();
 
 		// ---- channels ----
@@ -813,121 +796,6 @@ function listSkillLibrary(forceRefresh = false) {
 
 
 /**
- * Import a skill from the remote library into the global skills directory.
- * Downloads the item's files into a temp dir, then installs through the same
- * path as a zip upload (validates SKILL.md, normalizes frontmatter).
- */
-async function importSkillFromLibrary(skillName: string): Promise<{ name: string; filePath: string }> {
-	const source = getContentSource();
-	const tempRoot = join(tmpdir(), `inno-libskill-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-	const extractDir = join(tempRoot, "extract");
-	ensureDir(extractDir);
-	try {
-		await source.downloadItem("skills", skillName, extractDir);
-		return installSkillFromExtractedDir(extractDir, slugifySkillName(skillName), skillsDir);
-	} finally {
-		rmSync(tempRoot, { recursive: true, force: true });
-	}
-}
-
-function migrateLegacyPiSkills(): void {
-	const legacySkillsDir = join(paths.workspaceDir, ".pi", "skills");
-	if (!existsSync(legacySkillsDir)) return;
-	ensureDir(skillsDir);
-	for (const entry of readdirSync(legacySkillsDir, { withFileTypes: true })) {
-		if (!entry.isDirectory()) continue;
-		const legacySkillDir = join(legacySkillsDir, entry.name);
-		const legacySkillFile = join(legacySkillDir, "SKILL.md");
-		if (!existsSync(legacySkillFile)) continue;
-		const content = readText(legacySkillFile);
-		const skill = ensureSkillDocument(content, entry.name);
-		const targetDir = join(skillsDir, skill.name);
-		if (!existsSync(targetDir)) {
-			ensureDir(targetDir);
-			cpSync(legacySkillDir, targetDir, { recursive: true });
-			writeText(join(targetDir, "SKILL.md"), skill.content);
-		}
-	}
-}
-
-/**
- * One-time migration: if the platform_config document has never carried the
- * skill-disable list, adopt a legacy `<configDir>/skills.json` into it.
- * The file is left in place but never read again after the row exists.
- */
-async function seedSkillRegistryFromFile(doc: PlatformConfigDoc): Promise<PlatformConfigDoc> {
-	if (doc.skillRegistry !== undefined) return doc;
-	const registryPath = join(paths.configDir, "skills.json");
-	if (!existsSync(registryPath)) return doc;
-	const raw = readJson<{ disabled?: unknown }>(registryPath, {});
-	const disabled = Array.isArray(raw.disabled)
-		? raw.disabled.filter((item): item is string => typeof item === "string")
-		: [];
-	const next: PlatformConfigDoc = { ...doc, skillRegistry: { disabled } };
-	try {
-		await savePlatformConfigDoc(auth.tenantStore.database, next);
-	} catch (err) {
-		logger.warn({ err }, "failed to seed skills.json disable list into platform_config");
-	}
-	return next;
-}
-
-function disabledSkillNames(): Set<string> {
-	return platformSkillDisabled(platformDoc);
-}
-
-async function setSkillEnabled(name: string, enabled: boolean): Promise<void> {
-	platformDoc = withSkillDisabled(platformDoc ?? {}, name, enabled);
-	await savePlatformConfigDoc(auth.tenantStore.database, platformDoc);
-	writeDisabledSkillsIgnoreFile(platformSkillDisabled(platformDoc));
-}
-
-function writeDisabledSkillsIgnoreFile(disabled: Set<string>): void {
-	const lines = Array.from(disabled)
-		.sort()
-		.map((name) => `${name}/`);
-	writeText(join(skillsDir, ".ignore"), lines.length > 0 ? `${lines.join("\n")}\n` : "");
-}
-
-function listProjectSkills(): unknown[] {
-	ensureDir(skillsDir);
-	const disabled = disabledSkillNames();
-	const loaded = loadSkillsFromDir(skillsDir);
-	const loadedByPath = new Map(loaded.skills.map((skill) => [resolve(skill.filePath), skill]));
-	const diagnosticsByPath = new Map<string, string[]>();
-	for (const diagnostic of loaded.diagnostics) {
-		if (!diagnostic.path) continue;
-		const diagnosticPath = resolve(diagnostic.path);
-		const list = diagnosticsByPath.get(diagnosticPath) ?? [];
-		list.push(diagnostic.message);
-		diagnosticsByPath.set(diagnosticPath, list);
-	}
-
-	return readdirSync(skillsDir, { withFileTypes: true })
-		.filter((entry) => entry.isDirectory())
-		.map((entry) => {
-			const name = entry.name;
-			const filePath = join(skillsDir, name, "SKILL.md");
-			const content = existsSync(filePath) ? readText(filePath) : "";
-			const stat = existsSync(filePath) ? statSync(filePath) : statSync(join(skillsDir, name));
-			const loadedSkill = loadedByPath.get(resolve(filePath));
-			const fields = extractFrontmatterFields(content);
-			return {
-				name,
-				description: fields.description,
-				category: fields.category || undefined,
-				enabled: !disabled.has(name),
-				loaded: Boolean(loadedSkill),
-				filePath: relative(paths.workspaceDir, filePath),
-				size: existsSync(filePath) ? stat.size : 0,
-				updatedAt: stat.mtime.toISOString(),
-				diagnostics: diagnosticsByPath.get(resolve(filePath)) ?? [],
-			};
-		})
-		.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-/**
  * Refresh the agent's in-memory skills in the background.
  *
  * Skill listings (`listProjectSkills`) read from disk, so callers can respond
@@ -1300,8 +1168,6 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 
 	// --- Skills API ---
 	skills: (req, res, method, url) => handleSkillsRoutes(req, res, method, url, {
-		skillsDir,
-		sharedSkillsReadOnly: true,
 		catalog: {
 			listForTenant: async () => {
 				const tenant = requireRequestTenant(req);
@@ -1412,13 +1278,7 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 				return true;
 			},
 		},
-		scheduleSkillsReload,
-		listProjectSkills,
-		setSkillEnabled,
-		installSkillZip,
-		installSkillMarkdown,
 		listSkillLibrary,
-		importSkillFromLibrary,
 	}),
 
 	// --- Sessions API (extracted to server/routes/sessions.ts) ---

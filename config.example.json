@@ -77,9 +77,6 @@
 			"maxActiveMinutesPerDay": 480
 		}
 	},
-	"logging": {
-		"dir": ""
-	},
 	"presets": {
 		"dir": ""
 	}

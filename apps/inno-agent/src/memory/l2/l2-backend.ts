@@ -109,11 +109,9 @@ export function l2BackendFor(l2DataDir: string): L2Backend {
 	const key = resolve(l2DataDir);
 	let backend = backends.get(key);
 	if (backend) return backend;
-	try {
-		backend = resolver?.(key) ?? undefined!;
-	} catch (err) {
-		logger.warn({ err }, "[L2] backend resolver failed; falling back to file storage");
-	}
+	// A resolver failure must NOT fall back to file storage — that would put
+	// tenant memory on the worker's local disk. Fail loudly instead.
+	backend = resolver?.(key) ?? undefined!;
 	if (!backend) backend = new FileL2Backend(key);
 	backends.set(key, backend);
 	return backend;
