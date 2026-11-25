@@ -42,13 +42,10 @@ function catalogContext(overrides: Partial<SkillsRouteContext["catalog"]> = {}):
 		publishedAt: "2026-01-01T00:00:00Z",
 	};
 	return {
-		listSkillLibrary: vi.fn(async () => []),
 		catalog: {
 			listForTenant: vi.fn(async () => [entry]),
 			setEnabled: vi.fn(async () => entry),
-			enableIfPublished: vi.fn(async () => null),
 			installPackage: vi.fn(async () => entry),
-			importFromLibrary: vi.fn(async () => entry),
 			describe: vi.fn(async () => ({ entry, files: [{ relPath: "SKILL.md", sha256: "x", size: 4 }] })),
 			readFile: vi.fn(async () => new TextEncoder().encode("body")),
 			writeFile: vi.fn(async () => entry),
@@ -74,14 +71,6 @@ describe("catalog-backed skill management", () => {
 		)).toBe(true);
 		expect(res.statusCode).toBe(201);
 		expect(ctx.catalog.installPackage).toHaveBeenCalledOnce();
-	});
-
-	it("import enables published skills and publishes missing ones", async () => {
-		const ctx = catalogContext();
-		const res = fakeRes();
-		expect(await handleSkillsRoutes(reqWithBody({ name: "demo" }), res, "POST", "/api/skill-library/import", ctx)).toBe(true);
-		expect(res.statusCode).toBe(201);
-		expect(ctx.catalog.importFromLibrary).toHaveBeenCalledOnce();
 	});
 
 	it("deletes through the catalog", async () => {

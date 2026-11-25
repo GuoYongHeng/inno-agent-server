@@ -201,10 +201,6 @@ export interface InnoConfig {
 	bridge?: {
 		token: string;
 	};
-	github?: {
-		/** Personal access token to raise GitHub API rate limits for the skill library. */
-		token: string;
-	};
 	/** Remote source for the skill library + preset workspaces. */
 	contentHub?: InnoContentHubConfig;
 	memory?: InnoMemoryConfig;
@@ -469,13 +465,10 @@ export function normalizeUiConfig(ui: Partial<InnoUiConfig> | undefined): InnoUi
 
 /**
  * Normalize the Content Hub config, filling missing fields from the built-in
- * public-hub defaults. `legacyGithubToken` lets us migrate the older
- * `config.github.token` (which only fed the skill library) into the hub token
- * so existing users keep their rate-limit credential with zero changes.
+ * public-hub defaults.
  */
 export function normalizeContentHubConfig(
 	hub: Partial<InnoContentHubConfig> | undefined,
-	legacyGithubToken?: string,
 ): InnoContentHubConfig {
 	const type = hub?.type === "bundle" ? "bundle" : "github";
 	const trimmed = (v: string | undefined, fallback: string) => (v?.trim() ? v.trim() : fallback);
@@ -486,8 +479,7 @@ export function normalizeContentHubConfig(
 		ref: trimmed(hub?.ref, DEFAULT_CONTENT_HUB.ref),
 		skillsPath: trimmed(hub?.skillsPath, DEFAULT_CONTENT_HUB.skillsPath),
 		baseUrl: hub?.baseUrl?.trim() ?? "",
-		// Prefer an explicit hub token; otherwise inherit the legacy github token.
-		token: (hub?.token?.trim() || legacyGithubToken?.trim()) ?? "",
+		token: hub?.token?.trim() ?? "",
 	};
 }
 
@@ -535,8 +527,7 @@ export function normalizeConfig(
 		feishu: config.feishu,
 		channels: config.channels,
 		bridge: config.bridge,
-		github: config.github,
-		contentHub: normalizeContentHubConfig(config.contentHub, config.github?.token),
+		contentHub: normalizeContentHubConfig(config.contentHub),
 		memory: normalizeMemoryConfig(config.memory),
 		smartInput: normalizeSmartInputConfig(config.smartInput),
 		ui: normalizeUiConfig(config.ui),

@@ -15,7 +15,6 @@ export function createRouteDispatcher(handlers: RouteHandlers) {
 		{ prefix: "/api/channels", handler: handlers.channels },
 		{ prefix: "/api/bridge", handler: handlers.channels },
 		{ prefix: "/api/skills", handler: handlers.skills },
-		{ prefix: "/api/skill-library", handler: handlers.skills },
 		{ prefix: "/api/sessions", handler: handlers.sessions },
 		{ prefix: "/api/wiki", handler: handlers.wiki },
 		{ prefix: "/api/l2", handler: handlers.wiki },

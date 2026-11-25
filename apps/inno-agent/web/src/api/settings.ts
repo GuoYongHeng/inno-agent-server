@@ -97,23 +97,6 @@ export async function saveSandboxSettings(payload: SandboxSettingsPayload): Prom
 	});
 }
 
-export interface ContentHubPayload {
-	type: "github" | "bundle";
-	owner?: string;
-	repo?: string;
-	ref?: string;
-	skillsPath?: string;
-	baseUrl?: string;
-	token?: string;
-}
-
-export async function saveContentHubSettings(payload: ContentHubPayload): Promise<InnoSettings> {
-	return apiFetch<InnoSettings>("/api/settings/content-hub", {
-		method: "PUT",
-		body: JSON.stringify(payload),
-	});
-}
-
 export async function saveThemeSettings(theme: string): Promise<InnoSettings> {
 	return apiFetch<InnoSettings>("/api/settings/theme", {
 		method: "PUT",

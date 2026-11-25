@@ -33,7 +33,7 @@
 - ⏰ **主动调度器**——自然语言创建 cron 任务,可从 agent、UI 或守护进程触发。
 - 💬 **个人 IM 渠道**——飞书(原生)+ 微信(iLink 扫码登录或 bridge 模式),统一dispatcher 回推提醒。
 - 🎯 **简单模式 + 预设**——面向非技术用户的一键预设工作区(教案、PPT 制作、情景讲解)。
-- 🧩 **技能目录 + 内容中心**——平台技能在对象存储 + PostgreSQL（`tenant_skills` 启用）；可用远程 hub 浏览发现，用 `npm run skills:publish` 发布。预设随镜像打包（`presets.dir`）。
+- 🧩 **技能目录 + 内容中心**——平台技能在对象存储 + PostgreSQL（`tenant_skills` 启用）；远程 hub 仅作部署时导入源，用 `npm run skills:publish` 发布。预设随镜像打包（`presets.dir`）。
 - ✏️ **对话分支编辑**——重新编辑已发送的纯文本 Web 消息，并从该节点重新生成后续对话；旧分支不会进入当前模型上下文。
 - 🔌 **可插拔模型供应商**——任意 `openai-completions` 或 `anthropic-messages` 端点(Anthropic、OpenAI、DeepSeek、Ollama、本地模型),UI 内实时切换。
 - 🌍 **国际化与主题**——中/英文界面,四套主题。
@@ -104,7 +104,7 @@ Provider 目录由部署方在 `config.json` 中统一种子，账号只能在 S
 }
 ```
 
-此文件只放部署字段和固定默认模型。provider 目录用 `npm run platform:config -- platform.json` 写入 `platform_config` 行，`platform.json` 形如 `{"providers": {"innospark": {"baseUrl": ..., "api": "anthropic-messages", "apiKey": ..., "models": [{"id": "claude-sonnet-4-6", ...}]}}}`；每个供应商声明 `baseUrl`、`api`(`openai-completions` 或 `anthropic-messages`)、`apiKey` 和 `models[]` 列表。服务端托管配置（provider 目录、渠道凭据/端点、Tavily、内容中心）只存于 PostgreSQL `platform_config` 行——`config.json` 不得声明这些键（含则拒绝启动）；运维用 `npm run platform:config -- <file>` 写入。用户级默认值（memory、smartInput、UI 主题、scheduler 时区=Asia/Shanghai）硬编码在代码里，按租户在 `tenant_configs` 覆盖。此文件是服务端托管的模型目录——租户无法通过 API 或 UI 修改 provider，其默认模型选择按租户存于 PostgreSQL。
+`config.json` 是所有平台配置的唯一事实源：部署字段、固定默认模型、服务端托管目录（providers/apiKey、渠道端点与凭据、Tavily、内容中心）都在此声明。每个供应商声明 `baseUrl`、`api`(`openai-completions` 或 `anthropic-messages`)、`apiKey` 和 `models[]` 列表。运维将该文件注入容器；租户不可写——用户级默认值（memory、smartInput、UI 主题、scheduler 时区=Asia/Shanghai）硬编码在代码里，按租户在 `tenant_configs` 覆盖。此文件是服务端托管的模型目录——租户无法通过 API 或 UI 修改 provider，其默认模型选择按租户存于 PostgreSQL。
 
 ### 运行时路径
 
@@ -128,7 +128,7 @@ agent 没有 shell，也没有宿主机执行能力。文件工具（`read`、`w
 
 ### 内容中心(Content Hub)
 
-**平台技能**存放在对象存储 `platform/skills/<id>/<version>/`，元数据在 `skill_catalog`，租户启用关系在 `tenant_skills`；平台技能对租户只读+可启用。镜像内 `INNO_SKILLS_DIR` 会在启动时 seed 进目录；运维用 `npm run skills:publish` 发布更新（需 `DATABASE_URL` + 对象存储）。**租户自有技能**（Web 上传或内容中心导入）存放在 `tenants/<tenantId>/skills/<id>/<version>/`，仅 owner 租户可见（`skill_catalog.owner_tenant_id`），可由 owner 编辑/删除——不会写入任何共享本地技能目录。远程**内容中心**（`contentHub`，默认 [`Chloris-Blaxk/inno-agent-hub`](https://github.com/Chloris-Blaxk/inno-agent-hub)）主要用于浏览；租户「导入」只会启用**已经发布**到 catalog 的技能。简单模式预设不属于内容中心，由 `presets.dir` 配置。
+**平台技能**存放在对象存储 `platform/skills/<id>/<version>/`，元数据在 `skill_catalog`，租户启用关系在 `tenant_skills`；平台技能对租户只读+可启用。镜像内 `INNO_SKILLS_DIR` 会在启动时 seed 进目录；运维用 `npm run skills:publish` 发布更新（需 `DATABASE_URL` + 对象存储）。**租户自有技能**（Web 上传）存放在 `tenants/<tenantId>/skills/<id>/<version>/`，仅 owner 租户可见（`skill_catalog.owner_tenant_id`），可由 owner 编辑/删除——不会写入任何共享本地技能目录。远程**内容中心**（`contentHub`，默认 [`Chloris-Blaxk/inno-agent-hub`](https://github.com/Chloris-Blaxk/inno-agent-hub)）只是**部署时的分发渠道**：compose 的 `skills-init` 任务（或手动 `node dist/skills/import-hub-cli.js`）把 hub 里的技能一次性拉进平台 catalog；运行时不与 hub 通信，租户没有浏览/导入入口。简单模式预设不属于内容中心，由 `presets.dir` 配置。
 
 ## 架构
 

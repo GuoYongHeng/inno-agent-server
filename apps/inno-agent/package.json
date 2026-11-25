@@ -15,7 +15,7 @@
 		"auth:schema": "tsx src/auth/migrate.ts --print",
 		"skills:publish": "tsx src/skills/publish-cli.ts",
 		"workspace:fsck": "node dist/workspace-fsck.js",
-		"platform:config": "tsx src/platform-config-cli.ts"
+		"skills:import-hub": "tsx src/skills/import-hub-cli.ts"
 	},
 	"dependencies": {
 		"@aws-sdk/client-s3": "3.1173.0",

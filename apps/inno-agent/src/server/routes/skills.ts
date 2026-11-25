@@ -1,7 +1,5 @@
 import type { IncomingMessage as HttpReq, ServerResponse } from "node:http";
 import { basename } from "node:path";
-import { logger } from "../../logger.js";
-import type { SkillLibraryItem } from "../../content-source/types.js";
 import type { SkillManifestFile } from "../../skills/skill-object-key.js";
 import {
 	contentTypeForWorkspaceFile,
@@ -35,12 +33,8 @@ export interface CatalogSkillListing {
 export interface SkillsCatalogContext {
 	listForTenant: () => Promise<CatalogSkillListing[]>;
 	setEnabled: (skillId: string, enabled: boolean) => Promise<CatalogSkillListing | null>;
-	/** Enable a published catalog skill; returns null when not in catalog. */
-	enableIfPublished: (skillId: string) => Promise<CatalogSkillListing | null>;
 	/** Upload .zip/.md → publish bodies to object storage + catalog, enable for the tenant. */
 	installPackage: (fileName: string, data: Buffer) => Promise<CatalogSkillListing>;
-	/** Content-hub import → publish when missing, enable for the tenant. Throws on failure. */
-	importFromLibrary: (name: string) => Promise<CatalogSkillListing>;
 	/** Catalog record + manifest file list; null when the skill is not published. */
 	describe: (skillId: string) => Promise<{ entry: CatalogSkillListing; files: SkillManifestFile[] } | null>;
 	/** Bytes of one packaged file; null when the skill or file is missing. */
@@ -55,7 +49,6 @@ export interface SkillsRouteContext {
 	/** Platform catalog + tenant_skills. Required: object storage is a boot
 	 * dependency, so every skill operation goes through it. */
 	catalog: SkillsCatalogContext;
-	listSkillLibrary: (forceRefresh?: boolean) => Promise<SkillLibraryItem[]>;
 }
 
 /** Build the UI tree shape from a published skill's flat manifest file list. */
@@ -97,7 +90,7 @@ function manifestToTree(files: SkillManifestFile[], updatedAt: string): Workspac
 }
 
 /**
- * /api/skills* and /api/skill-library* route domain. Returns true when the
+ * /api/skills* route domain. Returns true when the
  * request was handled.
  */
 export async function handleSkillsRoutes(
@@ -151,36 +144,6 @@ export async function handleSkillsRoutes(
 
 	if (method === "POST" && url === "/api/skills/reload") {
 		json(res, 200, { reloaded: true, skills: await catalog.listForTenant() });
-		return true;
-	}
-
-	// --- Remote skill library (GitHub) ---
-	if (method === "GET" && url.split("?")[0] === "/api/skill-library") {
-		const forceRefresh = new URL(url, "http://localhost").searchParams.get("refresh") === "1";
-		try {
-			json(res, 200, await ctx.listSkillLibrary(forceRefresh));
-		} catch (err) {
-			logger.warn({ err }, "failed to list skill library");
-			json(res, 502, { error: err instanceof Error ? err.message : "Failed to load skill library" });
-		}
-		return true;
-	}
-
-	if (method === "POST" && url === "/api/skill-library/import") {
-		const body = (await readBody(req)) as Record<string, unknown>;
-		const skillName = typeof body.name === "string" ? body.name.trim() : "";
-		if (!skillName) {
-			json(res, 400, { error: "Missing skill name" });
-			return true;
-		}
-		try {
-			const entry = await catalog.enableIfPublished(slugifySkillName(skillName))
-				?? await catalog.importFromLibrary(skillName);
-			json(res, 201, entry);
-		} catch (err) {
-			logger.warn({ err }, "failed to import skill from library");
-			json(res, 502, { error: err instanceof Error ? err.message : "Failed to import skill" });
-		}
 		return true;
 	}
 

@@ -30,7 +30,6 @@ export interface SettingsRouteContext {
 	reloadFeishuChannel: () => Promise<void>;
 	syncChannelOwnership?: (previous: InnoConfig, next: InnoConfig) => Promise<void>;
 	scheduleSkillsReload: () => void;
-	invalidateContentSource: () => void;
 	/** Drop the cached sandbox manager so the next session open reads the new settings. */
 	invalidateSandbox?: () => void;
 }
@@ -88,9 +87,6 @@ function buildSafeSettings(config: InnoConfig) {
 		bridge: config.bridge
 			? { token: maskSecret(config.bridge.token) }
 			: undefined,
-		github: config.github
-			? { token: maskSecret(config.github.token) }
-			: undefined,
 		tavily: config.tavily
 			? { apiKey: maskSecret(config.tavily.apiKey) }
 			: undefined,
@@ -98,9 +94,8 @@ function buildSafeSettings(config: InnoConfig) {
 		sandbox: config.sandbox
 			? { ...config.sandbox, apiKey: maskSecret(config.sandbox.apiKey) }
 			: undefined,
-		contentHub: config.contentHub
-			? { ...config.contentHub, token: maskSecret(config.contentHub.token) }
-			: undefined,
+		// Deploy-time import source only — never a runtime settings surface.
+		contentHub: undefined,
 	};
 }
 
@@ -277,11 +272,6 @@ export async function handleSettingsRoutes(
 	if (method === "PUT" && url === "/api/settings/sandbox") {
 		json(res, 403, { error: "Sandbox settings are managed by the server operator" });
 		return true;
-	}
-
-	// --- Content Hub settings (source for skill library + presets) ---
-	if (method === "PUT" && url === "/api/settings/content-hub") {
-		return rejectSharedRuntime("Content Hub settings");
 	}
 
 	// PUT /api/settings/theme — persist UI theme preference

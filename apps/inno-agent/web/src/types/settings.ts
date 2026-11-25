@@ -112,15 +112,6 @@ export interface InnoSettings {
 	serverManaged?: { providers?: boolean; tavily?: boolean; channelCredentials?: boolean };
 	/** True when the server has E2B_API_KEY in its environment. */
 	sandboxEnvKey?: boolean;
-	contentHub?: {
-		type: "github" | "bundle";
-		owner: string;
-		repo: string;
-		ref: string;
-		skillsPath: string;
-		baseUrl: string;
-		token: string; // masked
-	};
 	memory?: { l2Enabled: boolean; l3Enabled: boolean };
 	smartInput?: SmartInputSettings;
 	ui?: { theme: string; mathSingleDollar: boolean };

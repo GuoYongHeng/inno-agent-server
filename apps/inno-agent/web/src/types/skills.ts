@@ -9,10 +9,3 @@ export interface SkillInfo {
 	diagnostics: string[];
 	category?: string;
 }
-
-export interface SkillLibraryItem {
-	name: string;
-	description: string;
-	installed: boolean;
-	category?: string;
-}

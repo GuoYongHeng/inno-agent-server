@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { fetchRemote } from "./proxy-fetch.js";
 import type { InnoContentHubConfig } from "../config.js";
 import { ensureDir } from "../storage/file-store.js";
 import { logger } from "../logger.js";
@@ -59,7 +60,7 @@ export class BundleServiceSource implements RemoteContentSource {
 		if (!forceRefresh && this.indexCache && now - this.indexCache.fetchedAt < INDEX_CACHE_TTL_MS) {
 			return this.indexCache.index;
 		}
-		const res = await fetch(`${this.base}/index.json`, { headers: this.headers() });
+		const res = await fetchRemote(`${this.base}/index.json`, { headers: this.headers() });
 		if (!res.ok) {
 			throw new Error(`Bundle service index request failed (${res.status} ${res.statusText})`);
 		}
@@ -96,7 +97,7 @@ export class BundleServiceSource implements RemoteContentSource {
 	async downloadItem(category: ContentCategory, name: string, targetDir: string): Promise<void> {
 		if (!isSafeItemName(name)) throw new Error(`Invalid item name: ${name}`);
 		const url = `${this.base}/${category}/${encodeURIComponent(name)}.tar.gz`;
-		const res = await fetch(url, { headers: this.headers() });
+		const res = await fetchRemote(url, { headers: this.headers() });
 		if (!res.ok) {
 			throw new Error(`Failed to download ${category}/${name} (${res.status} ${res.statusText})`);
 		}

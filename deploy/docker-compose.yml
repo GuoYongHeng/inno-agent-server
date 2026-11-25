@@ -55,19 +55,23 @@ services:
       INNO_OBJECT_STORAGE_ACCESS_KEY_ID: inno
       INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-inno-minio-secret-change-me}
       INNO_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+      # 直连 GitHub 失败时回退的代理（容器内访问宿主机代理用 host.docker.internal）
+      INNO_HUB_PROXY: ${INNO_HUB_PROXY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
     volumes:
-      # /etc/inno-agent/config.json holds DEPLOYMENT fields only (server /
-      # sandbox / objectStorage / presets / defaultProvider / defaultModel).
-      # The server-managed catalog — providers/apiKeys, tavily key, channel
-      # endpoints/bridge token — lives in the platform_config row and is
-      # written once via `npm run platform:config -- <file>`; the file may
-      # not carry those keys (boot refuses). Tenants only pick a model and
-      # flip channel/memory toggles — their choices live in tenant_configs.
+      # /etc/inno-agent/config.json is the SINGLE SOURCE OF TRUTH for all
+      # platform config: deployment fields, default model, and the
+      # server-managed catalog (providers/apiKeys, tavily, channel
+      # endpoints, bridge token, content hub) — it only changes on redeploy.
+      # Tenants only pick a model and flip channel/memory toggles; their
+      # choices live in tenant_configs. Keep the volume persistent because
+      # the file holds real credentials.
       - inno-agent-config:/etc/inno-agent
       # Everything else the agent writes — workspace copies in
       # INNO_WORKSPACE_DIR (including its .inno-scratch caches) — is
@@ -162,6 +166,40 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+
+  # One-shot skill import: pull every skill from the content hub (config.json
+  # `contentHub`) and publish it into the object store + skill_catalog. The
+  # hub is a DEPLOY-TIME distribution channel only — the running server never
+  # talks to it. Re-run manually after bumping the hub repo:
+  #   docker compose run --rm skills-init
+  skills-init:
+    image: inno-agent-backend:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    working_dir: /app/apps/inno-agent
+    entrypoint: [node, dist/skills/import-hub-cli.js]
+    volumes:
+      - inno-agent-config:/etc/inno-agent
+    environment:
+      INNO_CONFIG_DIR: /etc/inno-agent
+      DATABASE_URL: postgresql://inno:inno@postgres:5432/inno
+      INNO_OBJECT_STORAGE_PROVIDER: s3
+      INNO_OBJECT_STORAGE_ENDPOINT: http://minio:9000
+      INNO_OBJECT_STORAGE_REGION: us-east-1
+      INNO_OBJECT_STORAGE_BUCKET: inno
+      INNO_OBJECT_STORAGE_ACCESS_KEY_ID: inno
+      INNO_OBJECT_STORAGE_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-inno-minio-secret-change-me}
+      INNO_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+      # 直连 GitHub 失败时回退的代理（容器内访问宿主机代理用 host.docker.internal）
+      INNO_HUB_PROXY: ${INNO_HUB_PROXY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
 
 volumes:
   postgres-data:

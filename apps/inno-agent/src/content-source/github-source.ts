@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import type { InnoContentHubConfig } from "../config.js";
 import { ensureDir } from "../storage/file-store.js";
 import { logger } from "../logger.js";
+import { fetchRemote } from "./proxy-fetch.js";
 import {
 	CATEGORY_MARKER,
 	isSafeItemName,
@@ -60,7 +61,7 @@ export class GitHubContentSource implements RemoteContentSource {
 	}
 
 	private async getJson<T>(url: string): Promise<T> {
-		const res = await fetch(url, { headers: this.headers() });
+		const res = await fetchRemote(url, { headers: this.headers() });
 		if (!res.ok) {
 			// Surface rate-limit exhaustion with a clearer hint than a raw 403.
 			if (res.status === 403 && res.headers.get("x-ratelimit-remaining") === "0") {
@@ -104,7 +105,7 @@ export class GitHubContentSource implements RemoteContentSource {
 		let lastErr: unknown;
 		for (let attempt = 0; attempt < attempts; attempt++) {
 			try {
-				const res = await fetch(url, { headers });
+				const res = await fetchRemote(url, { headers });
 				if (res.status !== 429 && res.status < 500) return res;
 				if (attempt === attempts - 1) return res;
 				const retryAfter = Number(res.headers.get("retry-after"));

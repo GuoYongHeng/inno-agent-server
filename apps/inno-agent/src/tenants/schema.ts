@@ -571,14 +571,6 @@ ALTER TABLE skill_catalog ADD COLUMN IF NOT EXISTS owner_tenant_id text NULL REF
 CREATE INDEX IF NOT EXISTS skill_catalog_owner_idx ON skill_catalog (owner_tenant_id) WHERE owner_tenant_id IS NOT NULL;
 `;
 
-const PLATFORM_CONFIG_SQL = `
-CREATE TABLE IF NOT EXISTS platform_config (
-	id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-	config TEXT NOT NULL,
-	updated_at timestamptz NOT NULL DEFAULT now()
-);
-`;
-
 export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 1, name: "baseline", sql: BASELINE_SQL },
 	{ version: 2, name: "search_extensions", sql: EXTENSIONS_SQL },
@@ -599,8 +591,21 @@ export const TENANT_MIGRATIONS: readonly Migration[] = [
 	{ version: 17, name: "session_preset_id", sql: `
 ALTER TABLE durable_sessions ADD COLUMN IF NOT EXISTS preset_id text;
 ` },
-	{ version: 18, name: "platform_config", sql: PLATFORM_CONFIG_SQL },
+	// platform_config was dropped by migration 20 — this create is a no-op for
+	// databases that already applied it; fresh databases create then drop it.
+	{ version: 18, name: "platform_config", sql: `
+CREATE TABLE IF NOT EXISTS platform_config (
+	id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+	config TEXT NOT NULL,
+	updated_at timestamptz NOT NULL DEFAULT now()
+);
+` },
 	{ version: 19, name: "skill_catalog_owner", sql: SKILL_CATALOG_OWNER_SQL },
+	// platform_config proved unnecessary: config.json is the single source of
+	// truth for server-managed config too. Drop it; existing rows are abandoned.
+	{ version: 20, name: "drop_platform_config", sql: `
+DROP TABLE IF EXISTS platform_config;
+` },
 ];
 
 /** Every migration's SQL in order, for `auth:migrate --print`. */

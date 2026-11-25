@@ -72,27 +72,26 @@ CONTENT_DIR=scripts/content-hub-server/content-example PORT=8787 \
 
 > `owner`/`repo`/`ref`/`skillsPath`/`presetsPath` 这些是 github 模式的字段,bundle 模式下忽略,可保留以便随时切回。
 
-也可以在 App 里改:**设置 →「内容源」→ 选「自托管服务」**,填 baseUrl/token。
+### ③ 导入到平台 catalog
 
-### ③ 重启后端生效
+内容中心只是**部署时导入源**(运行时不与它通信,App 里也没有内容源设置)。改完 `config.json` 后执行一次性导入:
 
-> ⚠️ 改 `config.json` 后**必须重启后端**——它只在启动时读 config。
-> (在 App「内容源」面板里改则即时生效,无需重启。)
+```bash
+npm run skills:import-hub        # 或 compose: docker compose run --rm skills-init
+```
 
 ```bash
 bash restart-dev.sh restart --skip-build
 ```
 
-验证整条链路通了:
+验证导入链路（内容中心只是部署时导入源,运行时没有浏览接口）:
 
 ```bash
-# 后端 → 本地服务,应列出预设
-curl -s localhost:3000/api/preset-library | python3 -m json.tool
-# 应列出技能
-curl -s localhost:3000/api/skill-library  | python3 -m json.tool
+# index 正常返回
+curl -s localhost:8080/index.json | python3 -m json.tool
+# 配置 config.json 的 contentHub 指向该服务后,一次性导入平台 catalog
+DATABASE_URL=postgres://... npm run skills:import-hub
 ```
-
-然后打开 App、开启简单模式,欢迎页就会显示这些预设卡片。
 
 ---
 
@@ -184,7 +183,6 @@ inno-agent 的 `BundleServiceSource` 只依赖三个只读接口:
 | 现象 | 原因 / 处理 |
 |---|---|
 | 预设卡片不显示某个模板 | 多半是 `preset.json` 的 `id` ≠ 目录名;或目录以 `_`/`.` 开头 |
-| `/api/preset-library` 返回空 | 服务没起 / `baseUrl` 写错 / 后端没重启 |
 | 改了 config 不生效 | 后端只在启动读 config,需 `restart-dev.sh restart --skip-build`(或用 App 面板改) |
 | 401 Unauthorized | 服务开了 `HUB_TOKEN` 但 config 里 `token` 没填或不一致 |
 | 下载的 tarball 多一层目录 | 客户端用 `tar --strip-components=1` 解包;手动验证时也要加这个参数 |

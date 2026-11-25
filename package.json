@@ -24,7 +24,8 @@
 		"restart": "bash restart-dev.sh",
 		"restart:fast": "bash restart-dev.sh --skip-build",
 		"showcase:dev": "npm run dev --workspace inno-agent-showcase",
-		"showcase:build": "npm run build --workspace inno-agent-showcase"
+		"showcase:build": "npm run build --workspace inno-agent-showcase",
+		"skills:import-hub": "npm --workspace inno-agent run skills:import-hub --"
 	},
 	"engines": {
 		"node": ">=22.19.0"

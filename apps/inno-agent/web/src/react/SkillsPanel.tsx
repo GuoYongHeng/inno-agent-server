@@ -5,7 +5,7 @@ import { Tree, type NodeRendererProps } from "react-arborist";
 import { RefreshCw, Upload, Trash2, ChevronLeft, File, FileText, FileType, Folder, FolderOpen, Globe, Pencil, Save, X, PanelLeftClose, PanelLeftOpen, Download, Check, FileCode2, Search, Puzzle } from "lucide-react";
 import { skillsStore } from "../stores/skills-store.js";
 import { skillRawUrl } from '../api/skills.js';
-import type { SkillInfo, SkillLibraryItem } from "../types/skills.js";
+import type { SkillInfo } from "../types/skills.js";
 import type { WorkspaceFileDetail, WorkspaceFileKind, WorkspaceTreeNode } from "../types/workspace.js";
 import { type ArboristNode, toArboristNodes } from "../types/workspace.js";
 import { normalizeMarkdownMath } from "../utils/markdown-math.js";
@@ -393,8 +393,6 @@ function SkillCard({ skill, category, onClick }: { skill: SkillInfo; category: s
 
 /* ---------- Main SkillsPanel ---------- */
 
-type SkillsTab = "mine" | "library";
-
 export function SkillsPanel({ dndManager }: { dndManager: DragDropManager }) {
 	const { t } = useTranslation();
 	const uploadRef = useRef<HTMLInputElement | null>(null);
@@ -404,23 +402,13 @@ export function SkillsPanel({ dndManager }: { dndManager: DragDropManager }) {
 		isLoading: skillsStore.isLoading,
 		isUploading: skillsStore.isUploading,
 		error: skillsStore.error,
-		library: skillsStore.library,
-		isLoadingLibrary: skillsStore.isLoadingLibrary,
-		libraryError: skillsStore.libraryError,
-		importing: skillsStore.importing,
-		notice: skillsStore.notice,
 	}));
-	const [tab, setTab] = useState<SkillsTab>("mine");
 	const [query, setQuery] = useState("");
 	const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
 
 	useEffect(() => {
 		void skillsStore.load();
 	}, []);
-
-	useEffect(() => {
-		if (tab === "library") void skillsStore.loadLibrary();
-	}, [tab]);
 
 	function handleUpload(event: React.ChangeEvent<HTMLInputElement>) {
 		const file = event.target.files?.[0];
@@ -432,12 +420,7 @@ export function SkillsPanel({ dndManager }: { dndManager: DragDropManager }) {
 	const activeSkill = state.selectedSkill ? state.skills.find((s) => s.name === state.selectedSkill) : null;
 
 	const uncategorizedLabel = t("skills.uncategorized");
-	// "mine" lists every installed skill (cards carry their own enable toggle);
-	// the former "all" tab was the same list and has been merged into it.
-	const sourceItems = useMemo<(SkillInfo | SkillLibraryItem)[]>(() => {
-		if (tab === "library") return state.library;
-		return state.skills;
-	}, [tab, state.skills, state.library]);
+	const sourceItems = useMemo<SkillInfo[]>(() => state.skills, [state.skills]);
 
 	const groups = useMemo(
 		() => groupByCategory(
@@ -452,12 +435,6 @@ export function SkillsPanel({ dndManager }: { dndManager: DragDropManager }) {
 	);
 	const totalMatched = useMemo(() => groups.reduce((sum, [, items]) => sum + items.length, 0), [groups]);
 
-	// Reset the category filter when switching tabs (categories differ per source).
-	function switchTab(next: SkillsTab) {
-		setTab(next);
-		setCategoryFilter(null);
-	}
-
 	// Detail view — file browser
 	if (activeSkill) {
 		return (
@@ -469,28 +446,15 @@ export function SkillsPanel({ dndManager }: { dndManager: DragDropManager }) {
 		);
 	}
 
-	const isLibraryTab = tab === "library";
-	const isEmptySource = isLibraryTab ? state.library.length === 0 : state.skills.length === 0;
+	const isEmptySource = state.skills.length === 0;
 
 	return (
 		<div className="skills-panel-scroll h-full overflow-y-scroll">
 			<div className="mx-auto flex w-full max-w-[1160px] flex-col px-5 pb-10 pt-2">
 				{/* Tabs + search + actions */}
 				<div className="mb-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-					<div className="flex gap-6">
-						{(["mine", "library"] as SkillsTab[]).map((key) => (
-							<button
-								key={key}
-								className={`border-b-[2.5px] py-2.5 text-[15px] ${
-									tab === key
-										? "border-[var(--inno-text)] font-medium text-[var(--inno-text)]"
-										: "border-transparent text-[var(--inno-text-muted)] hover:text-[var(--inno-text)]"
-								}`}
-								onClick={() => switchTab(key)}
-							>
-								{t(`skills.tabs.${key}`)}
-							</button>
-						))}
+					<div className="border-b-[2.5px] border-[var(--inno-text)] py-2.5 text-[15px] font-medium text-[var(--inno-text)]">
+						{t("skills.tabs.mine")}
 					</div>
 					<div className="flex min-w-0 items-center gap-2 max-md:w-full">
 						<div className="flex min-w-0 w-[220px] items-center gap-2 rounded-[18px] border border-[var(--inno-border)] bg-[var(--inno-card-bg)] px-3.5 py-[7px] max-md:flex-1">
@@ -514,8 +478,8 @@ export function SkillsPanel({ dndManager }: { dndManager: DragDropManager }) {
 						</div>
 						<button
 							className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[var(--inno-text-muted)] hover:bg-[var(--inno-surface-muted)] hover:text-[var(--inno-text)]"
-							title={isLibraryTab ? t("skills.reload") : t("preview.refresh", "Refresh")}
-							onClick={() => void (isLibraryTab ? skillsStore.loadLibrary(true) : skillsStore.reload())}
+							title={t("preview.refresh", "Refresh")}
+							onClick={() => void skillsStore.reload()}
 						>
 							<RefreshCw size={15} />
 						</button>
@@ -562,34 +526,24 @@ export function SkillsPanel({ dndManager }: { dndManager: DragDropManager }) {
 					</div>
 				) : null}
 
-				{(isLibraryTab ? state.libraryError : state.error) ? (
+				{state.error ? (
 					<div className="mb-3 rounded-lg bg-[var(--inno-danger-bg)] px-3 py-2 text-xs text-[var(--inno-danger)]">
-						{isLibraryTab ? state.libraryError : state.error}
+						{state.error}
 					</div>
 				) : null}
 
 				{/* Body */}
-				{(isLibraryTab ? state.isLoadingLibrary : state.isLoading) ? (
+				{state.isLoading ? (
 					<div className="flex items-center justify-center py-16 text-[var(--inno-text-muted)]">
 						<Spinner size={16} className="mr-2" />
 						{t("common.loading")}
 					</div>
 				) : isEmptySource ? (
-					tab === "mine" ? (
-						<div className="flex flex-col items-center py-24 text-center">
-							<Puzzle size={44} strokeWidth={1.5} className="mb-3.5 text-[var(--inno-text-subtle)] opacity-60" />
-							<div className="mb-1.5 text-[15px] font-semibold text-[var(--inno-text)]">{t("skills.mineEmpty")}</div>
-							<div className="text-[12.5px] text-[var(--inno-text-subtle)]">{t("skills.mineEmptyDesc")}</div>
-						</div>
-					) : (
-						<div className="flex flex-col items-center py-24 text-center">
-							<Puzzle size={44} strokeWidth={1.5} className="mb-3.5 text-[var(--inno-text-subtle)] opacity-60" />
-							<div className="mb-1.5 text-[15px] font-semibold text-[var(--inno-text)]">
-								{isLibraryTab ? t("skills.libraryEmpty") : t("skills.empty")}
-							</div>
-							{!isLibraryTab ? <div className="max-w-sm text-[12.5px] text-[var(--inno-text-subtle)]">{t("skills.emptyDesc")}</div> : null}
-						</div>
-					)
+					<div className="flex flex-col items-center py-24 text-center">
+						<Puzzle size={44} strokeWidth={1.5} className="mb-3.5 text-[var(--inno-text-subtle)] opacity-60" />
+						<div className="mb-1.5 text-[15px] font-semibold text-[var(--inno-text)]">{t("skills.mineEmpty")}</div>
+						<div className="text-[12.5px] text-[var(--inno-text-subtle)]">{t("skills.mineEmptyDesc")}</div>
+					</div>
 				) : totalMatched === 0 ? (
 					<div className="py-16 text-center text-sm text-[var(--inno-text-muted)]">{t("skills.noResults")}</div>
 				) : (
@@ -602,61 +556,14 @@ export function SkillsPanel({ dndManager }: { dndManager: DragDropManager }) {
 								<span className="text-[12.5px] text-[var(--inno-text-subtle)]">· {items.length}</span>
 							</div>
 							<div className="grid min-w-0 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-3">
-								{isLibraryTab
-									? (items as SkillLibraryItem[]).map((item) => {
-											const isImporting = state.importing.has(item.name);
-											const tone = tileToneFor(category);
-											return (
-												<div
-													key={item.name}
-													className="flex min-w-0 w-full items-center gap-3 overflow-hidden rounded-[14px] border border-[var(--inno-border)] bg-[var(--inno-card-bg)] px-4 py-3.5"
-												>
-													<span
-														className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-[10px]"
-														style={{ background: tone.bg, color: tone.fg }}
-													>
-														<Puzzle size={19} strokeWidth={1.8} />
-													</span>
-													<div className="min-w-0 flex-1">
-														<div className="truncate text-[13.5px] font-medium text-[var(--inno-text)]">{item.name}</div>
-														{item.description ? (
-															<div className="mt-0.5 line-clamp-2 text-[11.5px] leading-relaxed text-[var(--inno-text-subtle)]">{item.description}</div>
-														) : null}
-													</div>
-													{item.installed ? (
-														<span className="flex shrink-0 items-center gap-1 rounded-md bg-[var(--inno-success-bg)] px-2 py-1 text-[11px] font-medium text-[var(--inno-success)]">
-															<Check size={12} /> {t("skills.installed")}
-														</span>
-													) : (
-														<button
-															disabled={isImporting}
-															className="flex h-7 shrink-0 items-center gap-1 rounded-md inno-primary-button px-2.5 text-xs text-white disabled:opacity-50"
-															onClick={() => void skillsStore.importFromLibrary(item.name)}
-														>
-															<Download size={12} />
-															{isImporting ? t("skills.importing") : t("skills.import")}
-														</button>
-													)}
-												</div>
-											);
-										})
-									: (items as SkillInfo[]).map((skill) => (
-											<SkillCard key={skill.name} skill={skill} category={category} onClick={() => void skillsStore.selectSkill(skill.name)} />
-										))}
+								{(items as SkillInfo[]).map((skill) => (
+									<SkillCard key={skill.name} skill={skill} category={category} onClick={() => void skillsStore.selectSkill(skill.name)} />
+								))}
 							</div>
 						</div>
 					))
 				)}
 			</div>
-			{state.notice ? (
-				<div
-					role="status"
-					className="fixed bottom-5 right-5 z-50 flex items-center gap-2 rounded-xl border border-[var(--inno-border)] bg-[var(--inno-card-bg)] px-4 py-2.5 text-[13px] text-[var(--inno-text)] shadow-lg"
-				>
-					<Check size={14} className="shrink-0 text-[var(--inno-success)]" />
-					{t("skills.importDone", { name: state.notice })}
-				</div>
-			) : null}
 		</div>
 	);
 }

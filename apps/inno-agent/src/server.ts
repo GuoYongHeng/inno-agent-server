@@ -15,11 +15,7 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, sta
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
-import { normalizeSandboxConfig, type InnoConfig } from "./config.js";
-import {
-	readRawConfigFile,
-	resolvePlatformConfig,
-} from "./platform-config.js";
+import { loadConfig, normalizeSandboxConfig, type InnoConfig } from "./config.js";
 import { installFetchLogger } from "./utils/fetch-logger.js";
 import { applyProviderProxyBypass } from "./utils/proxy-bypass.js";
 import { ensureDir, readText, writeText } from "./storage/file-store.js";
@@ -79,8 +75,6 @@ import { TEMP_WORKSPACE_ID, WorkspaceRegistry, type WorkspaceMeta } from "./work
 import { WorkspaceReplica } from "./workspace/workspace-replica.js";
 import { ObjectWorkspaceStore } from "./workspace/object-workspace-store.js";
 import type { WorkspaceStore } from "./workspace/workspace-store.js";
-import type { RemoteContentSource } from "./content-source/index.js";
-import { ContentHubCatalog } from "./content-source/catalog-service.js";
 import { readAuthRuntimeConfig, readListenConfig } from "./auth/config.js";
 import { assertSignUpAllowed, isPublicApiRequest, isTrustedOrigin, requireSession } from "./auth/http.js";
 import { createAuthRuntime } from "./auth/runtime.js";
@@ -244,11 +238,6 @@ const workspaceStoreForRequest = (request: HttpReq): WorkspaceStore => {
 // lazily next to the workspace registry it materializes into.
 let workspaceReplica: WorkspaceReplica | null = null;
 
-const contentHubCatalog = new ContentHubCatalog({
-	paths,
-	skillsDir,
-	getConfig: () => config,
-});
 
 // All stateful services are declared with !: — they are guaranteed to be
 // initialised before any API handler that uses them runs, because the HTTP
@@ -277,15 +266,11 @@ async function ensureBootstrapped(): Promise<void> {
 		logger.info("[inno-server] first meaningful request — bootstrapping...");
 
 		// ---- config (loaded lazily, not at process start) ----
-		// Platform config = file-backed deployment fields + the server-managed
-		// document (provider catalog, channel credentials, Tavily, hub) from
-		// the `platform_config` row. config.json may not carry managed keys;
-		// ops write the row via `npm run platform:config`.
-		const resolved = await resolvePlatformConfig(
-			auth.tenantStore.database,
-			readRawConfigFile(paths.configPath),
-		);
-		config = resolved.config;
+		// config.json is the single source of truth for all platform config —
+		// deployment fields AND the server-managed catalog (providers, tavily,
+		// channel credentials, hub). Tenants never write it; their selections
+		// live in tenant_configs.
+		config = loadConfig(paths.configPath);
 		applyProviderProxyBypass(config);
 		getSandboxManager(); // fail fast on a sandbox config that cannot work
 
@@ -468,9 +453,6 @@ async function ensureBootstrapped(): Promise<void> {
 
 		bootstrapped = true;
 		logger.info("[inno-server] bootstrap complete");
-		// Simple Mode cards and the remote skill library are warmed in the
-		// background. Never make the first meaningful API response wait on GitHub.
-		void contentHubCatalog.warm();
 	}).catch((err) => {
 		logger.error({ err }, "[inno-server] bootstrap failed");
 		bootstrapPromise = null; // allow retry on next request
@@ -634,7 +616,7 @@ function installSkillZip(fileName: string, data: Buffer, targetRoot: string = sk
 /**
  * Install a skill from an already-extracted directory: locate the SKILL.md,
  * normalize its frontmatter, and copy the package into the skills directory.
- * Shared by zip upload and skill-library import.
+ * Shared by zip upload and markdown upload.
  */
 function installSkillFromExtractedDir(extractDir: string, fallbackName: string, targetRoot: string = skillsDir): { name: string; filePath: string } {
 	const skillFile = findSkillFile(extractDir);
@@ -771,28 +753,6 @@ function importWorkspaceZip(fileName: string, data: Buffer, name?: string): Work
 	} finally {
 		rmSync(tempRoot, { recursive: true, force: true });
 	}
-}
-
-// ---------------------------------------------------------------------------
-// Remote content hub (skill library + preset workspaces)
-//
-// Backed by a RemoteContentSource (GitHub repo by default, or a self-hosted
-// bundle service). The source is created lazily from config.contentHub and
-// recreated whenever the hub config changes, so settings edits take effect
-// without a restart.
-// ---------------------------------------------------------------------------
-/** Get (or rebuild) the content source for the current config.contentHub. */
-function getContentSource(): RemoteContentSource {
-	return contentHubCatalog.getSource();
-}
-
-/** Drop the source so the next call rebuilds it (and its cache) from config. */
-function invalidateContentSource(): void {
-	contentHubCatalog.invalidate();
-}
-
-function listSkillLibrary(forceRefresh = false) {
-	return contentHubCatalog.listSkillLibrary(forceRefresh);
 }
 
 
@@ -1180,13 +1140,6 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 				const row = await getSkillCatalog().setEnabled(tenant.tenantId, skillId, enabled);
 				return row ? toCatalogSkillListing(row) : null;
 			},
-			enableIfPublished: async (skillId) => {
-				const tenant = requireRequestTenant(req);
-				const existing = await getSkillCatalog().get(skillId);
-				if (!existing) return null;
-				const row = await getSkillCatalog().setEnabled(tenant.tenantId, skillId, true);
-				return row ? toCatalogSkillListing(row) : null;
-			},
 			installPackage: async (fileName, data) => {
 				const tenant = requireRequestTenant(req);
 				const tempRoot = mkdtempSync(join(tmpdir(), "inno-skill-pub-"));
@@ -1196,21 +1149,6 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 						? installSkillZip(fileName, data, tempRoot)
 						: installSkillMarkdown(fileName, data, tempRoot);
 					return await publishSkillDirToCatalog(join(tempRoot, installed.name), "upload", tenant);
-				} finally {
-					rmSync(tempRoot, { recursive: true, force: true });
-				}
-			},
-			importFromLibrary: async (skillName) => {
-				const tenant = requireRequestTenant(req);
-				const tempRoot = mkdtempSync(join(tmpdir(), "inno-skill-lib-"));
-				try {
-					const extractDir = join(tempRoot, "extract");
-					ensureDir(extractDir);
-					await getContentSource().downloadItem("skills", skillName, extractDir);
-					const staged = join(tempRoot, "staged");
-					ensureDir(staged);
-					const installed = installSkillFromExtractedDir(extractDir, slugifySkillName(skillName), staged);
-					return await publishSkillDirToCatalog(join(staged, installed.name), "library-import", tenant);
 				} finally {
 					rmSync(tempRoot, { recursive: true, force: true });
 				}
@@ -1279,7 +1217,6 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 				return true;
 			},
 		},
-		listSkillLibrary,
 	}),
 
 	// --- Sessions API (extracted to server/routes/sessions.ts) ---
@@ -1314,7 +1251,6 @@ const { dispatch: dispatchRoutes } = createRouteDispatcher({
 		reloadFeishuChannel,
 		syncChannelOwnership: (previous, next) => tenantChannelManager!.syncOwnership(previous, next),
 		scheduleSkillsReload,
-		invalidateContentSource,
 		invalidateSandbox: () => { sandboxManager = undefined; },
 	}),
 
